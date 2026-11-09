@@ -51,24 +51,24 @@
 #  define ElfW(type) Elf32_##type
 # endif
 struct link_map {
-   ElfW(Addr) l_addr;
-   char *l_name;
-   ElfW(Dyn) *l_ld;
-   struct link_map *l_next, *l_prev;
+  ElfW(Addr) l_addr;
+  char *l_name;
+  ElfW(Dyn) *l_ld;
+  struct link_map *l_next, *l_prev;
 };
 struct dl_phdr_info {
-   ElfW(Addr) dlpi_addr;
-   const char *dlpi_name;
-   const ElfW(Phdr) *dlpi_phdr;
-   ElfW(Half) dlpi_phnum;
+  ElfW(Addr) dlpi_addr;
+  const char *dlpi_name;
+  const ElfW(Phdr) *dlpi_phdr;
+  ElfW(Half) dlpi_phnum;
 };
 enum { RT_CONSISTENT, RT_ADD, RT_DELETE };
 struct r_debug {
-   int r_version;
-   struct link_map *r_map;
-   ElfW(Addr) r_brk;
-   int r_state;
-   ElfW(Addr) r_ldbase;
+  int r_version;
+  struct link_map *r_map;
+  ElfW(Addr) r_brk;
+  int r_state;
+  ElfW(Addr) r_ldbase;
 };
 #else
 # include <link.h>
@@ -97,37 +97,37 @@ void apkenv_debugger_init();
 #if 0
 struct link_map
 {
-    uintptr_t l_addr;
-    char * l_name;
-    uintptr_t l_ld;
-    struct link_map * l_next;
-    struct link_map * l_prev;
+  uintptr_t l_addr;
+  char * l_name;
+  uintptr_t l_ld;
+  struct link_map * l_next;
+  struct link_map * l_prev;
 };
 
 /* needed for dl_iterate_phdr to be passed to the callbacks provided */
 struct dl_phdr_info
 {
-    Elf32_Addr dlpi_addr;
-    const char *dlpi_name;
-    const Elf32_Phdr *dlpi_phdr;
-    Elf32_Half dlpi_phnum;
+  Elf32_Addr dlpi_addr;
+  const char *dlpi_name;
+  const Elf32_Phdr *dlpi_phdr;
+  Elf32_Half dlpi_phnum;
 };
 
 
 // Values for r_debug->state
 enum {
-    RT_CONSISTENT,
-    RT_ADD,
-    RT_DELETE
+  RT_CONSISTENT,
+  RT_ADD,
+  RT_DELETE
 };
 
 struct r_debug
 {
-    int32_t r_version;
-    struct link_map * r_map;
-    void (*r_brk)(void);
-    int32_t r_state;
-    uintptr_t r_ldbase;
+  int32_t r_version;
+  struct link_map * r_map;
+  void (*r_brk)(void);
+  int32_t r_state;
+  uintptr_t r_ldbase;
 };
 #endif
 
@@ -142,74 +142,74 @@ typedef struct soinfo soinfo;
 
 struct soinfo
 {
-    const char name[SOINFO_NAME_LEN];
-    AElf(Phdr) *phdr;
-    int phnum;
-    uintptr_t entry;
-    uintptr_t base;
-    size_t size;
+  const char name[SOINFO_NAME_LEN];
+  AElf(Phdr) *phdr;
+  int phnum;
+  uintptr_t entry;
+  uintptr_t base;
+  size_t size;
 
-    int unused;  // DO NOT USE, maintained for compatibility.
+  int unused;  // DO NOT USE, maintained for compatibility.
 
-    AElf(Dyn) *dynamic;
+  AElf(Dyn) *dynamic;
 
-    uintptr_t wrprotect_start;
-    uintptr_t wrprotect_end;
+  uintptr_t wrprotect_start;
+  uintptr_t wrprotect_end;
 
-    soinfo *next;
-    unsigned flags;
+  soinfo *next;
+  unsigned flags;
 
-    const char *strtab;
-    AElf(Sym) *symtab;
+  const char *strtab;
+  AElf(Sym) *symtab;
 
-    unsigned nbucket;
-    unsigned nchain;
-    unsigned *bucket;
-    unsigned *chain;
+  unsigned nbucket;
+  unsigned nchain;
+  unsigned *bucket;
+  unsigned *chain;
 
-    uintptr_t *plt_got;
+  uintptr_t *plt_got;
 
 #ifdef ANDROID_64BIT_LINKER
-    AElf(Rela) *plt_rela;
-    unsigned plt_rela_count;
+  AElf(Rela) *plt_rela;
+  unsigned plt_rela_count;
 
-    AElf(Rela) *rela;
-    unsigned rela_count;
+  AElf(Rela) *rela;
+  unsigned rela_count;
 #else
-    AElf(Rel) *plt_rel;
-    unsigned plt_rel_count;
+  AElf(Rel) *plt_rel;
+  unsigned plt_rel_count;
 
-    AElf(Rel) *rel;
-    unsigned rel_count;
+  AElf(Rel) *rel;
+  unsigned rel_count;
 #endif
 
-    uintptr_t *preinit_array;
-    unsigned preinit_array_count;
+  uintptr_t *preinit_array;
+  unsigned preinit_array_count;
 
-    uintptr_t *init_array;
-    unsigned init_array_count;
-    uintptr_t *fini_array;
-    unsigned fini_array_count;
+  uintptr_t *init_array;
+  unsigned init_array_count;
+  uintptr_t *fini_array;
+  unsigned fini_array_count;
 
-    void (*init_func)(void);
-    void (*fini_func)(void);
+  void (*init_func)(void);
+  void (*fini_func)(void);
 
 #ifdef ANDROID_ARM_LINKER
-    /* ARM EABI section used for stack unwinding. */
-    unsigned *ARM_exidx;
-    unsigned ARM_exidx_count;
+  /* ARM EABI section used for stack unwinding. */
+  unsigned *ARM_exidx;
+  unsigned ARM_exidx_count;
 #endif
 
-    unsigned refcount;
-    struct link_map linkmap;
+  unsigned refcount;
+  struct link_map linkmap;
 
-    int constructors_called;
+  int constructors_called;
 
-    uintptr_t gnu_relro_start;
-    size_t gnu_relro_len;
+  uintptr_t gnu_relro_start;
+  size_t gnu_relro_len;
 
-    /* apkenv stuff */
-    char fullpath[SOINFO_NAME_LEN];
+  /* apkenv stuff */
+  char fullpath[SOINFO_NAME_LEN];
 };
 
 

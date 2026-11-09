@@ -53,20 +53,28 @@ int bionic_dlclose(void *handle);
 #define RTLD_LOCAL 0
 #define RTLD_NOW 2
 static void warnx(const char *format, ...) {
-   va_list args;
-   va_start(args, format); vfprintf(stderr, format, args); va_end(args);
-   fputc('\n', stderr);
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fputc('\n', stderr);
 }
 static void errx(int status, const char *format, ...) {
-   va_list args;
-   va_start(args, format); vfprintf(stderr, format, args); va_end(args);
-   fputc('\n', stderr); exit(status);
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fputc('\n', stderr);
+  exit(status);
 }
 static void err(int status, const char *format, ...) {
-   int saved = errno;
-   va_list args;
-   va_start(args, format); vfprintf(stderr, format, args); va_end(args);
-   fprintf(stderr, ": %s\n", strerror(saved)); exit(status);
+  int saved = errno;
+  va_list args;
+  va_start(args, format);
+  vfprintf(stderr, format, args);
+  va_end(args);
+  fprintf(stderr, ": %s\n", strerror(saved));
+  exit(status);
 }
 #endif
 
@@ -76,7 +84,7 @@ static void err(int status, const char *format, ...) {
 static lunaria_touch_event
 touch_to_lunaria(const ArmExecTouchEvent *te)
 {
-   return *te;
+  return *te;
 }
 #include "dvm/dvm_media.h"
 
@@ -91,106 +99,116 @@ extern void arm64_exec_svc_ring_dump(void);
  * therefore deliberately have no guest ELF beside the APK libraries. */
 static int elf_dep_seen(const char *name, char seen[][LUNA_GUEST_NAME_MAX + 1], size_t n)
 {
-   for (size_t i = 0; i < n; ++i)
-      if (!strcmp(name, seen[i])) return 1;
-   return 0;
+  for (size_t i = 0; i < n; ++i)
+    if (!strcmp(name, seen[i])) return 1;
+  return 0;
 }
 
 static int elf_vaddr_to_offset(const Elf64_Phdr *ph, size_t n,
                                Elf64_Addr va, Elf64_Off *off)
 {
-   for (size_t i = 0; i < n; ++i) {
-      if (ph[i].p_type != PT_LOAD) continue;
-      if (va >= ph[i].p_vaddr && va < ph[i].p_vaddr + ph[i].p_filesz) {
-         *off = ph[i].p_offset + (va - ph[i].p_vaddr);
-         return 1;
-      }
-   }
-   return 0;
+  for (size_t i = 0; i < n; ++i) {
+    if (ph[i].p_type != PT_LOAD) continue;
+    if (va >= ph[i].p_vaddr && va < ph[i].p_vaddr + ph[i].p_filesz) {
+      *off = ph[i].p_offset + (va - ph[i].p_vaddr);
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static size_t elf_read_needed(const char *path,
                               char names[][LUNA_GUEST_NAME_MAX + 1], size_t cap)
 {
-   FILE *f = fopen(path, "rb");
-   Elf64_Ehdr eh = {0};
-   Elf64_Phdr *ph = NULL;
-   size_t count = 0;
-   unsigned char ident[EI_NIDENT];
-   if (!f || fread(ident, sizeof ident, 1, f) != 1 ||
-       memcmp(ident, ELFMAG, SELFMAG) || ident[EI_DATA] != ELFDATA2LSB)
-      goto out;
-   const bool elf32 = ident[EI_CLASS] == ELFCLASS32;
-   if (ident[EI_CLASS] != ELFCLASS32 && ident[EI_CLASS] != ELFCLASS64) goto out;
-   rewind(f);
-   if (elf32) {
-      Elf32_Ehdr h;
-      if (fread(&h, sizeof h, 1, f) != 1 || h.e_machine != EM_ARM ||
-          h.e_phentsize != sizeof(Elf32_Phdr)) goto out;
-      eh.e_phnum = h.e_phnum;
-      eh.e_phoff = h.e_phoff;
-   } else {
-      if (fread(&eh, sizeof eh, 1, f) != 1 || eh.e_machine != EM_AARCH64 ||
-          eh.e_phentsize != sizeof(Elf64_Phdr)) goto out;
-   }
-   if (!eh.e_phnum) goto out;
-   ph = calloc(eh.e_phnum, sizeof *ph);
-   if (!ph || fseeko(f, (off_t)eh.e_phoff, SEEK_SET)) goto out;
-   for (size_t i = 0; i < eh.e_phnum; ++i) {
-      if (elf32) {
-         Elf32_Phdr h;
-         if (fread(&h, sizeof h, 1, f) != 1) goto out;
-         ph[i] = (Elf64_Phdr){ .p_type=h.p_type, .p_flags=h.p_flags,
-            .p_offset=h.p_offset, .p_vaddr=h.p_vaddr, .p_paddr=h.p_paddr,
-            .p_filesz=h.p_filesz, .p_memsz=h.p_memsz, .p_align=h.p_align };
-      } else if (fread(&ph[i], sizeof ph[i], 1, f) != 1) goto out;
-   }
+  FILE *f = fopen(path, "rb");
+  Elf64_Ehdr eh = {0};
+  Elf64_Phdr *ph = NULL;
+  size_t count = 0;
+  unsigned char ident[EI_NIDENT];
+  if (!f || fread(ident, sizeof ident, 1, f) != 1 ||
+      memcmp(ident, ELFMAG, SELFMAG) || ident[EI_DATA] != ELFDATA2LSB)
+    goto out;
+  const bool elf32 = ident[EI_CLASS] == ELFCLASS32;
+  if (ident[EI_CLASS] != ELFCLASS32 && ident[EI_CLASS] != ELFCLASS64) goto out;
+  rewind(f);
+  if (elf32) {
+    Elf32_Ehdr h;
+    if (fread(&h, sizeof h, 1, f) != 1 || h.e_machine != EM_ARM ||
+        h.e_phentsize != sizeof(Elf32_Phdr)) goto out;
+    eh.e_phnum = h.e_phnum;
+    eh.e_phoff = h.e_phoff;
+  } else {
+    if (fread(&eh, sizeof eh, 1, f) != 1 || eh.e_machine != EM_AARCH64 ||
+        eh.e_phentsize != sizeof(Elf64_Phdr)) goto out;
+  }
+  if (!eh.e_phnum) goto out;
+  ph = calloc(eh.e_phnum, sizeof *ph);
+  if (!ph || fseeko(f, (off_t)eh.e_phoff, SEEK_SET)) goto out;
+  for (size_t i = 0; i < eh.e_phnum; ++i) {
+    if (elf32) {
+      Elf32_Phdr h;
+      if (fread(&h, sizeof h, 1, f) != 1) goto out;
+      ph[i] = (Elf64_Phdr) {
+        .p_type=h.p_type, .p_flags=h.p_flags,
+                          .p_offset=h.p_offset, .p_vaddr=h.p_vaddr, .p_paddr=h.p_paddr,
+                                                                    .p_filesz=h.p_filesz, .p_memsz=h.p_memsz, .p_align=h.p_align
+      };
+    } else if (fread(&ph[i], sizeof ph[i], 1, f) != 1) goto out;
+  }
 
-   const Elf64_Phdr *dynamic = NULL;
-   for (size_t i = 0; i < eh.e_phnum; ++i)
-      if (ph[i].p_type == PT_DYNAMIC) { dynamic = &ph[i]; break; }
-   if (!dynamic || !dynamic->p_filesz) goto out;
+  const Elf64_Phdr *dynamic = NULL;
+  for (size_t i = 0; i < eh.e_phnum; ++i)
+    if (ph[i].p_type == PT_DYNAMIC) {
+      dynamic = &ph[i];
+      break;
+    }
+  if (!dynamic || !dynamic->p_filesz) goto out;
 
-   const size_t dyn_size = elf32 ? sizeof(Elf32_Dyn) : sizeof(Elf64_Dyn);
-   size_t ndyn = dynamic->p_filesz / dyn_size;
-   Elf64_Dyn *dyn = calloc(ndyn, sizeof *dyn);
-   if (!dyn || fseeko(f, (off_t)dynamic->p_offset, SEEK_SET)) {
-      free(dyn); goto out;
-   }
-   for (size_t i = 0; i < ndyn; ++i) {
-      if (elf32) {
-         Elf32_Dyn d;
-         if (fread(&d, sizeof d, 1, f) != 1) { free(dyn); goto out; }
-         dyn[i].d_tag = d.d_tag;
-         dyn[i].d_un.d_val = d.d_un.d_val;
-      } else if (fread(&dyn[i], sizeof dyn[i], 1, f) != 1) {
-         free(dyn); goto out;
+  const size_t dyn_size = elf32 ? sizeof(Elf32_Dyn) : sizeof(Elf64_Dyn);
+  size_t ndyn = dynamic->p_filesz / dyn_size;
+  Elf64_Dyn *dyn = calloc(ndyn, sizeof *dyn);
+  if (!dyn || fseeko(f, (off_t)dynamic->p_offset, SEEK_SET)) {
+    free(dyn);
+    goto out;
+  }
+  for (size_t i = 0; i < ndyn; ++i) {
+    if (elf32) {
+      Elf32_Dyn d;
+      if (fread(&d, sizeof d, 1, f) != 1) {
+        free(dyn);
+        goto out;
       }
-   }
-   Elf64_Addr strtab_va = 0;
-   for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; ++i)
-      if (dyn[i].d_tag == DT_STRTAB) strtab_va = dyn[i].d_un.d_ptr;
-   Elf64_Off strtab_off;
-   if (!strtab_va || !elf_vaddr_to_offset(ph, eh.e_phnum,
-                                           strtab_va, &strtab_off)) {
+      dyn[i].d_tag = d.d_tag;
+      dyn[i].d_un.d_val = d.d_un.d_val;
+    } else if (fread(&dyn[i], sizeof dyn[i], 1, f) != 1) {
       free(dyn);
       goto out;
-   }
-   for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL && count < cap; ++i) {
-      if (dyn[i].d_tag != DT_NEEDED) continue;
-      if (fseeko(f, (off_t)(strtab_off + dyn[i].d_un.d_val), SEEK_SET)) continue;
-      size_t len = 0;
-      int ch;
-      while (len < LUNA_GUEST_NAME_MAX && (ch = fgetc(f)) != EOF && ch != '\0')
-         names[count][len++] = (char)ch;
-      names[count][len] = '\0';
-      if (len && (ch == '\0' || len == LUNA_GUEST_NAME_MAX)) ++count;
-   }
-   free(dyn);
+    }
+  }
+  Elf64_Addr strtab_va = 0;
+  for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL; ++i)
+    if (dyn[i].d_tag == DT_STRTAB) strtab_va = dyn[i].d_un.d_ptr;
+  Elf64_Off strtab_off;
+  if (!strtab_va || !elf_vaddr_to_offset(ph, eh.e_phnum,
+                                         strtab_va, &strtab_off)) {
+    free(dyn);
+    goto out;
+  }
+  for (size_t i = 0; i < ndyn && dyn[i].d_tag != DT_NULL && count < cap; ++i) {
+    if (dyn[i].d_tag != DT_NEEDED) continue;
+    if (fseeko(f, (off_t)(strtab_off + dyn[i].d_un.d_val), SEEK_SET)) continue;
+    size_t len = 0;
+    int ch;
+    while (len < LUNA_GUEST_NAME_MAX && (ch = fgetc(f)) != EOF && ch != '\0')
+      names[count][len++] = (char)ch;
+    names[count][len] = '\0';
+    if (len && (ch == '\0' || len == LUNA_GUEST_NAME_MAX)) ++count;
+  }
+  free(dyn);
 out:
-   free(ph);
-   if (f) fclose(f);
-   return count;
+  free(ph);
+  if (f) fclose(f);
+  return count;
 }
 
 /* A directory of real AArch64 Android platform libraries.
@@ -206,14 +224,14 @@ out:
  * before being left to the SVC bridge.  Unset, nothing changes. */
 static const char *a64_syslib_dir(void)
 {
-   static const char *dir;
-   static int probed;
-   if (!probed) {
-      probed = 1;
-      dir = getenv("LUNARIA_SYSLIB_DIR");
-      if (dir && !*dir) dir = NULL;
-   }
-   return dir;
+  static const char *dir;
+  static int probed;
+  if (!probed) {
+    probed = 1;
+    dir = getenv("LUNARIA_SYSLIB_DIR");
+    if (dir && !*dir) dir = NULL;
+  }
+  return dir;
 }
 
 /* Platform libraries every Android process sees before any app DSO loads.
@@ -225,157 +243,158 @@ static const char *a64_syslib_dir(void)
  * A device does not have two linkers — preload once, for every entry. */
 static void a64_preload_platform_libs(void)
 {
-   const char *sys = a64_syslib_dir();
-   char libpath[PATH_MAX];
-   struct stat stbuf;
+  const char *sys = a64_syslib_dir();
+  char libpath[PATH_MAX];
+  struct stat stbuf;
 
-   if (!sys) return;
+  if (!sys) return;
 
-   /* libc as a pure-code provider only — see the comment at the ELF-path
-    * call site.  Full ctor/TLS bootstrap is still the emulator's job. */
-   {
-      int have_pure = 0;
-      if ((size_t)snprintf(libpath, sizeof libpath,
-                           "%s/libc-pure.so", sys) < sizeof libpath &&
-          stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
-         have_pure = 1;
-      else if ((size_t)snprintf(libpath, sizeof libpath,
-                                "%s/libc.so", sys) < sizeof libpath &&
-               stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
-         have_pure = 1; /* legacy syslib layout */
-      if (have_pure) {
-         printf("preloading arm64 pure-code library: %s\n", libpath);
-         if (arm64_exec_load_library(libpath, 0) < 0)
-            warnx("failed to load pure-code library %s", libpath);
-      }
-   }
+  /* libc as a pure-code provider only — see the comment at the ELF-path
+   * call site.  Full ctor/TLS bootstrap is still the emulator's job. */
+  {
+    int have_pure = 0;
+    if ((size_t)snprintf(libpath, sizeof libpath,
+                         "%s/libc-pure.so", sys) < sizeof libpath &&
+        stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
+      have_pure = 1;
+    else if ((size_t)snprintf(libpath, sizeof libpath,
+                              "%s/libc.so", sys) < sizeof libpath &&
+             stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
+      have_pure = 1; /* legacy syslib layout */
+    if (have_pure) {
+      printf("preloading arm64 pure-code library: %s\n", libpath);
+      if (arm64_exec_load_library(libpath, 0) < 0)
+        warnx("failed to load pure-code library %s", libpath);
+    }
+  }
 
-   /* Guest-side malloc family as in-process code instead of traps. */
-   {
-      const char *off = getenv("LUNARIA_GUEST_LIBC");
-      if (!(off && !strcmp(off, "0")) &&
-          (size_t)snprintf(libpath, sizeof libpath,
-                           "%s/liblunaria_guest.so", sys) < sizeof libpath &&
+  /* Guest-side malloc family as in-process code instead of traps. */
+  {
+    const char *off = getenv("LUNARIA_GUEST_LIBC");
+    if (!(off && !strcmp(off, "0")) &&
+        (size_t)snprintf(libpath, sizeof libpath,
+                         "%s/liblunaria_guest.so", sys) < sizeof libpath &&
+        stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+      printf("preloading arm64 guest libc: %s\n", libpath);
+      if (arm64_exec_load_library(libpath, 0) < 0)
+        warnx("failed to load guest libc %s", libpath);
+    }
+  }
+
+  /* The ART runtime images every zygote child has mapped (see lib/stub.c). */
+  {
+    static const char *const art_images[] = {
+      "libart.so", "libartbase.so", "libdexfile.so", "libnativeloader.so", NULL
+    };
+    for (const char *const *img = art_images; *img; ++img) {
+      if ((size_t)snprintf(libpath, sizeof libpath, "%s/%s", sys, *img) < sizeof libpath &&
           stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-         printf("preloading arm64 guest libc: %s\n", libpath);
-         if (arm64_exec_load_library(libpath, 0) < 0)
-            warnx("failed to load guest libc %s", libpath);
+        printf("preloading arm64 ART image: %s\n", libpath);
+        if (arm64_exec_load_library(libpath, 0) < 0)
+          warnx("failed to load ART image %s", libpath);
       }
-   }
-
-   /* The ART runtime images every zygote child has mapped (see art_image.c). */
-   {
-      static const char *const art_images[] = {
-         "libart.so", "libartbase.so", "libdexfile.so", "libnativeloader.so", NULL};
-      for (const char *const *img = art_images; *img; ++img) {
-         if ((size_t)snprintf(libpath, sizeof libpath, "%s/%s", sys, *img) < sizeof libpath &&
-             stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-            printf("preloading arm64 ART image: %s\n", libpath);
-            if (arm64_exec_load_library(libpath, 0) < 0)
-               warnx("failed to load ART image %s", libpath);
-         }
-      }
-   }
+    }
+  }
 }
 
 static bool elf_matches(const char *path, bool elf64)
 {
-   unsigned char ident[EI_NIDENT];
-   uint16_t type, machine;
-   FILE *f = fopen(path, "rb");
-   if (!f) return false;
-   bool ok = fread(ident, sizeof ident, 1, f) == 1 &&
-      fread(&type, sizeof type, 1, f) == 1 && fread(&machine, sizeof machine, 1, f) == 1 &&
-      !memcmp(ident, ELFMAG, SELFMAG) && ident[EI_DATA] == ELFDATA2LSB &&
-      ident[EI_CLASS] == (elf64 ? ELFCLASS64 : ELFCLASS32) &&
-      machine == (elf64 ? EM_AARCH64 : EM_ARM);
-   fclose(f);
-   return ok;
+  unsigned char ident[EI_NIDENT];
+  uint16_t type, machine;
+  FILE *f = fopen(path, "rb");
+  if (!f) return false;
+  bool ok = fread(ident, sizeof ident, 1, f) == 1 &&
+            fread(&type, sizeof type, 1, f) == 1 && fread(&machine, sizeof machine, 1, f) == 1 &&
+            !memcmp(ident, ELFMAG, SELFMAG) && ident[EI_DATA] == ELFDATA2LSB &&
+            ident[EI_CLASS] == (elf64 ? ELFCLASS64 : ELFCLASS32) &&
+            machine == (elf64 ? EM_AARCH64 : EM_ARM);
+  fclose(f);
+  return ok;
 }
 
 static bool elf_preload_needed(const char *path, const char *dir,
                                char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n, bool elf64)
 {
-   char needed[64][LUNA_GUEST_NAME_MAX + 1];
-   size_t n = elf_read_needed(path, needed, 64);
-   for (size_t i = 0; i < n; ++i) {
-      char dep_path[PATH_MAX];
-      struct stat st;
-      if (elf_dep_seen(needed[i], seen, *seen_n)) continue;
-      if (*seen_n < 128) {
-         memcpy(seen[*seen_n], needed[i], LUNA_GUEST_NAME_MAX + 1);
-         seen[*seen_n][LUNA_GUEST_NAME_MAX] = '\0';
-         ++*seen_n;
+  char needed[64][LUNA_GUEST_NAME_MAX + 1];
+  size_t n = elf_read_needed(path, needed, 64);
+  for (size_t i = 0; i < n; ++i) {
+    char dep_path[PATH_MAX];
+    struct stat st;
+    if (elf_dep_seen(needed[i], seen, *seen_n)) continue;
+    if (*seen_n < 128) {
+      memcpy(seen[*seen_n], needed[i], LUNA_GUEST_NAME_MAX + 1);
+      seen[*seen_n][LUNA_GUEST_NAME_MAX] = '\0';
+      ++*seen_n;
+    }
+    size_t dir_len = strlen(dir), name_len = strnlen(needed[i], LUNA_GUEST_NAME_MAX + 1);
+    if (dir_len + name_len + 1 > sizeof dep_path) {
+      warnx("AArch64 dependency path too long: %s", needed[i]);
+      continue;
+    }
+    memcpy(dep_path, dir, dir_len);
+    memcpy(dep_path + dir_len, needed[i], name_len + 1);
+    if (stat(dep_path, &st) != 0 || !elf_matches(dep_path, elf64)) {
+      /* Not beside the APK's libraries.  Before handing it to the SVC
+       * bridge, look for the real thing among the platform libraries. */
+      const char *sys = elf64 ? a64_syslib_dir() : NULL;
+      int found = 0;
+      if (sys) {
+        char cand[PATH_MAX];
+        /* libc is process state, not merely a code DSO.  The copy in the
+         * syslib directory is loaded separately below as a deliberately
+         * filtered pure-code image.  Loading it here would run bionic's
+         * constructors and split pthread/allocator/errno ownership
+         * between bionic and Lunaria's Android ABI implementation. */
+        if (strcmp(needed[i], "libc.so") != 0 &&
+            (size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
+            < sizeof cand &&
+            stat(cand, &st) == 0 && elf_matches(cand, elf64)) {
+          printf("preloading arm64 platform library: %s\n", cand);
+          if (arm_exec_link_library(cand) < 0)
+            warnx("failed to load platform library %s", cand);
+          else
+            found = 1;
+        }
       }
-      size_t dir_len = strlen(dir), name_len = strnlen(needed[i], LUNA_GUEST_NAME_MAX + 1);
-      if (dir_len + name_len + 1 > sizeof dep_path) {
-         warnx("AArch64 dependency path too long: %s", needed[i]);
-         continue;
-      }
-      memcpy(dep_path, dir, dir_len);
-      memcpy(dep_path + dir_len, needed[i], name_len + 1);
-      if (stat(dep_path, &st) != 0 || !elf_matches(dep_path, elf64)) {
-         /* Not beside the APK's libraries.  Before handing it to the SVC
-          * bridge, look for the real thing among the platform libraries. */
-         const char *sys = elf64 ? a64_syslib_dir() : NULL;
-         int found = 0;
-         if (sys) {
-            char cand[PATH_MAX];
-            /* libc is process state, not merely a code DSO.  The copy in the
-             * syslib directory is loaded separately below as a deliberately
-             * filtered pure-code image.  Loading it here would run bionic's
-             * constructors and split pthread/allocator/errno ownership
-             * between bionic and Lunaria's Android ABI implementation. */
-            if (strcmp(needed[i], "libc.so") != 0 &&
-                (size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
-                < sizeof cand &&
-                stat(cand, &st) == 0 && elf_matches(cand, elf64)) {
-               printf("preloading arm64 platform library: %s\n", cand);
-               if (arm_exec_link_library(cand) < 0)
-                  warnx("failed to load platform library %s", cand);
-               else
-                  found = 1;
-            }
-         }
-         if (!found)
-            continue; /* Android platform library: handled by the emulator. */
-         continue;    /* loaded from the platform directory, not from `dir` */
-      }
-      if (!elf_preload_needed(dep_path, dir, seen, seen_n, elf64)) return false;
-      printf("loading ELF%u DT_NEEDED: %s\n", elf64 ? 64u : 32u, dep_path);
-      if (arm_exec_link_library(dep_path) < 0) {
-         warnx("failed to load ELF dependency %s", dep_path);
-         return false;
-      }
-   }
-   return true;
+      if (!found)
+        continue; /* Android platform library: handled by the emulator. */
+      continue;    /* loaded from the platform directory, not from `dir` */
+    }
+    if (!elf_preload_needed(dep_path, dir, seen, seen_n, elf64)) return false;
+    printf("loading ELF%u DT_NEEDED: %s\n", elf64 ? 64u : 32u, dep_path);
+    if (arm_exec_link_library(dep_path) < 0) {
+      warnx("failed to load ELF dependency %s", dep_path);
+      return false;
+    }
+  }
+  return true;
 }
 
 bool arm_loader_load_needed(const char *path, bool elf64)
 {
-   char dir[PATH_MAX];
-   char seen[128][LUNA_GUEST_NAME_MAX + 1];
-   size_t seen_n = 0;
-   const char *slash = path ? strrchr(path, '/') : NULL;
-   size_t n = slash ? (size_t)(slash - path) + 1u : 0u;
-   if (!path || n >= sizeof dir) return false;
-   memcpy(dir, path, n);
-   dir[n] = '\0';
-   /* Do not revisit the root through a dependency cycle. */
-   const char *leaf = slash ? slash + 1 : path;
-   snprintf(seen[seen_n++], sizeof seen[0], "%s", leaf);
-   return elf_preload_needed(path, dir, seen, &seen_n, elf64);
+  char dir[PATH_MAX];
+  char seen[128][LUNA_GUEST_NAME_MAX + 1];
+  size_t seen_n = 0;
+  const char *slash = path ? strrchr(path, '/') : NULL;
+  size_t n = slash ? (size_t)(slash - path) + 1u : 0u;
+  if (!path || n >= sizeof dir) return false;
+  memcpy(dir, path, n);
+  dir[n] = '\0';
+  /* Do not revisit the root through a dependency cycle. */
+  const char *leaf = slash ? slash + 1 : path;
+  snprintf(seen[seen_n++], sizeof seen[0], "%s", leaf);
+  return elf_preload_needed(path, dir, seen, &seen_n, elf64);
 }
 
 void arm64_loader_load_needed(const char *path)
 {
-   (void)arm_loader_load_needed(path, true);
+  (void)arm_loader_load_needed(path, true);
 }
 
 static void a64_preload_needed(const char *path, const char *dir,
-                              char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n)
+                               char seen[][LUNA_GUEST_NAME_MAX + 1], size_t *seen_n)
 {
-   (void)elf_preload_needed(path, dir, seen, seen_n, true);
+  (void)elf_preload_needed(path, dir, seen, seen_n, true);
 }
 
 /* LUNARIA_TOUCH_FIFO — taps arriving while the emulator is already running.
@@ -393,7 +412,10 @@ static void a64_preload_needed(const char *path, const char *dir,
  * what a guest expects — a DOWN and an UP in the same frame is not a tap.
  */
 #define TF_MAX 16
-static struct { float x, y; int up_frame; } g_tf_hold[TF_MAX];
+static struct {
+  float x, y;
+  int up_frame;
+} g_tf_hold[TF_MAX];
 static int g_tf_nhold;
 static intptr_t g_tf_fd = -2;
 static char g_tf_buf[256];
@@ -420,121 +442,131 @@ static size_t g_tf_len;
 static int touch_parse_coord(const char *s, int extent, float *out,
                              const char **end)
 {
-   char *stop = NULL;
-   double v;
-   if (!s) return 0;
-   while (*s == ' ' || *s == '\t') ++s;
-   v = strtod(s, &stop);
-   if (stop == s) return 0;
-   while (*stop == ' ' || *stop == '\t') ++stop;
-   if (stop[0] == 'p' && stop[1] == 'x') {
-      stop += 2;                      /* guest pixels, verbatim */
-   } else {
-      if (stop[0] == '%') ++stop;     /* "50%" and "50" mean the same thing */
-      v = v * (double)extent / 100.0;
-   }
-   if (v < 0.0) return 0;
-   if (extent > 0 && v > (double)(extent - 1)) v = (double)(extent - 1);
-   *out = (float)v;
-   if (end) *end = stop;
-   return 1;
+  char *stop = NULL;
+  double v;
+  if (!s) return 0;
+  while (*s == ' ' || *s == '\t') ++s;
+  v = strtod(s, &stop);
+  if (stop == s) return 0;
+  while (*stop == ' ' || *stop == '\t') ++stop;
+  if (stop[0] == 'p' && stop[1] == 'x') {
+    stop += 2;                      /* guest pixels, verbatim */
+  } else {
+    if (stop[0] == '%') ++stop;     /* "50%" and "50" mean the same thing */
+    v = v * (double)extent / 100.0;
+  }
+  if (v < 0.0) return 0;
+  if (extent > 0 && v > (double)(extent - 1)) v = (double)(extent - 1);
+  *out = (float)v;
+  if (end) *end = stop;
+  return 1;
 }
 
 /* "x,y" in either spelling, as one pair. */
 static int touch_parse_xy(const char *s, float *x, float *y, const char **end)
 {
-   const char *p = NULL;
-   const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-   if (!touch_parse_coord(s, w, x, &p)) return 0;
-   while (*p == ' ' || *p == '\t') ++p;
-   if (*p != ',') return 0;
-   if (!touch_parse_coord(p + 1, h, y, &p)) return 0;
-   if (end) *end = p;
-   return 1;
+  const char *p = NULL;
+  const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+  if (!touch_parse_coord(s, w, x, &p)) return 0;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p != ',') return 0;
+  if (!touch_parse_coord(p + 1, h, y, &p)) return 0;
+  if (end) *end = p;
+  return 1;
 }
 
 static void touch_fifo_line(const char *line, int frame_count)
 {
-   float x = -1, y = -1;
-   int hold = 6;
-   const char *rest = NULL;
-   /* Explicit samples use the same host input route as a physical drag. */
-   static const char *const commands[] = { "down ", "up ", "move " };
-   for (int action = 0; action < 3; ++action) {
-      const size_t n = strlen(commands[action]);
-      if (!strncmp(line, commands[action], n)) {
-         if (!touch_parse_xy(line + n, &x, &y, &rest)) return;
-         while (*rest == ' ' || *rest == '\t') ++rest;
-         if (*rest) return;
-         arm_exec_touch_push(action, x, y);
-         fprintf(stderr, "[loader] TOUCH_FIFO sample action=%d (%.0f,%.0f) frame %d\n",
-                 action, x, y, frame_count);
-         return;
-      }
-   }
-   if (!touch_parse_xy(line, &x, &y, &rest)) return;
-   while (*rest == ' ' || *rest == '\t') ++rest;
-   if (*rest == ',') hold = atoi(rest + 1);
-   if (hold < 1) hold = 1;
-   arm_exec_touch_push(0, x, y);
-   fprintf(stderr, "[loader] TOUCH_FIFO DOWN (%.0f,%.0f) frame %d hold=%d\n",
-           x, y, frame_count, hold);
-   if (g_tf_nhold < TF_MAX) {
-      g_tf_hold[g_tf_nhold].x = x;
-      g_tf_hold[g_tf_nhold].y = y;
-      g_tf_hold[g_tf_nhold].up_frame = frame_count + hold;
-      ++g_tf_nhold;
-   } else {
-      arm_exec_touch_push(1, x, y);
-   }
+  float x = -1, y = -1;
+  int hold = 6;
+  const char *rest = NULL;
+  /* "key N": Android keycode N, down and up (4 is Back).  It goes where a
+   * key from the keyboard would: the focused Android window, else the guest. */
+  if (!strncmp(line, "key ", 4)) {
+    const int code = atoi(line + 4);
+    if (code > 0) {
+      arm_exec_android_key(code);
+      fprintf(stderr, "[loader] TOUCH_FIFO key %d frame %d\n", code, frame_count);
+    }
+    return;
+  }
+  /* Explicit samples use the same host input route as a physical drag. */
+  static const char *const commands[] = { "down ", "up ", "move " };
+  for (int action = 0; action < 3; ++action) {
+    const size_t n = strlen(commands[action]);
+    if (!strncmp(line, commands[action], n)) {
+      if (!touch_parse_xy(line + n, &x, &y, &rest)) return;
+      while (*rest == ' ' || *rest == '\t') ++rest;
+      if (*rest) return;
+      arm_exec_touch_push(action, x, y);
+      fprintf(stderr, "[loader] TOUCH_FIFO sample action=%d (%.0f,%.0f) frame %d\n",
+              action, x, y, frame_count);
+      return;
+    }
+  }
+  if (!touch_parse_xy(line, &x, &y, &rest)) return;
+  while (*rest == ' ' || *rest == '\t') ++rest;
+  if (*rest == ',') hold = atoi(rest + 1);
+  if (hold < 1) hold = 1;
+  arm_exec_touch_push(0, x, y);
+  fprintf(stderr, "[loader] TOUCH_FIFO DOWN (%.0f,%.0f) frame %d hold=%d\n",
+          x, y, frame_count, hold);
+  if (g_tf_nhold < TF_MAX) {
+    g_tf_hold[g_tf_nhold].x = x;
+    g_tf_hold[g_tf_nhold].y = y;
+    g_tf_hold[g_tf_nhold].up_frame = frame_count + hold;
+    ++g_tf_nhold;
+  } else {
+    arm_exec_touch_push(1, x, y);
+  }
 }
 
 static void touch_fifo_tick(int frame_count)
 {
-   /* Finish the taps whose hold has run out, and keep the rest pressed. */
-   for (int i = 0; i < g_tf_nhold; ) {
-      if (frame_count >= g_tf_hold[i].up_frame) {
-         arm_exec_touch_push(1, g_tf_hold[i].x, g_tf_hold[i].y);
-         fprintf(stderr, "[loader] TOUCH_FIFO UP (%.0f,%.0f) frame %d\n",
-                 g_tf_hold[i].x, g_tf_hold[i].y, frame_count);
-         g_tf_hold[i] = g_tf_hold[--g_tf_nhold];
-      } else {
-         arm_exec_touch_push(2, g_tf_hold[i].x, g_tf_hold[i].y);
-         ++i;
-      }
-   }
+  /* Finish the taps whose hold has run out, and keep the rest pressed. */
+  for (int i = 0; i < g_tf_nhold; ) {
+    if (frame_count >= g_tf_hold[i].up_frame) {
+      arm_exec_touch_push(1, g_tf_hold[i].x, g_tf_hold[i].y);
+      fprintf(stderr, "[loader] TOUCH_FIFO UP (%.0f,%.0f) frame %d\n",
+              g_tf_hold[i].x, g_tf_hold[i].y, frame_count);
+      g_tf_hold[i] = g_tf_hold[--g_tf_nhold];
+    } else {
+      arm_exec_touch_push(2, g_tf_hold[i].x, g_tf_hold[i].y);
+      ++i;
+    }
+  }
 
-   if (g_tf_fd == -2) {
-      const char *path = getenv("LUNARIA_TOUCH_FIFO");
-      g_tf_fd = -1;
-      if (path && *path) {
-         g_tf_fd = luna_os_command_pipe_open(path);
-         if (g_tf_fd < 0)
-            fprintf(stderr, "[loader] TOUCH_FIFO open(%s): %s\n",
-                    path, strerror(errno));
-         else
-            fprintf(stderr, "[loader] TOUCH_FIFO listening on %s "
-                    "(echo 'x,y[,hold]' > %s; x and y are percentages of "
-                    "the %dx%d framebuffer unless written as '640px')\n",
-                    path, path, arm_exec_fb_width(), arm_exec_fb_height());
-      }
-   }
-   if (g_tf_fd < 0) return;
+  if (g_tf_fd == -2) {
+    const char *path = getenv("LUNARIA_TOUCH_FIFO");
+    g_tf_fd = -1;
+    if (path && *path) {
+      g_tf_fd = luna_os_command_pipe_open(path);
+      if (g_tf_fd < 0)
+        fprintf(stderr, "[loader] TOUCH_FIFO open(%s): %s\n",
+                path, strerror(errno));
+      else
+        fprintf(stderr, "[loader] TOUCH_FIFO listening on %s "
+                        "(echo 'x,y[,hold]' > %s; x and y are percentages of "
+                        "the %dx%d framebuffer unless written as '640px')\n",
+                path, path, arm_exec_fb_width(), arm_exec_fb_height());
+    }
+  }
+  if (g_tf_fd < 0) return;
 
-   for (;;) {
-      char chunk[128];
-      ptrdiff_t n = luna_os_command_pipe_read(g_tf_fd, chunk, sizeof chunk);
-      if (n <= 0) break;
-      for (ptrdiff_t i = 0; i < n; ++i) {
-         if (chunk[i] == '\n' || chunk[i] == ';') {
-            g_tf_buf[g_tf_len] = '\0';
-            if (g_tf_len) touch_fifo_line(g_tf_buf, frame_count);
-            g_tf_len = 0;
-         } else if (g_tf_len + 1 < sizeof g_tf_buf) {
-            g_tf_buf[g_tf_len++] = chunk[i];
-         }
+  for (;;) {
+    char chunk[128];
+    ptrdiff_t n = luna_os_command_pipe_read(g_tf_fd, chunk, sizeof chunk);
+    if (n <= 0) break;
+    for (ptrdiff_t i = 0; i < n; ++i) {
+      if (chunk[i] == '\n' || chunk[i] == ';') {
+        g_tf_buf[g_tf_len] = '\0';
+        if (g_tf_len) touch_fifo_line(g_tf_buf, frame_count);
+        g_tf_len = 0;
+      } else if (g_tf_len + 1 < sizeof g_tf_buf) {
+        g_tf_buf[g_tf_len++] = chunk[i];
       }
-   }
+    }
+  }
 }
 #undef TF_MAX
 
@@ -550,60 +582,76 @@ static void touch_fifo_tick(int frame_count)
  * wants a checkbox and then Confirm, in that order. */
 static void touch_test_tick(int frame_count)
 {
-   touch_fifo_tick(frame_count);
+  touch_fifo_tick(frame_count);
 #define TT_MAX 8
-   static float tt_x[TT_MAX], tt_y[TT_MAX], tt_x2[TT_MAX], tt_y2[TT_MAX];
-   static int tt_n = -1, tt_frame = 60, tt_hold = 10, tt_gap = 60;
-   if (tt_n < 0) {
-      tt_n = 0;
-      const char *tt = getenv("LUNARIA_TOUCH_TEST");
-      for (const char *p = tt; p && *p && tt_n < TT_MAX; ) {
-         float x = -1, y = -1, x2 = -1, y2 = -1;
-         const char *after = NULL;
-         if (touch_parse_xy(p, &x, &y, &after)) {
-            /* "x,y>x2,y2" drags: the press travels to the second point over
-             * the hold, one MOVE a frame, and lifts there. */
-            if (*after == '>' && !touch_parse_xy(after + 1, &x2, &y2, NULL)) x2 = y2 = -1;
-            if (x2 < 0) { x2 = x; y2 = y; }
-            tt_x[tt_n] = x; tt_y[tt_n] = y; tt_x2[tt_n] = x2; tt_y2[tt_n] = y2; ++tt_n;
-         }
-         const char *semi = strchr(p, ';');
-         if (!semi) break;
-         p = semi + 1;
+  static float tt_x[TT_MAX], tt_y[TT_MAX], tt_x2[TT_MAX], tt_y2[TT_MAX];
+  static int tt_n = -1, tt_frame = 60, tt_hold = 10, tt_gap = 60;
+  if (tt_n < 0) {
+    tt_n = 0;
+    const char *tt = getenv("LUNARIA_TOUCH_TEST");
+    for (const char *p = tt; p && *p && tt_n < TT_MAX; ) {
+      float x = -1, y = -1, x2 = -1, y2 = -1;
+      const char *after = NULL;
+      if (touch_parse_xy(p, &x, &y, &after)) {
+        /* "x,y>x2,y2" drags: the press travels to the second point over
+         * the hold, one MOVE a frame, and lifts there. */
+        if (*after == '>' && !touch_parse_xy(after + 1, &x2, &y2, NULL)) x2 = y2 = -1;
+        if (x2 < 0) {
+          x2 = x;
+          y2 = y;
+        }
+        tt_x[tt_n] = x;
+        tt_y[tt_n] = y;
+        tt_x2[tt_n] = x2;
+        tt_y2[tt_n] = y2;
+        ++tt_n;
       }
-      const char *tf = getenv("LUNARIA_TOUCH_FRAME");
-      if (tf) { int v = atoi(tf); if (v > 0) tt_frame = v; }
-      const char *th = getenv("LUNARIA_TOUCH_HOLD");
-      if (th) { int v = atoi(th); if (v > 0) tt_hold = v; }
-      const char *tg = getenv("LUNARIA_TOUCH_GAP");
-      if (tg) { int v = atoi(tg); if (v > 0) tt_gap = v; }
-   }
-   if (tt_n <= 0) return;
-   const int stride = tt_hold + tt_gap;
-   /* The pump can step more than one frame between ticks; an edge is crossed,
-    * not landed on. */
-   static int prev_frame = -1;
-   const int prev = prev_frame;
-   prev_frame = frame_count;
-   for (int t = 0; t < tt_n; ++t) {
-      const int down = tt_frame + t * stride;
-      if (prev < down && frame_count >= down) {
-         arm_exec_touch_push(0, tt_x[t], tt_y[t]);  /* ACTION_DOWN */
-         fprintf(stderr, "[loader] TOUCH_TEST[%d] DOWN (%.0f,%.0f) frame %d\n",
-                 t, tt_x[t], tt_y[t], frame_count);
-      }
-      /* ACTION_MOVE every frame while held: Unity keeps the touch active */
-      if (frame_count > down && frame_count < down + tt_hold) {
-         const float f = (float)(frame_count - down) / (float)tt_hold;
-         arm_exec_touch_push(2, tt_x[t] + (tt_x2[t] - tt_x[t]) * f,
-                                tt_y[t] + (tt_y2[t] - tt_y[t]) * f);
-      }
-      if (prev < down + tt_hold && frame_count >= down + tt_hold) {
-         arm_exec_touch_push(1, tt_x2[t], tt_y2[t]);  /* ACTION_UP */
-         fprintf(stderr, "[loader] TOUCH_TEST[%d] UP (%.0f,%.0f) frame %d (hold=%d)\n",
-                 t, tt_x2[t], tt_y2[t], frame_count, tt_hold);
-      }
-   }
+      const char *semi = strchr(p, ';');
+      if (!semi) break;
+      p = semi + 1;
+    }
+    const char *tf = getenv("LUNARIA_TOUCH_FRAME");
+    if (tf) {
+      int v = atoi(tf);
+      if (v > 0) tt_frame = v;
+    }
+    const char *th = getenv("LUNARIA_TOUCH_HOLD");
+    if (th) {
+      int v = atoi(th);
+      if (v > 0) tt_hold = v;
+    }
+    const char *tg = getenv("LUNARIA_TOUCH_GAP");
+    if (tg) {
+      int v = atoi(tg);
+      if (v > 0) tt_gap = v;
+    }
+  }
+  if (tt_n <= 0) return;
+  const int stride = tt_hold + tt_gap;
+  /* The pump can step more than one frame between ticks; an edge is crossed,
+   * not landed on. */
+  static int prev_frame = -1;
+  const int prev = prev_frame;
+  prev_frame = frame_count;
+  for (int t = 0; t < tt_n; ++t) {
+    const int down = tt_frame + t * stride;
+    if (prev < down && frame_count >= down) {
+      arm_exec_touch_push(0, tt_x[t], tt_y[t]);  /* ACTION_DOWN */
+      fprintf(stderr, "[loader] TOUCH_TEST[%d] DOWN (%.0f,%.0f) frame %d\n",
+              t, tt_x[t], tt_y[t], frame_count);
+    }
+    /* ACTION_MOVE every frame while held: Unity keeps the touch active */
+    if (frame_count > down && frame_count < down + tt_hold) {
+      const float f = (float)(frame_count - down) / (float)tt_hold;
+      arm_exec_touch_push(2, tt_x[t] + (tt_x2[t] - tt_x[t]) * f,
+                          tt_y[t] + (tt_y2[t] - tt_y[t]) * f);
+    }
+    if (prev < down + tt_hold && frame_count >= down + tt_hold) {
+      arm_exec_touch_push(1, tt_x2[t], tt_y2[t]);  /* ACTION_UP */
+      fprintf(stderr, "[loader] TOUCH_TEST[%d] UP (%.0f,%.0f) frame %d (hold=%d)\n",
+              t, tt_x2[t], tt_y2[t], frame_count, tt_hold);
+    }
+  }
 #undef TT_MAX
 }
 
@@ -611,115 +659,25 @@ static void touch_test_tick(int frame_count)
  * instead of the (idle) A32 one. */
 static int g_dump_arm64;
 
-/* Throughput, once every LUNARIA_PERF_S seconds (0 disables).
- *
- * "Slower than a phone" is the whole of the report most of the time, and
- * answering it needs three numbers side by side: how often the host pump
- * turns, how often the guest actually presents, and how many guest
- * instructions were retired to get there.  Which of the three moved tells the
- * difference between the emulator starving the guest, the guest starving
- * itself on a lock, and the host GL being the bottleneck — and it costs two
- * counter reads a frame, so it is on by default rather than behind a trace
- * flag nobody sets until the run has already been thrown away. */
-/* Where a pump frame's wall clock goes.
- *
- * "20 frames a second" is the symptom; it says nothing about whether the
- * emulator was running guest code, presenting, or waiting.  Each stage of the
- * frame adds its own time here and the totals are reported next to [perf], so
- * a frame that costs 50 ms can be read as "16 ms of guest, 30 ms of swap"
- * rather than guessed at. */
-enum frame_stage {
-   FRAME_STAGE_SCHED,      /* run_threads(): guest code and its SVCs */
-   FRAME_STAGE_IDLE,       /* every guest thread parked: the frame's own sleep */
-   FRAME_STAGE_MEDIA,      /* the media clock and the pending-preferences write */
-   FRAME_STAGE_SWAP,       /* eglSwapBuffers on the host */
-   FRAME_STAGE_INPUT,      /* window system events */
-   FRAME_STAGE_LAST
-};
-static uint64_t g_frame_stage_ns[FRAME_STAGE_LAST];
-static const char *const g_frame_stage_name[FRAME_STAGE_LAST] = {
-   "sched", "idle", "media", "swap", "input"
-};
-
 static uint64_t frame_now_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
-static void frame_stage_add(enum frame_stage st, uint64_t t0)
+/* Scheduler watchdog, every 10 seconds: a guest thread or heap lock that was
+ * lost shows up here by name. */
+static void watchdog_tick(void)
 {
-   g_frame_stage_ns[st] += frame_now_ns() - t0;
-}
-
-static void frame_stage_report(double window, unsigned long long frames)
-{
-   uint64_t tot = 0;
-   for (int i = 0; i < FRAME_STAGE_LAST; ++i) tot += g_frame_stage_ns[i];
-   if (!tot || !frames) return;
-   fprintf(stderr, "[frame]   %.1f ms each, of which", window * 1e3 / (double)frames);
-   for (int i = 0; i < FRAME_STAGE_LAST; ++i)
-      fprintf(stderr, " %s=%.1f", g_frame_stage_name[i],
-              (double)g_frame_stage_ns[i] / 1e6 / (double)frames);
-   fprintf(stderr, " ms (%.0f%% of the frame accounted for)\n",
-           100.0 * (double)tot / (window * 1e9));
-   for (int i = 0; i < FRAME_STAGE_LAST; ++i) g_frame_stage_ns[i] = 0;
-}
-
-static void perf_tick(void)
-{
-   static double every = -1.0;      /* -1: not configured, 0: disabled */
-   static double t0, last;
-   static uint64_t last_frames, last_presents, last_composites, last_ticks, last_xlat;
-   static uint64_t frames;
-
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-
-   ++frames;
-   if (every < 0.0) {
-      const char *e = getenv("LUNARIA_PERF_S");
-      every = e && *e ? atof(e) : 10.0;
-      if (every < 0.0) every = 0.0;
-      t0 = last = now;
-   }
-   if (!(every > 0.0) || now - last < every) return;
-
-   const uint64_t presents = arm_exec_guest_swap_count();
-   const uint64_t composites = luna_comp_frames();
-   const uint64_t gticks   = arm_exec_sched_ticks();
-   const uint64_t xlat     = arm_exec_translated_insn();
-   const double   dt       = now - last;
-
-   fprintf(stderr,
-           "[perf] t=%.0fs pump=%llu (%.1f/s) present=%llu (%.1f/s) composite=%llu (%.1f/s) "
-           "guest=%.0fM insn (%.1f Mips) xlat=%.1fM (%.1f M/s)\n",
-           now - t0,
-           (unsigned long long)frames, (double)(frames - last_frames) / dt,
-           (unsigned long long)presents, (double)(presents - last_presents) / dt,
-           (unsigned long long)composites, (double)(composites - last_composites) / dt,
-           (double)gticks / 1e6, (double)(gticks - last_ticks) / dt / 1e6,
-           (double)xlat / 1e6, (double)(xlat - last_xlat) / dt / 1e6);
-   {
-      uint64_t a32[3];
-      arm_exec_translated_insn_a32(a32);
-      if (a32[0] | a32[1] | a32[2])
-         fprintf(stderr, "[perf]   a32 xlat by engine: threads=%.1fM main=%.1fM "
-                 "callbacks=%.1fM\n", (double)a32[0] / 1e6, (double)a32[1] / 1e6,
-                 (double)a32[2] / 1e6);
-   }
-
-   arm_exec_ticks_report();
-   frame_stage_report(dt, frames - last_frames);
-
-   last = now;
-   last_frames = frames;
-   last_presents = presents;
-   last_composites = composites;
-   last_ticks = gticks;
-   last_xlat = xlat;
+  static double last;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+  if (!last) last = now;
+  if (now - last < 10.0) return;
+  last = now;
+  arm_exec_watchdog_tick();
 }
 
 /* A guest that stops presenting is the shape every "it just sits there" bug
@@ -733,42 +691,42 @@ static void perf_tick(void)
  * LUNARIA_STALL_S seconds with no present triggers a report; 0 disables. */
 static void stall_watch_tick(void)
 {
-   static double next_s = -1.0;   /* -1: not configured yet, 0: disabled */
-   static uint64_t last_swaps;
-   static double last_change;
-   static int reports;
+  static double next_s = -1.0;   /* -1: not configured yet, 0: disabled */
+  static uint64_t last_swaps;
+  static double last_change;
+  static int reports;
 
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 
-   if (next_s < 0.0) {
-      const char *e = getenv("LUNARIA_STALL_S");
-      next_s = e && *e ? atof(e) : 10.0;
-      if (next_s < 0.0) next_s = 0.0;
-      last_change = now;
-   }
-   if (!(next_s > 0.0)) return;
+  if (next_s < 0.0) {
+    const char *e = getenv("LUNARIA_STALL_S");
+    next_s = e && *e ? atof(e) : 10.0;
+    if (next_s < 0.0) next_s = 0.0;
+    last_change = now;
+  }
+  if (!(next_s > 0.0)) return;
 
-   const uint64_t swaps = arm_exec_guest_swap_count();
-   if (swaps != last_swaps) {
-      last_swaps = swaps;
-      last_change = now;
-      reports = 0;
-      return;
-   }
-   /* Nothing to say before the guest has presented at all: startup legitimately
-    * takes tens of seconds, and the pump loop is the only thing running. */
-   if (swaps == 0 || now - last_change < next_s) return;
-   if (reports >= 8) return;
+  const uint64_t swaps = arm_exec_guest_swap_count();
+  if (swaps != last_swaps) {
+    last_swaps = swaps;
+    last_change = now;
+    reports = 0;
+    return;
+  }
+  /* Nothing to say before the guest has presented at all: startup legitimately
+   * takes tens of seconds, and the pump loop is the only thing running. */
+  if (swaps == 0 || now - last_change < next_s) return;
+  if (reports >= 8) return;
 
-   fprintf(stderr, "[stall] guest has not presented for %.1fs "
-           "(%llu presents so far) — dumping guest threads #%d "
-           "(LUNARIA_STALL_S=0 to silence)\n",
-           now - last_change, (unsigned long long)swaps, reports);
-   ++reports;
-   arm64_exec_svc_ring_dump();
-   last_change = now;   /* re-arm, so a long stall reports periodically */
+  fprintf(stderr, "[stall] guest has not presented for %.1fs "
+                  "(%llu presents so far) — dumping guest threads #%d "
+                  "(LUNARIA_STALL_S=0 to silence)\n",
+          now - last_change, (unsigned long long)swaps, reports);
+  ++reports;
+  arm64_exec_svc_ring_dump();
+  last_change = now;   /* re-arm, so a long stall reports periodically */
 }
 
 /* The other half of the same diagnostic: a guest that is presenting happily
@@ -785,45 +743,45 @@ _Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,"diagnostic signal flag must be lock-f
 static atomic_bool thread_dump_pending;
 static void thread_dump_signal(int sig)
 {
-   (void)sig;
-   atomic_store_explicit(&thread_dump_pending,true,memory_order_relaxed);
+  (void)sig;
+  atomic_store_explicit(&thread_dump_pending,true,memory_order_relaxed);
 }
 #endif
 
 static void thread_dump_request_tick(void)
 {
-   static int every;
-   if (++every < 30) return;   /* ~twice a second at 60 fps */
-   every = 0;
-   /* /tmp/lunaria-threads.<pid> names one process when several run; the
-    * bare name is whichever process polls it first. */
-   char own[64];
-   snprintf(own, sizeof own, "/tmp/lunaria-threads.%d", (int)getpid());
-   if (access("/tmp/lunaria-il2cpp-syms", F_OK) == 0) {
-      unlink("/tmp/lunaria-il2cpp-syms");
-      const int rc = arm_exec_il2cpp_symbols("/tmp/lunaria-il2cpp-syms.txt");
-      if (rc) fprintf(stderr, "[il2cpp-syms] failed (%d)\n", rc);
-      return;
-   }
-   bool requested=false;
+  static int every;
+  if (++every < 30) return;   /* ~twice a second at 60 fps */
+  every = 0;
+  /* /tmp/lunaria-threads.<pid> names one process when several run; the
+   * bare name is whichever process polls it first. */
+  char own[64];
+  snprintf(own, sizeof own, "/tmp/lunaria-threads.%d", (int)getpid());
+  if (access("/tmp/lunaria-il2cpp-syms", F_OK) == 0) {
+    unlink("/tmp/lunaria-il2cpp-syms");
+    const int rc = arm_exec_il2cpp_symbols("/tmp/lunaria-il2cpp-syms.txt");
+    if (rc) fprintf(stderr, "[il2cpp-syms] failed (%d)\n", rc);
+    return;
+  }
+  bool requested=false;
 #ifndef _WIN32
-   requested=atomic_exchange_explicit(&thread_dump_pending,false,memory_order_relaxed);
+  requested=atomic_exchange_explicit(&thread_dump_pending,false,memory_order_relaxed);
 #endif
-   if (!requested) {
-      if (access(own, F_OK) == 0) unlink(own);
-      else if (access("/tmp/lunaria-threads", F_OK) == 0) unlink("/tmp/lunaria-threads");
-      else return;
-   }
-   fprintf(stderr, "[threads] dump requested\n");
-   arm64_exec_svc_ring_dump();
+  if (!requested) {
+    if (access(own, F_OK) == 0) unlink(own);
+    else if (access("/tmp/lunaria-threads", F_OK) == 0) unlink("/tmp/lunaria-threads");
+    else return;
+  }
+  fprintf(stderr, "[threads] dump requested\n");
+  arm64_exec_svc_ring_dump();
 }
 
 static void svc_dump_handler(int sig) {
-    (void)sig;
-    if (g_dump_arm64)
-        arm64_exec_svc_ring_dump();
-    else
-        arm_exec_svc_ring_dump();
+  (void)sig;
+  if (g_dump_arm64)
+    arm64_exec_svc_ring_dump();
+  else
+    arm_exec_svc_ring_dump();
 }
 
 /* A signal handler cannot safely walk the scheduler, allocate C++ containers
@@ -836,224 +794,224 @@ static void svc_dump_handler(int sig) {
 #ifdef _WIN32
 static void *unsafe_alarm_thread(void *value)
 {
-   uintptr_t seconds = (uintptr_t)value;
-   while (seconds--) Sleep(1000);
-   svc_dump_handler(0);
-   return NULL;
+  uintptr_t seconds = (uintptr_t)value;
+  while (seconds--) Sleep(1000);
+  svc_dump_handler(0);
+  return NULL;
 }
 #endif
 static void schedule_unsafe_alarm_dump(void)
 {
-   const char *value = getenv("LUNARIA_UNSAFE_ALARM_DUMP_S");
-   char *end = NULL;
-   long seconds;
+  const char *value = getenv("LUNARIA_UNSAFE_ALARM_DUMP_S");
+  char *end = NULL;
+  long seconds;
 
-   if (!value || !*value) return;
-   errno = 0;
-   seconds = strtol(value, &end, 10);
-   if (errno || end == value || *end || seconds <= 0 || (unsigned long)seconds > UINT_MAX) {
-      fprintf(stderr, "[loader] ignoring invalid "
-              "LUNARIA_UNSAFE_ALARM_DUMP_S=%s\n", value);
-      return;
-   }
+  if (!value || !*value) return;
+  errno = 0;
+  seconds = strtol(value, &end, 10);
+  if (errno || end == value || *end || seconds <= 0 || (unsigned long)seconds > UINT_MAX) {
+    fprintf(stderr, "[loader] ignoring invalid "
+                    "LUNARIA_UNSAFE_ALARM_DUMP_S=%s\n", value);
+    return;
+  }
 #ifdef _WIN32
-   pthread_t worker;
-   int error = pthread_create(&worker, NULL, unsafe_alarm_thread, (void *)(uintptr_t)seconds);
-   if (error) fprintf(stderr, "[loader] diagnostic timer: %s\n", strerror(error));
-   else pthread_detach(worker);
+  pthread_t worker;
+  int error = pthread_create(&worker, NULL, unsafe_alarm_thread, (void *)(uintptr_t)seconds);
+  if (error) fprintf(stderr, "[loader] diagnostic timer: %s\n", strerror(error));
+  else pthread_detach(worker);
 #else
-   signal(SIGALRM, svc_dump_handler);
-   alarm((unsigned int)seconds);
+  signal(SIGALRM, svc_dump_handler);
+  alarm((unsigned int)seconds);
 #endif
 }
 
 /* libmono.so @ 0x20000000: mono_defaults struct and key fields */
 static uint32_t mono_export_call(const char *sym)
 {
-   uint32_t va = arm_exec_lookup_export(sym);
-   return va ? (uint32_t)arm_exec_call(va, 0, 0, 0, 0) : 0u;
+  uint32_t va = arm_exec_lookup_export(sym);
+  return va ? (uint32_t)arm_exec_call(va, 0, 0, 0, 0) : 0u;
 }
 
 static void dump_mono_defaults(const char *when)
 {
-   if (!getenv("LUNARIA_TRACE_MONO")) return;
-   uint32_t base = arm_exec_lookup_export("mono_defaults");
-   uint32_t corlib_fn = mono_export_call("mono_get_corlib");
-   uint32_t object_fn = mono_export_call("mono_get_object_class");
-   uint32_t root_fn  = mono_export_call("mono_get_root_domain");
-   uint32_t corlib_asm = mono_export_call("mono_unity_assembly_get_mscorlib");
-   if (base) {
-      fprintf(stderr,
-              "[mono] %s: defaults@%#x corlib=%#x object=%#x void=%#x byte=%#x int32=%#x string=%#x\n",
-              when, base,
-              arm_exec_read32(base + 0x00u),
-              arm_exec_read32(base + 0x04u),
-              arm_exec_read32(base + 0x0cu),
-              arm_exec_read32(base + 0x08u),
-              arm_exec_read32(base + 0x20u),
-              arm_exec_read32(base + 0x44u));
-   } else {
-      fprintf(stderr, "[mono] %s: mono_defaults symbol not found\n", when);
-   }
-   fprintf(stderr, "[mono] %s: mono_get_corlib()=%#x mono_get_object_class()=%#x mono_get_root_domain()=%#x mono_unity_assembly_get_mscorlib()=%#x\n",
-           when, corlib_fn, object_fn, root_fn, corlib_asm);
+  if (!getenv("LUNARIA_TRACE_MONO")) return;
+  uint32_t base = arm_exec_lookup_export("mono_defaults");
+  uint32_t corlib_fn = mono_export_call("mono_get_corlib");
+  uint32_t object_fn = mono_export_call("mono_get_object_class");
+  uint32_t root_fn  = mono_export_call("mono_get_root_domain");
+  uint32_t corlib_asm = mono_export_call("mono_unity_assembly_get_mscorlib");
+  if (base) {
+    fprintf(stderr,
+            "[mono] %s: defaults@%#x corlib=%#x object=%#x void=%#x byte=%#x int32=%#x string=%#x\n",
+            when, base,
+            arm_exec_read32(base + 0x00u),
+            arm_exec_read32(base + 0x04u),
+            arm_exec_read32(base + 0x0cu),
+            arm_exec_read32(base + 0x08u),
+            arm_exec_read32(base + 0x20u),
+            arm_exec_read32(base + 0x44u));
+  } else {
+    fprintf(stderr, "[mono] %s: mono_defaults symbol not found\n", when);
+  }
+  fprintf(stderr, "[mono] %s: mono_get_corlib()=%#x mono_get_object_class()=%#x mono_get_root_domain()=%#x mono_unity_assembly_get_mscorlib()=%#x\n",
+          when, corlib_fn, object_fn, root_fn, corlib_asm);
 }
 
 static int
 run_jni_game(struct jvm *jvm)
 {
-   // Works only with unity libs for now
-   // XXX: What this basically is that, we port the Java bits to C
-   // XXX: This will become unneccessary as we make dalvik interpreter
+  // Works only with unity libs for now
+  // XXX: What this basically is that, we port the Java bits to C
+  // XXX: This will become unneccessary as we make dalvik interpreter
 
-   struct {
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jobject);
-      } native_init_jni;
+  struct {
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jobject);
+    } native_init_jni;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject);
-      } native_done;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject);
+    } native_done;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jstring);
-      } native_file;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jstring);
+    } native_file;
 
-      union {
-         void *ptr;
-         jboolean (*fun)(JNIEnv*, jobject);
-      } native_pause;
+    union {
+      void *ptr;
+      jboolean (*fun)(JNIEnv*, jobject);
+    } native_pause;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jint, jobject);
-      } native_recreate_gfx_state;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jint, jobject);
+    } native_recreate_gfx_state;
 
-      union {
-         void *ptr;
-         jboolean (*fun)(JNIEnv*, jobject);
-      } native_render;
+    union {
+      void *ptr;
+      jboolean (*fun)(JNIEnv*, jobject);
+    } native_render;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject);
-      } native_resume;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject);
+    } native_resume;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jboolean);
-      } native_focus_changed;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jboolean);
+    } native_focus_changed;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jstring);
-      } native_set_input_string;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jstring);
+    } native_set_input_string;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject);
-      } native_soft_input_closed;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject);
+    } native_soft_input_closed;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jboolean);
-      } native_set_input_canceled;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jboolean);
+    } native_set_input_canceled;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jobject);
-      } native_init_www;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jobject);
+    } native_init_www;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jobject);
-      } native_init_web_request;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jobject);
+    } native_init_web_request;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jlong);
-      } native_add_vsync_time;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jlong);
+    } native_add_vsync_time;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jboolean);
-      } native_forward_events_to_dalvik;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jboolean);
+    } native_forward_events_to_dalvik;
 
-      union {
-         void *ptr;
-         void (*fun)(JNIEnv*, jobject, jobject);
-      } native_inject_event;
-   } unity;
+    union {
+      void *ptr;
+      void (*fun)(JNIEnv*, jobject, jobject);
+    } native_inject_event;
+  } unity;
 
-   static const char *unity_player_class = "com.unity3d.player.UnityPlayer";
-   unity.native_init_jni.ptr = jvm_get_native_method(jvm, unity_player_class, "initJni");
-   unity.native_done.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeDone");
-   unity.native_file.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeFile");
-   unity.native_pause.ptr = jvm_get_native_method(jvm, unity_player_class, "nativePause");
-   unity.native_recreate_gfx_state.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeRecreateGfxState");
-   unity.native_render.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeRender");
-   unity.native_resume.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeResume");
-   unity.native_focus_changed.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeFocusChanged");
-   unity.native_set_input_string.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeSetInputString");
-   unity.native_soft_input_closed.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeSoftInputClosed");
-   unity.native_set_input_canceled.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeSetInputCanceled");
-   unity.native_init_www.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInitWWW");
-   unity.native_init_web_request.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInitWebRequest");
-   unity.native_add_vsync_time.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeAddVSyncTime");
-   unity.native_forward_events_to_dalvik.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeForwardEventsToDalvik");
-   unity.native_inject_event.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInjectEvent");
+  static const char *unity_player_class = "com.unity3d.player.UnityPlayer";
+  unity.native_init_jni.ptr = jvm_get_native_method(jvm, unity_player_class, "initJni");
+  unity.native_done.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeDone");
+  unity.native_file.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeFile");
+  unity.native_pause.ptr = jvm_get_native_method(jvm, unity_player_class, "nativePause");
+  unity.native_recreate_gfx_state.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeRecreateGfxState");
+  unity.native_render.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeRender");
+  unity.native_resume.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeResume");
+  unity.native_focus_changed.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeFocusChanged");
+  unity.native_set_input_string.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeSetInputString");
+  unity.native_soft_input_closed.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeSoftInputClosed");
+  unity.native_set_input_canceled.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeSetInputCanceled");
+  unity.native_init_www.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInitWWW");
+  unity.native_init_web_request.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInitWebRequest");
+  unity.native_add_vsync_time.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeAddVSyncTime");
+  unity.native_forward_events_to_dalvik.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeForwardEventsToDalvik");
+  unity.native_inject_event.ptr = jvm_get_native_method(jvm, unity_player_class, "nativeInjectEvent");
 
-   if (!unity.native_init_jni.ptr) {
-      warnx("not a unity jni lib");
-      return EXIT_FAILURE;
-   }
+  if (!unity.native_init_jni.ptr) {
+    warnx("not a unity jni lib");
+    return EXIT_FAILURE;
+  }
 
-   const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+  const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
 
-   if (unity.native_file.ptr) {
-      const char *apk = lunaria_apk_mount_path();
-      if (apk && *apk)
-         unity.native_file.fun(&jvm->env, context, jvm->env->NewStringUTF(&jvm->env, apk));
+  if (unity.native_file.ptr) {
+    const char *apk = lunaria_apk_mount_path();
+    if (apk && *apk)
+      unity.native_file.fun(&jvm->env, context, jvm->env->NewStringUTF(&jvm->env, apk));
 
-      DIR *dir;
-      const char *obb_dir = getenv("ANDROID_EXTERNAL_OBB_DIR");
-      if (obb_dir && (dir = opendir(obb_dir))) {
-         for (struct dirent *d; (d = readdir(dir));) {
-            if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
-               continue;
+    DIR *dir;
+    const char *obb_dir = getenv("ANDROID_EXTERNAL_OBB_DIR");
+    if (obb_dir && (dir = opendir(obb_dir))) {
+      for (struct dirent *d; (d = readdir(dir));) {
+        if (!strcmp(d->d_name, ".") || !strcmp(d->d_name, ".."))
+          continue;
 
-            char path[4096];
-            snprintf(path, sizeof(path), "%s/%s", obb_dir, d->d_name);
-            unity.native_file.fun(&jvm->env, context, jvm->env->NewStringUTF(&jvm->env, path));
-         }
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/%s", obb_dir, d->d_name);
+        unity.native_file.fun(&jvm->env, context, jvm->env->NewStringUTF(&jvm->env, path));
       }
-   }
+    }
+  }
 
-   unity.native_init_jni.fun(&jvm->env, context, context);
+  unity.native_init_jni.fun(&jvm->env, context, context);
 
-   // unity.native_forward_events_to_dalvik.fun(&jvm->env, context, true);
-   if (unity.native_init_www.ptr)
-      unity.native_init_www.fun(&jvm->env, context, jvm->env->FindClass(&jvm->env, "com/unity3d/player/WWW"));
-   if (unity.native_init_web_request.ptr)
-      unity.native_init_web_request.fun(&jvm->env, context, jvm->env->FindClass(&jvm->env, "com/unity3d/player/UnityWebRequest"));
-   unity.native_recreate_gfx_state.fun(&jvm->env, context, 0, context);
-   unity.native_focus_changed.fun(&jvm->env, context, true);
-   unity.native_resume.fun(&jvm->env, context);
-   unity.native_done.fun(&jvm->env, context);
-   // unity.native_add_vsync_time.fun(&jvm->env, context, 0);
+  // unity.native_forward_events_to_dalvik.fun(&jvm->env, context, true);
+  if (unity.native_init_www.ptr)
+    unity.native_init_www.fun(&jvm->env, context, jvm->env->FindClass(&jvm->env, "com/unity3d/player/WWW"));
+  if (unity.native_init_web_request.ptr)
+    unity.native_init_web_request.fun(&jvm->env, context, jvm->env->FindClass(&jvm->env, "com/unity3d/player/UnityWebRequest"));
+  unity.native_recreate_gfx_state.fun(&jvm->env, context, 0, context);
+  unity.native_focus_changed.fun(&jvm->env, context, true);
+  unity.native_resume.fun(&jvm->env, context);
+  unity.native_done.fun(&jvm->env, context);
+  // unity.native_add_vsync_time.fun(&jvm->env, context, 0);
 
-   while (unity.native_render.fun(&jvm->env, context)) {
-      static int i = 0;
-      if (++i >= 10) {
-         unity.native_inject_event.fun(&jvm->env, context, jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/view/MotionEvent")));
-         i = 0;
-      }
-   }
+  while (unity.native_render.fun(&jvm->env, context)) {
+    static int i = 0;
+    if (++i >= 10) {
+      unity.native_inject_event.fun(&jvm->env, context, jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/view/MotionEvent")));
+      i = 0;
+    }
+  }
 
-   return EXIT_SUCCESS;
+  return EXIT_SUCCESS;
 }
 
 /* --- host frame pump pacing ----------------------------------------------
@@ -1076,9 +1034,9 @@ run_jni_game(struct jvm *jvm)
 static uint64_t
 pump_now_us(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
 
 /* The Android side of one turn of the main loop: what the framework does on
@@ -1093,10 +1051,10 @@ pump_now_us(void)
 static struct luna_process_pool *g_component_pool;
 static int component_submit(void *user,const char *process,const void *bytes,size_t size)
 {
-   uint32_t pid=0;
-   int rc=luna_process_pool_send(user,process,bytes,size,&pid);
-   if(!rc)fprintf(stderr,"[service-broker] accepted start for %s pid=%u\n",process,pid);
-   return rc;
+  uint32_t pid=0;
+  int rc=luna_process_pool_send(user,process,bytes,size,&pid);
+  if(!rc)fprintf(stderr,"[service-broker] accepted start for %s pid=%u\n",process,pid);
+  return rc;
 }
 /* Other installed packages that run as component hosts (Play Store, Play
  * services): one lazily-created pool per package, each exec'ing the launcher
@@ -1105,127 +1063,146 @@ static int component_submit(void *user,const char *process,const void *bytes,siz
 static struct luna_process_channel *g_service_channel;   /* a host's link to its parent */
 #define PACKAGE_POOL_MAX 8
 static struct {
-   char *package, *services, *providers;
-   char process[512];
-   struct luna_process_pool *pool;
+  char *package, *services, *providers;
+  char process[512];
+  struct luna_process_pool *pool;
 } g_package_pools[PACKAGE_POOL_MAX];
 static struct luna_process_pool *package_pool(const char *package)
 {
-   if(g_service_channel)return NULL;   /* only the owner of the pools starts hosts */
-   for(int i=0;i<PACKAGE_POOL_MAX;++i)
-      if(g_package_pools[i].package && !strcmp(g_package_pools[i].package,package))return g_package_pools[i].pool;
-   int slot=-1;
-   for(int i=0;i<PACKAGE_POOL_MAX;++i)if(!g_package_pools[i].package){slot=i;break;}
-   if(slot<0)return NULL;
-   struct lunaria_android_package record;
-   char host[4096],executable[4096];
-   if(!lunaria_android_package_find(package,&record) || !record.source_dir)return NULL;
-   if(luna_apk_system_archive(package,host,sizeof host) &&
+  if(g_service_channel)return NULL;   /* only the owner of the pools starts hosts */
+  for(int i=0; i<PACKAGE_POOL_MAX; ++i)
+    if(g_package_pools[i].package && !strcmp(g_package_pools[i].package,package))return g_package_pools[i].pool;
+  int slot=-1;
+  for(int i=0; i<PACKAGE_POOL_MAX; ++i)if(!g_package_pools[i].package) {
+      slot=i;
+      break;
+    }
+  if(slot<0)return NULL;
+  struct lunaria_android_package record;
+  char host[4096],executable[4096];
+  if(!lunaria_android_package_find(package,&record) || !record.source_dir)return NULL;
+  if(luna_apk_system_archive(package,host,sizeof host) &&
       !arm_exec_map_guest_path(record.source_dir,host,sizeof host))return NULL;
-   if(luna_os_executable_path(executable,sizeof executable)<0)return NULL;
-   char *services=NULL,*providers=NULL,process[512];
-   if(luna_apk_service_manifest(host,&services,&providers,process,sizeof process))return NULL;
-   /* Guest pid ranges of each host start above the application's own pool. */
-   struct luna_process_pool *pool=luna_process_pool_open_host(executable,host,(uint32_t)record.uid,811,600000u+(uint32_t)slot*65536u);
-   if(!pool){free(services);free(providers);fprintf(stderr,"[binder] cannot host %s: %s\n",package,strerror(errno));return NULL;}
-   const char *owner=getenv("ANDROID_PACKAGE_NAME");
-   const char *profile=owner && !strcmp(owner,package) ? getenv("LUNARIA_PROFILE") :
-      (!strcmp(package,"com.google.android.gms") || !strcmp(package,"com.android.vending") ||
-       !strcmp(package,"com.google.android.gsf")) ? luna_google_profile_current() : "default";
-   if(luna_process_pool_set_profile(pool,profile && *profile ? profile : "default")){
-      free(services);free(providers);luna_process_pool_close(pool);return NULL;
-   }
-   g_package_pools[slot].services=services;
-   g_package_pools[slot].providers=providers;
-   snprintf(g_package_pools[slot].process,sizeof g_package_pools[slot].process,"%s",process);
-   g_package_pools[slot].package=strdup(package);g_package_pools[slot].pool=pool;
-   return pool;
+  if(luna_os_executable_path(executable,sizeof executable)<0)return NULL;
+  char *services=NULL,*providers=NULL,process[512];
+  if(luna_apk_service_manifest(host,&services,&providers,process,sizeof process))return NULL;
+  /* Guest pid ranges of each host start above the application's own pool. */
+  struct luna_process_pool *pool=luna_process_pool_open_host(executable,host,(uint32_t)record.uid,811,600000u+(uint32_t)slot*65536u);
+  if(!pool) {
+    free(services);
+    free(providers);
+    fprintf(stderr,"[binder] cannot host %s: %s\n",package,strerror(errno));
+    return NULL;
+  }
+  const char *owner=getenv("ANDROID_PACKAGE_NAME");
+  const char *profile=owner && !strcmp(owner,package) ? getenv("LUNARIA_PROFILE") :
+                      (!strcmp(package,"com.google.android.gms") || !strcmp(package,"com.android.vending") ||
+                       !strcmp(package,"com.google.android.gsf")) ? luna_google_profile_current() : "default";
+  if(luna_process_pool_set_profile(pool,profile && *profile ? profile : "default")) {
+    free(services);
+    free(providers);
+    luna_process_pool_close(pool);
+    return NULL;
+  }
+  g_package_pools[slot].services=services;
+  g_package_pools[slot].providers=providers;
+  snprintf(g_package_pools[slot].process,sizeof g_package_pools[slot].process,"%s",process);
+  g_package_pools[slot].package=strdup(package);
+  g_package_pools[slot].pool=pool;
+  return pool;
 }
 static uint32_t binder_route_u32(const unsigned char *p)
-{ return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
+{
+  return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
+}
 static int binder_route_body(const unsigned char *m,size_t size,const unsigned char **body,size_t *length)
 {
-   if(size<24)return -EPROTO;
-   size_t pn=binder_route_u32(m+16);
-   if(pn>size-24)return -EPROTO;
-   size_t an=binder_route_u32(m+20+pn);
-   if(an>size-24-pn)return -EPROTO;
-   *body=m+24+pn+an;*length=size-24-pn-an;
-   return 0;
+  if(size<24)return -EPROTO;
+  size_t pn=binder_route_u32(m+16);
+  if(pn>size-24)return -EPROTO;
+  size_t an=binder_route_u32(m+20+pn);
+  if(an>size-24-pn)return -EPROTO;
+  *body=m+24+pn+an;
+  *length=size-24-pn-an;
+  return 0;
 }
 
 /* Resolve an incoming bind against the destination APK, before starting a VM.
  * The service table is parsed once per package; its process names are already
  * expanded from the manifest's application defaults and :private names. */
 static int binder_service_process(const char *package,const char *table,
-                                 const void *bytes,size_t size,char *out,size_t cap)
-{
-   const unsigned char *body=NULL;size_t length=0;
-   int decoded=binder_route_body(bytes,size,&body,&length);
-   if(decoded)return decoded;
-   struct dvm *vm=dvm_jni_vm();
-   unsigned cookie=dvm_gil_enter_from_guest(vm);
-   int operation=0;uint32_t intent=0;
-   int result=dvm_service_unpack(vm,body,length,&operation,&intent);
-   if(!result && operation!=3)result=-EPROTO;
-   union dvm_value component={0},cls={0},action={0};
-   if(!result){
-      dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
-      if(component.l)dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cls);
-      dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
-      const char *name=cls.l ? dvm_string_utf8(vm,cls.l) : NULL;
-      const char *act=action.l ? dvm_string_utf8(vm,action.l) : NULL;
-      char full[512];
-      int n=name ? snprintf(full,sizeof full,"%s%s",*name=='.' ? package : "",name) : 0;
-      result=n<0 || (size_t)n>=sizeof full ? -ENAMETOOLONG : -ENOENT;
-      if(name)for(char *p=full;*p;++p)if(*p=='/')*p='.';
-      char *rows=strdup(table ? table : ""),*scan=rows,*row;
-      if(!rows)result=-ENOMEM;
-      while(rows && (row=luna_strsep(&scan,";"))){
-         char *service=luna_strsep(&row,"|"),*enabled=luna_strsep(&row,"|");
-         (void)luna_strsep(&row,"|");
-         char *actions=luna_strsep(&row,"|"),*item;
-         if(!service || !enabled || !atoi(enabled) || !actions || !row || !*row)continue;
-         bool match=name && n>=0 && (size_t)n<sizeof full && !strcmp(service,full);
-         while(!name && act && (item=luna_strsep(&actions,",")))if(!strcmp(item,act))match=true;
-         if(!match)continue;
-         n=snprintf(out,cap,"%s",row);
-         result=n<0 || (size_t)n>=cap ? -ENAMETOOLONG : 0;
-         break;
-      }
-      free(rows);
-   }
-   dvm_gil_leave_to_guest(vm,cookie);
-   return result;
-}
-static int binder_provider_process(const char *package,const char *table,
                                   const void *bytes,size_t size,char *out,size_t cap)
 {
-   const unsigned char *body=NULL;size_t length=0;
-   int rc=binder_route_body(bytes,size,&body,&length);
-   if(rc)return rc;
-   if(length<8)return -EPROTO;
-   size_t n=binder_route_u32(body+4);
-   if(n>length-8 || n<10 || memcmp(body+8,"content://",10))return -EPROTO;
-   const char *authority=(const char *)body+18;
-   size_t count=0;
-   while(count<n-10 && authority[count]!='/' && authority[count]!='?' && authority[count]!='#')++count;
-   char name[256];
-   if(!count || count>=sizeof name || memchr(authority,0,count))return -EPROTO;
-   memcpy(name,authority,count);name[count]=0;
-   struct luna_providers providers;
-   rc=luna_providers_open(&providers,table,package);
-   if(rc)return rc;
-   rc=-ENOENT;
-   for(size_t i=0;i<providers.count;++i){
-      const struct luna_provider *p=&providers.items[i];
-      if(!p->enabled || !luna_provider_authority(p,name))continue;
-      int written=snprintf(out,cap,"%s",p->process);
-      rc=written<0 || (size_t)written>=cap ? -ENAMETOOLONG : 0;
+  const unsigned char *body=NULL;
+  size_t length=0;
+  int decoded=binder_route_body(bytes,size,&body,&length);
+  if(decoded)return decoded;
+  struct dvm *vm=dvm_jni_vm();
+  unsigned cookie=dvm_gil_enter_from_guest(vm);
+  int operation=0;
+  uint32_t intent=0;
+  int result=dvm_service_unpack(vm,body,length,&operation,&intent);
+  if(!result && operation!=3)result=-EPROTO;
+  union dvm_value component= {0},cls= {0},action= {0};
+  if(!result) {
+    dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
+    if(component.l)dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cls);
+    dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
+    const char *name=cls.l ? dvm_string_utf8(vm,cls.l) : NULL;
+    const char *act=action.l ? dvm_string_utf8(vm,action.l) : NULL;
+    char full[512];
+    int n=name ? snprintf(full,sizeof full,"%s%s",*name=='.' ? package : "",name) : 0;
+    result=n<0 || (size_t)n>=sizeof full ? -ENAMETOOLONG : -ENOENT;
+    if(name)for(char *p=full; *p; ++p)if(*p=='/')*p='.';
+    char *rows=strdup(table ? table : ""),*scan=rows,*row;
+    if(!rows)result=-ENOMEM;
+    while(rows && (row=luna_strsep(&scan,";"))) {
+      char *service=luna_strsep(&row,"|"),*enabled=luna_strsep(&row,"|");
+      (void)luna_strsep(&row,"|");
+      char *actions=luna_strsep(&row,"|"),*item;
+      if(!service || !enabled || !atoi(enabled) || !actions || !row || !*row)continue;
+      bool match=name && n>=0 && (size_t)n<sizeof full && !strcmp(service,full);
+      while(!name && act && (item=luna_strsep(&actions,",")))if(!strcmp(item,act))match=true;
+      if(!match)continue;
+      n=snprintf(out,cap,"%s",row);
+      result=n<0 || (size_t)n>=cap ? -ENAMETOOLONG : 0;
       break;
-   }
-   luna_providers_close(&providers);
-   return rc;
+    }
+    free(rows);
+  }
+  dvm_gil_leave_to_guest(vm,cookie);
+  return result;
+}
+static int binder_provider_process(const char *package,const char *table,
+                                   const void *bytes,size_t size,char *out,size_t cap)
+{
+  const unsigned char *body=NULL;
+  size_t length=0;
+  int rc=binder_route_body(bytes,size,&body,&length);
+  if(rc)return rc;
+  if(length<8)return -EPROTO;
+  size_t n=binder_route_u32(body+4);
+  if(n>length-8 || n<10 || memcmp(body+8,"content://",10))return -EPROTO;
+  const char *authority=(const char *)body+18;
+  size_t count=0;
+  while(count<n-10 && authority[count]!='/' && authority[count]!='?' && authority[count]!='#')++count;
+  char name[256];
+  if(!count || count>=sizeof name || memchr(authority,0,count))return -EPROTO;
+  memcpy(name,authority,count);
+  name[count]=0;
+  struct luna_providers providers;
+  rc=luna_providers_open(&providers,table,package);
+  if(rc)return rc;
+  rc=-ENOENT;
+  for(size_t i=0; i<providers.count; ++i) {
+    const struct luna_provider *p=&providers.items[i];
+    if(!p->enabled || !luna_provider_authority(p,name))continue;
+    int written=snprintf(out,cap,"%s",p->process);
+    rc=written<0 || (size_t)written>=cap ? -ENAMETOOLONG : 0;
+    break;
+  }
+  luna_providers_close(&providers);
+  return rc;
 }
 /* The Binder transport.  A parent addresses a child by package name; a child
  * has only its parent, reached through its control channel (peer == NULL). */
@@ -1234,261 +1211,284 @@ static int binder_provider_process(const char *package,const char *table,
  * name), and that process delivers it.  One host per package, whoever asks. */
 static int binder_transport_send_fds(void *user,const char *peer,const void *bytes,size_t size,const int *fds,size_t nfds)
 {
-   (void)user;
-   if(g_service_channel){
-      if(!peer)return luna_process_channel_send_fds(g_service_channel,bytes,size,fds,nfds);
-      const size_t n=strlen(peer);
-      unsigned char *wrapped=n<=NAME_MAX_WRAPPED ? malloc(8+n+size) : NULL;
-      if(!wrapped)return -ENOMEM;
-      memcpy(wrapped,"LBF1",4);
-      for(unsigned i=0;i<4;++i)wrapped[4+i]=(unsigned char)((uint32_t)n>>(i*8));
-      memcpy(wrapped+8,peer,n);memcpy(wrapped+8+n,bytes,size);
-      int rc=luna_process_channel_send_fds(g_service_channel,wrapped,8+n+size,fds,nfds);
-      free(wrapped);return rc;
-   }
-   const unsigned char *direct=bytes;
-   if(size>=8 && !memcmp(direct,"LBD1",4)){
-      uint32_t target=0;
-      for(unsigned i=0;i<4;++i)target|=(uint32_t)direct[4+i]<<(8*i);
-      if(target==(uint32_t)getpid())
-         return dvm_binder_receive_fds(dvm_jni_vm(),peer,direct+8,size-8,fds,nfds) ? 0 : -EPROTO;
-      for(int i=0;i<PACKAGE_POOL_MAX;++i){
-         if(!g_package_pools[i].pool)continue;
-         int rc=luna_process_pool_send_to_host_fds(g_package_pools[i].pool,target,direct+8,size-8,fds,nfds);
-         if(rc!=-ESRCH)return rc;
-      }
-      return g_component_pool ? luna_process_pool_send_to_host_fds(g_component_pool,target,direct+8,size-8,fds,nfds) : -ESRCH;
-   }
-   if(!peer)return -ENOTCONN;
-   /* Dynamic receivers live in already-running VMs. The broker fans out the
-    * immutable Intent snapshot; each VM resolves its registered filters. */
-   if(size>=24 && !memcmp(bytes,"LBC1",4)){
-      uint32_t sender=binder_route_u32((const unsigned char *)bytes+4);
-      int error=0;
-      if(sender!=(uint32_t)getpid())
-         (void)dvm_binder_receive_fds(dvm_jni_vm(),peer,bytes,size,fds,nfds);
-      for(int i=0;i<PACKAGE_POOL_MAX;++i){
-         if(!g_package_pools[i].pool)continue;
-         int rc=luna_process_pool_publish_fds(g_package_pools[i].pool,sender,bytes,size,fds,nfds);
-         if(rc<0 && !error)error=rc;
-      }
-      if(g_component_pool){
-         int rc=luna_process_pool_publish_fds(g_component_pool,sender,bytes,size,fds,nfds);
-         if(rc<0 && !error)error=rc;
-      }
-      return error;
-   }
-   const char *self=getenv("ANDROID_PACKAGE_NAME");
-   const bool own=self && !strcmp(self,peer);
-   const bool bind=size>=4 && !memcmp(bytes,"LBB1",4);
-   const bool provider=size>=4 && !memcmp(bytes,"LBQ1",4);
-   if(own && (bind || provider)){
-      char process[512];
-      int rc=bind ? binder_service_process(peer,getenv("ANDROID_SERVICES"),bytes,size,process,sizeof process) :
-         binder_provider_process(peer,getenv("ANDROID_CONTENT_PROVIDERS"),bytes,size,process,sizeof process);
-      if(rc)return rc;
-      const char *current=getenv("ANDROID_PROCESS_NAME");
-      if(current && !strcmp(current,process))
-         return dvm_binder_receive_fds(dvm_jni_vm(),peer,bytes,size,fds,nfds) ? 0 : -EPROTO;
-      uint32_t pid=0;
-      return g_component_pool ? luna_process_pool_send_fds(g_component_pool,process,bytes,size,&pid,fds,nfds) : -ENOTCONN;
-   }
-   struct luna_process_pool *pool=package_pool(peer);
-   if(!pool)return -ENOENT;
-   const char *process=peer,*services=NULL,*providers=NULL;
-   for(int i=0;i<PACKAGE_POOL_MAX;++i)if(g_package_pools[i].pool==pool){
-      process=g_package_pools[i].process;services=g_package_pools[i].services;providers=g_package_pools[i].providers;break;
-   }
-   char target[512];
-   if(bind || provider){
-      int rc=bind ? binder_service_process(peer,services,bytes,size,target,sizeof target) :
-         binder_provider_process(peer,providers,bytes,size,target,sizeof target);
-      if(rc)return rc;
-      process=target;
-      fprintf(stderr,"[binder] %s process: %s -> %s\n",bind ? "service" : "provider",peer,process);
-   }
-   /* An answer for a host that has gone away is dropped, not a reason to start it. */
-   const unsigned char *magic=bytes;
-   if(size>=4 && !memcmp(magic,"LBR1",4) && !luna_process_pool_running(pool,process))return -ECONNREFUSED;
-   uint32_t pid=0;
-   return luna_process_pool_send_fds(pool,process,bytes,size,&pid,fds,nfds);
+  (void)user;
+  if(g_service_channel) {
+    if(!peer)return luna_process_channel_send_fds(g_service_channel,bytes,size,fds,nfds);
+    const size_t n=strlen(peer);
+    unsigned char *wrapped=n<=NAME_MAX_WRAPPED ? malloc(8+n+size) : NULL;
+    if(!wrapped)return -ENOMEM;
+    memcpy(wrapped,"LBF1",4);
+    for(unsigned i=0; i<4; ++i)wrapped[4+i]=(unsigned char)((uint32_t)n>>(i*8));
+    memcpy(wrapped+8,peer,n);
+    memcpy(wrapped+8+n,bytes,size);
+    int rc=luna_process_channel_send_fds(g_service_channel,wrapped,8+n+size,fds,nfds);
+    free(wrapped);
+    return rc;
+  }
+  const unsigned char *direct=bytes;
+  if(size>=8 && !memcmp(direct,"LBD1",4)) {
+    uint32_t target=0;
+    for(unsigned i=0; i<4; ++i)target|=(uint32_t)direct[4+i]<<(8*i);
+    if(target==(uint32_t)getpid())
+      return dvm_binder_receive_fds(dvm_jni_vm(),peer,direct+8,size-8,fds,nfds) ? 0 : -EPROTO;
+    for(int i=0; i<PACKAGE_POOL_MAX; ++i) {
+      if(!g_package_pools[i].pool)continue;
+      int rc=luna_process_pool_send_to_host_fds(g_package_pools[i].pool,target,direct+8,size-8,fds,nfds);
+      if(rc!=-ESRCH)return rc;
+    }
+    return g_component_pool ? luna_process_pool_send_to_host_fds(g_component_pool,target,direct+8,size-8,fds,nfds) : -ESRCH;
+  }
+  if(!peer)return -ENOTCONN;
+  /* Dynamic receivers live in already-running VMs. The broker fans out the
+   * immutable Intent snapshot; each VM resolves its registered filters. */
+  if(size>=24 && !memcmp(bytes,"LBC1",4)) {
+    uint32_t sender=binder_route_u32((const unsigned char *)bytes+4);
+    int error=0;
+    if(sender!=(uint32_t)getpid())
+      (void)dvm_binder_receive_fds(dvm_jni_vm(),peer,bytes,size,fds,nfds);
+    for(int i=0; i<PACKAGE_POOL_MAX; ++i) {
+      if(!g_package_pools[i].pool)continue;
+      int rc=luna_process_pool_publish_fds(g_package_pools[i].pool,sender,bytes,size,fds,nfds);
+      if(rc<0 && !error)error=rc;
+    }
+    if(g_component_pool) {
+      int rc=luna_process_pool_publish_fds(g_component_pool,sender,bytes,size,fds,nfds);
+      if(rc<0 && !error)error=rc;
+    }
+    return error;
+  }
+  const char *self=getenv("ANDROID_PACKAGE_NAME");
+  const bool own=self && !strcmp(self,peer);
+  const bool bind=size>=4 && !memcmp(bytes,"LBB1",4);
+  const bool provider=size>=4 && !memcmp(bytes,"LBQ1",4);
+  if(own && (bind || provider)) {
+    char process[512];
+    int rc=bind ? binder_service_process(peer,getenv("ANDROID_SERVICES"),bytes,size,process,sizeof process) :
+           binder_provider_process(peer,getenv("ANDROID_CONTENT_PROVIDERS"),bytes,size,process,sizeof process);
+    if(rc)return rc;
+    const char *current=getenv("ANDROID_PROCESS_NAME");
+    if(current && !strcmp(current,process))
+      return dvm_binder_receive_fds(dvm_jni_vm(),peer,bytes,size,fds,nfds) ? 0 : -EPROTO;
+    uint32_t pid=0;
+    return g_component_pool ? luna_process_pool_send_fds(g_component_pool,process,bytes,size,&pid,fds,nfds) : -ENOTCONN;
+  }
+  struct luna_process_pool *pool=package_pool(peer);
+  if(!pool)return -ENOENT;
+  const char *process=peer,*services=NULL,*providers=NULL;
+  for(int i=0; i<PACKAGE_POOL_MAX; ++i)if(g_package_pools[i].pool==pool) {
+      process=g_package_pools[i].process;
+      services=g_package_pools[i].services;
+      providers=g_package_pools[i].providers;
+      break;
+    }
+  char target[512];
+  if(bind || provider) {
+    int rc=bind ? binder_service_process(peer,services,bytes,size,target,sizeof target) :
+           binder_provider_process(peer,providers,bytes,size,target,sizeof target);
+    if(rc)return rc;
+    process=target;
+    fprintf(stderr,"[binder] %s process: %s -> %s\n",bind ? "service" : "provider",peer,process);
+  }
+  /* An answer for a host that has gone away is dropped, not a reason to start it. */
+  const unsigned char *magic=bytes;
+  if(size>=4 && !memcmp(magic,"LBR1",4) && !luna_process_pool_running(pool,process))return -ECONNREFUSED;
+  uint32_t pid=0;
+  return luna_process_pool_send_fds(pool,process,bytes,size,&pid,fds,nfds);
 }
 static int binder_transport_send(void *user,const char *peer,const void *bytes,size_t size)
-{ return binder_transport_send_fds(user,peer,bytes,size,NULL,0); }
+{
+  return binder_transport_send_fds(user,peer,bytes,size,NULL,0);
+}
 static void component_reply(void *user,const char *name,uint32_t pid,const void *bytes,size_t size)
 {
-   (void)user;
-   size_t nfds=0;const int *fds=luna_process_message_fds(&nfds);
-   const unsigned char *p=bytes;
-   if(size>=8 && !memcmp(p,"LBF1",4)){
-      uint32_t n=0;for(unsigned i=0;i<4;++i)n|=(uint32_t)p[4+i]<<(i*8);
-      if(n==0 || n>NAME_MAX_WRAPPED || size<8+(size_t)n){fprintf(stderr,"[service-broker] malformed forward from %s\n",name);return;}
-      char dest[NAME_MAX_WRAPPED+1];memcpy(dest,p+8,n);dest[n]=0;
-      const char *self=getenv("ANDROID_PACKAGE_NAME");
-      if(size>=12+(size_t)n && !memcmp(p+8+n,"LBD1",4)){
-         (void)binder_transport_send_fds(NULL,dest,p+8+n,size-8-n,fds,nfds);return;
-      }
-      if(self && !strcmp(dest,self) && memcmp(p+8+n,"LBB1",4) && memcmp(p+8+n,"LBQ1",4) && memcmp(p+8+n,"LBC1",4)){
-         (void)dvm_binder_receive(dvm_jni_vm(),NULL,p+8+n,size-8-n);return;
-      }
+  (void)user;
+  size_t nfds=0;
+  const int *fds=luna_process_message_fds(&nfds);
+  const unsigned char *p=bytes;
+  if(size>=8 && !memcmp(p,"LBF1",4)) {
+    uint32_t n=0;
+    for(unsigned i=0; i<4; ++i)n|=(uint32_t)p[4+i]<<(i*8);
+    if(n==0 || n>NAME_MAX_WRAPPED || size<8+(size_t)n) {
+      fprintf(stderr,"[service-broker] malformed forward from %s\n",name);
+      return;
+    }
+    char dest[NAME_MAX_WRAPPED+1];
+    memcpy(dest,p+8,n);
+    dest[n]=0;
+    const char *self=getenv("ANDROID_PACKAGE_NAME");
+    if(size>=12+(size_t)n && !memcmp(p+8+n,"LBD1",4)) {
       (void)binder_transport_send_fds(NULL,dest,p+8+n,size-8-n,fds,nfds);
       return;
-   }
-   if(size>=8 && !memcmp(p,"LBD1",4)){
-      (void)binder_transport_send_fds(NULL,name,bytes,size,fds,nfds);return;
-   }
-   if(size>=12 && p[0]=='L' && p[1]=='B'){
-      if(!dvm_binder_receive(dvm_jni_vm(),name,bytes,size))
-         fprintf(stderr,"[service-broker] unknown Binder message from %s pid=%u\n",name,pid);
+    }
+    if(self && !strcmp(dest,self) && memcmp(p+8+n,"LBB1",4) && memcmp(p+8+n,"LBQ1",4) && memcmp(p+8+n,"LBC1",4)) {
+      (void)dvm_binder_receive(dvm_jni_vm(),NULL,p+8+n,size-8-n);
       return;
-   }
-   if(size!=8 || memcmp(p,"LSR1",4)){
-      fprintf(stderr,"[service-broker] invalid reply from %s pid=%u\n",name,pid);return;
-   }
-   uint32_t bits=0;for(unsigned i=0;i<4;++i)bits|=(uint32_t)p[4+i]<<(i*8);
-   int64_t status=bits>INT32_MAX ? (int64_t)bits-INT64_C(4294967296) : bits;
-   fprintf(stderr,"[service-broker] %s pid=%u lifecycle result=%lld\n",name,pid,(long long)status);
+    }
+    (void)binder_transport_send_fds(NULL,dest,p+8+n,size-8-n,fds,nfds);
+    return;
+  }
+  if(size>=8 && !memcmp(p,"LBD1",4)) {
+    (void)binder_transport_send_fds(NULL,name,bytes,size,fds,nfds);
+    return;
+  }
+  if(size>=12 && p[0]=='L' && p[1]=='B') {
+    if(!dvm_binder_receive(dvm_jni_vm(),name,bytes,size))
+      fprintf(stderr,"[service-broker] unknown Binder message from %s pid=%u\n",name,pid);
+    return;
+  }
+  if(size!=8 || memcmp(p,"LSR1",4)) {
+    fprintf(stderr,"[service-broker] invalid reply from %s pid=%u\n",name,pid);
+    return;
+  }
+  uint32_t bits=0;
+  for(unsigned i=0; i<4; ++i)bits|=(uint32_t)p[4+i]<<(i*8);
+  int64_t status=bits>INT32_MAX ? (int64_t)bits-INT64_C(4294967296) : bits;
+  fprintf(stderr,"[service-broker] %s pid=%u lifecycle result=%lld\n",name,pid,(long long)status);
 }
 static void component_pool_tick(void)
 {
-   for(int i=0;i<PACKAGE_POOL_MAX;++i){
-      if(!g_package_pools[i].pool)continue;
-      int rc=luna_process_pool_tick(g_package_pools[i].pool,component_reply,NULL);
-      if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[binder] IPC error from %s: %s\n",g_package_pools[i].package,strerror(-rc));
-      char name[512];uint32_t pid;int status;
-      while(luna_process_pool_next_exit(g_package_pools[i].pool,name,sizeof name,&pid,&status)>0)
-         fprintf(stderr,"[binder] %s pid=%u exited status=%d\n",name,pid,status);
-   }
-   if(!g_component_pool)return;
-   int rc=luna_process_pool_tick(g_component_pool,component_reply,NULL);
-   if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[service-broker] IPC error: %s\n",strerror(-rc));
-   char name[512];uint32_t pid;int status;
-   while(luna_process_pool_next_exit(g_component_pool,name,sizeof name,&pid,&status)>0)
-      fprintf(stderr,"[service-broker] %s pid=%u exited status=%d\n",name,pid,status);
+  for(int i=0; i<PACKAGE_POOL_MAX; ++i) {
+    if(!g_package_pools[i].pool)continue;
+    int rc=luna_process_pool_tick(g_package_pools[i].pool,component_reply,NULL);
+    if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[binder] IPC error from %s: %s\n",g_package_pools[i].package,strerror(-rc));
+    char name[512];
+    uint32_t pid;
+    int status;
+    while(luna_process_pool_next_exit(g_package_pools[i].pool,name,sizeof name,&pid,&status)>0)
+      fprintf(stderr,"[binder] %s pid=%u exited status=%d\n",name,pid,status);
+  }
+  if(!g_component_pool)return;
+  int rc=luna_process_pool_tick(g_component_pool,component_reply,NULL);
+  if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[service-broker] IPC error: %s\n",strerror(-rc));
+  char name[512];
+  uint32_t pid;
+  int status;
+  while(luna_process_pool_next_exit(g_component_pool,name,sizeof name,&pid,&status)>0)
+    fprintf(stderr,"[service-broker] %s pid=%u exited status=%d\n",name,pid,status);
 }
 static void component_pool_install(struct dvm *vm,int is_a64)
 {
-   if(!vm)return;
-   char executable[4096];
-   if(luna_os_executable_path(executable,sizeof executable)<0)return;
-   /* The Android parent is zygote, independent of the host spawn parent.
-    * Reserve ranges above the application's 1000..5095 namespace. */
-   g_component_pool=luna_process_pool_open(executable,is_a64 ? "--service-process-arm64" : "--service-process-arm32",811,5096);
-   if(!g_component_pool){fprintf(stderr,"[service-broker] unavailable: %s\n",strerror(errno));return;}
-   dvm_service_set_submit(vm,component_submit,g_component_pool);
-   dvm_binder_set_transport(binder_transport_send,NULL);
-   dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
-   dvm_binder_set_pump(component_pool_tick);
+  if(!vm)return;
+  char executable[4096];
+  if(luna_os_executable_path(executable,sizeof executable)<0)return;
+  /* The Android parent is zygote, independent of the host spawn parent.
+   * Reserve ranges above the application's 1000..5095 namespace. */
+  g_component_pool=luna_process_pool_open(executable,is_a64 ? "--service-process-arm64" : "--service-process-arm32",811,5096);
+  if(!g_component_pool) {
+    fprintf(stderr,"[service-broker] unavailable: %s\n",strerror(errno));
+    return;
+  }
+  dvm_service_set_submit(vm,component_submit,g_component_pool);
+  dvm_binder_set_transport(binder_transport_send,NULL);
+  dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
+  dvm_binder_set_pump(component_pool_tick);
 }
 
 static bool process_exit_status(int *status)
 {
-   if (dvm_jni_process_exited(status)) return true;
-   if (!arm_exec_guest_exit_count()) return false;
-   if (status) *status=arm_exec_guest_exit_status();
-   return true;
+  if (dvm_jni_process_exited(status)) return true;
+  if (!arm_exec_guest_exit_count()) return false;
+  if (status) *status=arm_exec_guest_exit_status();
+  return true;
 }
 
 static void
 pump_java_frame(void)
 {
-   component_pool_tick();
-   if (luna_guest_paused() || process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
-   thread_dump_request_tick();
-   arm_exec_main_choreographer_tick();
-   const uint64_t t_media = frame_now_ns();
-   static int profile=-1;
-   static uint64_t sums[5],count,reported;
-   if(profile<0) profile=getenv("LUNARIA_JAVA_FRAME_PROF")!=NULL;
-   uint64_t marks[6]={0};if(profile) marks[0]=frame_now_ns();
-   struct dvm *vm = dvm_jni_vm();
-   if (vm) {
-      /* The main thread's Looper.  A device runs it every turn of the main
-       * loop, so a Handler.postDelayed() callback lands near its due time;
-       * without this it only ran when the guest itself called into Java, which
-       * left armed callbacks seconds late (see dvm_main_looper_tick). */
-      dvm_main_looper_tick(vm);
-      if(profile) marks[1]=frame_now_ns();
-      dvm_media_pump_active(vm);
-      if(profile) marks[2]=frame_now_ns();
-      dvm_glsurface_tick(vm);
-      if(profile) marks[3]=frame_now_ns();
-      /* Preferences an apply() left pending: on a device the framework writes
-       * them behind the caller's back, and this is that writer. */
-      dvm_prefs_flush(vm);
-      if(profile) marks[4]=frame_now_ns();
-      /* The input method: a game blocked on the text the player is typing
-       * calls no Java of its own, so the keystrokes need a way in that does
-       * not depend on the guest doing anything. */
-      dvm_ime_frame(vm);
-      if(profile) marks[5]=frame_now_ns();
-   }
-   if(profile && vm) {
-      for(int i=0;i<5;++i) sums[i]+=marks[i+1]-marks[i];
-      ++count;
-      if(!reported) reported=marks[5];
-      if(marks[5]-reported>=10000000000ull) {
-         fprintf(stderr,"[java-frame] %llu turns looper=%.3f player=%.3f glview=%.3f prefs=%.3f ime=%.3f ms/turn\n",
-            (unsigned long long)count,sums[0]/1e6/count,sums[1]/1e6/count,
-            sums[2]/1e6/count,sums[3]/1e6/count,sums[4]/1e6/count);
-         memset(sums,0,sizeof sums);count=0;reported=marks[5];
-      }
-   }
-   frame_stage_add(FRAME_STAGE_MEDIA, t_media);
+  component_pool_tick();
+  if (luna_guest_paused() || process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
+  thread_dump_request_tick();
+  arm_exec_main_choreographer_tick();
+  static int profile=-1;
+  static uint64_t sums[5],count,reported;
+  if(profile<0) profile=getenv("LUNARIA_JAVA_FRAME_PROF")!=NULL;
+  uint64_t marks[6]= {0};
+  if(profile) marks[0]=frame_now_ns();
+  struct dvm *vm = dvm_jni_vm();
+  if (vm) {
+    /* The main thread's Looper.  A device runs it every turn of the main
+     * loop, so a Handler.postDelayed() callback lands near its due time;
+     * without this it only ran when the guest itself called into Java, which
+     * left armed callbacks seconds late (see dvm_main_looper_tick). */
+    dvm_main_looper_tick(vm);
+    if(profile) marks[1]=frame_now_ns();
+    dvm_media_pump_active(vm);
+    if(profile) marks[2]=frame_now_ns();
+    dvm_glsurface_tick(vm);
+    if(profile) marks[3]=frame_now_ns();
+    /* Preferences an apply() left pending: on a device the framework writes
+     * them behind the caller's back, and this is that writer. */
+    dvm_prefs_flush(vm);
+    if(profile) marks[4]=frame_now_ns();
+    /* The input method: a game blocked on the text the player is typing
+     * calls no Java of its own, so the keystrokes need a way in that does
+     * not depend on the guest doing anything. */
+    dvm_ime_frame(vm);
+    if(profile) marks[5]=frame_now_ns();
+  }
+  if(profile && vm) {
+    for(int i=0; i<5; ++i) sums[i]+=marks[i+1]-marks[i];
+    ++count;
+    if(!reported) reported=marks[5];
+    if(marks[5]-reported>=10000000000ull) {
+      fprintf(stderr,"[java-frame] %llu turns looper=%.3f player=%.3f glview=%.3f prefs=%.3f ime=%.3f ms/turn\n",
+              (unsigned long long)count,sums[0]/1e6/count,sums[1]/1e6/count,
+              sums[2]/1e6/count,sums[3]/1e6/count,sums[4]/1e6/count);
+      memset(sums,0,sizeof sums);
+      count=0;
+      reported=marks[5];
+    }
+  }
 }
 
 static void
 pump_run_frame(void (*run_threads)(void))
 {
-   static uint64_t budget_us = 0;
-   if (!budget_us) {
-      const char *e = getenv("LUNARIA_FRAME_US");
-      long v = (e && *e) ? atol(e) : 16000;
-      budget_us = v > 0 ? (uint64_t)v : 16000;
-   }
-   /* The Java half of the frame runs after the guest's share, so the share
-    * is whatever the budget leaves once last frame's Java half is paid for;
-    * otherwise every frame is budget + Java, and a light screen that costs
-    * 9 ms to draw is held to 40 frames a second by the 16 ms before it.
-    * Never less than 2 ms, so the guest still runs when the Java half alone
-    * is over budget. */
-   static uint64_t java_us;
-   const uint64_t guest_us = budget_us > java_us + 2000ull ? budget_us - java_us : 2000ull;
-   const uint64_t deadline = pump_now_us() + guest_us;
-   for (;;) {
-      const uint64_t before = arm_exec_sched_ticks();
-      const uint64_t t_sched = frame_now_ns();
-      run_threads();
-      frame_stage_add(FRAME_STAGE_SCHED, t_sched);
-      if (process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
-      const uint64_t now = pump_now_us();
-      if (now >= deadline)
-         break;
-      if (arm_exec_sched_ticks() != before)
-         continue;   /* the guest is working — let it have the whole frame */
-      /* Everything is parked and the Java half has a message due: the rest of
-       * the guest's share would only delay it.  (A Java-only app such as a
-       * Compose UI has no guest work at all, and used to idle here for most
-       * of every frame while its main Looper waited.) */
-      if (dvm_main_work_due(dvm_jni_vm()))
-         break;
-      /* Everything is parked.  Wait in small steps so that a wakeup which
-       * becomes visible mid-frame is not held back until the next one. */
-      const uint64_t t_idle = frame_now_ns();
-      (void)dvm_pump_wait_us((deadline - now > 1000ull) ? 1000u : (unsigned)(deadline - now));
-      frame_stage_add(FRAME_STAGE_IDLE, t_idle);
-   }
-   const uint64_t java_start = pump_now_us();
-   pump_java_frame();
-   java_us = pump_now_us() - java_start;
-   /* The window shows 60 pictures a second.  A Java half that finishes early and
-    * starts the next turn at once (it has work due) runs the main Looper a
-    * hundred times a second, and every turn holds the interpreter lock the
-    * media player's own threads need: a video then falls behind its clock and
-    * drops frames.  Leave the lock alone for the rest of the period. */
-   static const uint64_t period_us = 16000;
-   const uint64_t used = pump_now_us() - (deadline - guest_us);
-   if (used < period_us) (void)dvm_pump_wait_us((unsigned)(period_us - used));
+  static uint64_t budget_us = 0;
+  if (!budget_us) {
+    const char *e = getenv("LUNARIA_FRAME_US");
+    long v = (e && *e) ? atol(e) : 16000;
+    budget_us = v > 0 ? (uint64_t)v : 16000;
+  }
+  /* The Java half of the frame runs after the guest's share, so the share
+   * is whatever the budget leaves once last frame's Java half is paid for;
+   * otherwise every frame is budget + Java, and a light screen that costs
+   * 9 ms to draw is held to 40 frames a second by the 16 ms before it.
+   * Never less than 2 ms, so the guest still runs when the Java half alone
+   * is over budget. */
+  static uint64_t java_us;
+  const uint64_t guest_us = budget_us > java_us + 2000ull ? budget_us - java_us : 2000ull;
+  const uint64_t deadline = pump_now_us() + guest_us;
+  for (;;) {
+    const uint64_t before = arm_exec_sched_ticks();
+    run_threads();
+    if (process_exit_status(NULL) || arm_exec_guest_abort_count()) return;
+    const uint64_t now = pump_now_us();
+    if (now >= deadline)
+      break;
+    if (arm_exec_sched_ticks() != before)
+      continue;   /* the guest is working — let it have the whole frame */
+    /* Everything is parked and the Java half has a message due: the rest of
+     * the guest's share would only delay it.  (A Java-only app such as a
+     * Compose UI has no guest work at all, and used to idle here for most
+     * of every frame while its main Looper waited.) */
+    if (dvm_main_work_due(dvm_jni_vm()))
+      break;
+    /* Everything is parked.  Wait in small steps so that a wakeup which
+     * becomes visible mid-frame is not held back until the next one. */
+    (void)dvm_pump_wait_us((deadline - now > 1000ull) ? 1000u : (unsigned)(deadline - now));
+  }
+  const uint64_t java_start = pump_now_us();
+  pump_java_frame();
+  java_us = pump_now_us() - java_start;
+  /* The window shows 60 pictures a second.  A Java half that finishes early and
+   * starts the next turn at once (it has work due) runs the main Looper a
+   * hundred times a second, and every turn holds the interpreter lock the
+   * media player's own threads need: a video then falls behind its clock and
+   * drops frames.  Leave the lock alone for the rest of the period. */
+  static const uint64_t period_us = 16000;
+  const uint64_t used = pump_now_us() - (deadline - guest_us);
+  if (used < period_us) (void)dvm_pump_wait_us((unsigned)(period_us - used));
 }
 
 /* Calls one no-argument (or single-null-argument) lifecycle method through the
@@ -1498,18 +1498,18 @@ static int
 dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
                    const char *method, const char *sig, int takes_null_arg)
 {
-   jclass k = jvm->native.FindClass(&jvm->env, cls);
-   jmethodID m = k ? jvm->native.GetMethodID(&jvm->env, k, method, sig) : NULL;
-   if (!m)
-      return 0;
-   fprintf(stderr, "[loader] dex startup: %s.%s%s\n", cls, method, sig);
-   if (takes_null_arg) {
-      jvalue arg = { .l = NULL }; /* a fresh launch has no savedInstanceState */
-      jvm->native.CallVoidMethodA(&jvm->env, self, m, &arg);
-   } else {
-      jvm->native.CallVoidMethodA(&jvm->env, self, m, NULL);
-   }
-   return 1;
+  jclass k = jvm->native.FindClass(&jvm->env, cls);
+  jmethodID m = k ? jvm->native.GetMethodID(&jvm->env, k, method, sig) : NULL;
+  if (!m)
+    return 0;
+  fprintf(stderr, "[loader] dex startup: %s.%s%s\n", cls, method, sig);
+  if (takes_null_arg) {
+    jvalue arg = { .l = NULL }; /* a fresh launch has no savedInstanceState */
+    jvm->native.CallVoidMethodA(&jvm->env, self, m, &arg);
+  } else {
+    jvm->native.CallVoidMethodA(&jvm->env, self, m, NULL);
+  }
+  return 1;
 }
 
 /* Start the package the way Android does: construct the launcher Activity and
@@ -1528,146 +1528,149 @@ dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
 static int
 start_manifest_providers(struct jvm *jvm, jobject context)
 {
-   const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
-   if (!encoded || !*encoded) { dvm_content_providers_startup(dvm_jni_vm(),false); return 0; }
-   const char *package=getenv("ANDROID_PACKAGE_NAME");
-   const char *process=getenv("ANDROID_PROCESS_NAME");
-   if(!process || !*process)process=package;
-   struct luna_providers providers;
-   if(luna_providers_open(&providers,encoded,package)<0)return -1;
-   int started=0;
-   char failed[256]="";
-   for(size_t index=0;index<providers.count;++index){
-      struct luna_provider *row=&providers.items[index];
-      if(!luna_provider_local(row,process))continue;
-      char *entry=row->name,*authority=row->authority,*metadata=row->metadata;
-      char cls[256];
-      size_t n = 0;
-      for (const char *p = entry; *p && n + 1 < sizeof cls; ++p)
-         cls[n++] = (*p == '.') ? '/' : *p;
-      cls[n] = '\0';
-      snprintf(failed, sizeof failed, "%s", cls);
-      if (!*cls || !dvm_jni_class_in_dex(cls)) goto provider_failed;
+  const char *encoded = getenv("ANDROID_CONTENT_PROVIDERS");
+  if (!encoded || !*encoded) {
+    dvm_content_providers_startup(dvm_jni_vm(),false);
+    return 0;
+  }
+  const char *package=getenv("ANDROID_PACKAGE_NAME");
+  const char *process=getenv("ANDROID_PROCESS_NAME");
+  if(!process || !*process)process=package;
+  struct luna_providers providers;
+  if(luna_providers_open(&providers,encoded,package)<0)return -1;
+  int started=0;
+  char failed[256]="";
+  for(size_t index=0; index<providers.count; ++index) {
+    struct luna_provider *row=&providers.items[index];
+    if(!luna_provider_local(row,process))continue;
+    char *entry=row->name,*authority=row->authority,*metadata=row->metadata;
+    char cls[256];
+    size_t n = 0;
+    for (const char *p = entry; *p && n + 1 < sizeof cls; ++p)
+      cls[n++] = (*p == '.') ? '/' : *p;
+    cls[n] = '\0';
+    snprintf(failed, sizeof failed, "%s", cls);
+    if (!*cls || !dvm_jni_class_in_dex(cls)) goto provider_failed;
 
-      jclass provider_class = jvm->native.FindClass(&jvm->env, cls);
-      jmethodID ctor = provider_class ? jvm->native.GetMethodID(
-         &jvm->env, provider_class, "<init>", "()V") : NULL;
-      jobject provider = (provider_class && ctor) ? jvm->native.NewObjectA(
-         &jvm->env, provider_class, ctor, NULL) : NULL;
-      if (!provider) {
-         fprintf(stderr, "[loader] content provider: cannot construct %s\n", cls);
-         goto provider_failed;
-      }
-      if(jvm->native.ExceptionCheck(&jvm->env))goto provider_failed;
+    jclass provider_class = jvm->native.FindClass(&jvm->env, cls);
+    jmethodID ctor = provider_class ? jvm->native.GetMethodID(
+                       &jvm->env, provider_class, "<init>", "()V") : NULL;
+    jobject provider = (provider_class && ctor) ? jvm->native.NewObjectA(
+                         &jvm->env, provider_class, ctor, NULL) : NULL;
+    if (!provider) {
+      fprintf(stderr, "[loader] content provider: cannot construct %s\n", cls);
+      goto provider_failed;
+    }
+    if(jvm->native.ExceptionCheck(&jvm->env))goto provider_failed;
 
-      jclass info_class = jvm->native.FindClass(&jvm->env,
-                                                 "android/content/pm/ProviderInfo");
-      jobject info = info_class
-         ? jvm->native.AllocObject(&jvm->env, info_class) : NULL;
-      if (info && authority) {
-         jfieldID field = jvm->native.GetFieldID(&jvm->env, info_class,
-                                                  "authority",
-                                                  "Ljava/lang/String;");
-         jstring value = jvm->native.NewStringUTF(&jvm->env, authority);
-         if (field && value)
-            jvm->native.SetObjectField(&jvm->env, info, field, value);
-      }
-      if (info && metadata && *metadata) {
-         jclass bundle_class = jvm->native.FindClass(&jvm->env,
-                                                       "android/os/Bundle");
-         jmethodID bundle_ctor = bundle_class ? jvm->native.GetMethodID(
-            &jvm->env, bundle_class, "<init>", "()V") : NULL;
-         jobject bundle = (bundle_class && bundle_ctor)
-            ? jvm->native.NewObjectA(&jvm->env, bundle_class, bundle_ctor, NULL)
-            : NULL;
-         if (bundle) {
-            char *meta_save = NULL;
-            for (char *pair = strtok_r(metadata, ",", &meta_save); pair;
-                 pair = strtok_r(NULL, ",", &meta_save)) {
-               char *value = strchr(pair, '~');
-               if (!value) continue;
-               *value++ = '\0';
-               char *end = NULL;
-               long iv = strtol(value, &end, 0);
-               if (end && *end == '\0') {
-                  jmethodID put = jvm->native.GetMethodID(
-                     &jvm->env, bundle_class, "putInt",
-                     "(Ljava/lang/String;I)V");
-                  if (put) {
-                     jvalue a[2] = {
-                        { .l = jvm->native.NewStringUTF(&jvm->env, pair) },
-                        { .i = (jint)iv }
-                     };
-                     jvm->native.CallVoidMethodA(&jvm->env, bundle, put, a);
-                  }
-               } else {
-                  jmethodID put = jvm->native.GetMethodID(
-                     &jvm->env, bundle_class, "putString",
-                     "(Ljava/lang/String;Ljava/lang/String;)V");
-                  if (put) {
-                     jvalue a[2] = {
-                        { .l = jvm->native.NewStringUTF(&jvm->env, pair) },
-                        { .l = jvm->native.NewStringUTF(&jvm->env, value) }
-                     };
-                     jvm->native.CallVoidMethodA(&jvm->env, bundle, put, a);
-                  }
-               }
+    jclass info_class = jvm->native.FindClass(&jvm->env,
+                        "android/content/pm/ProviderInfo");
+    jobject info = info_class
+                   ? jvm->native.AllocObject(&jvm->env, info_class) : NULL;
+    if (info && authority) {
+      jfieldID field = jvm->native.GetFieldID(&jvm->env, info_class,
+                                              "authority",
+                                              "Ljava/lang/String;");
+      jstring value = jvm->native.NewStringUTF(&jvm->env, authority);
+      if (field && value)
+        jvm->native.SetObjectField(&jvm->env, info, field, value);
+    }
+    if (info && metadata && *metadata) {
+      jclass bundle_class = jvm->native.FindClass(&jvm->env,
+                            "android/os/Bundle");
+      jmethodID bundle_ctor = bundle_class ? jvm->native.GetMethodID(
+                                &jvm->env, bundle_class, "<init>", "()V") : NULL;
+      jobject bundle = (bundle_class && bundle_ctor)
+                       ? jvm->native.NewObjectA(&jvm->env, bundle_class, bundle_ctor, NULL)
+                       : NULL;
+      if (bundle) {
+        char *meta_save = NULL;
+        for (char *pair = strtok_r(metadata, ",", &meta_save); pair;
+             pair = strtok_r(NULL, ",", &meta_save)) {
+          char *value = strchr(pair, '~');
+          if (!value) continue;
+          *value++ = '\0';
+          char *end = NULL;
+          long iv = strtol(value, &end, 0);
+          if (end && *end == '\0') {
+            jmethodID put = jvm->native.GetMethodID(
+                              &jvm->env, bundle_class, "putInt",
+                              "(Ljava/lang/String;I)V");
+            if (put) {
+              jvalue a[2] = {
+                { .l = jvm->native.NewStringUTF(&jvm->env, pair) },
+                { .i = (jint)iv }
+              };
+              jvm->native.CallVoidMethodA(&jvm->env, bundle, put, a);
             }
-            jfieldID field = jvm->native.GetFieldID(
-               &jvm->env, info_class, "metaData", "Landroid/os/Bundle;");
-            if (field)
-               jvm->native.SetObjectField(&jvm->env, info, field, bundle);
-         }
+          } else {
+            jmethodID put = jvm->native.GetMethodID(
+                              &jvm->env, bundle_class, "putString",
+                              "(Ljava/lang/String;Ljava/lang/String;)V");
+            if (put) {
+              jvalue a[2] = {
+                { .l = jvm->native.NewStringUTF(&jvm->env, pair) },
+                { .l = jvm->native.NewStringUTF(&jvm->env, value) }
+              };
+              jvm->native.CallVoidMethodA(&jvm->env, bundle, put, a);
+            }
+          }
+        }
+        jfieldID field = jvm->native.GetFieldID(
+                           &jvm->env, info_class, "metaData", "Landroid/os/Bundle;");
+        if (field)
+          jvm->native.SetObjectField(&jvm->env, info, field, bundle);
       }
-      if (info) {
-         jfieldID grant = jvm->native.GetFieldID(&jvm->env, info_class,
-                                                  "grantUriPermissions", "Z");
-         if (grant)
-            jvm->native.SetBooleanField(&jvm->env, info, grant, row->grant_uri ? JNI_TRUE : JNI_FALSE);
-         jfieldID field=jvm->native.GetFieldID(&jvm->env,info_class,"processName","Ljava/lang/String;");
-         if(field)jvm->native.SetObjectField(&jvm->env,info,field,
-                                     jvm->native.NewStringUTF(&jvm->env,row->process));
-         field=jvm->native.GetFieldID(&jvm->env,info_class,"name","Ljava/lang/String;");
-         if(field)jvm->native.SetObjectField(&jvm->env,info,field,
-                                     jvm->native.NewStringUTF(&jvm->env,row->name));
-      }
-      jmethodID attach = jvm->native.GetMethodID(
-         &jvm->env, provider_class, "attachInfo",
-         "(Landroid/content/Context;Landroid/content/pm/ProviderInfo;)V");
-      if (attach) {
-         jvalue args[2] = { { .l = context }, { .l = info } };
-         jvm->native.CallVoidMethodA(&jvm->env, provider, attach, args);
-      }
-      /* ContentProvider.attachInfo calls onCreate itself; calling it again
-       * here initializes each provider twice. */
-      if(!attach || jvm->native.ExceptionCheck(&jvm->env))goto provider_failed;
-      fprintf(stderr,"[loader] content provider: started %s (%s)\n",cls,process);
-      ++started;
-   }
-   luna_providers_close(&providers);
-   dvm_content_providers_startup(dvm_jni_vm(),false);
-   return started;
+    }
+    if (info) {
+      jfieldID grant = jvm->native.GetFieldID(&jvm->env, info_class,
+                                              "grantUriPermissions", "Z");
+      if (grant)
+        jvm->native.SetBooleanField(&jvm->env, info, grant, row->grant_uri ? JNI_TRUE : JNI_FALSE);
+      jfieldID field=jvm->native.GetFieldID(&jvm->env,info_class,"processName","Ljava/lang/String;");
+      if(field)jvm->native.SetObjectField(&jvm->env,info,field,
+                                            jvm->native.NewStringUTF(&jvm->env,row->process));
+      field=jvm->native.GetFieldID(&jvm->env,info_class,"name","Ljava/lang/String;");
+      if(field)jvm->native.SetObjectField(&jvm->env,info,field,
+                                            jvm->native.NewStringUTF(&jvm->env,row->name));
+    }
+    jmethodID attach = jvm->native.GetMethodID(
+                         &jvm->env, provider_class, "attachInfo",
+                         "(Landroid/content/Context;Landroid/content/pm/ProviderInfo;)V");
+    if (attach) {
+      jvalue args[2] = { { .l = context }, { .l = info } };
+      jvm->native.CallVoidMethodA(&jvm->env, provider, attach, args);
+    }
+    /* ContentProvider.attachInfo calls onCreate itself; calling it again
+     * here initializes each provider twice. */
+    if(!attach || jvm->native.ExceptionCheck(&jvm->env))goto provider_failed;
+    fprintf(stderr,"[loader] content provider: started %s (%s)\n",cls,process);
+    ++started;
+  }
+  luna_providers_close(&providers);
+  dvm_content_providers_startup(dvm_jni_vm(),false);
+  return started;
 provider_failed:
-   fprintf(stderr, "[loader] content provider failed: %s\n", failed);
-   if (jvm->native.ExceptionCheck(&jvm->env)) jvm->native.ExceptionDescribe(&jvm->env);
-   luna_providers_close(&providers);
-   return -1;
+  fprintf(stderr, "[loader] content provider failed: %s\n", failed);
+  if (jvm->native.ExceptionCheck(&jvm->env)) jvm->native.ExceptionDescribe(&jvm->env);
+  luna_providers_close(&providers);
+  return -1;
 }
 
 static uint32_t
 arm_lookup_native_two(const char *primary, const char *fallback,
                       const char *name)
 {
-   uint32_t va = arm_exec_lookup_native(primary, name);
-   return va ? va : arm_exec_lookup_native(fallback, name);
+  uint32_t va = arm_exec_lookup_native(primary, name);
+  return va ? va : arm_exec_lookup_native(fallback, name);
 }
 
 static uint32_t
 arm_lookup_native_sig_two(const char *primary, const char *fallback,
                           const char *name, char *sig, size_t sig_size)
 {
-   uint32_t va = arm_exec_lookup_native_sig(primary, name, sig, sig_size);
-   return va ? va : arm_exec_lookup_native_sig(fallback, name, sig, sig_size);
+  uint32_t va = arm_exec_lookup_native_sig(primary, name, sig, sig_size);
+  return va ? va : arm_exec_lookup_native_sig(fallback, name, sig, sig_size);
 }
 
 /* Activity.attach() gives every Activity a base Context before any native
@@ -1677,222 +1680,234 @@ arm_lookup_native_sig_two(const char *primary, const char *fallback,
 static jobject
 alloc_attached_activity(struct jvm *jvm)
 {
-   jobject activity = jvm->native.AllocObject(&jvm->env,
-      jvm->native.FindClass(&jvm->env, "android/app/Activity"));
-   jclass context_class = jvm->native.FindClass(&jvm->env,
-                                                "android/content/Context");
-   jobject base = context_class
-      ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
-   jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
-   jmethodID attach = ac ? jvm->native.GetMethodID(&jvm->env, ac,
-      "attachBaseContext", "(Landroid/content/Context;)V") : NULL;
-   if (activity && base && attach) {
-      jvalue arg = { .l = base };
-      jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
-   }
-   return activity;
+  jobject activity = jvm->native.AllocObject(&jvm->env,
+                     jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+  jclass context_class = jvm->native.FindClass(&jvm->env,
+                         "android/content/Context");
+  jobject base = context_class
+                 ? jvm->native.AllocObject(&jvm->env, context_class) : NULL;
+  jclass ac = jvm->native.FindClass(&jvm->env, "android/app/Activity");
+  jmethodID attach = ac ? jvm->native.GetMethodID(&jvm->env, ac,
+                     "attachBaseContext", "(Landroid/content/Context;)V") : NULL;
+  if (activity && base && attach) {
+    jvalue arg = { .l = base };
+    jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
+  }
+  return activity;
 }
 
 static int
 run_dex_activity(struct jvm *jvm, int is_a64)
 {
-   void (*run_threads)(void) = is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
-   const char *act = getenv("ANDROID_LAUNCH_ACTIVITY");
-   if (!act || !*act) {
-      fprintf(stderr, "[loader] dex startup: ANDROID_LAUNCH_ACTIVITY unset\n");
-      return EXIT_FAILURE;
-   }
-   /* The manifest gives a dotted name; the VM and JNI want slashes. */
-   char cls[256];
-   size_t n = 0;
-   for (const char *p = act; *p && n + 1 < sizeof cls; ++p)
-      cls[n++] = (*p == '.') ? '/' : *p;
-   cls[n] = '\0';
+  void (*run_threads)(void) = is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
+  const char *act = getenv("ANDROID_LAUNCH_ACTIVITY");
+  if (!act || !*act) {
+    fprintf(stderr, "[loader] dex startup: ANDROID_LAUNCH_ACTIVITY unset\n");
+    return EXIT_FAILURE;
+  }
+  /* The manifest gives a dotted name; the VM and JNI want slashes. */
+  char cls[256];
+  size_t n = 0;
+  for (const char *p = act; *p && n + 1 < sizeof cls; ++p)
+    cls[n++] = (*p == '.') ? '/' : *p;
+  cls[n] = '\0';
 
-   /* A component of the platform itself (Settings screens) is launched like one of the app's. */
-   if (!dvm_jni_class_in_dex(cls) && !jvm->native.FindClass(&jvm->env, cls)) {
-      fprintf(stderr, "[loader] dex startup: %s is not in any dex\n", cls);
-      return EXIT_FAILURE;
-   }
+  /* A component of the platform itself (Settings screens) is launched like one of the app's. */
+  if (!dvm_jni_class_in_dex(cls) && !jvm->native.FindClass(&jvm->env, cls)) {
+    fprintf(stderr, "[loader] dex startup: %s is not in any dex\n", cls);
+    return EXIT_FAILURE;
+  }
 
-   if (!(is_a64 ? arm64_exec_host_egl_init() : arm_exec_host_egl_init()))
-      fprintf(stderr, "[loader] host EGL init failed\n");
+  if (!(is_a64 ? arm64_exec_host_egl_init() : arm_exec_host_egl_init()))
+    fprintf(stderr, "[loader] host EGL init failed\n");
 
-   jobject base_context=NULL,application=NULL;
-   if(luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
+  jobject base_context=NULL,application=NULL;
+  if(luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
                             dvm_jni_class_in_dex,start_manifest_providers,
-                            &base_context,&application)<0){
-      fprintf(stderr,"[loader] process Application initialization failed\n");
+                            &base_context,&application)<0) {
+    fprintf(stderr,"[loader] process Application initialization failed\n");
+    return EXIT_FAILURE;
+  }
+
+  /* ActivityThread uses Instrumentation.newActivity(), which invokes the
+   * launcher's no-argument constructor before attach()/onCreate().  Using
+   * AllocObject here created an object Android can never create: every Java
+   * field initializer in ComponentActivity, FragmentActivity, AppCompat and
+   * the application class was skipped.  The first super.onCreate() then saw
+   * null SavedStateRegistryController/FragmentController fields. */
+  jclass activity_class = jvm->native.FindClass(&jvm->env, cls);
+  jmethodID ctor = activity_class
+                   ? jvm->native.GetMethodID(&jvm->env, activity_class, "<init>", "()V")
+                   : NULL;
+  jobject activity = (activity_class && ctor)
+                     ? jvm->native.NewObjectA(&jvm->env, activity_class, ctor, NULL) : NULL;
+  if (!activity) {
+    fprintf(stderr, "[loader] dex startup: cannot construct %s\n", cls);
+    return EXIT_FAILURE;
+  }
+  jni_set_current_activity(&jvm->env, activity);
+
+  /* Activity.attach() establishes both ContextWrapper.mBase and the process
+   * Application before any lifecycle callback.  The host framework exposes
+   * those two observable pieces directly. */
+  if (base_context) {
+    jmethodID attach = jvm->native.GetMethodID(
+                         &jvm->env, activity_class, "attachBaseContext",
+                         "(Landroid/content/Context;)V");
+    if (attach) {
+      jvalue arg = { .l = base_context };
+      jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
+    }
+  }
+  if (application) {
+    jclass platform_activity = jvm->native.FindClass(&jvm->env,
+                               "android/app/Activity");
+    jfieldID app_field = platform_activity ? jvm->native.GetFieldID(
+                           &jvm->env, platform_activity, "application",
+                           "Landroid/app/Application;") : NULL;
+    if (app_field)
+      jvm->native.SetObjectField(&jvm->env, activity, app_field, application);
+  }
+
+  /* ActivityThread applies the manifest theme through the virtual method
+   * before onCreate; AppCompat also keeps theme state in its delegate. */
+  const uint32_t theme_resource = arm_exec_activity_theme(cls);
+  if (theme_resource) {
+    jmethodID set_theme = jvm->native.GetMethodID(
+                            &jvm->env, activity_class, "setTheme", "(I)V");
+    if (set_theme) {
+      jvalue arg = { .i = (jint)theme_resource };
+      jvm->native.CallVoidMethodA(&jvm->env, activity, set_theme, &arg);
+      if (jvm->native.ExceptionCheck(&jvm->env)) return EXIT_FAILURE;
+    }
+  }
+
+  dvm_jni_main_transaction(&jvm->env, true);
+  dvm_jni_attach_activity(&jvm->env, activity);
+  dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 0);
+  if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
+                          "(Landroid/os/Bundle;)V", 1)) {
+    fprintf(stderr, "[loader] dex startup: %s has no onCreate\n", cls);
+    dvm_jni_main_transaction(&jvm->env, false);
+    return EXIT_FAILURE;
+  }
+  dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 1);
+  /* The initial create/start/resume sequence is one main-thread lifecycle
+   * transaction. A startActivity request made by onCreate is queued until
+   * this transaction has attached its window; draining it between callbacks
+   * would resume the child first and then put the launcher above it. */
+  /* onStart/onResume are what make an Activity visible and running; an app
+   * that starts its render thread in onResume never starts without them. */
+  /* A launcher that called finish() from onCreate (a splash that starts the
+   * real activity) goes straight to onDestroy, which the activity stack has
+   * already delivered.  Starting, resuming or showing it again would put its
+   * window back on top of the activity that replaced it, and that window
+   * would take the input focus. */
+  const int launcher_finished = dvm_jni_activity_finishing(&jvm->env, activity);
+  if (!launcher_finished) {
+    dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 0);
+    dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
+    dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 1);
+  }
+  if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
+    dex_call_lifecycle(jvm, activity, cls, "onPostCreate",
+                       "(Landroid/os/Bundle;)V", 1);
+  }
+  if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
+    dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 0);
+  }
+  if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
+    dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
+  }
+  if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
+    dex_call_lifecycle(jvm, activity, cls, "onPostResume", "()V", 0);
+    dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 1);
+
+    /* Attach the resumed Activity to its window before running its renderer.
+     * SurfaceView dispatches its lifecycle callbacks through the main Looper;
+     * the app's callback owns connecting its native renderer to that Surface. */
+    if (!dvm_jni_activity_finishing(&jvm->env, activity))
+      dvm_jni_show_activity(&jvm->env, activity);
+  }
+  dvm_jni_main_transaction(&jvm->env, false);
+  run_threads();
+  pump_java_frame();
+
+  int max_frames = 0;
+  {
+    const char *mf = getenv("LUNARIA_MAX_FRAMES");
+    if (mf && *mf) max_frames = atoi(mf);
+  }
+  fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
+          max_frames);
+  dvm_media_start_event_thread(dvm_jni_vm());
+  int frame = 0, exit_status = 0;
+  for (; max_frames <= 0 || frame < max_frames; ++frame) {
+    if (arm_exec_guest_abort_count() > 0) {
+      fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
       return EXIT_FAILURE;
-   }
-
-   /* ActivityThread uses Instrumentation.newActivity(), which invokes the
-    * launcher's no-argument constructor before attach()/onCreate().  Using
-    * AllocObject here created an object Android can never create: every Java
-    * field initializer in ComponentActivity, FragmentActivity, AppCompat and
-    * the application class was skipped.  The first super.onCreate() then saw
-    * null SavedStateRegistryController/FragmentController fields. */
-   jclass activity_class = jvm->native.FindClass(&jvm->env, cls);
-   jmethodID ctor = activity_class
-      ? jvm->native.GetMethodID(&jvm->env, activity_class, "<init>", "()V")
-      : NULL;
-   jobject activity = (activity_class && ctor)
-      ? jvm->native.NewObjectA(&jvm->env, activity_class, ctor, NULL) : NULL;
-   if (!activity) {
-      fprintf(stderr, "[loader] dex startup: cannot construct %s\n", cls);
-      return EXIT_FAILURE;
-   }
-   jni_set_current_activity(&jvm->env, activity);
-
-   /* Activity.attach() establishes both ContextWrapper.mBase and the process
-    * Application before any lifecycle callback.  The host framework exposes
-    * those two observable pieces directly. */
-   if (base_context) {
-      jmethodID attach = jvm->native.GetMethodID(
-         &jvm->env, activity_class, "attachBaseContext",
-         "(Landroid/content/Context;)V");
-      if (attach) {
-         jvalue arg = { .l = base_context };
-         jvm->native.CallVoidMethodA(&jvm->env, activity, attach, &arg);
-      }
-   }
-   if (application) {
-      jclass platform_activity = jvm->native.FindClass(&jvm->env,
-                                                        "android/app/Activity");
-      jfieldID app_field = platform_activity ? jvm->native.GetFieldID(
-         &jvm->env, platform_activity, "application",
-         "Landroid/app/Application;") : NULL;
-      if (app_field)
-         jvm->native.SetObjectField(&jvm->env, activity, app_field, application);
-   }
-
-   /* ActivityThread applies the manifest theme through the virtual method
-    * before onCreate; AppCompat also keeps theme state in its delegate. */
-   const uint32_t theme_resource = arm_exec_activity_theme(cls);
-   if (theme_resource) {
-      jmethodID set_theme = jvm->native.GetMethodID(
-         &jvm->env, activity_class, "setTheme", "(I)V");
-      if (set_theme) {
-         jvalue arg = { .i = (jint)theme_resource };
-         jvm->native.CallVoidMethodA(&jvm->env, activity, set_theme, &arg);
-         if (jvm->native.ExceptionCheck(&jvm->env)) return EXIT_FAILURE;
-      }
-   }
-
-   dvm_jni_main_transaction(&jvm->env, true);
-   dvm_jni_attach_activity(&jvm->env, activity);
-   dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 0);
-   if (!dex_call_lifecycle(jvm, activity, cls, "onCreate",
-                           "(Landroid/os/Bundle;)V", 1)) {
-      fprintf(stderr, "[loader] dex startup: %s has no onCreate\n", cls);
-      dvm_jni_main_transaction(&jvm->env, false);
-      return EXIT_FAILURE;
-   }
-   dvm_jni_activity_dispatch(&jvm->env, activity, "Created", 1);
-   /* The initial create/start/resume sequence is one main-thread lifecycle
-    * transaction. A startActivity request made by onCreate is queued until
-    * this transaction has attached its window; draining it between callbacks
-    * would resume the child first and then put the launcher above it. */
-   /* onStart/onResume are what make an Activity visible and running; an app
-    * that starts its render thread in onResume never starts without them. */
-   /* A launcher that called finish() from onCreate (a splash that starts the
-    * real activity) goes straight to onDestroy, which the activity stack has
-    * already delivered.  Starting, resuming or showing it again would put its
-    * window back on top of the activity that replaced it, and that window
-    * would take the input focus. */
-   const int launcher_finished = dvm_jni_activity_finishing(&jvm->env, activity);
-   if (!launcher_finished) {
-      dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 0);
-      dex_call_lifecycle(jvm, activity, cls, "onStart",  "()V", 0);
-      dvm_jni_activity_dispatch(&jvm->env, activity, "Started", 1);
-   }
-   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
-      dex_call_lifecycle(jvm, activity, cls, "onPostCreate",
-                         "(Landroid/os/Bundle;)V", 1);
-   }
-   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
-      dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 0);
-   }
-   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
-      dex_call_lifecycle(jvm, activity, cls, "onResume", "()V", 0);
-   }
-   if (!dvm_jni_activity_finishing(&jvm->env, activity)) {
-      dex_call_lifecycle(jvm, activity, cls, "onPostResume", "()V", 0);
-      dvm_jni_activity_dispatch(&jvm->env, activity, "Resumed", 1);
-
-      /* Attach the resumed Activity to its window before running its renderer.
-       * SurfaceView dispatches its lifecycle callbacks through the main Looper;
-       * the app's callback owns connecting its native renderer to that Surface. */
-      if (!dvm_jni_activity_finishing(&jvm->env, activity))
-         dvm_jni_show_activity(&jvm->env, activity);
-   }
-   dvm_jni_main_transaction(&jvm->env, false);
-   run_threads();
-   pump_java_frame();
-
-   int max_frames = 0;
-   { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
-   fprintf(stderr, "[loader] dex startup: entering pump loop (max_frames=%d)\n",
-           max_frames);
-   dvm_media_start_event_thread(dvm_jni_vm());
-   int frame = 0, exit_status = 0;
-   for (; max_frames <= 0 || frame < max_frames; ++frame) {
-      if (arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest abort — stopping dex loop (frame %d)\n", frame);
-         return EXIT_FAILURE;
-      }
-      if (process_exit_status(&exit_status)) return exit_status;
-      pump_run_frame(run_threads);
-      if (process_exit_status(&exit_status)) return exit_status;
-      if (arm_exec_guest_abort_count()) return EXIT_FAILURE;
-      if (is_a64) arm64_exec_egl_swap(); else arm_exec_egl_swap();
-      arm_exec_glfw_poll();
-      /* LUNARIA_TOUCH_FIFO / LUNARIA_TOUCH_TEST: the other pump loops replay them;
-       * this one drives Unity titles whose entry point is a dex Activity. */
-      touch_test_tick(frame);
-      /* The framework input queue feeds Activity/View dispatch, independently
-       * of the engine's Java-owned renderer. NativeActivity retains its NDK
-       * input queue; Unity's Java path must not bypass its View callbacks. */
-      ArmExecTouchEvent touch;
-      struct dvm *input_vm=dvm_jni_vm();
-      for (int n=0;input_vm && n<64 && arm_exec_touch_next(&touch);++n)
-         (void)dvm_ui_dispatch_touch(input_vm,&touch);
-      stall_watch_tick();
-      perf_tick();
-      if (frame < 5 || frame % 50 == 0)
-         fprintf(stderr, "[loader] dex pump frame %d\n", frame);
-      if (arm_exec_glfw_should_close()) {
-         fprintf(stderr, "[loader] window closed — stopping dex loop (frame %d)\n", frame);
-         break;
-      }
-   }
-   if (max_frames > 0 && frame == max_frames)
-      fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting dex loop\n", max_frames);
-   return EXIT_SUCCESS;
+    }
+    if (process_exit_status(&exit_status)) return exit_status;
+    pump_run_frame(run_threads);
+    if (process_exit_status(&exit_status)) return exit_status;
+    if (arm_exec_guest_abort_count()) return EXIT_FAILURE;
+    if (is_a64) arm64_exec_egl_swap();
+    else arm_exec_egl_swap();
+    arm_exec_glfw_poll();
+    /* LUNARIA_TOUCH_FIFO / LUNARIA_TOUCH_TEST: the other pump loops replay them;
+     * this one drives Unity titles whose entry point is a dex Activity. */
+    touch_test_tick(frame);
+    /* The framework input queue feeds Activity/View dispatch, independently
+     * of the engine's Java-owned renderer. NativeActivity retains its NDK
+     * input queue; Unity's Java path must not bypass its View callbacks. */
+    ArmExecTouchEvent touch;
+    struct dvm *input_vm=dvm_jni_vm();
+    for (int n=0; input_vm && n<64 && arm_exec_touch_next(&touch); ++n)
+      (void)dvm_ui_dispatch_touch(input_vm,&touch);
+    int key_action,key_code,key_meta,key_repeat;
+    for (int n=0; input_vm && n<16 && arm_exec_java_key_next(&key_action,&key_code,&key_meta,&key_repeat); ++n)
+      (void)dvm_ui_dispatch_key(input_vm,key_action,key_code,key_meta,key_repeat);
+    stall_watch_tick();
+    watchdog_tick();
+    if (frame < 5 || frame % 50 == 0)
+      fprintf(stderr, "[loader] dex pump frame %d\n", frame);
+    if (arm_exec_glfw_should_close()) {
+      fprintf(stderr, "[loader] window closed — stopping dex loop (frame %d)\n", frame);
+      break;
+    }
+  }
+  if (max_frames > 0 && frame == max_frames)
+    fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting dex loop\n", max_frames);
+  return EXIT_SUCCESS;
 }
 
 /* Independent component VM entry: no launcher Activity or EGL/window setup. */
-struct service_inbox { struct service_inbox *next; size_t size,nfds; int fds[LUNA_PROCESS_FD_MAX]; unsigned char bytes[]; };
+struct service_inbox {
+  struct service_inbox *next;
+  size_t size,nfds;
+  int fds[LUNA_PROCESS_FD_MAX];
+  unsigned char bytes[];
+};
 struct service_process {
-   struct dvm *vm;
-   struct luna_process_channel *channel;
-   atomic_int fatal, io_stop;
-   pthread_t io_thread;
-   pthread_mutex_t inbox_lock;
-   struct service_inbox *inbox_head, *inbox_tail;
-   int control_fd;
+  struct dvm *vm;
+  struct luna_process_channel *channel;
+  atomic_int fatal, io_stop;
+  pthread_t io_thread;
+  pthread_mutex_t inbox_lock;
+  struct service_inbox *inbox_head, *inbox_tail;
+  int control_fd;
 };
 static void service_process_command(void *user,const void *bytes,size_t size,const int *fds,size_t nfds)
 {
-   struct service_process *process=user;
-   if(process->fatal)return;
-   if(dvm_binder_receive_fds(process->vm,NULL,bytes,size,fds,nfds))return;
-   int status=dvm_service_dispatch(process->vm,bytes,size);
-   unsigned char reply[8]={'L','S','R','1',0,0,0,0};
-   for(unsigned i=0;i<4;++i)reply[4+i]=(unsigned char)((uint32_t)status>>(i*8));
-   int rc=luna_process_channel_send(process->channel,reply,sizeof reply);
-   if(rc<0 || status==-EIO)process->fatal=1;
-   fprintf(stderr,"[service-process] command result=%d\n",status);
+  struct service_process *process=user;
+  if(process->fatal)return;
+  if(dvm_binder_receive_fds(process->vm,NULL,bytes,size,fds,nfds))return;
+  int status=dvm_service_dispatch(process->vm,bytes,size);
+  unsigned char reply[8]= {'L','S','R','1',0,0,0,0};
+  for(unsigned i=0; i<4; ++i)reply[4+i]=(unsigned char)((uint32_t)status>>(i*8));
+  int rc=luna_process_channel_send(process->channel,reply,sizeof reply);
+  if(rc<0 || status==-EIO)process->fatal=1;
+  fprintf(stderr,"[service-process] command result=%d\n",status);
 }
 /* Binder's transport must not depend on the application's main Looper. A
  * service onBind/onCreate may hold a Java monitor while Binder threads keep
@@ -1900,456 +1915,493 @@ static void service_process_command(void *user,const void *bytes,size_t size,con
  * belong to the main thread. The socket blocks in poll when there is no work. */
 static void service_process_receive(void *user, const void *bytes, size_t size)
 {
-   struct service_process *process = user;
-   if (dvm_binder_receive_io(process->vm, bytes, size)) return;
-   struct service_inbox *message = malloc(sizeof *message + size);
-   if (!message) { atomic_store(&process->fatal, 1); return; }
-   message->nfds=0;
-   size_t nfds=0;const int *fds=luna_process_message_fds(&nfds);
-   for(size_t i=0;i<nfds;++i){
-      int fd=luna_fd_dup(fds[i],0,1);
-      if(fd<0){for(size_t j=0;j<message->nfds;++j)luna_fd_close(message->fds[j]);free(message);atomic_store(&process->fatal,1);return;}
-      message->fds[message->nfds++]=fd;
-   }
-   message->next = NULL;
-   message->size = size;
-   memcpy(message->bytes, bytes, size);
-   pthread_mutex_lock(&process->inbox_lock);
-   if (process->inbox_tail) process->inbox_tail->next = message;
-   else process->inbox_head = message;
-   process->inbox_tail = message;
-   pthread_mutex_unlock(&process->inbox_lock);
+  struct service_process *process = user;
+  if (dvm_binder_receive_io(process->vm, bytes, size)) return;
+  struct service_inbox *message = malloc(sizeof *message + size);
+  if (!message) {
+    atomic_store(&process->fatal, 1);
+    return;
+  }
+  message->nfds=0;
+  size_t nfds=0;
+  const int *fds=luna_process_message_fds(&nfds);
+  for(size_t i=0; i<nfds; ++i) {
+    int fd=luna_fd_dup(fds[i],0,1);
+    if(fd<0) {
+      for(size_t j=0; j<message->nfds; ++j)luna_fd_close(message->fds[j]);
+      free(message);
+      atomic_store(&process->fatal,1);
+      return;
+    }
+    message->fds[message->nfds++]=fd;
+  }
+  message->next = NULL;
+  message->size = size;
+  memcpy(message->bytes, bytes, size);
+  pthread_mutex_lock(&process->inbox_lock);
+  if (process->inbox_tail) process->inbox_tail->next = message;
+  else process->inbox_head = message;
+  process->inbox_tail = message;
+  pthread_mutex_unlock(&process->inbox_lock);
 }
 static void *service_process_io(void *user)
 {
-   struct service_process *process = user;
-   while (!atomic_load(&process->io_stop)) {
-      struct pollfd fd = luna_pollfd_make(process->control_fd, POLLIN);
-      int rc = luna_socket_poll(&fd, 1, 100);
-      if (rc < 0 && errno == EINTR) continue;
-      if (rc > 0) rc = luna_process_channel_tick(process->channel, service_process_receive, process);
-      if (rc < 0) { atomic_store(&process->fatal, 1); break; }
-   }
-   return NULL;
+  struct service_process *process = user;
+  while (!atomic_load(&process->io_stop)) {
+    struct pollfd fd = luna_pollfd_make(process->control_fd, POLLIN);
+    int rc = luna_socket_poll(&fd, 1, 100);
+    if (rc < 0 && errno == EINTR) continue;
+    if (rc > 0) rc = luna_process_channel_tick(process->channel, service_process_receive, process);
+    if (rc < 0) {
+      atomic_store(&process->fatal, 1);
+      break;
+    }
+  }
+  return NULL;
 }
 static void service_process_drain(struct service_process *process)
 {
-   for (unsigned n = 0; n < 32; ++n) {
-      pthread_mutex_lock(&process->inbox_lock);
-      struct service_inbox *message = process->inbox_head;
-      if (message) {
-         process->inbox_head = message->next;
-         if (!process->inbox_head) process->inbox_tail = NULL;
-      }
-      pthread_mutex_unlock(&process->inbox_lock);
-      if (!message) break;
-      service_process_command(process, message->bytes, message->size,message->fds,message->nfds);
-      for(size_t i=0;i<message->nfds;++i)luna_fd_close(message->fds[i]);
-      free(message);
-   }
+  for (unsigned n = 0; n < 32; ++n) {
+    pthread_mutex_lock(&process->inbox_lock);
+    struct service_inbox *message = process->inbox_head;
+    if (message) {
+      process->inbox_head = message->next;
+      if (!process->inbox_head) process->inbox_tail = NULL;
+    }
+    pthread_mutex_unlock(&process->inbox_lock);
+    if (!message) break;
+    service_process_command(process, message->bytes, message->size,message->fds,message->nfds);
+    for(size_t i=0; i<message->nfds; ++i)luna_fd_close(message->fds[i]);
+    free(message);
+  }
 }
 static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
 {
-   struct service_process process={0};
-   process.channel=luna_process_channel_open(control_fd);
-   if(!process.channel){fprintf(stderr,"[service-process] control channel: %s\n",strerror(errno));return EXIT_FAILURE;}
-   process.vm=dvm_jni_vm();
-   process.control_fd=control_fd;
-   atomic_init(&process.fatal,0);atomic_init(&process.io_stop,0);
-   int io_error=pthread_mutex_init(&process.inbox_lock,NULL);
-   if(io_error){luna_process_channel_close(process.channel);return EXIT_FAILURE;}
-   dvm_content_providers_startup(process.vm,true);
-   g_service_channel=process.channel;
-   dvm_binder_set_transport(binder_transport_send,NULL);
-   dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
-   dvm_binder_set_pump(NULL);
-   io_error=pthread_create(&process.io_thread,NULL,service_process_io,&process);
-   if(io_error){
-      g_service_channel=NULL;
-      pthread_mutex_destroy(&process.inbox_lock);luna_process_channel_close(process.channel);return EXIT_FAILURE;
-   }
-   jobject base=NULL,application=NULL;
-   int result=EXIT_FAILURE;
-   if(!process.vm || luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
-        dvm_jni_class_in_dex,start_manifest_providers,&base,&application)<0){
-      fprintf(stderr,"[service-process] Application initialization failed\n");
-      goto done;
-   }
-   fprintf(stderr,"[service-process] ready: %s pid=%d\n",
-           getenv("ANDROID_PROCESS_NAME") ? getenv("ANDROID_PROCESS_NAME") : "?",arm_exec_guest_pid());
-   dvm_deliver_boot_completed(process.vm);
-   void (*run_threads)(void)=is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
-   result=EXIT_SUCCESS;
-   while(!process.fatal){
-      int status=0;
-      if(process_exit_status(&status)){result=status;break;}
-      service_process_drain(&process);
-      run_threads();dvm_main_looper_tick(process.vm);dvm_prefs_flush(process.vm);
-      usleep(1000);
-   }
-   if(process.fatal)result=EXIT_FAILURE;
+  struct service_process process= {0};
+  process.channel=luna_process_channel_open(control_fd);
+  if(!process.channel) {
+    fprintf(stderr,"[service-process] control channel: %s\n",strerror(errno));
+    return EXIT_FAILURE;
+  }
+  process.vm=dvm_jni_vm();
+  process.control_fd=control_fd;
+  atomic_init(&process.fatal,0);
+  atomic_init(&process.io_stop,0);
+  int io_error=pthread_mutex_init(&process.inbox_lock,NULL);
+  if(io_error) {
+    luna_process_channel_close(process.channel);
+    return EXIT_FAILURE;
+  }
+  dvm_content_providers_startup(process.vm,true);
+  g_service_channel=process.channel;
+  dvm_binder_set_transport(binder_transport_send,NULL);
+  dvm_binder_set_fd_transport(binder_transport_send_fds,NULL);
+  dvm_binder_set_pump(NULL);
+  io_error=pthread_create(&process.io_thread,NULL,service_process_io,&process);
+  if(io_error) {
+    g_service_channel=NULL;
+    pthread_mutex_destroy(&process.inbox_lock);
+    luna_process_channel_close(process.channel);
+    return EXIT_FAILURE;
+  }
+  jobject base=NULL,application=NULL;
+  int result=EXIT_FAILURE;
+  if(!process.vm || luna_application_start(jvm,getenv("ANDROID_APPLICATION_CLASS"),
+      dvm_jni_class_in_dex,start_manifest_providers,&base,&application)<0) {
+    fprintf(stderr,"[service-process] Application initialization failed\n");
+    goto done;
+  }
+  fprintf(stderr,"[service-process] ready: %s pid=%d\n",
+          getenv("ANDROID_PROCESS_NAME") ? getenv("ANDROID_PROCESS_NAME") : "?",arm_exec_guest_pid());
+  dvm_deliver_boot_completed(process.vm);
+  void (*run_threads)(void)=is_a64 ? arm64_exec_run_pending_threads : arm_exec_run_pending_threads;
+  result=EXIT_SUCCESS;
+  while(!process.fatal) {
+    int status=0;
+    if(process_exit_status(&status)) {
+      result=status;
+      break;
+    }
+    service_process_drain(&process);
+    run_threads();
+    dvm_main_looper_tick(process.vm);
+    dvm_prefs_flush(process.vm);
+    usleep(1000);
+  }
+  if(process.fatal)result=EXIT_FAILURE;
 done:
-   dvm_content_providers_startup(process.vm,false);
-   atomic_store(&process.io_stop,1);
-   pthread_join(process.io_thread,NULL);
-   while(process.inbox_head){
-      struct service_inbox *next=process.inbox_head->next;
-      for(size_t i=0;i<process.inbox_head->nfds;++i)luna_fd_close(process.inbox_head->fds[i]);
-      free(process.inbox_head);process.inbox_head=next;
-   }
-   pthread_mutex_destroy(&process.inbox_lock);
-   g_service_channel=NULL;
-   luna_process_channel_close(process.channel);return result;
+  dvm_content_providers_startup(process.vm,false);
+  atomic_store(&process.io_stop,1);
+  pthread_join(process.io_thread,NULL);
+  while(process.inbox_head) {
+    struct service_inbox *next=process.inbox_head->next;
+    for(size_t i=0; i<process.inbox_head->nfds; ++i)luna_fd_close(process.inbox_head->fds[i]);
+    free(process.inbox_head);
+    process.inbox_head=next;
+  }
+  pthread_mutex_destroy(&process.inbox_lock);
+  g_service_channel=NULL;
+  luna_process_channel_close(process.channel);
+  return result;
 }
 
 static int
 run_jni_game_arm64(struct jvm *jvm)
 {
-   /* Neither engine's native entry point is exported.  An ordinary Android
-    * app has none: its entry point is the launcher Activity, in the dex.  With
-    * a bytecode VM that is runnable, so start it the way Android does instead
-    * of giving up on the package. */
-   int result = run_dex_activity(jvm, 1);
-   int exit_status=0;
-   if (process_exit_status(&exit_status)) return exit_status;
-   if (result == EXIT_SUCCESS) return EXIT_SUCCESS;
-   fprintf(stderr, "[loader] arm64: no known entry point\n");
-   return EXIT_FAILURE;
+  /* Neither engine's native entry point is exported.  An ordinary Android
+   * app has none: its entry point is the launcher Activity, in the dex.  With
+   * a bytecode VM that is runnable, so start it the way Android does instead
+   * of giving up on the package. */
+  int result = run_dex_activity(jvm, 1);
+  int exit_status=0;
+  if (process_exit_status(&exit_status)) return exit_status;
+  if (result == EXIT_SUCCESS) return EXIT_SUCCESS;
+  fprintf(stderr, "[loader] arm64: no known entry point\n");
+  return EXIT_FAILURE;
 }
 
 static int
 run_jni_game_arm(struct jvm *jvm)
 {
-   const char *launcher = getenv("ANDROID_LAUNCH_ACTIVITY");
-   if (launcher && *launcher) {
-      int result = run_dex_activity(jvm, 0), status = 0;
-      return process_exit_status(&status) ? status : result;
-   }
+  const char *launcher = getenv("ANDROID_LAUNCH_ACTIVITY");
+  if (launcher && *launcher) {
+    int result = run_dex_activity(jvm, 0), status = 0;
+    return process_exit_status(&status) ? status : result;
+  }
 
-   /* Unity <= 2019: all methods on UnityPlayer.
-    * Unity 2020+:  render/lifecycle moved to UnityPlayerForActivityOrService. */
-   static const char *cls      = "com.unity3d.player.UnityPlayer";
-   static const char *cls_svc  = "com.unity3d.player.UnityPlayerForActivityOrService";
+  /* Unity <= 2019: all methods on UnityPlayer.
+   * Unity 2020+:  render/lifecycle moved to UnityPlayerForActivityOrService. */
+  static const char *cls      = "com.unity3d.player.UnityPlayer";
+  static const char *cls_svc  = "com.unity3d.player.UnityPlayerForActivityOrService";
 
-   /* Helper: look up from primary class, fall back to the service class */
+  /* Helper: look up from primary class, fall back to the service class */
 #define LOOKUP2(name) arm_lookup_native_two(cls, cls_svc, name)
 #define LOOKUP2_SIG(name, sig_buf) \
    arm_lookup_native_sig_two(cls, cls_svc, name, sig_buf, sizeof(sig_buf))
 
-   uint32_t va_init_jni = arm_exec_lookup_native(cls, "initJni");
-   uint32_t va_done     = LOOKUP2("nativeDone");
-   uint32_t va_render   = LOOKUP2("nativeRender");
-   uint32_t va_resume   = LOOKUP2("nativeResume");
-   uint32_t va_focus    = LOOKUP2("nativeFocusChanged");
-   char recreate_sig[128] = {0};
-   uint32_t va_recreate = LOOKUP2_SIG("nativeRecreateGfxState", recreate_sig);
-   uint32_t va_inject   = arm_exec_lookup_native(cls, "nativeInjectEvent");
-   uint32_t va_file     = arm_exec_lookup_native(cls, "nativeFile");
-   uint32_t va_resize   = LOOKUP2("nativeResize");
-   uint32_t va_fwd_dalv = LOOKUP2("nativeForwardEventsToDalvik");
-   uint32_t fwd_flag_va = 0; /* Unity 5.3 ForwardEventsToDalvik BSS byte */
+  uint32_t va_init_jni = arm_exec_lookup_native(cls, "initJni");
+  uint32_t va_done     = LOOKUP2("nativeDone");
+  uint32_t va_render   = LOOKUP2("nativeRender");
+  uint32_t va_resume   = LOOKUP2("nativeResume");
+  uint32_t va_focus    = LOOKUP2("nativeFocusChanged");
+  char recreate_sig[128] = {0};
+  uint32_t va_recreate = LOOKUP2_SIG("nativeRecreateGfxState", recreate_sig);
+  uint32_t va_inject   = arm_exec_lookup_native(cls, "nativeInjectEvent");
+  uint32_t va_file     = arm_exec_lookup_native(cls, "nativeFile");
+  uint32_t va_resize   = LOOKUP2("nativeResize");
+  uint32_t va_fwd_dalv = LOOKUP2("nativeForwardEventsToDalvik");
+  uint32_t fwd_flag_va = 0; /* Unity 5.3 ForwardEventsToDalvik BSS byte */
 
 #undef LOOKUP2
 #undef LOOKUP2_SIG
 
-   if (!va_init_jni || !va_render) {
-      warnx("not a unity jni lib");
-      return EXIT_FAILURE;
-   }
+  if (!va_init_jni || !va_render) {
+    warnx("not a unity jni lib");
+    return EXIT_FAILURE;
+  }
 
-   uint32_t env = arm_exec_env_va();
-   const jobject context = alloc_attached_activity(jvm);
-   uint32_t ctx = (uint32_t)(uintptr_t)context;
-   jni_set_current_activity(&jvm->env, context);
-   uint32_t mono_root = mono_export_call("mono_get_root_domain");
+  uint32_t env = arm_exec_env_va();
+  const jobject context = alloc_attached_activity(jvm);
+  uint32_t ctx = (uint32_t)(uintptr_t)context;
+  jni_set_current_activity(&jvm->env, context);
+  uint32_t mono_root = mono_export_call("mono_get_root_domain");
 
-   /* JIT trampolines must exist before initJni — Unity 4.x maps mscorlib inside
-    * initJni, and mono branches into uninitialized codeman slots without mini_init. */
-   arm_exec_ensure_mono_trampolines();
-   dump_mono_defaults("after mono trampolines");
+  /* JIT trampolines must exist before initJni — Unity 4.x maps mscorlib inside
+   * initJni, and mono branches into uninitialized codeman slots without mini_init. */
+  arm_exec_ensure_mono_trampolines();
+  dump_mono_defaults("after mono trampolines");
 
-   /* Mount the APK before initJni.  On a real device UnityPlayer passes
-    * getPackageCodePath() (the .apk file) via nativeFile during construction,
-    * before initJni reads assets/bin/Data.  Calling nativeFile after initJni
-    * leaves ArchiveFileSystem unmounted and splash upload runs with unset
-    * texture callbacks. */
-   if (va_file) {
-      const char *apk = lunaria_apk_mount_path();
-      if (apk && *apk) {
-         fprintf(stderr, "[loader] calling nativeFile (%s)...\n", apk);
-         jobject str = jvm->native.NewStringUTF(&jvm->env, apk);
-         arm_exec_call(va_file, env, ctx, (uint32_t)(uintptr_t)str, 0);
-         arm_exec_run_pending_threads();
-      }
-   }
-
-   fprintf(stderr, "[loader] calling initJni (va=0x%08x) mono_root_domain=0x%08x...\n",
-           va_init_jni, mono_root);
-
-   arm_exec_call(va_init_jni, env, ctx, ctx, 0);
-   arm_exec_run_pending_threads();
-   fprintf(stderr, "[loader] initJni done: mono_root_domain=0x%08x\n",
-           mono_export_call("mono_get_root_domain"));
-   dump_mono_defaults("after initJni");
-
-   /* Unity registers paths in initJni; register embedded machine.config before
-    * nativeRender calls mono_jit_init_version (gmisc-unix.c:69 otherwise). */
-   arm_exec_prepare_mono_config();
-   arm_exec_sync_mono_domain_slot();
-
-   /* mono_file_map_open/… are hooked via SVC; leave Unity's override from initJni
-    * unless it blocks our hooks (cleared on libunity load if needed). */
-
-   /* EGL は main() の arm_exec_jni_onload より前に初期化済み。
-    * 念のため再度 make-current を試みる（arm_exec_host_egl_init は冪等）。 */
-   if (!arm_exec_host_egl_init())
-      fprintf(stderr, "[loader] host EGL re-init failed — GL calls may be no-ops\n");
-
-   /* initJni/threads may overflow the ARM stack if Mono recurses deeply.
-    * Reset saved R4-R11 so nativeRecreateGfxState starts with a clean register state. */
-   arm_exec_reset_saved_regs();
-
-   if (va_recreate) {
-      const jobject fake_surf = jvm->native.AllocObject(&jvm->env,
-            jvm->native.FindClass(&jvm->env, "android/view/Surface"));
-      /* Unity 4.x: nativeRecreateGfxState(Landroid/view/Surface;)V  — Surface only
-       * Unity 5+ : nativeRecreateGfxState(ILandroid/view/Surface;)V — displayId + Surface
-       * Java 側は updateGLDisplay(0, surface) で主ディスプレイ=0 を渡す。
-       * 1 を渡すと Surface が G[1] に格納され、メインスレッドが待つ G[0]
-       * (libunity 0x02e601a0 相当) が永遠に 0 のまま cond_wait でデッドロック
-       * する (Unity 2023 IL2CPP で確認)。 */
-      int unity4_sig = (recreate_sig[0] == '(' && recreate_sig[1] == 'L');
-      if (unity4_sig) {
-         fprintf(stderr, "[loader] calling nativeRecreateGfxState (Unity4 surface-only)...\n");
-         arm_exec_call(va_recreate, env, ctx, (uint32_t)(uintptr_t)fake_surf, 0);
-      } else {
-         fprintf(stderr, "[loader] calling nativeRecreateGfxState (displayId=0)...\n");
-         arm_exec_call(va_recreate, env, ctx, 0, (uint32_t)(uintptr_t)fake_surf);
-      }
+  /* Mount the APK before initJni.  On a real device UnityPlayer passes
+   * getPackageCodePath() (the .apk file) via nativeFile during construction,
+   * before initJni reads assets/bin/Data.  Calling nativeFile after initJni
+   * leaves ArchiveFileSystem unmounted and splash upload runs with unset
+   * texture callbacks. */
+  if (va_file) {
+    const char *apk = lunaria_apk_mount_path();
+    if (apk && *apk) {
+      fprintf(stderr, "[loader] calling nativeFile (%s)...\n", apk);
+      jobject str = jvm->native.NewStringUTF(&jvm->env, apk);
+      arm_exec_call(va_file, env, ctx, (uint32_t)(uintptr_t)str, 0);
       arm_exec_run_pending_threads();
-      fprintf(stderr, "[loader] nativeRecreateGfxState done\n");
-   }
-   dump_mono_defaults("after nativeRecreateGfxState");
-   /* ウィンドウサイズを通知。nativeResize は (IIII)V = (w, h, texW, texH):
-    * libunity は touch スケールを xscale=w/texW, yscale=h/texH で計算する
-    * (libunity+0x39c7d0)。texW/texH は AAPCS でスタック渡しのため
-    * arm_exec_call (レジスタ 4 本のみ) だと 0 を読み scale=inf になり、
-    * 以後の全タッチ座標が inf に化ける (GUI.Button が反応しない真因)。 */
-   fprintf(stderr, "[loader] calling nativeResize...\n");
-   if (va_resize) {
+    }
+  }
+
+  fprintf(stderr, "[loader] calling initJni (va=0x%08x) mono_root_domain=0x%08x...\n",
+          va_init_jni, mono_root);
+
+  arm_exec_call(va_init_jni, env, ctx, ctx, 0);
+  arm_exec_run_pending_threads();
+  fprintf(stderr, "[loader] initJni done: mono_root_domain=0x%08x\n",
+          mono_export_call("mono_get_root_domain"));
+  dump_mono_defaults("after initJni");
+
+  /* Unity registers paths in initJni; register embedded machine.config before
+   * nativeRender calls mono_jit_init_version (gmisc-unix.c:69 otherwise). */
+  arm_exec_prepare_mono_config();
+  arm_exec_sync_mono_domain_slot();
+
+  /* mono_file_map_open/… are hooked via SVC; leave Unity's override from initJni
+   * unless it blocks our hooks (cleared on libunity load if needed). */
+
+  /* EGL は main() の arm_exec_jni_onload より前に初期化済み。
+   * 念のため再度 make-current を試みる（arm_exec_host_egl_init は冪等）。 */
+  if (!arm_exec_host_egl_init())
+    fprintf(stderr, "[loader] host EGL re-init failed — GL calls may be no-ops\n");
+
+  /* initJni/threads may overflow the ARM stack if Mono recurses deeply.
+   * Reset saved R4-R11 so nativeRecreateGfxState starts with a clean register state. */
+  arm_exec_reset_saved_regs();
+
+  if (va_recreate) {
+    const jobject fake_surf = jvm->native.AllocObject(&jvm->env,
+                              jvm->native.FindClass(&jvm->env, "android/view/Surface"));
+    /* Unity 4.x: nativeRecreateGfxState(Landroid/view/Surface;)V  — Surface only
+     * Unity 5+ : nativeRecreateGfxState(ILandroid/view/Surface;)V — displayId + Surface
+     * Java 側は updateGLDisplay(0, surface) で主ディスプレイ=0 を渡す。
+     * 1 を渡すと Surface が G[1] に格納され、メインスレッドが待つ G[0]
+     * (libunity 0x02e601a0 相当) が永遠に 0 のまま cond_wait でデッドロック
+     * する (Unity 2023 IL2CPP で確認)。 */
+    int unity4_sig = (recreate_sig[0] == '(' && recreate_sig[1] == 'L');
+    if (unity4_sig) {
+      fprintf(stderr, "[loader] calling nativeRecreateGfxState (Unity4 surface-only)...\n");
+      arm_exec_call(va_recreate, env, ctx, (uint32_t)(uintptr_t)fake_surf, 0);
+    } else {
+      fprintf(stderr, "[loader] calling nativeRecreateGfxState (displayId=0)...\n");
+      arm_exec_call(va_recreate, env, ctx, 0, (uint32_t)(uintptr_t)fake_surf);
+    }
+    arm_exec_run_pending_threads();
+    fprintf(stderr, "[loader] nativeRecreateGfxState done\n");
+  }
+  dump_mono_defaults("after nativeRecreateGfxState");
+  /* ウィンドウサイズを通知。nativeResize は (IIII)V = (w, h, texW, texH):
+   * libunity は touch スケールを xscale=w/texW, yscale=h/texH で計算する
+   * (libunity+0x39c7d0)。texW/texH は AAPCS でスタック渡しのため
+   * arm_exec_call (レジスタ 4 本のみ) だと 0 を読み scale=inf になり、
+   * 以後の全タッチ座標が inf に化ける (GUI.Button が反応しない真因)。 */
+  fprintf(stderr, "[loader] calling nativeResize...\n");
+  if (va_resize) {
+    int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+    arm_exec_call6(va_resize, env, ctx, (uint32_t)w, (uint32_t)h,
+                   (uint32_t)w, (uint32_t)h);
+  }
+  fprintf(stderr, "[loader] calling nativeFocusChanged...\n");
+  if (va_focus)
+    arm_exec_call(va_focus, env, ctx, 1, 0);
+  /* APK meta-data unityplayer.ForwardNativeEventsToDalvik=true makes
+   * Unity 5.x nativeInjectEvent skip the native queue (return 0) when the
+   * forward-to-Dalvik flag byte is set.  We have no Dalvik touch dispatch —
+   * inject is our only path — so force the flag clear.  The JNI call itself
+   * can no-op if Unity's Scoped* TLS (+0x104) is busy; poke the BSS byte
+   * when the Unity 5.3 strb pattern matches. */
+  if (va_fwd_dalv) {
+    fprintf(stderr, "[loader] nativeForwardEventsToDalvik(false)\n");
+    arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
+    /* Unity 5.3.3: strb r7,[r0,#0xc] at fwd+0x118; literals at +0x154/+0x158 */
+    if (arm_exec_read32(va_fwd_dalv + 0x118u) == 0xe5c0700cu) {
+      uint32_t lit0 = arm_exec_read32(va_fwd_dalv + 0x154u);
+      uint32_t lit1 = arm_exec_read32(va_fwd_dalv + 0x158u);
+      fwd_flag_va = (va_fwd_dalv + 0x118u) + lit0 + lit1 + 0xcu;
+      uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
+      unsigned sh = (fwd_flag_va & 3u) * 8u;
+      unsigned cur = (word >> sh) & 0xffu;
+      if (cur) {
+        arm_exec_write32(fwd_flag_va & ~3u, word & ~(0xffu << sh));
+        fprintf(stderr, "[loader] cleared ForwardEventsToDalvik flag "
+                        "@ 0x%08x (was %u)\n", fwd_flag_va, cur);
+      } else {
+        fprintf(stderr, "[loader] ForwardEventsToDalvik flag @ 0x%08x "
+                        "already 0\n", fwd_flag_va);
+      }
+    }
+  }
+  fprintf(stderr, "[loader] calling nativeResume...\n");
+  if (va_resume)
+    arm_exec_call(va_resume, env, ctx, 0, 0);
+  fprintf(stderr, "[loader] nativeResume done, running pending threads...\n");
+  arm_exec_run_pending_threads();
+  fprintf(stderr, "[loader] entering render loop\n");
+  schedule_unsafe_alarm_dump();
+
+  /* 注意: nativeDone() はここでは呼ばない。Unity 5+ では nativeDone() は
+   * UnityPlayer.destroy() からの終了処理であり、レンダーループ前に呼ぶと
+   * エンジンが quit 状態になり nativeRender が即 return する。 */
+
+  /* limp mode: nativeRender が失敗(0)を返してもループを続ける。
+   * スタブ未実装による一過性の失敗後も他のサブシステムは前進し得る。 */
+  int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
+  int max_frames = 0;
+  {
+    const char *mf = getenv("LUNARIA_MAX_FRAMES");
+    if (mf && *mf) max_frames = atoi(mf);
+  }
+  for (;;) {
+    if (max_frames > 0 && frame_count >= max_frames) {
+      fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting render loop\n",
+              max_frames);
+      break;
+    }
+    /* フォーカス再送: 実機では surfaceChanged 後に focus が届く。
+     * ループ前の nativeFocusChanged はエンジン初期化で上書きされる
+     * 疑いがあるため、タップ前に再送して入力ゲートを開く */
+    {
+      static int tt_frame = 60, tt_parsed = 0;
+      if (!tt_parsed) {
+        tt_parsed = 1;
+        const char *tf = getenv("LUNARIA_TOUCH_FRAME");
+        if (tf) {
+          int v = atoi(tf);
+          if (v > 0) tt_frame = v;
+        }
+      }
+      if (getenv("LUNARIA_TOUCH_TEST") && frame_count == tt_frame - 10 &&
+          tt_frame > 10 && va_focus) {
+        arm_exec_call(va_focus, env, ctx, 1, 0);
+        fprintf(stderr, "[loader] nativeFocusChanged(1) re-sent (frame %d)\n",
+                frame_count);
+      }
+    }
+    touch_test_tick(frame_count);
+    /* GLFW mouse -> one MotionEvent per queued sample.  Each object carries
+     * its own immutable payload (JVM_OBJECT_MOTION); Unity keeps the jobject
+     * and reads it again during PlayerLoop.  One inject per frame. */
+    ArmExecTouchEvent te;
+    if (va_inject && arm_exec_touch_next(&te)) {
+      /* Re-clear in case Java/meta-data path set the flag during startup. */
+      if (fwd_flag_va) {
+        uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
+        unsigned sh = (fwd_flag_va & 3u) * 8u;
+        if ((word >> sh) & 0xffu)
+          arm_exec_write32(fwd_flag_va & ~3u, word & ~(0xffu << sh));
+      }
+      if (va_fwd_dalv)
+        arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
+      lunaria_touch_event lev = touch_to_lunaria(&te);
+      jobject motion_ev = jvm_new_motion_event(jvm, &lev);
+      int handled = arm_exec_call(va_inject, env, ctx,
+                                  (uint32_t)(uintptr_t)motion_ev, 0);
+      static int inj_log = 0;
+      if (inj_log < 100) {
+        fprintf(stderr, "[loader] injectEvent action=%d x=%.0f y=%.0f -> %d\n",
+                te.action, te.x, te.y, handled);
+        ++inj_log;
+      }
+    }
+    /* UnityPlayer GL thread loop: executeGLThreadJobs() then nativeRender().
+     * nativeRender MUST run to completion: abandoning it mid-PlayerLoop leaves
+     * Unity's reentrancy guard set, making every subsequent frame bail with
+     * "PlayerLoop called recursively!".  Use the unlimited variant. */
+    arm_exec_drain_gl_thread_jobs();
+    int ok = arm_exec_call_unlimited(va_render, env, ctx, 0, 0);
+    /* A guest process termination ends its GL thread as well.  Preserve
+     * guest memory: nativeRender's return value does not identify a fault
+     * and cannot authorize resetting engine state at a fixed address. */
+    if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
+      fprintf(stderr, "[loader] guest process terminated during nativeRender "
+                      "(frame %d)\n", frame_count);
+      break;
+    }
+    /* Android では surfaceChanged -> nativeResize がエンジン初期化後にも
+     * 届く。ループ前の nativeResize はエンジン未初期化で無視されるため
+     * (画面が 128x128 の既定値のままになる)、初回フレーム完了後に再送する。 */
+    int resized_w = 0, resized_h = 0;
+    if (arm_exec_take_view_resize(&resized_w, &resized_h) && va_resize) {
+      arm_exec_call6(va_resize, env, ctx, (uint32_t)resized_w, (uint32_t)resized_h,
+                     (uint32_t)resized_w, (uint32_t)resized_h);
+      fprintf(stderr, "[loader] nativeResize(%d,%d) — view resized\n",
+              resized_w, resized_h);
+    }
+    if (!resized_after_init && frame_count >= 1 && va_resize) {
       int w = arm_exec_fb_width(), h = arm_exec_fb_height();
       arm_exec_call6(va_resize, env, ctx, (uint32_t)w, (uint32_t)h,
                      (uint32_t)w, (uint32_t)h);
-   }
-   fprintf(stderr, "[loader] calling nativeFocusChanged...\n");
-   if (va_focus)
-      arm_exec_call(va_focus, env, ctx, 1, 0);
-   /* APK meta-data unityplayer.ForwardNativeEventsToDalvik=true makes
-    * Unity 5.x nativeInjectEvent skip the native queue (return 0) when the
-    * forward-to-Dalvik flag byte is set.  We have no Dalvik touch dispatch —
-    * inject is our only path — so force the flag clear.  The JNI call itself
-    * can no-op if Unity's Scoped* TLS (+0x104) is busy; poke the BSS byte
-    * when the Unity 5.3 strb pattern matches. */
-   if (va_fwd_dalv) {
-      fprintf(stderr, "[loader] nativeForwardEventsToDalvik(false)\n");
-      arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
-      /* Unity 5.3.3: strb r7,[r0,#0xc] at fwd+0x118; literals at +0x154/+0x158 */
-      if (arm_exec_read32(va_fwd_dalv + 0x118u) == 0xe5c0700cu) {
-         uint32_t lit0 = arm_exec_read32(va_fwd_dalv + 0x154u);
-         uint32_t lit1 = arm_exec_read32(va_fwd_dalv + 0x158u);
-         fwd_flag_va = (va_fwd_dalv + 0x118u) + lit0 + lit1 + 0xcu;
-         uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
-         unsigned sh = (fwd_flag_va & 3u) * 8u;
-         unsigned cur = (word >> sh) & 0xffu;
-         if (cur) {
-            arm_exec_write32(fwd_flag_va & ~3u, word & ~(0xffu << sh));
-            fprintf(stderr, "[loader] cleared ForwardEventsToDalvik flag "
-                    "@ 0x%08x (was %u)\n", fwd_flag_va, cur);
-         } else {
-            fprintf(stderr, "[loader] ForwardEventsToDalvik flag @ 0x%08x "
-                    "already 0\n", fwd_flag_va);
-         }
+      resized_after_init = 1;
+      fprintf(stderr, "[loader] nativeResize(%d,%d,%d,%d) re-sent after first frame\n",
+              w, h, w, h);
+    }
+    /* LUNARIA_TOUCH_DIAG=cntSyncVA,cntPhaseVA,getTouchVA:
+     * 毎フレーム libunity のタッチカウント関数をゲスト呼び出しして
+     * 「C# スクリプトが見る値」を直接観測する (診断用)。 */
+    {
+      static uint32_t dg_cnt_sync, dg_cnt_phase, dg_get;
+      static int dg_parsed;
+      if (!dg_parsed) {
+        dg_parsed = 1;
+        const char *d = getenv("LUNARIA_TOUCH_DIAG");
+        if (d) sscanf(d, "%x,%x,%x", &dg_cnt_sync, &dg_cnt_phase, &dg_get);
       }
-   }
-   fprintf(stderr, "[loader] calling nativeResume...\n");
-   if (va_resume)
-      arm_exec_call(va_resume, env, ctx, 0, 0);
-   fprintf(stderr, "[loader] nativeResume done, running pending threads...\n");
-   arm_exec_run_pending_threads();
-   fprintf(stderr, "[loader] entering render loop\n");
-   schedule_unsafe_alarm_dump();
+      if (dg_cnt_sync) {
+        int cs = arm_exec_call(dg_cnt_sync, 0, 0, 0, 0);
+        int cp = dg_cnt_phase ? arm_exec_call(dg_cnt_phase, 0, 0, 0, 0) : -1;
+        static int last_cs = -1, last_cp = -1;
+        if (cs != last_cs || cp != last_cp) {
+          fprintf(stderr, "[diag] frame=%d touchCount sync=%d phase=%d\n",
+                  frame_count, cs, cp);
+          last_cs = cs;
+          last_cp = cp;
+        }
+        if (cs > 0 && dg_get) {
+          const uint32_t out = 0x41013800; /* STR_SCRATCH 後半 */
+          int ok2 = arm_exec_call(dg_get, 0, out, 0, 0);
+          fprintf(stderr, "[diag]   GetTouch(0)=%d id=%d x=%f y=%f "
+                          "phase=%u f34=%u f38=%u f3c=%u tap=%u\n", ok2,
+                  (int)arm_exec_read32(out),
+          (double)*(float *)&(uint32_t) {
+            arm_exec_read32(out + 4)
+          },
+          (double)*(float *)&(uint32_t) {
+            arm_exec_read32(out + 8)
+          },
+          arm_exec_read32(out + 0x24), arm_exec_read32(out + 0x34),
+          arm_exec_read32(out + 0x38), arm_exec_read32(out + 0x3c),
+          arm_exec_read32(out + 0x20));
+        }
+      }
+    }
+    /* UnityMain などのゲストスレッドにも実行時間を与える */
+    arm_exec_run_pending_threads();
+    pump_java_frame();
+    /* Unity はeglSwapBuffersをJava側に任せる場合があるのでここで呼ぶ */
+    arm_exec_egl_swap();
+    ++frame_count;
+    if (ok != last_ok || (frame_count <= 5) || (frame_count % 100 == 0)) {
+      fprintf(stderr, "[loader] nativeRender -> %d (frame %d)\n", ok, frame_count);
+      last_ok = ok;
+    }
+    if (getenv("LUNARIA_TRACE_HEAP"))
+      fprintf(stderr, "[loader] heap used = %u MB (frame %d)\n",
+              arm_exec_heap_used() >> 20, frame_count);
+    if (getenv("LUNARIA_TRACE_MONO") &&
+        (frame_count == 1 || frame_count == 10 || frame_count == 100))
+      dump_mono_defaults("render loop");
+    fail_streak = ok ? 0 : fail_streak + 1;
+    /* 失敗が続いたらフレームペーシングして CPU/スワップ暴走を防ぐ */
+    if (fail_streak > 3)
+      usleep(16000);
+    if (arm_exec_glfw_should_close()) break;
+  }
 
-   /* 注意: nativeDone() はここでは呼ばない。Unity 5+ では nativeDone() は
-    * UnityPlayer.destroy() からの終了処理であり、レンダーループ前に呼ぶと
-    * エンジンが quit 状態になり nativeRender が即 return する。 */
+  /* 終了処理: nativeDone() は UnityPlayer.destroy() 相当 */
+  if (va_done)
+    arm_exec_call(va_done, env, ctx, 0, 0);
 
-   /* limp mode: nativeRender が失敗(0)を返してもループを続ける。
-    * スタブ未実装による一過性の失敗後も他のサブシステムは前進し得る。 */
-   int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
-   int max_frames = 0;
-   {
-      const char *mf = getenv("LUNARIA_MAX_FRAMES");
-      if (mf && *mf) max_frames = atoi(mf);
-   }
-   for (;;) {
-      if (max_frames > 0 && frame_count >= max_frames) {
-         fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting render loop\n",
-                 max_frames);
-         break;
-      }
-      /* フォーカス再送: 実機では surfaceChanged 後に focus が届く。
-       * ループ前の nativeFocusChanged はエンジン初期化で上書きされる
-       * 疑いがあるため、タップ前に再送して入力ゲートを開く */
-      {
-         static int tt_frame = 60, tt_parsed = 0;
-         if (!tt_parsed) {
-            tt_parsed = 1;
-            const char *tf = getenv("LUNARIA_TOUCH_FRAME");
-            if (tf) { int v = atoi(tf); if (v > 0) tt_frame = v; }
-         }
-         if (getenv("LUNARIA_TOUCH_TEST") && frame_count == tt_frame - 10 &&
-             tt_frame > 10 && va_focus) {
-            arm_exec_call(va_focus, env, ctx, 1, 0);
-            fprintf(stderr, "[loader] nativeFocusChanged(1) re-sent (frame %d)\n",
-                    frame_count);
-         }
-      }
-      touch_test_tick(frame_count);
-      /* GLFW mouse -> one MotionEvent per queued sample.  Each object carries
-       * its own immutable payload (JVM_OBJECT_MOTION); Unity keeps the jobject
-       * and reads it again during PlayerLoop.  One inject per frame. */
-      ArmExecTouchEvent te;
-      if (va_inject && arm_exec_touch_next(&te)) {
-         /* Re-clear in case Java/meta-data path set the flag during startup. */
-         if (fwd_flag_va) {
-            uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
-            unsigned sh = (fwd_flag_va & 3u) * 8u;
-            if ((word >> sh) & 0xffu)
-               arm_exec_write32(fwd_flag_va & ~3u, word & ~(0xffu << sh));
-         }
-         if (va_fwd_dalv)
-            arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
-         lunaria_touch_event lev = touch_to_lunaria(&te);
-         jobject motion_ev = jvm_new_motion_event(jvm, &lev);
-         int handled = arm_exec_call(va_inject, env, ctx,
-                                     (uint32_t)(uintptr_t)motion_ev, 0);
-         static int inj_log = 0;
-         if (inj_log < 100) {
-            fprintf(stderr, "[loader] injectEvent action=%d x=%.0f y=%.0f -> %d\n",
-                    te.action, te.x, te.y, handled);
-            ++inj_log;
-         }
-      }
-      /* UnityPlayer GL thread loop: executeGLThreadJobs() then nativeRender().
-       * nativeRender MUST run to completion: abandoning it mid-PlayerLoop leaves
-       * Unity's reentrancy guard set, making every subsequent frame bail with
-       * "PlayerLoop called recursively!".  Use the unlimited variant. */
-      arm_exec_drain_gl_thread_jobs();
-      int ok = arm_exec_call_unlimited(va_render, env, ctx, 0, 0);
-      /* A guest process termination ends its GL thread as well.  Preserve
-       * guest memory: nativeRender's return value does not identify a fault
-       * and cannot authorize resetting engine state at a fixed address. */
-      if (arm_exec_guest_exit_count() > 0 || arm_exec_guest_abort_count() > 0) {
-         fprintf(stderr, "[loader] guest process terminated during nativeRender "
-                         "(frame %d)\n", frame_count);
-         break;
-      }
-      /* Android では surfaceChanged -> nativeResize がエンジン初期化後にも
-       * 届く。ループ前の nativeResize はエンジン未初期化で無視されるため
-       * (画面が 128x128 の既定値のままになる)、初回フレーム完了後に再送する。 */
-      int resized_w = 0, resized_h = 0;
-      if (arm_exec_take_view_resize(&resized_w, &resized_h) && va_resize) {
-         arm_exec_call6(va_resize, env, ctx, (uint32_t)resized_w, (uint32_t)resized_h,
-                          (uint32_t)resized_w, (uint32_t)resized_h);
-         fprintf(stderr, "[loader] nativeResize(%d,%d) — view resized\n",
-                 resized_w, resized_h);
-      }
-      if (!resized_after_init && frame_count >= 1 && va_resize) {
-         int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-         arm_exec_call6(va_resize, env, ctx, (uint32_t)w, (uint32_t)h,
-                        (uint32_t)w, (uint32_t)h);
-         resized_after_init = 1;
-         fprintf(stderr, "[loader] nativeResize(%d,%d,%d,%d) re-sent after first frame\n",
-                 w, h, w, h);
-      }
-      /* LUNARIA_TOUCH_DIAG=cntSyncVA,cntPhaseVA,getTouchVA:
-       * 毎フレーム libunity のタッチカウント関数をゲスト呼び出しして
-       * 「C# スクリプトが見る値」を直接観測する (診断用)。 */
-      {
-         static uint32_t dg_cnt_sync, dg_cnt_phase, dg_get; static int dg_parsed;
-         if (!dg_parsed) {
-            dg_parsed = 1;
-            const char *d = getenv("LUNARIA_TOUCH_DIAG");
-            if (d) sscanf(d, "%x,%x,%x", &dg_cnt_sync, &dg_cnt_phase, &dg_get);
-         }
-         if (dg_cnt_sync) {
-            int cs = arm_exec_call(dg_cnt_sync, 0, 0, 0, 0);
-            int cp = dg_cnt_phase ? arm_exec_call(dg_cnt_phase, 0, 0, 0, 0) : -1;
-            static int last_cs = -1, last_cp = -1;
-            if (cs != last_cs || cp != last_cp) {
-               fprintf(stderr, "[diag] frame=%d touchCount sync=%d phase=%d\n",
-                       frame_count, cs, cp);
-               last_cs = cs; last_cp = cp;
-            }
-            if (cs > 0 && dg_get) {
-               const uint32_t out = 0x41013800; /* STR_SCRATCH 後半 */
-               int ok2 = arm_exec_call(dg_get, 0, out, 0, 0);
-               fprintf(stderr, "[diag]   GetTouch(0)=%d id=%d x=%f y=%f "
-                       "phase=%u f34=%u f38=%u f3c=%u tap=%u\n", ok2,
-                       (int)arm_exec_read32(out),
-                       (double)*(float *)&(uint32_t){arm_exec_read32(out + 4)},
-                       (double)*(float *)&(uint32_t){arm_exec_read32(out + 8)},
-                       arm_exec_read32(out + 0x24), arm_exec_read32(out + 0x34),
-                       arm_exec_read32(out + 0x38), arm_exec_read32(out + 0x3c),
-                       arm_exec_read32(out + 0x20));
-            }
-         }
-      }
-      /* UnityMain などのゲストスレッドにも実行時間を与える */
-      arm_exec_run_pending_threads();
-      pump_java_frame();
-      /* Unity はeglSwapBuffersをJava側に任せる場合があるのでここで呼ぶ */
-      arm_exec_egl_swap();
-      ++frame_count;
-      if (ok != last_ok || (frame_count <= 5) || (frame_count % 100 == 0)) {
-         fprintf(stderr, "[loader] nativeRender -> %d (frame %d)\n", ok, frame_count);
-         last_ok = ok;
-      }
-      if (getenv("LUNARIA_TRACE_HEAP"))
-         fprintf(stderr, "[loader] heap used = %u MB (frame %d)\n",
-                 arm_exec_heap_used() >> 20, frame_count);
-      if (getenv("LUNARIA_TRACE_MONO") &&
-          (frame_count == 1 || frame_count == 10 || frame_count == 100))
-         dump_mono_defaults("render loop");
-      fail_streak = ok ? 0 : fail_streak + 1;
-      /* 失敗が続いたらフレームペーシングして CPU/スワップ暴走を防ぐ */
-      if (fail_streak > 3)
-         usleep(16000);
-      if (arm_exec_glfw_should_close()) break;
-   }
-
-   /* 終了処理: nativeDone() は UnityPlayer.destroy() 相当 */
-   if (va_done)
-      arm_exec_call(va_done, env, ctx, 0, 0);
-
-   return EXIT_SUCCESS;
+  return EXIT_SUCCESS;
 }
 
 __attribute__((optimize(0))) static void
 raw_start(void *entry, int argc, const char *argv[])
 {
-   // XXX: make this part of the linker when it's rewritten
+  // XXX: make this part of the linker when it's rewritten
 #if ANDROID_X86_LINKER && defined(__i386__)
-   __asm__("mov 2*4(%ebp),%eax"); /* entry */
-   __asm__("mov 3*4(%ebp),%ecx"); /* argc */
-   __asm__("mov 4*4(%ebp),%edx"); /* argv */
-   __asm__("mov %edx,%esp"); /* trim stack. */
-   __asm__("push %edx"); /* push argv */
-   __asm__("push %ecx"); /* push argc */
-   __asm__("sub %edx,%edx"); /* no rtld_fini function */
-   __asm__("jmp *%eax"); /* goto entry */
+  __asm__("mov 2*4(%ebp),%eax"); /* entry */
+  __asm__("mov 3*4(%ebp),%ecx"); /* argc */
+  __asm__("mov 4*4(%ebp),%edx"); /* argv */
+  __asm__("mov %edx,%esp"); /* trim stack. */
+  __asm__("push %edx"); /* push argv */
+  __asm__("push %ecx"); /* push argc */
+  __asm__("sub %edx,%edx"); /* no rtld_fini function */
+  __asm__("jmp *%eax"); /* goto entry */
 #else
-   warnx("raw_start not implemented for this asm platform, can't execute binaries.");
+  warnx("raw_start not implemented for this asm platform, can't execute binaries.");
 #endif
 }
 
@@ -2363,12 +2415,12 @@ int luna_apk_prepare(int *argc, const char ***argv);
 static void
 host_abort_report(int sig)
 {
-   void *frames[48];
-   int n = luna_os_backtrace(frames, 48);
-   fprintf(stderr, "\n[host-abort] signal %d on a host thread; stack:\n", sig);
-   luna_os_backtrace_print(frames, n);
-   signal(sig, SIG_DFL);
-   raise(sig);
+  void *frames[48];
+  int n = luna_os_backtrace(frames, 48);
+  fprintf(stderr, "\n[host-abort] signal %d on a host thread; stack:\n", sig);
+  luna_os_backtrace_print(frames, n);
+  signal(sig, SIG_DFL);
+  raise(sig);
 }
 #endif
 
@@ -2380,422 +2432,426 @@ int
 main(int argc, const char *argv[])
 #endif
 {
-   /* Keep loader milestones in chronological order when stdout and stderr are
-    * redirected to one startup log.  Fully buffered stdout otherwise leaves
-    * "loading module" and dependency messages at the end of the file. */
-   setvbuf(stdout, NULL, _IOLBF, 0);
+  /* Keep loader milestones in chronological order when stdout and stderr are
+   * redirected to one startup log.  Fully buffered stdout otherwise leaves
+   * "loading module" and dependency messages at the end of the file. */
+  setvbuf(stdout, NULL, _IOLBF, 0);
 #ifndef _WIN32
-   signal(SIGABRT, host_abort_report);
-   /* Register before selecting a launch path, including DEX/NativeActivity. */
-   struct sigaction dump_action;
-   memset(&dump_action,0,sizeof dump_action);
-   dump_action.sa_handler=thread_dump_signal;
-   dump_action.sa_flags=SA_RESTART;
-   sigemptyset(&dump_action.sa_mask);
-   if(sigaction(SIGUSR1,&dump_action,NULL))perror("SIGUSR1 diagnostic handler");
+  signal(SIGABRT, host_abort_report);
+  /* Register before selecting a launch path, including DEX/NativeActivity. */
+  struct sigaction dump_action;
+  memset(&dump_action,0,sizeof dump_action);
+  dump_action.sa_handler=thread_dump_signal;
+  dump_action.sa_flags=SA_RESTART;
+  sigemptyset(&dump_action.sa_mask);
+  if(sigaction(SIGUSR1,&dump_action,NULL))perror("SIGUSR1 diagnostic handler");
 #endif
 
-   /* Descriptors 0, 1 and 2 are always open in an Android process: zygote
-    * hands every app /dev/null on stdin and the logger on stdout/stderr, and
-    * nothing the app allocates afterwards can land there.  The guest's file
-    * descriptors *are* this process's file descriptors, so a closed stdin here
-    * is a free descriptor there, and the first pipe() the guest makes comes
-    * back as fd 0.
-    *
-    * That is not a theoretical tidiness argument.  android_native_app_glue
-    * keeps its command pipe in android_app, and the loader finds that pipe by
-    * scanning the struct for a pair of descriptors that are both FIFOs; a
-    * guest whose msgread is fd 0 was skipped, so APP_CMD_INIT_WINDOW never
-    * reached android_main, the engine never learned it had a window, and the
-    * title ran its pump loop for ever without presenting a frame.  Anything
-    * the guest writes to its own stderr would also have gone into that pipe.
-    *
-    * So open /dev/null over whatever is missing before any of it exists. */
-   for (int fd = 0; fd <= 2; ++fd) {
-      if (luna_fd_get_cloexec(fd) != -1 || errno != EBADF)
-         continue;
+  /* Descriptors 0, 1 and 2 are always open in an Android process: zygote
+   * hands every app /dev/null on stdin and the logger on stdout/stderr, and
+   * nothing the app allocates afterwards can land there.  The guest's file
+   * descriptors *are* this process's file descriptors, so a closed stdin here
+   * is a free descriptor there, and the first pipe() the guest makes comes
+   * back as fd 0.
+   *
+   * That is not a theoretical tidiness argument.  android_native_app_glue
+   * keeps its command pipe in android_app, and the loader finds that pipe by
+   * scanning the struct for a pair of descriptors that are both FIFOs; a
+   * guest whose msgread is fd 0 was skipped, so APP_CMD_INIT_WINDOW never
+   * reached android_main, the engine never learned it had a window, and the
+   * title ran its pump loop for ever without presenting a frame.  Anything
+   * the guest writes to its own stderr would also have gone into that pipe.
+   *
+   * So open /dev/null over whatever is missing before any of it exists. */
+  for (int fd = 0; fd <= 2; ++fd) {
+    if (luna_fd_get_cloexec(fd) != -1 || errno != EBADF)
+      continue;
 #ifdef _WIN32
-      const char *null_path = "NUL";
+    const char *null_path = "NUL";
 #else
-      const char *null_path = "/dev/null";
+    const char *null_path = "/dev/null";
 #endif
-      int nul = luna_file_open(null_path, fd == 0 ? O_RDONLY : O_WRONLY, 0);
-      if (nul < 0)
-         break;
-      if (nul != fd) {
-         int copied = luna_fd_dup_to(nul, fd, 0);
-         luna_fd_close(nul);
-         if (copied < 0) break;
+    int nul = luna_file_open(null_path, fd == 0 ? O_RDONLY : O_WRONLY, 0);
+    if (nul < 0)
+      break;
+    if (nul != fd) {
+      int copied = luna_fd_dup_to(nul, fd, 0);
+      luna_fd_close(nul);
+      if (copied < 0) break;
+    }
+    fprintf(stderr, "[loader] fd %d was closed — opened %s on it "
+                    "(a guest descriptor must never land on stdin/stdout/stderr)\n",
+            fd, null_path);
+  }
+
+  int launch = luna_apk_prepare(&argc, &argv);
+  if (launch) return launch < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+
+  printf("loading module: %s\n", argv[1]);
+
+  /* A bare module loaded from the command line — every test under test/ —
+   * runs its work on guest pthreads exactly as a game does, so it must be
+   * scheduled the same way.  Without this the tests measured the flat-slice
+   * path while every real title measured the adaptive one, which made them
+   * quietly unrepresentative: test/heap_test.c reported 20,001 instructions
+   * a slice, a number no game ever sees.  LUNARIA_THREADS_RUN_ENGINE=0 puts
+   * a test back on the flat path to compare the two. */
+  {
+    const char *e = getenv("LUNARIA_THREADS_RUN_ENGINE");
+    arm64_exec_threads_run_engine(!(e && e[0] == '0'));
+  }
+
+  /* An ordinary Android application has no native process entry point.
+   * ActivityThread starts its Application/Activity bytecode first, and the
+   * app loads each JNI library itself with System.loadLibrary().  Requiring
+   * an arbitrary .so here inverted that order and also rejected APKs whose
+   * alphabetically first helper library had no JNI_OnLoad. */
+  if (!strcmp(argv[1], "--apk-process-arm64") ||
+      !strcmp(argv[1], "--apk-process-arm32") ||
+      !strcmp(argv[1], "--service-process-arm64") ||
+      !strcmp(argv[1], "--service-process-arm32")) {
+    const int service_process=!strncmp(argv[1],"--service-process-",18);
+    const int is_a64 = !strcmp(argv[1], "--apk-process-arm64") || !strcmp(argv[1], "--service-process-arm64");
+    if(service_process && (argc!=3 || strcmp(argv[2],"3")))
+      errx(EXIT_FAILURE,"component process requires control descriptor 3");
+    const char *libdir = getenv("ANDROID_NATIVE_LIB_DIR");
+    if (!libdir || !*libdir)
+      errx(EXIT_FAILURE, "ANDROID_NATIVE_LIB_DIR is required for APK process startup");
+
+    static struct jvm jvm;
+    jvm_init(&jvm);
+    int init_ok = is_a64 ? arm64_exec_context_init(&jvm)
+                  : arm_exec_context_init(&jvm);
+    if (init_ok < 0)
+      errx(EXIT_FAILURE, "%s context init failed",
+           is_a64 ? "arm64" : "arm32");
+    const char *data_root=getenv("LUNARIA_DATA_ROOT");
+    const char *gms_profile=getenv("LUNARIA_GMS_PROFILE");
+    char state_root[4096],state_dir[4096];
+    if (data_root && luna_google_accounts_directory(data_root,
+        gms_profile && *gms_profile ? gms_profile : "default",
+        state_root,sizeof state_root)==0 &&
+        snprintf(state_dir,sizeof state_dir,"%s/processes",state_root)<(int)sizeof state_dir) {
+      int state_error=luna_process_state_open(state_dir);
+      if (state_error) fprintf(stderr,"[loader] process registry: %s\n",strerror(-state_error));
+    }
+    arm_exec_set_main_lib_dir(libdir);
+    if (!service_process && !arm_exec_host_egl_init())
+      fprintf(stderr, "[loader] early APK-process host EGL init failed\n");
+    /* Same platform images a device maps before zygote forks the app. */
+    if (is_a64)
+      a64_preload_platform_libs();
+
+    if(!service_process)component_pool_install(dvm_jni_vm(),is_a64);
+    int ret = service_process ? run_service_process(&jvm,is_a64,3) : run_dex_activity(&jvm, is_a64);
+    if(g_component_pool) {
+      dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);
+      luna_process_pool_close(g_component_pool);
+      g_component_pool=NULL;
+    }
+    (void)process_exit_status(&ret);
+    arm_exec_begin_shutdown();
+    dvm_jni_shutdown();
+    arm_exec_shutdown_engines();
+    jvm_release(&jvm);
+    printf("exiting\n");
+    return ret;
+  }
+
+  /* ARM64 ELF: use A64 dynarmic emulation path */
+  if (arm64_elf_is_arm64(argv[1])) {
+    printf("detected ARM64 ELF — using A64 dynarmic emulation\n");
+    luna_os_setenv("GC_DONT_GC", "1", 0);
+    luna_os_setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0);
+    luna_os_setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0);
+    static struct jvm jvm;
+    jvm_init(&jvm);
+
+    if (arm64_exec_context_init(&jvm) < 0)
+      errx(EXIT_FAILURE, "arm64_exec_context_init failed");
+
+    /* Pre-load companion libraries from the same directory */
+    {
+      char dir[4096], libpath[4096];
+      char dep_seen[128][LUNA_GUEST_NAME_MAX + 1] = {{0}};
+      size_t dep_seen_n = 0;
+      struct stat stbuf;
+      snprintf(dir, sizeof(dir), "%s", argv[1]);
+      char *slash = strrchr(dir, '/');
+      if (slash) *(slash + 1) = '\0';
+      else dir[0] = '\0';
+
+      /* Map Android libc's code image only as a pure-code provider.  A
+       * process libc is not an ordinary dlopen dependency: bionic's linker
+       * bootstraps its main-thread TLS, auxv, allocator and libc globals as
+       * one operation before running application constructors.  Running
+       * libc.so's constructors here without that bootstrap produced a
+       * half-initialised libc (Cross Worlds reached a NULL JavaVM call in
+       * UE's fourth constructor).  arm_exec therefore exposes only the
+       * audited stateless routines from this image until that process
+       * bootstrap exists.  Shared with the APK-process entry. */
+      a64_preload_platform_libs();
+
+      /* Relocate dependencies before their consumer, as the Android
+       * dynamic linker does.  Loading libc++ directly used to bind its
+       * pthread imports to emulator SVC thunks because the platform libc
+       * had not entered the ELF global scope yet.  Later DSOs then bound
+       * the same names to bionic, producing two incompatible pthread
+       * implementations in one process. */
+      snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
+      if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+        a64_preload_needed(libpath, dir, dep_seen, &dep_seen_n);
+        printf("preloading arm64 libc++_shared after dependencies: %s\n",
+               libpath);
+        arm64_exec_load_library(libpath, 0);
       }
-      fprintf(stderr, "[loader] fd %d was closed — opened %s on it "
-              "(a guest descriptor must never land on stdin/stdout/stderr)\n",
-              fd, null_path);
-   }
-
-   int launch = luna_apk_prepare(&argc, &argv);
-   if (launch) return launch < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
-
-   printf("loading module: %s\n", argv[1]);
-
-   /* A bare module loaded from the command line — every test under test/ —
-    * runs its work on guest pthreads exactly as a game does, so it must be
-    * scheduled the same way.  Without this the tests measured the flat-slice
-    * path while every real title measured the adaptive one, which made them
-    * quietly unrepresentative: test/heap_test.c reported 20,001 instructions
-    * a slice, a number no game ever sees.  LUNARIA_THREADS_RUN_ENGINE=0 puts
-    * a test back on the flat path to compare the two. */
-   {
-      const char *e = getenv("LUNARIA_THREADS_RUN_ENGINE");
-      arm64_exec_threads_run_engine(!(e && e[0] == '0'));
-   }
-
-   /* An ordinary Android application has no native process entry point.
-    * ActivityThread starts its Application/Activity bytecode first, and the
-    * app loads each JNI library itself with System.loadLibrary().  Requiring
-    * an arbitrary .so here inverted that order and also rejected APKs whose
-    * alphabetically first helper library had no JNI_OnLoad. */
-   if (!strcmp(argv[1], "--apk-process-arm64") ||
-       !strcmp(argv[1], "--apk-process-arm32") ||
-       !strcmp(argv[1], "--service-process-arm64") ||
-       !strcmp(argv[1], "--service-process-arm32")) {
-      const int service_process=!strncmp(argv[1],"--service-process-",18);
-      const int is_a64 = !strcmp(argv[1], "--apk-process-arm64") || !strcmp(argv[1], "--service-process-arm64");
-      if(service_process && (argc!=3 || strcmp(argv[2],"3")))
-         errx(EXIT_FAILURE,"component process requires control descriptor 3");
-      const char *libdir = getenv("ANDROID_NATIVE_LIB_DIR");
-      if (!libdir || !*libdir)
-         errx(EXIT_FAILURE, "ANDROID_NATIVE_LIB_DIR is required for APK process startup");
-
-      static struct jvm jvm;
-      jvm_init(&jvm);
-      int init_ok = is_a64 ? arm64_exec_context_init(&jvm)
-                           : arm_exec_context_init(&jvm);
-      if (init_ok < 0)
-         errx(EXIT_FAILURE, "%s context init failed",
-              is_a64 ? "arm64" : "arm32");
-      const char *data_root=getenv("LUNARIA_DATA_ROOT");
-      const char *gms_profile=getenv("LUNARIA_GMS_PROFILE");
-      char state_root[4096],state_dir[4096];
-      if (data_root && luna_google_accounts_directory(data_root,
-            gms_profile && *gms_profile ? gms_profile : "default",
-            state_root,sizeof state_root)==0 &&
-          snprintf(state_dir,sizeof state_dir,"%s/processes",state_root)<(int)sizeof state_dir) {
-         int state_error=luna_process_state_open(state_dir);
-         if (state_error) fprintf(stderr,"[loader] process registry: %s\n",strerror(-state_error));
+      /* Unity IL2CPP + Frame Pacing (must precede libunity PLT bind) */
+      static const char *unity_deps[] = {
+        "libil2cpp.so", "libswappywrapper.so", NULL
+      };
+      for (int k = 0; unity_deps[k]; k++) {
+        snprintf(libpath, sizeof(libpath), "%s%s", dir, unity_deps[k]);
+        if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+          printf("preloading arm64 dep: %s\n", libpath);
+          arm64_exec_load_library(libpath, 0);
+        }
       }
-      arm_exec_set_main_lib_dir(libdir);
-      if (!service_process && !arm_exec_host_egl_init())
-         fprintf(stderr, "[loader] early APK-process host EGL init failed\n");
-      /* Same platform images a device maps before zygote forks the app. */
-      if (is_a64)
-         a64_preload_platform_libs();
-
-      if(!service_process)component_pool_install(dvm_jni_vm(),is_a64);
-      int ret = service_process ? run_service_process(&jvm,is_a64,3) : run_dex_activity(&jvm, is_a64);
-      if(g_component_pool){
-         dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);
-         luna_process_pool_close(g_component_pool);g_component_pool=NULL;
+      /* libpsoservice.so and other UE companion libs */
+      static const char *ue_deps[] = {
+        "libpsoservice.so", "libhwcpipe.so", NULL
+      };
+      for (int k = 0; ue_deps[k]; k++) {
+        snprintf(libpath, sizeof(libpath), "%s%s", dir, ue_deps[k]);
+        if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+          printf("preloading arm64 dep: %s\n", libpath);
+          arm64_exec_load_library(libpath, 0);
+        }
       }
+
+      /* Finally follow the main ELF's actual dependency graph.  This
+       * catches APK-private libraries without title-specific name lists. */
+      a64_preload_needed(argv[1], dir, dep_seen, &dep_seen_n);
+    }
+
+    if (!arm64_exec_host_egl_init())
+      fprintf(stderr, "[loader] early arm64 host EGL init failed\n");
+
+    int jni_ver = arm64_exec_jni_onload(argv[1], &jvm);
+    int ret=0;
+    if (!process_exit_status(&ret)) {
+      if (jni_ver < 0) warnx("arm64_exec_jni_onload failed");
+      ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm64(&jvm);
       (void)process_exit_status(&ret);
-      arm_exec_begin_shutdown();
-      dvm_jni_shutdown();
-      arm_exec_shutdown_engines();
-      jvm_release(&jvm);
-      printf("exiting\n");
-      return ret;
-   }
+    }
+    arm_exec_begin_shutdown();
+    dvm_jni_shutdown();
+    arm_exec_shutdown_engines();
+    jvm_release(&jvm);
+    printf("exiting\n");
+    return ret;
+  }
 
-   /* ARM64 ELF: use A64 dynarmic emulation path */
-   if (arm64_elf_is_arm64(argv[1])) {
-      printf("detected ARM64 ELF — using A64 dynarmic emulation\n");
+  /* ARM 32-bit ELF: use dynarmic emulation path */
+  if (arm_elf_is_arm32(argv[1])) {
+    printf("detected ARM32 ELF — using dynarmic emulation\n");
+    /* Boehm GC の stop-the-world はシグナルでスレッドを止めるが、協調
+     * スレッドモデルではシグナル配送がなく suspend ack を永遠に待って
+     * ハングする。bdwgc が GC_init で参照する GC_DONT_GC で抑止する
+     * (環境変数で明示指定されていれば尊重する)。
+     * LUNARIA_GC_ENABLE=1 のときは回収を有効化する（リーク抑止の実験/本対応）。
+     * 注意: bdwgc は GC_DONT_GC の「存在」で判定するため、有効化時は
+     * setenv せず unsetenv しておく。 */
+    if (getenv("LUNARIA_GC_ENABLE"))
+      luna_os_unsetenv("GC_DONT_GC");
+    else
       luna_os_setenv("GC_DONT_GC", "1", 0);
-      luna_os_setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0);
-      luna_os_setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0);
-      static struct jvm jvm;
-      jvm_init(&jvm);
+    /* Boehm GC computes max_heap_size from the 32-bit address space (~4 GB),
+     * producing requests of ~3.7 GB which our mmap bump allocator must reject.
+     * With zero heap the GC calls GC_scratch_alloc(0) -> ABORT("Bad GET_MEM arg").
+     * Cap the heap to 256 MB so the GC gets usable memory without flooding. */
+    luna_os_setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0); /* 256 MB */
+    luna_os_setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0); /* 64 MB */
+    static struct jvm jvm;
+    jvm_init(&jvm);
 
-      if (arm64_exec_context_init(&jvm) < 0)
-         errx(EXIT_FAILURE, "arm64_exec_context_init failed");
+    /* ARM context を先に初期化して依存ライブラリをプリロードする。
+     * libmono.so のエクスポートシンボルを libunity.so のパッチより先に収集する。 */
+    if (arm_exec_context_init(&jvm) < 0)
+      errx(EXIT_FAILURE, "arm_exec_context_init failed");
 
-      /* Pre-load companion libraries from the same directory */
-      {
-         char dir[4096], libpath[4096];
-         char dep_seen[128][LUNA_GUEST_NAME_MAX + 1] = {{0}};
-         size_t dep_seen_n = 0;
-         struct stat stbuf;
-         snprintf(dir, sizeof(dir), "%s", argv[1]);
-         char *slash = strrchr(dir, '/');
-         if (slash) *(slash + 1) = '\0'; else dir[0] = '\0';
+    /* 依存ライブラリを引数より同一ディレクトリから探してロードする */
+    {
+      char dir[4096], libpath[4096];
+      struct stat stbuf;
+      snprintf(dir, sizeof(dir), "%s", argv[1]);
+      /* dirname相当 (末尾スラッシュまで) */
+      char *slash = strrchr(dir, '/');
+      if (slash) *(slash + 1) = '\0';
+      else dir[0] = '\0';
 
-         /* Map Android libc's code image only as a pure-code provider.  A
-          * process libc is not an ordinary dlopen dependency: bionic's linker
-          * bootstraps its main-thread TLS, auxv, allocator and libc globals as
-          * one operation before running application constructors.  Running
-          * libc.so's constructors here without that bootstrap produced a
-          * half-initialised libc (Cross Worlds reached a NULL JavaVM call in
-          * UE's fourth constructor).  arm_exec therefore exposes only the
-          * audited stateless routines from this image until that process
-          * bootstrap exists.  Shared with the APK-process entry. */
-         a64_preload_platform_libs();
+      /* libmono.so または libmonobdwgc-2.0.so を探してロード */
+      static const char *mono_candidates[] = {
+        "libmono.so", "libmonobdwgc-2.0.so", NULL
+      };
+      for (int k = 0; mono_candidates[k]; k++) {
+        snprintf(libpath, sizeof(libpath), "%s%s", dir, mono_candidates[k]);
+        if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
+          printf("preloading mono: %s at base 0x20000000\n", libpath);
+          arm_exec_load_library(libpath, 0x20000000u);
+          break;
+        }
+      }
+      /* libmain.so はロードしない: 中身は Java の NativeLoader 経由で
+       * libunity.so を dlopen するだけのスタブで、エミュレーション環境では
+       * NativeLoader 待ちでハングする */
 
-         /* Relocate dependencies before their consumer, as the Android
-          * dynamic linker does.  Loading libc++ directly used to bind its
-          * pthread imports to emulator SVC thunks because the platform libc
-          * had not entered the ELF global scope yet.  Later DSOs then bound
-          * the same names to bionic, producing two incompatible pthread
-          * implementations in one process. */
-         snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
-         if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-            a64_preload_needed(libpath, dir, dep_seen, &dep_seen_n);
-            printf("preloading arm64 libc++_shared after dependencies: %s\n",
-                   libpath);
-            arm64_exec_load_library(libpath, 0);
-         }
-         /* Unity IL2CPP + Frame Pacing (must precede libunity PLT bind) */
-         static const char *unity_deps[] = {
-            "libil2cpp.so", "libswappywrapper.so", NULL
-         };
-         for (int k = 0; unity_deps[k]; k++) {
-            snprintf(libpath, sizeof(libpath), "%s%s", dir, unity_deps[k]);
-            if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-               printf("preloading arm64 dep: %s\n", libpath);
-               arm64_exec_load_library(libpath, 0);
-            }
-         }
-         /* libpsoservice.so and other UE companion libs */
-         static const char *ue_deps[] = {
-            "libpsoservice.so", "libhwcpipe.so", NULL
-         };
-         for (int k = 0; ue_deps[k]; k++) {
-            snprintf(libpath, sizeof(libpath), "%s%s", dir, ue_deps[k]);
-            if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-               printf("preloading arm64 dep: %s\n", libpath);
-               arm64_exec_load_library(libpath, 0);
-            }
-         }
-
-         /* Finally follow the main ELF's actual dependency graph.  This
-          * catches APK-private libraries without title-specific name lists. */
-         a64_preload_needed(argv[1], dir, dep_seen, &dep_seen_n);
+      /* libc++_shared.so -> libil2cpp.so の順 (IL2CPP ゲーム対応) */
+      snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
+      if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
+        printf("preloading libc++_shared: %s\n", libpath);
+        arm_exec_load_library(libpath, 0);
       }
 
-      if (!arm64_exec_host_egl_init())
-         fprintf(stderr, "[loader] early arm64 host EGL init failed\n");
-
-      int jni_ver = arm64_exec_jni_onload(argv[1], &jvm);
-      int ret=0;
-      if (!process_exit_status(&ret)) {
-         if (jni_ver < 0) warnx("arm64_exec_jni_onload failed");
-         ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm64(&jvm);
-         (void)process_exit_status(&ret);
-      }
-      arm_exec_begin_shutdown();
-      dvm_jni_shutdown();
-      arm_exec_shutdown_engines();
-      jvm_release(&jvm);
-      printf("exiting\n");
-      return ret;
-   }
-
-   /* ARM 32-bit ELF: use dynarmic emulation path */
-   if (arm_elf_is_arm32(argv[1])) {
-      printf("detected ARM32 ELF — using dynarmic emulation\n");
-      /* Boehm GC の stop-the-world はシグナルでスレッドを止めるが、協調
-       * スレッドモデルではシグナル配送がなく suspend ack を永遠に待って
-       * ハングする。bdwgc が GC_init で参照する GC_DONT_GC で抑止する
-       * (環境変数で明示指定されていれば尊重する)。
-       * LUNARIA_GC_ENABLE=1 のときは回収を有効化する（リーク抑止の実験/本対応）。
-       * 注意: bdwgc は GC_DONT_GC の「存在」で判定するため、有効化時は
-       * setenv せず unsetenv しておく。 */
-      if (getenv("LUNARIA_GC_ENABLE"))
-         luna_os_unsetenv("GC_DONT_GC");
-      else
-         luna_os_setenv("GC_DONT_GC", "1", 0);
-      /* Boehm GC computes max_heap_size from the 32-bit address space (~4 GB),
-       * producing requests of ~3.7 GB which our mmap bump allocator must reject.
-       * With zero heap the GC calls GC_scratch_alloc(0) -> ABORT("Bad GET_MEM arg").
-       * Cap the heap to 256 MB so the GC gets usable memory without flooding. */
-      luna_os_setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0); /* 256 MB */
-      luna_os_setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0); /* 64 MB */
-      static struct jvm jvm;
-      jvm_init(&jvm);
-
-      /* ARM context を先に初期化して依存ライブラリをプリロードする。
-       * libmono.so のエクスポートシンボルを libunity.so のパッチより先に収集する。 */
-      if (arm_exec_context_init(&jvm) < 0)
-         errx(EXIT_FAILURE, "arm_exec_context_init failed");
-
-      /* 依存ライブラリを引数より同一ディレクトリから探してロードする */
-      {
-         char dir[4096], libpath[4096];
-         struct stat stbuf;
-         snprintf(dir, sizeof(dir), "%s", argv[1]);
-         /* dirname相当 (末尾スラッシュまで) */
-         char *slash = strrchr(dir, '/');
-         if (slash) *(slash + 1) = '\0';
-         else dir[0] = '\0';
-
-         /* libmono.so または libmonobdwgc-2.0.so を探してロード */
-         static const char *mono_candidates[] = {
-            "libmono.so", "libmonobdwgc-2.0.so", NULL
-         };
-         for (int k = 0; mono_candidates[k]; k++) {
-            snprintf(libpath, sizeof(libpath), "%s%s", dir, mono_candidates[k]);
-            if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
-               printf("preloading mono: %s at base 0x20000000\n", libpath);
-               arm_exec_load_library(libpath, 0x20000000u);
-               break;
-            }
-         }
-         /* libmain.so はロードしない: 中身は Java の NativeLoader 経由で
-          * libunity.so を dlopen するだけのスタブで、エミュレーション環境では
-          * NativeLoader 待ちでハングする */
-
-         /* libc++_shared.so -> libil2cpp.so の順 (IL2CPP ゲーム対応) */
-         snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
-         if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
-            printf("preloading libc++_shared: %s\n", libpath);
-            arm_exec_load_library(libpath, 0);
-         }
-
-         /* libil2cpp.so: libunity.so より先にシンボルテーブルへ登録 */
-         snprintf(libpath, sizeof(libpath), "%s%s", dir, "libil2cpp.so");
-         if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
-            printf("preloading il2cpp: %s\n", libpath);
-            arm_exec_load_library(libpath, 0);
-         }
-
-         /* libswappywrapper.so (Android Frame Pacing): libunity.so が SwappyGL_* を
-          * 呼ぶため、先にロードして PLT を解決しておかないと NULL 呼び出しになる */
-         snprintf(libpath, sizeof(libpath), "%s%s", dir, "libswappywrapper.so");
-         if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
-            printf("preloading swappywrapper: %s\n", libpath);
-            arm_exec_load_library(libpath, 0);
-         }
-
-         /* UE4 companion libs (DT_NEEDED of libUE4.so / optional plugins) */
-         static const char *ue4_deps[] = {
-            "libplaycore.so", "libhwcpipe.so", "libtry-alloc-lib.so",
-            "libOVRPlugin.so", "libvrapi.so", NULL
-         };
-         for (int k = 0; ue4_deps[k]; k++) {
-            snprintf(libpath, sizeof(libpath), "%s%s", dir, ue4_deps[k]);
-            if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
-               printf("preloading UE4 dep: %s\n", libpath);
-               arm_exec_load_library(libpath, 0);
-            }
-         }
+      /* libil2cpp.so: libunity.so より先にシンボルテーブルへ登録 */
+      snprintf(libpath, sizeof(libpath), "%s%s", dir, "libil2cpp.so");
+      if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
+        printf("preloading il2cpp: %s\n", libpath);
+        arm_exec_load_library(libpath, 0);
       }
 
-      /* ホスト側 EGL/GLES2 コンテキストを libunity.so の INIT_ARRAY / JNI_OnLoad よりも
-       * 前に作成する。Unity の INIT_ARRAY コンストラクタが eglGetCurrentContext() を
-       * チェックして EGL 準備済みなら eglGetProcAddress() で GL 関数ポインタを取得する
-       * ため、ここで初期化しておく必要がある。 */
-      if (!arm_exec_host_egl_init())
-         fprintf(stderr, "[loader] early host EGL init failed\n");
-
-      /* メインライブラリ (libunity.so) をロード & JNI_OnLoad 実行 */
-      int jni_ver = arm_exec_jni_onload(argv[1], &jvm);
-      int ret=0;
-      if (!process_exit_status(&ret)) {
-         if (jni_ver < 0) warnx("arm_exec_jni_onload failed");
-         ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm(&jvm);
-         (void)process_exit_status(&ret);
+      /* libswappywrapper.so (Android Frame Pacing): libunity.so が SwappyGL_* を
+       * 呼ぶため、先にロードして PLT を解決しておかないと NULL 呼び出しになる */
+      snprintf(libpath, sizeof(libpath), "%s%s", dir, "libswappywrapper.so");
+      if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
+        printf("preloading swappywrapper: %s\n", libpath);
+        arm_exec_load_library(libpath, 0);
       }
-      arm_exec_begin_shutdown();
-      dvm_jni_shutdown();
-      arm_exec_shutdown_engines();
-      jvm_release(&jvm);
-      printf("exiting\n");
-      return ret;
-   }
 
-   {
-      char abs[PATH_MAX], paths[4096];
-      if (!luna_file_realpath(argv[1], abs, sizeof abs))
-         snprintf(abs, sizeof abs, "%s", argv[1]);
-      snprintf(paths, sizeof(paths), "%s", dirname(abs));
-      dl_parse_library_path(paths, ":");
-   }
-
-   void *handle;
-   if (!(handle = bionic_dlopen(argv[1], RTLD_LOCAL | RTLD_NOW)))
-      errx(EXIT_FAILURE, "dlopen failed: %s", bionic_dlerror());
-
-   struct {
-      union {
-         void *ptr;
-         jint (*fun)(void*, void*);
-      } JNI_OnLoad;
-
-      union {
-         void *ptr;
-      } start;
-   } entry = {0};
-
-   {
-      union {
-         char bytes[sizeof(Elf32_Ehdr)];
-         Elf32_Ehdr hdr;
-      } elf;
-
-      FILE *f;
-      if (!(f = fopen(argv[1], "rb")))
-         err(EXIT_FAILURE, "fopen(%s)", argv[1]);
-
-      if (fread(elf.bytes, 1, sizeof(elf.bytes), f) != sizeof(elf.bytes)) {
-         fclose(f);
-         err(EXIT_FAILURE, "fread(%s)", argv[1]);
+      /* UE4 companion libs (DT_NEEDED of libUE4.so / optional plugins) */
+      static const char *ue4_deps[] = {
+        "libplaycore.so", "libhwcpipe.so", "libtry-alloc-lib.so",
+        "libOVRPlugin.so", "libvrapi.so", NULL
+      };
+      for (int k = 0; ue4_deps[k]; k++) {
+        snprintf(libpath, sizeof(libpath), "%s%s", dir, ue4_deps[k]);
+        if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
+          printf("preloading UE4 dep: %s\n", libpath);
+          arm_exec_load_library(libpath, 0);
+        }
       }
+    }
+
+    /* ホスト側 EGL/GLES2 コンテキストを libunity.so の INIT_ARRAY / JNI_OnLoad よりも
+     * 前に作成する。Unity の INIT_ARRAY コンストラクタが eglGetCurrentContext() を
+     * チェックして EGL 準備済みなら eglGetProcAddress() で GL 関数ポインタを取得する
+     * ため、ここで初期化しておく必要がある。 */
+    if (!arm_exec_host_egl_init())
+      fprintf(stderr, "[loader] early host EGL init failed\n");
+
+    /* メインライブラリ (libunity.so) をロード & JNI_OnLoad 実行 */
+    int jni_ver = arm_exec_jni_onload(argv[1], &jvm);
+    int ret=0;
+    if (!process_exit_status(&ret)) {
+      if (jni_ver < 0) warnx("arm_exec_jni_onload failed");
+      ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm(&jvm);
+      (void)process_exit_status(&ret);
+    }
+    arm_exec_begin_shutdown();
+    dvm_jni_shutdown();
+    arm_exec_shutdown_engines();
+    jvm_release(&jvm);
+    printf("exiting\n");
+    return ret;
+  }
+
+  {
+    char abs[PATH_MAX], paths[4096];
+    if (!luna_file_realpath(argv[1], abs, sizeof abs))
+      snprintf(abs, sizeof abs, "%s", argv[1]);
+    snprintf(paths, sizeof(paths), "%s", dirname(abs));
+    dl_parse_library_path(paths, ":");
+  }
+
+  void *handle;
+  if (!(handle = bionic_dlopen(argv[1], RTLD_LOCAL | RTLD_NOW)))
+    errx(EXIT_FAILURE, "dlopen failed: %s", bionic_dlerror());
+
+  struct {
+    union {
+      void *ptr;
+      jint (*fun)(void*, void*);
+    } JNI_OnLoad;
+
+    union {
+      void *ptr;
+    } start;
+  } entry = {0};
+
+  {
+    union {
+      char bytes[sizeof(Elf32_Ehdr)];
+      Elf32_Ehdr hdr;
+    } elf;
+
+    FILE *f;
+    if (!(f = fopen(argv[1], "rb")))
+      err(EXIT_FAILURE, "fopen(%s)", argv[1]);
+
+    if (fread(elf.bytes, 1, sizeof(elf.bytes), f) != sizeof(elf.bytes)) {
       fclose(f);
+      err(EXIT_FAILURE, "fread(%s)", argv[1]);
+    }
+    fclose(f);
 
-      struct soinfo *si = handle;
-      if (elf.hdr.e_entry)
-         entry.start.ptr = (void*)(intptr_t)(si->base + elf.hdr.e_entry);
-   }
+    struct soinfo *si = handle;
+    if (elf.hdr.e_entry)
+      entry.start.ptr = (void*)(intptr_t)(si->base + elf.hdr.e_entry);
+  }
 
-   int ret = EXIT_FAILURE;
-   if (entry.start.ptr) {
-      printf("jumping to %p\n", entry.start.ptr);
-      raw_start(entry.start.ptr, argc - 1, &argv[1]);
-   } else if ((entry.JNI_OnLoad.ptr = bionic_dlsym(handle, "JNI_OnLoad"))) {
-      static struct jvm jvm;
-      jvm_init(&jvm);
-      entry.JNI_OnLoad.fun(&jvm.vm, NULL);
-      ret = run_jni_game(&jvm);
-      arm_exec_begin_shutdown();
-      dvm_jni_shutdown();
-      arm_exec_shutdown_engines();
-      jvm_release(&jvm);
-   } else {
-      warnx("no entrypoint found in %s", argv[1]);
-   }
+  int ret = EXIT_FAILURE;
+  if (entry.start.ptr) {
+    printf("jumping to %p\n", entry.start.ptr);
+    raw_start(entry.start.ptr, argc - 1, &argv[1]);
+  } else if ((entry.JNI_OnLoad.ptr = bionic_dlsym(handle, "JNI_OnLoad"))) {
+    static struct jvm jvm;
+    jvm_init(&jvm);
+    entry.JNI_OnLoad.fun(&jvm.vm, NULL);
+    ret = run_jni_game(&jvm);
+    arm_exec_begin_shutdown();
+    dvm_jni_shutdown();
+    arm_exec_shutdown_engines();
+    jvm_release(&jvm);
+  } else {
+    warnx("no entrypoint found in %s", argv[1]);
+  }
 
-   dvm_jni_report();
-   /* The guest is done; stop the engines before anything static goes away. */
-   arm_exec_shutdown_engines();
-   printf("unloading module: %s\n", argv[1]);
-   bionic_dlclose(handle);
-   printf("exiting\n");
-   return ret;
+  dvm_jni_report();
+  /* The guest is done; stop the engines before anything static goes away. */
+  arm_exec_shutdown_engines();
+  printf("unloading module: %s\n", argv[1]);
+  bionic_dlclose(handle);
+  printf("exiting\n");
+  return ret;
 }
 
 #ifdef _WIN32
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
-   char **argv = calloc((size_t)argc + 1, sizeof *argv);
-   if (!argv) return EXIT_FAILURE;
-   for (int i = 0; i < argc; i++) {
-      int n = WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, NULL, 0, NULL, NULL);
-      if (!n || !(argv[i] = malloc((size_t)n)) ||
-          !WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, argv[i], n, NULL, NULL)) {
-         for (int j = 0; j <= i; j++) free(argv[j]);
-         free(argv); return EXIT_FAILURE;
-      }
-   }
-   int result = lunaria_main(argc, (const char **)argv);
-   for (int i = 0; i < argc; i++) free(argv[i]);
-   free(argv); return result;
+  char **argv = calloc((size_t)argc + 1, sizeof *argv);
+  if (!argv) return EXIT_FAILURE;
+  for (int i = 0; i < argc; i++) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, NULL, 0, NULL, NULL);
+    if (!n || !(argv[i] = malloc((size_t)n)) ||
+        !WideCharToMultiByte(CP_UTF8, 0, wide_argv[i], -1, argv[i], n, NULL, NULL)) {
+      for (int j = 0; j <= i; j++) free(argv[j]);
+      free(argv);
+      return EXIT_FAILURE;
+    }
+  }
+  int result = lunaria_main(argc, (const char **)argv);
+  for (int i = 0; i < argc; i++) free(argv[i]);
+  free(argv);
+  return result;
 }
 #endif

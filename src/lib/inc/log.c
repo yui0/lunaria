@@ -1,3 +1,10 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -7,38 +14,38 @@
 _Noreturn void
 __android_log_assert(const char *condition, const char *tag, const char *fmt, ...)
 {
-   char message[1024];
-   if (fmt) {
-      va_list args;
-      va_start(args, fmt);
-      vsnprintf(message, sizeof message, fmt, args);
-      va_end(args);
-   }
-   luna_log_assert_write(condition, tag, fmt ? message : NULL);
-   abort();
+  char message[1024];
+  if (fmt) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof message, fmt, args);
+    va_end(args);
+  }
+  luna_log_assert_write(condition, tag, fmt ? message : NULL);
+  abort();
 }
 
 int
 __android_log_vprint(int prio, const char *tag,  const char *fmt, va_list ap)
 {
-   int ret = printf("(%d) %s :: ", prio, tag);
-   ret += vprintf(fmt, ap);
-   ret += (puts("") != EOF);
-   return ret;
+  int ret = printf("(%d) %s :: ", prio, tag);
+  ret += vprintf(fmt, ap);
+  ret += (puts("") != EOF);
+  return ret;
 }
 
 int
 __android_log_print(int prio, const char *tag,  const char *fmt, ...)
 {
-   va_list ap;
-   va_start(ap, fmt);
-   int ret = __android_log_vprint(prio, tag, fmt, ap);
-   va_end(ap);
-   return ret;
+  va_list ap;
+  va_start(ap, fmt);
+  int ret = __android_log_vprint(prio, tag, fmt, ap);
+  va_end(ap);
+  return ret;
 }
 
 int
 __android_log_write(int prio, const char *tag, const char *text)
 {
-   return __android_log_print(prio, tag, "%s", text);
+  return __android_log_print(prio, tag, "%s", text);
 }

@@ -1,3 +1,11 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 /* GL stubs: libEGL (LUNARIA_STUB_EGL) and libGLESv3 (LUNARIA_STUB_GLESV3). */
 
 #if defined(LUNARIA_STUB_EGL)
@@ -11,20 +19,23 @@
 #include "lunaria_os.h"
 
 struct ANativeWindow {
-   char header[4];
-   GLFWwindow *glfw;
+  char header[4];
+  GLFWwindow *glfw;
 };
 
 EGLSurface
 eglCreateWindowSurface(EGLDisplay display, EGLConfig config, NativeWindowType native_window, EGLint const *attrib_list)
 {
-   static union { EGLSurface (*fun)(EGLDisplay, EGLConfig, NativeWindowType, EGLint const*); void *ptr; } orig;
-   if (!orig.ptr) orig.ptr = dlsym(RTLD_NEXT, "eglCreateWindowSurface");
-   struct ANativeWindow *window = (struct ANativeWindow*)native_window;
-   NativeWindowType host_window = native_window;
-   if (!memcmp(window->header, "andr", sizeof(window->header)))
-      host_window = (NativeWindowType)luna_os_native_window(window->glfw);
-   return orig.fun(display, config, host_window, attrib_list);
+  static union {
+    EGLSurface (*fun)(EGLDisplay, EGLConfig, NativeWindowType, EGLint const*);
+    void *ptr;
+  } orig;
+  if (!orig.ptr) orig.ptr = dlsym(RTLD_NEXT, "eglCreateWindowSurface");
+  struct ANativeWindow *window = (struct ANativeWindow*)native_window;
+  NativeWindowType host_window = native_window;
+  if (!memcmp(window->header, "andr", sizeof(window->header)))
+    host_window = (NativeWindowType)luna_os_native_window(window->glfw);
+  return orig.fun(display, config, host_window, attrib_list);
 }
 
 #elif defined(LUNARIA_STUB_GLESV3)
@@ -41,10 +52,12 @@ eglCreateWindowSurface(EGLDisplay display, EGLConfig config, NativeWindowType na
 /* Provide weak aliases for GLES3 entry points not in gl2.h.
  * These are backed by the host GLES driver loaded at startup. */
 static void *glesv3_pfn(const char *name) {
-    static void *h;
-    if (!h) { h = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
-               if (!h) h = dlopen("libGLESv2.so",   RTLD_NOW | RTLD_GLOBAL); }
-    return h ? dlsym(h, name) : NULL;
+  static void *h;
+  if (!h) {
+    h = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) h = dlopen("libGLESv2.so",   RTLD_NOW | RTLD_GLOBAL);
+  }
+  return h ? dlsym(h, name) : NULL;
 }
 
 #pragma GCC diagnostic push
@@ -55,14 +68,34 @@ static void *glesv3_pfn(const char *name) {
 
 /* GLES3 symbols that libUnreal.so needs but are absent from GLES2 headers */
 GLES3_FWD(void, glGenVertexArrays, int n, unsigned *a)
-    { static void(*f)(int,unsigned*); if(!f) f=glesv3_pfn("glGenVertexArrays"); if(f) f(n,a); }
+{
+  static void(*f)(int,unsigned*);
+  if(!f) f=glesv3_pfn("glGenVertexArrays");
+  if(f) f(n,a);
+}
 GLES3_FWD(void, glBindVertexArray, unsigned a)
-    { static void(*f)(unsigned); if(!f) f=glesv3_pfn("glBindVertexArray"); if(f) f(a); }
+{
+  static void(*f)(unsigned);
+  if(!f) f=glesv3_pfn("glBindVertexArray");
+  if(f) f(a);
+}
 GLES3_FWD(void, glDeleteVertexArrays, int n, const unsigned *a)
-    { static void(*f)(int,const unsigned*); if(!f) f=glesv3_pfn("glDeleteVertexArrays"); if(f) f(n,a); }
+{
+  static void(*f)(int,const unsigned*);
+  if(!f) f=glesv3_pfn("glDeleteVertexArrays");
+  if(f) f(n,a);
+}
 GLES3_FWD(void, glTexStorage2D, unsigned t, int l, unsigned f2, int w, int h)
-    { static void(*fn)(unsigned,int,unsigned,int,int); if(!fn) fn=glesv3_pfn("glTexStorage2D"); if(fn) fn(t,l,f2,w,h); }
+{
+  static void(*fn)(unsigned,int,unsigned,int,int);
+  if(!fn) fn=glesv3_pfn("glTexStorage2D");
+  if(fn) fn(t,l,f2,w,h);
+}
 GLES3_FWD(void, glBlitFramebuffer, int sx0,int sy0,int sx1,int sy1,int dx0,int dy0,int dx1,int dy1,unsigned mask,unsigned filter)
-    { static void(*fn)(int,int,int,int,int,int,int,int,unsigned,unsigned); if(!fn) fn=glesv3_pfn("glBlitFramebuffer"); if(fn) fn(sx0,sy0,sx1,sy1,dx0,dy0,dx1,dy1,mask,filter); }
+{
+  static void(*fn)(int,int,int,int,int,int,int,int,unsigned,unsigned);
+  if(!fn) fn=glesv3_pfn("glBlitFramebuffer");
+  if(fn) fn(sx0,sy0,sx1,sy1,dx0,dy0,dx1,dy1,mask,filter);
+}
 
 #endif

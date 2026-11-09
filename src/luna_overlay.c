@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * See luna_boot.h for what this layer is and why it exists.
  *
  * luna-ui owns the window in every other program in this tree; here it must
@@ -66,12 +68,12 @@ static bool g_menu_modal;
 static bool  g_doc_dirty;
 static char *g_changed_image_path;
 struct overlay_image_update {
- struct overlay_image_update *next;
- char key[64];
- int width,height;
- unsigned char *rgba;
- bool refresh;          /* upload x0..x1 / y0..y1 of the stored picture instead of rgba */
- int x0,y0,x1,y1;
+  struct overlay_image_update *next;
+  char key[64];
+  int width,height;
+  unsigned char *rgba;
+  bool refresh;          /* upload x0..x1 / y0..y1 of the stored picture instead of rgba */
+  int x0,y0,x1,y1;
 };
 static struct overlay_image_update *g_image_updates;
 static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
@@ -88,44 +90,45 @@ static int g_window_w, g_window_h;
 
 static void overlay_window_objects_forget(void)
 {
-   g_window_fbo = g_window_tex = g_window_program = 0;
-   g_window_w = g_window_h = 0;
+  g_window_fbo = g_window_tex = g_window_program = 0;
+  g_window_w = g_window_h = 0;
 }
 
 static bool overlay_window_buffer(int w, int h)
 {
-   if (!g_window_program) {
-      g_window_program = create_shader_program(
-         "layout(location=0) in vec2 pos; out vec2 uv;"
-         "void main(){uv=pos;gl_Position=vec4(pos*2.0-1.0,0.0,1.0);}",
-         "in vec2 uv; uniform sampler2D image; out vec4 color;"
-         "void main(){color=texture(image,uv);}", "Android window composite");
-      if (!g_window_program) return false;
-      g_window_sampler = glGetUniformLocation(g_window_program, "image");
-   }
-   if (!g_window_tex) glGenTextures(1, &g_window_tex);
-   if (!g_window_fbo) glGenFramebuffers(1, &g_window_fbo);
-   glActiveTexture(GL_TEXTURE0);
-   glBindTexture(GL_TEXTURE_2D, g_window_tex);
-   if (g_window_w != w || g_window_h != h) {
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
-                   GL_UNSIGNED_BYTE, NULL);
-      g_window_w = w; g_window_h = h;
-   }
-   glBindFramebuffer(GL_FRAMEBUFFER, g_window_fbo);
-   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+  if (!g_window_program) {
+    g_window_program = create_shader_program(
+                         "layout(location=0) in vec2 pos; out vec2 uv;"
+                         "void main(){uv=pos;gl_Position=vec4(pos*2.0-1.0,0.0,1.0);}",
+                         "in vec2 uv; uniform sampler2D image; out vec4 color;"
+                         "void main(){color=texture(image,uv);}", "Android window composite");
+    if (!g_window_program) return false;
+    g_window_sampler = glGetUniformLocation(g_window_program, "image");
+  }
+  if (!g_window_tex) glGenTextures(1, &g_window_tex);
+  if (!g_window_fbo) glGenFramebuffers(1, &g_window_fbo);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, g_window_tex);
+  if (g_window_w != w || g_window_h != h) {
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, NULL);
+    g_window_w = w;
+    g_window_h = h;
+  }
+  glBindFramebuffer(GL_FRAMEBUFFER, g_window_fbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                          GL_TEXTURE_2D, g_window_tex, 0);
-   return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+  return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
 }
 
 static bool overlay_document_wrapper(const LunaElement *e)
 {
-   return !strcmp(e->type, "body") || !strcmp(e->type, "html") ||
-          !strcmp(e->type, "head");
+  return !strcmp(e->type, "body") || !strcmp(e->type, "html") ||
+         !strcmp(e->type, "head");
 }
 
 /* Only a background-filled rectangle followed by a coincident CLEAR and no
@@ -133,73 +136,79 @@ static bool overlay_document_wrapper(const LunaElement *e)
  * input/lifecycle still use its View tree and its parsed overlay document. */
 static bool overlay_plain_box(const LunaElement *e)
 {
-   return !e->text[0] && !e->is_input && !e->has_shadow && !e->has_outline &&
-          !e->has_gradient && !e->has_bg_image && !e->has_border_image &&
-          !e->bg_layer_count && !e->has_backdrop_blur && !e->has_filter &&
-          !e->border_width && !e->has_border_top && !e->has_border_right &&
-          !e->has_border_bottom && !e->has_border_left && !e->mix_blend_mode &&
-          !e->border_radius && !e->transform_rotate && e->cur_scale == 1 &&
-          !e->overflow_x && !e->overflow_y && !e->anim_name[0];
+  return !e->text[0] && !e->is_input && !e->has_shadow && !e->has_outline &&
+         !e->has_gradient && !e->has_bg_image && !e->has_border_image &&
+         !e->bg_layer_count && !e->has_backdrop_blur && !e->has_filter &&
+         !e->border_width && !e->has_border_top && !e->has_border_right &&
+         !e->has_border_bottom && !e->has_border_left && !e->mix_blend_mode &&
+         !e->border_radius && !e->transform_rotate && e->cur_scale == 1 &&
+         !e->overflow_x && !e->overflow_y && !e->anim_name[0];
 }
 
 static bool overlay_window_erased(int root)
 {
-   LunaElement *window = luna_element_at(root), *hole = NULL;
-   if (!element_has_class(window, "root") || !overlay_plain_box(window)) return false;
-   for (int i = root + 1; i < luna_element_count(); ++i) {
-      if (!elem_is_self_or_descendant(i, root)) continue;
-      if (hole) return false;
-      hole = luna_element_at(i);
-   }
-   if (!hole || !hole->clear_before_paint || !luna_element_visible(hole->id_idx) ||
-       hole->visibility_hidden || !overlay_plain_box(hole) || hole->cur_a != 0 ||
-       hole->opacity != 1) return false;
-   float wx, wy, ww, wh, hx, hy, hw, hh;
-   if (!luna_element_bounds(root, &wx, &wy, &ww, &wh) ||
-       !luna_element_bounds(hole->id_idx, &hx, &hy, &hw, &hh)) return false;
-   return ww > 0 && wh > 0 && wx == hx && wy == hy && ww == hw && wh == hh;
+  LunaElement *window = luna_element_at(root), *hole = NULL;
+  if (!element_has_class(window, "root") || !overlay_plain_box(window)) return false;
+  for (int i = root + 1; i < luna_element_count(); ++i) {
+    if (!elem_is_self_or_descendant(i, root)) continue;
+    if (hole) return false;
+    hole = luna_element_at(i);
+  }
+  if (!hole || !hole->clear_before_paint || !luna_element_visible(hole->id_idx) ||
+      hole->visibility_hidden || !overlay_plain_box(hole) || hole->cur_a != 0 ||
+      hole->opacity != 1) return false;
+  float wx, wy, ww, wh, hx, hy, hw, hh;
+  if (!luna_element_bounds(root, &wx, &wy, &ww, &wh) ||
+      !luna_element_bounds(hole->id_idx, &hx, &hy, &hw, &hh)) return false;
+  return ww > 0 && wh > 0 && wx == hx && wy == hy && ww == hw && wh == hh;
 }
 
 static void overlay_render_windows(int w, int h)
 {
-   if (!g_surface_holes) { luna_render(w, h); return; }
-   build_render_order();
-   for (int ri = 0; ri < luna_element_count(); ++ri) {
-      int root = render_order[ri];
-      LunaElement *e = luna_element_at(root);
-      if (overlay_document_wrapper(e)) continue;
-      int parent = e->parent_idx;
-      if (parent >= 0 && !overlay_document_wrapper(luna_element_at(parent))) continue;
-      if (!luna_element_visible(root) || overlay_window_erased(root)) continue;
-      bool hole = false;
-      for (int i = 0; i < luna_element_count() && !hole; ++i)
-         hole = luna_element_at(i)->clear_before_paint && elem_is_self_or_descendant(i, root);
-      if (!hole) { luna_render_region(root, w, h, 0, 0, w, h); continue; }
-      if (!overlay_window_buffer(w, h)) {
-         fprintf(stderr, "[overlay] cannot allocate Android window buffer %dx%d\n", w, h);
-         glBindFramebuffer(GL_FRAMEBUFFER, 0);
-         continue;
-      }
-      glDisable(GL_SCISSOR_TEST);
-      glClearColor(0, 0, 0, 0);
-      glClear(GL_COLOR_BUFFER_BIT);
+  if (!g_surface_holes) {
+    luna_render(w, h);
+    return;
+  }
+  build_render_order();
+  for (int ri = 0; ri < luna_element_count(); ++ri) {
+    int root = render_order[ri];
+    LunaElement *e = luna_element_at(root);
+    if (overlay_document_wrapper(e)) continue;
+    int parent = e->parent_idx;
+    if (parent >= 0 && !overlay_document_wrapper(luna_element_at(parent))) continue;
+    if (!luna_element_visible(root) || overlay_window_erased(root)) continue;
+    bool hole = false;
+    for (int i = 0; i < luna_element_count() && !hole; ++i)
+      hole = luna_element_at(i)->clear_before_paint && elem_is_self_or_descendant(i, root);
+    if (!hole) {
       luna_render_region(root, w, h, 0, 0, w, h);
+      continue;
+    }
+    if (!overlay_window_buffer(w, h)) {
+      fprintf(stderr, "[overlay] cannot allocate Android window buffer %dx%d\n", w, h);
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
-      glViewport(0, 0, w, h);
-      glDisable(GL_SCISSOR_TEST);
-      glEnable(GL_BLEND);
-      /* The window texture contains premultiplied RGB, including the alpha
-       * accumulated by multiple translucent Views. Composite it exactly once. */
-      glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-      luna_use_program(g_window_program);
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, g_window_tex);
-      glUniform1i(g_window_sampler, 0);
-      luna_bind_vao(g_rect_vao);
-      glDrawArrays(GL_TRIANGLES, 0, 6);
-      luna_bind_vao(0);
-      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-   }
+      continue;
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+    luna_render_region(root, w, h, 0, 0, w, h);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, w, h);
+    glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    /* The window texture contains premultiplied RGB, including the alpha
+     * accumulated by multiple translucent Views. Composite it exactly once. */
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    luna_use_program(g_window_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, g_window_tex);
+    glUniform1i(g_window_sampler, 0);
+    luna_bind_vao(g_rect_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    luna_bind_vao(0);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  }
 }
 
 /* The document is published by whichever guest thread runs the widget layer,
@@ -211,183 +220,272 @@ static bool g_native_input_focus;
 
 /* Sizes of the pictures queued under a key, readable at once: the layout pass
  * wants a bitmap's intrinsic size long before the presenting thread uploads it. */
-struct overlay_image_size {char key[96];int width,height;struct overlay_image_size *next;};
+struct overlay_image_size {
+  char key[96];
+  int width,height;
+  struct overlay_image_size *next;
+};
 static struct overlay_image_size *g_image_sizes;
 
 static void overlay_note_image_size(const char *key,int width,int height)
 {
- struct overlay_image_size **link=&g_image_sizes;
- while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
- struct overlay_image_size *e=*link;
- if(!width || !height) {if(e) {*link=e->next;free(e);} return;}
- if(!e) {
-  e=calloc(1,sizeof *e);if(!e) return;
-  snprintf(e->key,sizeof e->key,"%s",key);e->next=g_image_sizes;g_image_sizes=e;
- }
- e->width=width;e->height=height;
+  struct overlay_image_size **link=&g_image_sizes;
+  while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
+  struct overlay_image_size *e=*link;
+  if(!width || !height) {
+    if(e) {
+      *link=e->next;
+      free(e);
+    }
+    return;
+  }
+  if(!e) {
+    e=calloc(1,sizeof *e);
+    if(!e) return;
+    snprintf(e->key,sizeof e->key,"%s",key);
+    e->next=g_image_sizes;
+    g_image_sizes=e;
+  }
+  e->width=width;
+  e->height=height;
 }
 
 bool luna_overlay_image_size(const char *key,int *width,int *height)
 {
- bool found=false;
- pthread_mutex_lock(&g_doc_lock);
- for(struct overlay_image_size *e=g_image_sizes;e;e=e->next)
-  if(!strcmp(e->key,key)) {*width=e->width;*height=e->height;found=true;break;}
- pthread_mutex_unlock(&g_doc_lock);
- return found;
+  bool found=false;
+  pthread_mutex_lock(&g_doc_lock);
+  for(struct overlay_image_size *e=g_image_sizes; e; e=e->next)
+    if(!strcmp(e->key,key)) {
+      *width=e->width;
+      *height=e->height;
+      found=true;
+      break;
+    }
+  pthread_mutex_unlock(&g_doc_lock);
+  return found;
 }
 
 static bool overlay_queue_image(const char *key,int width,int height,unsigned char *rgba)
 {
- if(!key || !*key || strlen(key)>=sizeof ((struct overlay_image_update *)0)->key) {free(rgba);return false;}
- pthread_mutex_lock(&g_doc_lock);
- overlay_note_image_size(key,width,height);
- struct overlay_image_update *entry=g_image_updates;
- while(entry && strcmp(entry->key,key)) entry=entry->next;
- if(!entry) {
-  entry=calloc(1,sizeof *entry);
-  if(!entry) {pthread_mutex_unlock(&g_doc_lock);free(rgba);return false;}
-  strcpy(entry->key,key);entry->next=g_image_updates;g_image_updates=entry;
- }
- free(entry->rgba);entry->rgba=rgba;entry->width=width;entry->height=height;entry->refresh=false;
- pthread_mutex_unlock(&g_doc_lock);luna_overlay_wake();return true;
+  if(!key || !*key || strlen(key)>=sizeof ((struct overlay_image_update *)0)->key) {
+    free(rgba);
+    return false;
+  }
+  pthread_mutex_lock(&g_doc_lock);
+  overlay_note_image_size(key,width,height);
+  struct overlay_image_update *entry=g_image_updates;
+  while(entry && strcmp(entry->key,key)) entry=entry->next;
+  if(!entry) {
+    entry=calloc(1,sizeof *entry);
+    if(!entry) {
+      pthread_mutex_unlock(&g_doc_lock);
+      free(rgba);
+      return false;
+    }
+    strcpy(entry->key,key);
+    entry->next=g_image_updates;
+    g_image_updates=entry;
+  }
+  free(entry->rgba);
+  entry->rgba=rgba;
+  entry->width=width;
+  entry->height=height;
+  entry->refresh=false;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
+  return true;
 }
 /* A picture that is already RGBA, rows from the top (a decoded video frame):
  * flipped into the order the renderer wants without touching a pixel. */
 bool luna_overlay_image_rgba(const char *key,int width,int height,const uint8_t *rgba_top_down)
 {
- if(width<=0 || height<=0 || !rgba_top_down || (size_t)width>SIZE_MAX/4/(size_t)height) return false;
- const size_t row=(size_t)width*4;
- unsigned char *rgba=malloc(row*(size_t)height);if(!rgba) return false;
- for(int y=0;y<height;++y) memcpy(rgba+row*(size_t)(height-1-y),rgba_top_down+row*(size_t)y,row);
- return overlay_queue_image(key,width,height,rgba);
+  if(width<=0 || height<=0 || !rgba_top_down || (size_t)width>SIZE_MAX/4/(size_t)height) return false;
+  const size_t row=(size_t)width*4;
+  unsigned char *rgba=malloc(row*(size_t)height);
+  if(!rgba) return false;
+  for(int y=0; y<height; ++y) memcpy(rgba+row*(size_t)(height-1-y),rgba_top_down+row*(size_t)y,row);
+  return overlay_queue_image(key,width,height,rgba);
 }
 bool luna_overlay_image_argb(const char *key,int width,int height,const uint32_t *pixels)
 {
- if(width<=0 || height<=0 || !pixels || (size_t)width>SIZE_MAX/4/(size_t)height) return false;
- unsigned char *rgba=malloc((size_t)width*height*4);if(!rgba) return false;
- for(int y=0;y<height;++y) for(int x=0;x<width;++x) {
-  uint32_t p=pixels[(size_t)y*width+x];
-  unsigned char *q=rgba+4*((size_t)(height-1-y)*width+x);
-  q[0]=(unsigned char)(p>>16);q[1]=(unsigned char)(p>>8);q[2]=(unsigned char)p;q[3]=(unsigned char)(p>>24);
- }
- return overlay_queue_image(key,width,height,rgba);
+  if(width<=0 || height<=0 || !pixels || (size_t)width>SIZE_MAX/4/(size_t)height) return false;
+  unsigned char *rgba=malloc((size_t)width*height*4);
+  if(!rgba) return false;
+  for(int y=0; y<height; ++y) for(int x=0; x<width; ++x) {
+      uint32_t p=pixels[(size_t)y*width+x];
+      unsigned char *q=rgba+4*((size_t)(height-1-y)*width+x);
+      q[0]=(unsigned char)(p>>16);
+      q[1]=(unsigned char)(p>>8);
+      q[2]=(unsigned char)p;
+      q[3]=(unsigned char)(p>>24);
+    }
+  return overlay_queue_image(key,width,height,rgba);
 }
 /* Source lifetime is serialized with acquisition, separately from the document
  * handoff. A pull may publish an image, so never hold g_doc_lock here. */
 struct overlay_image_source {
- char key[96];void *user;luna_overlay_image_pull_fn pull;void (*release)(void *);
- struct overlay_image_source *next;
+  char key[96];
+  void *user;
+  luna_overlay_image_pull_fn pull;
+  void (*release)(void *);
+  struct overlay_image_source *next;
 };
 static pthread_mutex_t g_source_lock=PTHREAD_MUTEX_INITIALIZER;
 static struct overlay_image_source *g_image_sources;
 static void overlay_source_remove_key(const char *key)
 {
- pthread_mutex_lock(&g_source_lock);
- struct overlay_image_source **link=&g_image_sources;
- while(*link) {
-  struct overlay_image_source *e=*link;
-  if(!key || !strcmp(e->key,key)) {
-   *link=e->next;if(e->release) e->release(e->user);free(e);
-  } else link=&e->next;
- }
- pthread_mutex_unlock(&g_source_lock);
+  pthread_mutex_lock(&g_source_lock);
+  struct overlay_image_source **link=&g_image_sources;
+  while(*link) {
+    struct overlay_image_source *e=*link;
+    if(!key || !strcmp(e->key,key)) {
+      *link=e->next;
+      if(e->release) e->release(e->user);
+      free(e);
+    } else link=&e->next;
+  }
+  pthread_mutex_unlock(&g_source_lock);
 }
 bool luna_overlay_image_source(const char *key,void *user,luna_overlay_image_pull_fn pull,
                                void (*release)(void *))
 {
- if(!key || !*key || strlen(key)>=96 || !pull) return false;
- struct overlay_image_source *e=calloc(1,sizeof *e);if(!e) return false;
- strcpy(e->key,key);e->user=user;e->pull=pull;e->release=release;
- pthread_mutex_lock(&g_source_lock);
- struct overlay_image_source **link=&g_image_sources;
- while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
- if(*link) {struct overlay_image_source *old=*link;*link=old->next;if(old->release) old->release(old->user);free(old);}
- e->next=g_image_sources;g_image_sources=e;
- pthread_mutex_unlock(&g_source_lock);luna_overlay_wake();return true;
+  if(!key || !*key || strlen(key)>=96 || !pull) return false;
+  struct overlay_image_source *e=calloc(1,sizeof *e);
+  if(!e) return false;
+  strcpy(e->key,key);
+  e->user=user;
+  e->pull=pull;
+  e->release=release;
+  pthread_mutex_lock(&g_source_lock);
+  struct overlay_image_source **link=&g_image_sources;
+  while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
+  if(*link) {
+    struct overlay_image_source *old=*link;
+    *link=old->next;
+    if(old->release) old->release(old->user);
+    free(old);
+  }
+  e->next=g_image_sources;
+  g_image_sources=e;
+  pthread_mutex_unlock(&g_source_lock);
+  luna_overlay_wake();
+  return true;
 }
 void luna_overlay_image_sources_remove(void *user)
 {
- pthread_mutex_lock(&g_source_lock);
- struct overlay_image_source **link=&g_image_sources;
- while(*link) {
-  struct overlay_image_source *e=*link;
-  if(e->user==user) {*link=e->next;if(e->release) e->release(e->user);free(e);}
-  else link=&e->next;
- }
- pthread_mutex_unlock(&g_source_lock);
+  pthread_mutex_lock(&g_source_lock);
+  struct overlay_image_source **link=&g_image_sources;
+  while(*link) {
+    struct overlay_image_source *e=*link;
+    if(e->user==user) {
+      *link=e->next;
+      if(e->release) e->release(e->user);
+      free(e);
+    }
+    else link=&e->next;
+  }
+  pthread_mutex_unlock(&g_source_lock);
 }
 bool luna_overlay_has_image_sources(void)
 {
- pthread_mutex_lock(&g_source_lock);bool have=g_image_sources!=NULL;
- pthread_mutex_unlock(&g_source_lock);return have;
+  pthread_mutex_lock(&g_source_lock);
+  bool have=g_image_sources!=NULL;
+  pthread_mutex_unlock(&g_source_lock);
+  return have;
 }
 void luna_overlay_poll_image_sources(int64_t present_ns)
 {
- pthread_mutex_lock(&g_source_lock);
- for(struct overlay_image_source *e=g_image_sources;e;e=e->next) e->pull(e->user,e->key,present_ns);
- pthread_mutex_unlock(&g_source_lock);
+  pthread_mutex_lock(&g_source_lock);
+  for(struct overlay_image_source *e=g_image_sources; e; e=e->next) e->pull(e->user,e->key,present_ns);
+  pthread_mutex_unlock(&g_source_lock);
 }
 void luna_overlay_image_forget(const char *key)
-{if(key && *key) {overlay_source_remove_key(key);(void)overlay_queue_image(key,0,0,NULL);}}
+{
+  if(key && *key) {
+    overlay_source_remove_key(key);
+    (void)overlay_queue_image(key,0,0,NULL);
+  }
+}
 
 /* luna_reset_document() frees every texture, host-uploaded ones included, and
  * a guest bitmap is only queued again when its pixels change.  Without a copy
  * here, the first republish after the upload (a dialog's second pass, the
  * input method, a toast) left a RecyclerView raster with no picture. */
-struct overlay_image_store {char key[96];int width,height;unsigned char *rgba;struct overlay_image_store *next;};
+struct overlay_image_store {
+  char key[96];
+  int width,height;
+  unsigned char *rgba;
+  struct overlay_image_store *next;
+};
 static struct overlay_image_store *g_image_store;
 
 static void overlay_store_image(const char *key,int width,int height,const unsigned char *rgba)
 {
- struct overlay_image_store **link=&g_image_store;
- while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
- struct overlay_image_store *entry=*link;
- if(!rgba) {
-  if(entry) {*link=entry->next;free(entry->rgba);free(entry);}
-  return;
- }
- const size_t bytes=(size_t)width*height*4;
- if(!entry) {
-  entry=calloc(1,sizeof *entry);if(!entry) return;
-  snprintf(entry->key,sizeof entry->key,"%s",key);entry->next=g_image_store;g_image_store=entry;
- }
- if(entry->rgba && entry->width==width && entry->height==height) {memcpy(entry->rgba,rgba,bytes);return;}
- unsigned char *copy=malloc(bytes);
- if(!copy) return;
- memcpy(copy,rgba,bytes);free(entry->rgba);entry->rgba=copy;entry->width=width;entry->height=height;
+  struct overlay_image_store **link=&g_image_store;
+  while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
+  struct overlay_image_store *entry=*link;
+  if(!rgba) {
+    if(entry) {
+      *link=entry->next;
+      free(entry->rgba);
+      free(entry);
+    }
+    return;
+  }
+  const size_t bytes=(size_t)width*height*4;
+  if(!entry) {
+    entry=calloc(1,sizeof *entry);
+    if(!entry) return;
+    snprintf(entry->key,sizeof entry->key,"%s",key);
+    entry->next=g_image_store;
+    g_image_store=entry;
+  }
+  if(entry->rgba && entry->width==width && entry->height==height) {
+    memcpy(entry->rgba,rgba,bytes);
+    return;
+  }
+  unsigned char *copy=malloc(bytes);
+  if(!copy) return;
+  memcpy(copy,rgba,bytes);
+  free(entry->rgba);
+  entry->rgba=copy;
+  entry->width=width;
+  entry->height=height;
 }
 
 static void overlay_upload_image_list(struct overlay_image_update *list)
 {
- /* Called with the GL context current and the document lock NOT held: the
-  * queue was taken (and the store updated) under the lock; the uploads, the
-  * long part, run unlocked. */
- while(list) {
-  struct overlay_image_update *entry=list;list=entry->next;
-  if(entry->refresh) {
-   pthread_mutex_lock(&g_doc_lock);
-   for(struct overlay_image_store *st=g_image_store;st;st=st->next)
-    if(!strcmp(st->key,entry->key) && st->rgba)
-     (void)luna_update_texture_rgba_rect(st->key,st->width,st->height,st->rgba,
-        entry->x0,entry->y0,entry->x1-entry->x0,entry->y1-entry->y0);
-   pthread_mutex_unlock(&g_doc_lock);
-   free(entry);continue;
+  /* Called with the GL context current and the document lock NOT held: the
+   * queue was taken (and the store updated) under the lock; the uploads, the
+   * long part, run unlocked. */
+  while(list) {
+    struct overlay_image_update *entry=list;
+    list=entry->next;
+    if(entry->refresh) {
+      pthread_mutex_lock(&g_doc_lock);
+      for(struct overlay_image_store *st=g_image_store; st; st=st->next)
+        if(!strcmp(st->key,entry->key) && st->rgba)
+          (void)luna_update_texture_rgba_rect(st->key,st->width,st->height,st->rgba,
+                                              entry->x0,entry->y0,entry->x1-entry->x0,entry->y1-entry->y0);
+      pthread_mutex_unlock(&g_doc_lock);
+      free(entry);
+      continue;
+    }
+    if(entry->rgba) (void)luna_update_texture_rgba(entry->key,entry->width,entry->height,entry->rgba);
+    else luna_invalidate_texture(entry->key);
+    free(entry->rgba);
+    free(entry);
   }
-  if(entry->rgba) (void)luna_update_texture_rgba(entry->key,entry->width,entry->height,entry->rgba);
-  else luna_invalidate_texture(entry->key);
-  free(entry->rgba);free(entry);
- }
 }
 
 /* After a document reset: put every stored picture back. */
 static void overlay_restore_images(void)
 {
- /* The document's own pictures stay resident across a republish (see
-  * luna_set_persistent_texture_prefix); only a picture that is not there is
-  * uploaded again.  The new elements pick the resident texture up by key. */
- for(struct overlay_image_store *e=g_image_store;e;e=e->next)
-  if(!luna_has_texture(e->key)) (void)luna_update_texture_rgba(e->key,e->width,e->height,e->rgba);
+  /* The document's own pictures stay resident across a republish (see
+   * luna_set_persistent_texture_prefix); only a picture that is not there is
+   * uploaded again.  The new elements pick the resident texture up by key. */
+  for(struct overlay_image_store *e=g_image_store; e; e=e->next)
+    if(!luna_has_texture(e->key)) (void)luna_update_texture_rgba(e->key,e->width,e->height,e->rgba);
 }
 
 /* The picture under `key` changed only inside x0..x1, y0..y1 (rows from the top,
@@ -398,54 +496,78 @@ static void overlay_restore_images(void)
 bool luna_overlay_image_argb_rect(const char *key,int width,int height,const uint32_t *pixels,
                                   int x0,int y0,int x1,int y1)
 {
- if(width<=0 || height<=0 || !pixels || !key || !*key) return false;
- if(x0<0) x0=0;if(y0<0) y0=0;if(x1>width) x1=width;if(y1>height) y1=height;
- if(x1<=x0 || y1<=y0) return true;
- pthread_mutex_lock(&g_doc_lock);
- struct overlay_image_store *st=g_image_store;
- while(st && strcmp(st->key,key)) st=st->next;
- struct overlay_image_update *pending=g_image_updates;
- while(pending && strcmp(pending->key,key)) pending=pending->next;
- if(!st || !st->rgba || st->width!=width || st->height!=height || (pending && !pending->refresh)) {
+  if(width<=0 || height<=0 || !pixels || !key || !*key) return false;
+  if(x0<0) x0=0;
+  if(y0<0) y0=0;
+  if(x1>width) x1=width;
+  if(y1>height) y1=height;
+  if(x1<=x0 || y1<=y0) return true;
+  pthread_mutex_lock(&g_doc_lock);
+  struct overlay_image_store *st=g_image_store;
+  while(st && strcmp(st->key,key)) st=st->next;
+  struct overlay_image_update *pending=g_image_updates;
+  while(pending && strcmp(pending->key,key)) pending=pending->next;
+  if(!st || !st->rgba || st->width!=width || st->height!=height || (pending && !pending->refresh)) {
+    pthread_mutex_unlock(&g_doc_lock);
+    return luna_overlay_image_argb(key,width,height,pixels);
+  }
+  for(int y=y0; y<y1; ++y) for(int x=x0; x<x1; ++x) {
+      uint32_t p=pixels[(size_t)y*width+x];
+      unsigned char *q=st->rgba+4*((size_t)(height-1-y)*width+x);
+      q[0]=(unsigned char)(p>>16);
+      q[1]=(unsigned char)(p>>8);
+      q[2]=(unsigned char)p;
+      q[3]=(unsigned char)(p>>24);
+    }
+  const int sy0=height-y1,sy1=height-y0;       /* the stored picture is upside down */
+  if(!pending) {
+    pending=calloc(1,sizeof *pending);
+    if(!pending) {
+      pthread_mutex_unlock(&g_doc_lock);
+      return luna_overlay_image_argb(key,width,height,pixels);
+    }
+    strcpy(pending->key,key);
+    pending->refresh=true;
+    pending->width=width;
+    pending->height=height;
+    pending->x0=x0;
+    pending->x1=x1;
+    pending->y0=sy0;
+    pending->y1=sy1;
+    pending->next=g_image_updates;
+    g_image_updates=pending;
+  } else {
+    if(x0<pending->x0) pending->x0=x0;
+    if(x1>pending->x1) pending->x1=x1;
+    if(sy0<pending->y0) pending->y0=sy0;
+    if(sy1>pending->y1) pending->y1=sy1;
+  }
   pthread_mutex_unlock(&g_doc_lock);
-  return luna_overlay_image_argb(key,width,height,pixels);
- }
- for(int y=y0;y<y1;++y) for(int x=x0;x<x1;++x) {
-  uint32_t p=pixels[(size_t)y*width+x];
-  unsigned char *q=st->rgba+4*((size_t)(height-1-y)*width+x);
-  q[0]=(unsigned char)(p>>16);q[1]=(unsigned char)(p>>8);q[2]=(unsigned char)p;q[3]=(unsigned char)(p>>24);
- }
- const int sy0=height-y1,sy1=height-y0;       /* the stored picture is upside down */
- if(!pending) {
-  pending=calloc(1,sizeof *pending);
-  if(!pending) {pthread_mutex_unlock(&g_doc_lock);return luna_overlay_image_argb(key,width,height,pixels);}
-  strcpy(pending->key,key);pending->refresh=true;pending->width=width;pending->height=height;
-  pending->x0=x0;pending->x1=x1;pending->y0=sy0;pending->y1=sy1;
-  pending->next=g_image_updates;g_image_updates=pending;
- } else {
-  if(x0<pending->x0) pending->x0=x0;if(x1>pending->x1) pending->x1=x1;
-  if(sy0<pending->y0) pending->y0=sy0;if(sy1>pending->y1) pending->y1=sy1;
- }
- pthread_mutex_unlock(&g_doc_lock);luna_overlay_wake();return true;
+  luna_overlay_wake();
+  return true;
 }
 void luna_overlay_image_changed(const char *path)
 {
-   if (!path || !*path) return;
-   const size_t length = strlen(path) + 1;
-   char *copy = malloc(length);
-   if (!copy) return;
-   memcpy(copy, path, length);
-   pthread_mutex_lock(&g_doc_lock);
-   free(g_changed_image_path);
-   g_changed_image_path = copy;
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
+  if (!path || !*path) return;
+  const size_t length = strlen(path) + 1;
+  char *copy = malloc(length);
+  if (!copy) return;
+  memcpy(copy, path, length);
+  pthread_mutex_lock(&g_doc_lock);
+  free(g_changed_image_path);
+  g_changed_image_path = copy;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
 }
 
 /* Pointer events arrive on the host's event thread (GLFW polls there) and
  * cannot touch luna-ui's hit-testing state from outside the presenting
  * thread, so they queue here and are replayed at the top of present(). */
-struct overlay_pointer_event { double x, y; int action; long long event_ms; };
+struct overlay_pointer_event {
+  double x, y;
+  int action;
+  long long event_ms;
+};
 static struct overlay_pointer_event g_ptr_queue[64];
 static int g_ptr_count;
 static pthread_mutex_t g_ptr_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -474,17 +596,23 @@ static void (*g_wake_fn)(void);
  * GL objects it would create there are not names in the compositor's
  * context, and drawing with them there drew one texture in place of another
  * over half the screen (Cross Worlds' notice dialog). */
-void luna_overlay_set_hosted(bool hosted) { atomic_store(&g_hosted, hosted); }
+void luna_overlay_set_hosted(bool hosted) {
+  atomic_store(&g_hosted, hosted);
+}
 
 /* The compositor's thread, from its first frame on: the only thread that may
  * run the overlay once it is hosted. */
 void luna_overlay_bind_host_thread(void)
 {
-   g_host_thread = pthread_self();
-   atomic_store(&g_host_thread_set, true);
+  g_host_thread = pthread_self();
+  atomic_store(&g_host_thread_set, true);
 }
-void luna_overlay_set_wake(void (*fn)(void)) { g_wake_fn = fn; }
-void luna_overlay_wake(void) { if (g_wake_fn) g_wake_fn(); }
+void luna_overlay_set_wake(void (*fn)(void)) {
+  g_wake_fn = fn;
+}
+void luna_overlay_wake(void) {
+  if (g_wake_fn) g_wake_fn();
+}
 
 /* luna-ui's input path asks the app runner to schedule a repaint.  With
  * LUNA_UI_NO_PLATFORM there is no runner, and the symbol is the embedder's to
@@ -503,24 +631,24 @@ void luna_app_request_redraw(void) { }
  * in the process and dlsym finds them. */
 static void *overlay_get_proc(const char *name)
 {
-   void *p = (void *)eglGetProcAddress(name);
-   if (!p) p = luna_os_library_symbol(NULL, name);
-   if (getenv("LUNARIA_UI_TRACE_GLPROC")) {
+  void *p = (void *)eglGetProcAddress(name);
+  if (!p) p = luna_os_library_symbol(NULL, name);
+  if (getenv("LUNARIA_UI_TRACE_GLPROC")) {
 #ifdef _WIN32
-      const char *gles_module = "libGLESv2.dll", *gl_module = "opengl32.dll";
+    const char *gles_module = "libGLESv2.dll", *gl_module = "opengl32.dll";
 #else
-      const char *gles_module = "libGLESv2.so.2", *gl_module = "libGL.so.1";
+    const char *gles_module = "libGLESv2.so.2", *gl_module = "libGL.so.1";
 #endif
-      void *es = luna_os_library_loaded_symbol(gles_module, name);
-      void *gl = luna_os_library_loaded_symbol(gl_module, name);
-      static int n;
-      if (n++ < 24)
-         fprintf(stderr, "[overlay] proc %-28s egl=%p default=%p "
-                 "gles=%p gl=%p%s\n", name, (void *)eglGetProcAddress(name),
-                 luna_os_library_symbol(NULL, name), es, gl,
-                 (es && p != es) ? "  <== NOT the GLES symbol" : "");
-   }
-   return p;
+    void *es = luna_os_library_loaded_symbol(gles_module, name);
+    void *gl = luna_os_library_loaded_symbol(gl_module, name);
+    static int n;
+    if (n++ < 24)
+      fprintf(stderr, "[overlay] proc %-28s egl=%p default=%p "
+                      "gles=%p gl=%p%s\n", name, (void *)eglGetProcAddress(name),
+              luna_os_library_symbol(NULL, name), es, gl,
+              (es && p != es) ? "  <== NOT the GLES symbol" : "");
+  }
+  return p;
 }
 
 /* Seconds since the overlay came up.  Zero-based rather than raw monotonic: a
@@ -535,66 +663,66 @@ static void *overlay_get_proc(const char *name)
  * LUNARIA_OVERLAY_PROF=1 reports them. */
 static uint64_t overlay_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 static bool overlay_prof_on(void)
 {
-   static int on = -1;
-   if (on < 0) on = getenv("LUNARIA_OVERLAY_PROF") != NULL;
-   return on != 0;
+  static int on = -1;
+  if (on < 0) on = getenv("LUNARIA_OVERLAY_PROF") != NULL;
+  return on != 0;
 }
 
 static struct {
-   uint64_t frames, bind_ns, parse_ns, render_ns, ime_ns, restore_ns, total_ns;
+  uint64_t frames, bind_ns, parse_ns, render_ns, ime_ns, restore_ns, total_ns;
 } g_prof;
 
 static void overlay_prof_report(void)
 {
-   if (!g_prof.frames || (g_prof.frames % 300) != 0) return;
-   const double f = (double)g_prof.frames;
-   fprintf(stderr, "[overlay-prof] %llu presents, %.0f us each: "
-           "bind=%.0f parse=%.0f render=%.0f ime=%.0f restore=%.0f\n",
-           (unsigned long long)g_prof.frames, (double)g_prof.total_ns / f / 1e3,
-           (double)g_prof.bind_ns / f / 1e3, (double)g_prof.parse_ns / f / 1e3,
-           (double)g_prof.render_ns / f / 1e3, (double)g_prof.ime_ns / f / 1e3,
-           (double)g_prof.restore_ns / f / 1e3);
+  if (!g_prof.frames || (g_prof.frames % 300) != 0) return;
+  const double f = (double)g_prof.frames;
+  fprintf(stderr, "[overlay-prof] %llu presents, %.0f us each: "
+                  "bind=%.0f parse=%.0f render=%.0f ime=%.0f restore=%.0f\n",
+          (unsigned long long)g_prof.frames, (double)g_prof.total_ns / f / 1e3,
+          (double)g_prof.bind_ns / f / 1e3, (double)g_prof.parse_ns / f / 1e3,
+          (double)g_prof.render_ns / f / 1e3, (double)g_prof.ime_ns / f / 1e3,
+          (double)g_prof.restore_ns / f / 1e3);
 }
 
 static double overlay_now(void)
 {
-   static double epoch;
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   double t = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
-   if (epoch == 0.0) epoch = t;
-   return t - epoch;
+  static double epoch;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  double t = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+  if (epoch == 0.0) epoch = t;
+  return t - epoch;
 }
 
 /* LUNARIA_BOOT_DUMP=/path — write a PPM after each boot-card frame (QA only). */
 static void overlay_maybe_dump_boot(int w, int h, bool status_only)
 {
-   static int frame_no;
-   const char *dir = getenv("LUNARIA_BOOT_DUMP");
-   if (!dir || !*dir || !status_only || w <= 0 || h <= 0) return;
-   unsigned char *px = malloc((size_t)w * (size_t)h * 4u);
-   if (!px) return;
-   glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-   char path[512];
-   snprintf(path, sizeof path, "%s/boot_%04d.ppm", dir, frame_no++);
-   FILE *f = fopen(path, "wb");
-   if (f) {
-      fprintf(f, "P6\n%d %d\n255\n", w, h);
-      for (int y = h - 1; y >= 0; --y)
-         for (int x = 0; x < w; ++x) {
-            unsigned char *p = px + ((size_t)y * (size_t)w + (size_t)x) * 4u;
-            fwrite(p, 1, 3, f);
-         }
-      fclose(f);
-   }
-   free(px);
+  static int frame_no;
+  const char *dir = getenv("LUNARIA_BOOT_DUMP");
+  if (!dir || !*dir || !status_only || w <= 0 || h <= 0) return;
+  unsigned char *px = malloc((size_t)w * (size_t)h * 4u);
+  if (!px) return;
+  glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  char path[512];
+  snprintf(path, sizeof path, "%s/boot_%04d.ppm", dir, frame_no++);
+  FILE *f = fopen(path, "wb");
+  if (f) {
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    for (int y = h - 1; y >= 0; --y)
+      for (int x = 0; x < w; ++x) {
+        unsigned char *p = px + ((size_t)y * (size_t)w + (size_t)x) * 4u;
+        fwrite(p, 1, 3, f);
+      }
+    fclose(f);
+  }
+  free(px);
 }
 
 /* The overlay used to share the guest's context and put its state back
@@ -611,14 +739,14 @@ static void overlay_maybe_dump_boot(int w, int h, bool status_only)
  * a mistake here can never surface later as a failure inside the guest. */
 static void overlay_report_gl_errors(const char *where)
 {
-   static int reported;
-   GLenum e;
-   while ((e = glGetError()) != GL_NO_ERROR) {
-      if (reported < 16) {
-         fprintf(stderr, "[overlay] GL error 0x%04x at %s\n", (unsigned)e, where);
-         ++reported;
-      }
-   }
+  static int reported;
+  GLenum e;
+  while ((e = glGetError()) != GL_NO_ERROR) {
+    if (reported < 16) {
+      fprintf(stderr, "[overlay] GL error 0x%04x at %s\n", (unsigned)e, where);
+      ++reported;
+    }
+  }
 }
 
 /* The overlay's own context — not shared with the guest.
@@ -634,16 +762,16 @@ static EGLContext g_ov_ctx = EGL_NO_CONTEXT;
  * and the only handle onto it is the config id the context remembers. */
 static bool overlay_config_by_id(EGLDisplay dpy, EGLint id, EGLConfig *out)
 {
-   const EGLint attrs[] = { EGL_CONFIG_ID, id, EGL_NONE };
-   EGLint n = 0;
-   return eglChooseConfig(dpy, attrs, out, 1, &n) && n == 1;
+  const EGLint attrs[] = { EGL_CONFIG_ID, id, EGL_NONE };
+  EGLint n = 0;
+  return eglChooseConfig(dpy, attrs, out, 1, &n) && n == 1;
 }
 
 static bool overlay_config_of(EGLDisplay dpy, EGLContext ctx, EGLConfig *out)
 {
-   EGLint id = 0;
-   if (!eglQueryContext(dpy, ctx, EGL_CONFIG_ID, &id)) return false;
-   return overlay_config_by_id(dpy, id, out);
+  EGLint id = 0;
+  if (!eglQueryContext(dpy, ctx, EGL_CONFIG_ID, &id)) return false;
+  return overlay_config_by_id(dpy, id, out);
 }
 
 /* The config of the surface this overlay will actually be made current on.
@@ -661,54 +789,54 @@ static bool overlay_config_of(EGLDisplay dpy, EGLContext ctx, EGLConfig *out)
 static bool overlay_config_of_surface(EGLDisplay dpy, EGLSurface surf,
                                       EGLConfig *out)
 {
-   EGLint id = 0;
-   if (surf == EGL_NO_SURFACE) return false;
-   if (!eglQuerySurface(dpy, surf, EGL_CONFIG_ID, &id)) return false;
-   return overlay_config_by_id(dpy, id, out);
+  EGLint id = 0;
+  if (surf == EGL_NO_SURFACE) return false;
+  if (!eglQuerySurface(dpy, surf, EGL_CONFIG_ID, &id)) return false;
+  return overlay_config_by_id(dpy, id, out);
 }
 
 static bool overlay_context_create(void)
 {
-   EGLDisplay dpy = eglGetCurrentDisplay();
-   EGLContext current = eglGetCurrentContext();
-   EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
-   if (dpy == EGL_NO_DISPLAY) return false;
-   EGLConfig cfg;
-   /* The surface first: that is what this context gets made current on, and
-    * a context built for a different config cannot be. */
-   if (overlay_config_of_surface(dpy, draw, &cfg)) {
-      /* got it */
-   } else if (current != EGL_NO_CONTEXT) {
-      if (!overlay_config_of(dpy, current, &cfg)) return false;
-   } else {
-      const EGLint cfg_attrs[] = {
-         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-         EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
-         EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-         EGL_NONE
-      };
-      EGLint n = 0;
-      if (!eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &n) || n < 1)
-         return false;
-   }
-   /* Match the guest's GLES version when we can.  Preferring ES2 left the
-    * overlay on a context that cannot run the ES3 entry points luna-ui and
-    * the present path use (separate draw/read framebuffer binds, etc.), and
-    * every rebind then logged GL_INVALID_OPERATION (0x0502) on render. */
-   EGLint version = 3;
-   if (current != EGL_NO_CONTEXT)
-      (void)eglQueryContext(dpy, current, EGL_CONTEXT_CLIENT_VERSION, &version);
-   if (version < 2) version = 2;
-   const EGLint attrs[] = { EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE };
-   EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, attrs);
-   if (ctx == EGL_NO_CONTEXT && version != 2) {
-      const EGLint es2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-      ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, es2);
-   }
-   if (ctx == EGL_NO_CONTEXT) return false;
-   g_ov_dpy = dpy;
-   g_ov_ctx = ctx;
-   return true;
+  EGLDisplay dpy = eglGetCurrentDisplay();
+  EGLContext current = eglGetCurrentContext();
+  EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
+  if (dpy == EGL_NO_DISPLAY) return false;
+  EGLConfig cfg;
+  /* The surface first: that is what this context gets made current on, and
+   * a context built for a different config cannot be. */
+  if (overlay_config_of_surface(dpy, draw, &cfg)) {
+    /* got it */
+  } else if (current != EGL_NO_CONTEXT) {
+    if (!overlay_config_of(dpy, current, &cfg)) return false;
+  } else {
+    const EGLint cfg_attrs[] = {
+      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+      EGL_SURFACE_TYPE, EGL_WINDOW_BIT | EGL_PBUFFER_BIT,
+      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
+      EGL_NONE
+    };
+    EGLint n = 0;
+    if (!eglChooseConfig(dpy, cfg_attrs, &cfg, 1, &n) || n < 1)
+      return false;
+  }
+  /* Match the guest's GLES version when we can.  Preferring ES2 left the
+   * overlay on a context that cannot run the ES3 entry points luna-ui and
+   * the present path use (separate draw/read framebuffer binds, etc.), and
+   * every rebind then logged GL_INVALID_OPERATION (0x0502) on render. */
+  EGLint version = 3;
+  if (current != EGL_NO_CONTEXT)
+    (void)eglQueryContext(dpy, current, EGL_CONTEXT_CLIENT_VERSION, &version);
+  if (version < 2) version = 2;
+  const EGLint attrs[] = { EGL_CONTEXT_CLIENT_VERSION, version, EGL_NONE };
+  EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, attrs);
+  if (ctx == EGL_NO_CONTEXT && version != 2) {
+    const EGLint es2[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
+    ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, es2);
+  }
+  if (ctx == EGL_NO_CONTEXT) return false;
+  g_ov_dpy = dpy;
+  g_ov_ctx = ctx;
+  return true;
 }
 
 /* The window surface's EGLConfig can change when the guest recreates its
@@ -718,25 +846,25 @@ static bool overlay_context_create(void)
  * against the context that currently owns the surface. */
 static bool overlay_context_rebind(void)
 {
-   EGLDisplay dpy = eglGetCurrentDisplay();
-   if (dpy == EGL_NO_DISPLAY) return false;
-   /* Do not luna_shutdown() here: the overlay context is not current (that is
-    * why we are rebinding), and deleting its names against the guest's
-    * context would free the wrong objects.  Destroying the context drops its
-    * share-group resources with it. */
-   if (g_ov_ctx != EGL_NO_CONTEXT) {
-      eglDestroyContext(dpy, g_ov_ctx);
-      g_ov_ctx = EGL_NO_CONTEXT;
-   }
-   g_ready = false;
-   overlay_window_objects_forget();
-   g_w = g_h = 0;
-   if (!overlay_context_create()) return false;
-   pthread_mutex_lock(&g_doc_lock);
-   g_doc_dirty = true;
-   pthread_mutex_unlock(&g_doc_lock);
-   fprintf(stderr, "[overlay] rebuilt context for current surface config\n");
-   return true;
+  EGLDisplay dpy = eglGetCurrentDisplay();
+  if (dpy == EGL_NO_DISPLAY) return false;
+  /* Do not luna_shutdown() here: the overlay context is not current (that is
+   * why we are rebinding), and deleting its names against the guest's
+   * context would free the wrong objects.  Destroying the context drops its
+   * share-group resources with it. */
+  if (g_ov_ctx != EGL_NO_CONTEXT) {
+    eglDestroyContext(dpy, g_ov_ctx);
+    g_ov_ctx = EGL_NO_CONTEXT;
+  }
+  g_ready = false;
+  overlay_window_objects_forget();
+  g_w = g_h = 0;
+  if (!overlay_context_create()) return false;
+  pthread_mutex_lock(&g_doc_lock);
+  g_doc_dirty = true;
+  pthread_mutex_unlock(&g_doc_lock);
+  fprintf(stderr, "[overlay] rebuilt context for current surface config\n");
+  return true;
 }
 
 /* The faces the overlay draws with.
@@ -749,57 +877,76 @@ static bool overlay_context_rebind(void)
  * answer only when none of them is installed. */
 static unsigned char *overlay_read_file(const char *path, size_t *out_size)
 {
-   FILE *f = fopen(path, "rb");
-   if (!f) return NULL;
-   if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-   long n = ftell(f);
-   if (n <= 0) { fclose(f); return NULL; }
-   rewind(f);
-   unsigned char *buf = malloc((size_t)n);
-   if (!buf) { fclose(f); return NULL; }
-   size_t got = fread(buf, 1, (size_t)n, f);
-   fclose(f);
-   if (got != (size_t)n) { free(buf); return NULL; }
-   if (out_size) *out_size = got;
-   return buf;
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return NULL;
+  }
+  long n = ftell(f);
+  if (n <= 0) {
+    fclose(f);
+    return NULL;
+  }
+  rewind(f);
+  unsigned char *buf = malloc((size_t)n);
+  if (!buf) {
+    fclose(f);
+    return NULL;
+  }
+  size_t got = fread(buf, 1, (size_t)n, f);
+  fclose(f);
+  if (got != (size_t)n) {
+    free(buf);
+    return NULL;
+  }
+  if (out_size) *out_size = got;
+  return buf;
 }
 
 static unsigned char *overlay_load_font(int role, size_t *out_size)
 {
-   static const char *const regular[] = {
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-      "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-      "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-      "/usr/share/fonts/TTF/DejaVuSans.ttf",
-      NULL
-   };
-   static const char *const bold[] = {
-      "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-      "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-      "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
-      "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-      NULL
-   };
-   static const char *const mono[] = {
-      "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-      "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-      "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-      NULL
-   };
-   const char *const *list = NULL;
-   switch (role) {
-   case LUNA_FONT_REGULAR: list = regular; break;
-   case LUNA_FONT_BOLD:    list = bold;    break;
-   case LUNA_FONT_MONO:    list = mono;    break;
-   /* CJK, symbols and brands have no sensible fixed path: let the scan answer
-    * those, and the engine falls back cleanly when it finds none. */
-   default: return NULL;
-   }
-   for (int i = 0; list[i]; ++i) {
-      unsigned char *buf = overlay_read_file(list[i], out_size);
-      if (buf) return buf;
-   }
-   return NULL;
+  static const char *const regular[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    NULL
+  };
+  static const char *const bold[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    NULL
+  };
+  static const char *const mono[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    NULL
+  };
+  const char *const *list = NULL;
+  switch (role) {
+  case LUNA_FONT_REGULAR:
+    list = regular;
+    break;
+  case LUNA_FONT_BOLD:
+    list = bold;
+    break;
+  case LUNA_FONT_MONO:
+    list = mono;
+    break;
+  /* CJK, symbols and brands have no sensible fixed path: let the scan answer
+   * those, and the engine falls back cleanly when it finds none. */
+  default:
+    return NULL;
+  }
+  for (int i = 0; list[i]; ++i) {
+    unsigned char *buf = overlay_read_file(list[i], out_size);
+    if (buf) return buf;
+  }
+  return NULL;
 }
 
 /* luna-ui's own clock.
@@ -810,7 +957,9 @@ static unsigned char *overlay_load_font(int role, size_t *out_size)
  * every finite @keyframes animation read as already finished on its first
  * frame, and left the infinite ones at an arbitrary phase.  Supplying get_time
  * is what makes both ends of the comparison the same clock. */
-static double overlay_platform_time(void) { return overlay_now(); }
+static double overlay_platform_time(void) {
+  return overlay_now();
+}
 
 /* The clipboard luna-ui edits against.
  *
@@ -823,59 +972,61 @@ static double overlay_platform_time(void) { return overlay_now(); }
  * uses, because a device has one clipboard. */
 static void overlay_clipboard_set(const char *utf8)
 {
-   arm_exec_clipboard_set(utf8 ? utf8 : "");
+  arm_exec_clipboard_set(utf8 ? utf8 : "");
 }
 
 /* luna-ui frees the result with free(), which is what arm_exec_clipboard_get
  * allocates with. */
-static char *overlay_clipboard_get(void) { return arm_exec_clipboard_get(); }
+static char *overlay_clipboard_get(void) {
+  return arm_exec_clipboard_get();
+}
 
 void luna_overlay_prepare_platform(void)
 {
-   LunaPlatform platform;
-   memset(&platform, 0, sizeof platform);
-   platform.get_time = overlay_platform_time;
-   platform.get_proc = overlay_get_proc;
-   platform.load_font = overlay_load_font;
-   platform.set_clipboard = overlay_clipboard_set;
-   platform.get_clipboard = overlay_clipboard_get;
-   platform.struct_size = (uint32_t)sizeof platform;
-   luna_set_platform(&platform);
+  LunaPlatform platform;
+  memset(&platform, 0, sizeof platform);
+  platform.get_time = overlay_platform_time;
+  platform.get_proc = overlay_get_proc;
+  platform.load_font = overlay_load_font;
+  platform.set_clipboard = overlay_clipboard_set;
+  platform.get_clipboard = overlay_clipboard_get;
+  platform.struct_size = (uint32_t)sizeof platform;
+  luna_set_platform(&platform);
 }
 
 static bool overlay_start(int w, int h)
 {
-   if (g_ready) return true;
-   if (g_failed) return false;
+  if (g_ready) return true;
+  if (g_failed) return false;
 
-   luna_overlay_prepare_platform();
+  luna_overlay_prepare_platform();
 
-   /* The engine's shader set differs between desktop GL and GLES; ask the
-    * context which one this is rather than assuming.  Lunaria runs on both:
-    * a desktop driver through GLFW, and GLES on the console session. */
-   const char *ver = (const char *)glGetString(GL_VERSION);
-   bool es = ver && strstr(ver, "OpenGL ES") != NULL;
-   luna_set_gles3(es ? 1 : 0);
+  /* The engine's shader set differs between desktop GL and GLES; ask the
+   * context which one this is rather than assuming.  Lunaria runs on both:
+   * a desktop driver through GLFW, and GLES on the console session. */
+  const char *ver = (const char *)glGetString(GL_VERSION);
+  bool es = ver && strstr(ver, "OpenGL ES") != NULL;
+  luna_set_gles3(es ? 1 : 0);
 
-   LunaInitConfig cfg = {
-      .width = (float)w,
-      .height = (float)h,
-      .get_proc = overlay_get_proc,
-      .frameless = 1,
-   };
-   if (!luna_init(&cfg)) {
-      fprintf(stderr, "[overlay] luna_init failed — no emulator UI this run\n");
-      g_failed = true;
-      return false;
-   }
-   g_ready = true;
-   g_w = w;
-   g_h = h;
-   g_last_time = overlay_now();
-   fprintf(stderr, "[overlay] luna-ui up at %dx%d (%s, gles3=%d)\n", w, h,
-           ver ? ver : "?", es ? 1 : 0);
-   overlay_report_gl_errors("init");
-   return true;
+  LunaInitConfig cfg = {
+    .width = (float)w,
+    .height = (float)h,
+    .get_proc = overlay_get_proc,
+    .frameless = 1,
+  };
+  if (!luna_init(&cfg)) {
+    fprintf(stderr, "[overlay] luna_init failed — no emulator UI this run\n");
+    g_failed = true;
+    return false;
+  }
+  g_ready = true;
+  g_w = w;
+  g_h = h;
+  g_last_time = overlay_now();
+  fprintf(stderr, "[overlay] luna-ui up at %dx%d (%s, gles3=%d)\n", w, h,
+          ver ? ver : "?", es ? 1 : 0);
+  overlay_report_gl_errors("init");
+  return true;
 }
 
 /* Which screen this present is drawing.
@@ -899,380 +1050,410 @@ static int g_screen = OV_APP;
  * Both presenters use this decision so the documents cannot alternate. */
 static bool overlay_boot_up(void)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   const bool up = g_status_html != NULL && g_html == NULL;
-   pthread_mutex_unlock(&g_doc_lock);
-   return up && !g_failed;
+  pthread_mutex_lock(&g_doc_lock);
+  const bool up = g_status_html != NULL && g_html == NULL;
+  pthread_mutex_unlock(&g_doc_lock);
+  return up && !g_failed;
 }
 
 /* True when the two strings say the same thing, NULL included. */
 static bool overlay_same(const char *a, const char *b)
 {
-   if (a == b) return true;
-   if (!a || !b) return false;
-   return strcmp(a, b) == 0;
+  if (a == b) return true;
+  if (!a || !b) return false;
+  return strcmp(a, b) == 0;
 }
 
 /* Positions the guest changed without republishing the document (a scroll, an
  * offsetTopAndBottom): absolute left/top per element id, applied to the live
  * tree by the presenting thread. A republish supersedes them. */
-struct overlay_move { char id[32]; float left, top; struct overlay_move *next; };
+struct overlay_move {
+  char id[32];
+  float left, top;
+  struct overlay_move *next;
+};
 static struct overlay_move *g_moves;
 static void overlay_moves_free(struct overlay_move *m)
 {
-   while (m) { struct overlay_move *n = m->next; free(m); m = n; }
+  while (m) {
+    struct overlay_move *n = m->next;
+    free(m);
+    m = n;
+  }
 }
 
 bool luna_overlay_move(const char *id, float left, float top)
 {
-   if (!id || !*id || strlen(id) >= sizeof ((struct overlay_move *)0)->id) return false;
-   pthread_mutex_lock(&g_doc_lock);
-   if (!g_html || g_doc_dirty) { pthread_mutex_unlock(&g_doc_lock); return false; }
-   struct overlay_move *m = g_moves;
-   while (m && strcmp(m->id, id)) m = m->next;
-   if (!m) {
-      m = calloc(1, sizeof *m);
-      if (!m) { pthread_mutex_unlock(&g_doc_lock); return false; }
-      strcpy(m->id, id);
-      m->next = g_moves; g_moves = m;
-   }
-   m->left = left; m->top = top;
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
-   return true;
+  if (!id || !*id || strlen(id) >= sizeof ((struct overlay_move *)0)->id) return false;
+  pthread_mutex_lock(&g_doc_lock);
+  if (!g_html || g_doc_dirty) {
+    pthread_mutex_unlock(&g_doc_lock);
+    return false;
+  }
+  struct overlay_move *m = g_moves;
+  while (m && strcmp(m->id, id)) m = m->next;
+  if (!m) {
+    m = calloc(1, sizeof *m);
+    if (!m) {
+      pthread_mutex_unlock(&g_doc_lock);
+      return false;
+    }
+    strcpy(m->id, id);
+    m->next = g_moves;
+    g_moves = m;
+  }
+  m->left = left;
+  m->top = top;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
+  return true;
 }
 
 void luna_overlay_set_document(const char *html, const char *css)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   /* Re-emitting the same document is not a change to it.  The Android view
-    * layer republishes on every invalidate, and a reparse throws away the
-    * live tree: ids, click wiring, @keyframes timelines, the caret and the
-    * focus of whatever the user is typing into.  Compare first — a few KB of
-    * strcmp against a full parse and a re-layout. */
-   if (overlay_same(html, g_html) && (!css || overlay_same(css, g_css))) {
-      pthread_mutex_unlock(&g_doc_lock);
-      return;
-   }
-   free(g_html);
-   g_html = html ? strdup(html) : NULL;
-   if (css) {
-      free(g_css);
-      g_css = strdup(css);
-   }
-   g_doc_dirty = true;
-   overlay_moves_free(g_moves); g_moves = NULL;
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
+  pthread_mutex_lock(&g_doc_lock);
+  /* Re-emitting the same document is not a change to it.  The Android view
+   * layer republishes on every invalidate, and a reparse throws away the
+   * live tree: ids, click wiring, @keyframes timelines, the caret and the
+   * focus of whatever the user is typing into.  Compare first — a few KB of
+   * strcmp against a full parse and a re-layout. */
+  if (overlay_same(html, g_html) && (!css || overlay_same(css, g_css))) {
+    pthread_mutex_unlock(&g_doc_lock);
+    return;
+  }
+  free(g_html);
+  g_html = html ? strdup(html) : NULL;
+  if (css) {
+    free(g_css);
+    g_css = strdup(css);
+  }
+  g_doc_dirty = true;
+  overlay_moves_free(g_moves);
+  g_moves = NULL;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
 }
 
 void luna_overlay_set_status(const char *html, const char *css)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   free(g_status_html);
-   g_status_html = html ? strdup(html) : NULL;
-   if (css) {
-      free(g_status_css);
-      g_status_css = strdup(css);
-   } else if (!html) {
-      free(g_status_css);
-      g_status_css = NULL;
-   }
-   /* Only dirty the parsed document when the card is the screen on display;
-    * the application screen does not contain it. */
-   if (g_screen == OV_BOOT) g_doc_dirty = true;
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
+  pthread_mutex_lock(&g_doc_lock);
+  free(g_status_html);
+  g_status_html = html ? strdup(html) : NULL;
+  if (css) {
+    free(g_status_css);
+    g_status_css = strdup(css);
+  } else if (!html) {
+    free(g_status_css);
+    g_status_css = NULL;
+  }
+  /* Only dirty the parsed document when the card is the screen on display;
+   * the application screen does not contain it. */
+  if (g_screen == OV_BOOT) g_doc_dirty = true;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
 }
 
 void luna_overlay_set_ime(const char *html, const char *css)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   free(g_ime_html);
-   g_ime_html = html ? strdup(html) : NULL;
-   if (css) {
-      free(g_ime_css);
-      g_ime_css = strdup(css);
-   } else if (!html) {
-      free(g_ime_css);
-      g_ime_css = NULL;
-   }
-   /* Raising or dropping the panel changes the application screen's markup,
-    * so that screen is reparsed; the boot screen never contains it. */
-   if (g_screen == OV_APP) g_doc_dirty = true;
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
+  pthread_mutex_lock(&g_doc_lock);
+  free(g_ime_html);
+  g_ime_html = html ? strdup(html) : NULL;
+  if (css) {
+    free(g_ime_css);
+    g_ime_css = strdup(css);
+  } else if (!html) {
+    free(g_ime_css);
+    g_ime_css = NULL;
+  }
+  /* Raising or dropping the panel changes the application screen's markup,
+   * so that screen is reparsed; the boot screen never contains it. */
+  if (g_screen == OV_APP) g_doc_dirty = true;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
 }
 
 void luna_overlay_set_toast(const char *html, const char *css)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   free(g_toast_html);
-   g_toast_html = html ? strdup(html) : NULL;
-   free(g_toast_css);
-   g_toast_css = html && css ? strdup(css) : NULL;
-   if (g_screen == OV_APP) g_doc_dirty = true;
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
+  pthread_mutex_lock(&g_doc_lock);
+  free(g_toast_html);
+  g_toast_html = html ? strdup(html) : NULL;
+  free(g_toast_css);
+  g_toast_css = html && css ? strdup(css) : NULL;
+  if (g_screen == OV_APP) g_doc_dirty = true;
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
 }
 
 void luna_overlay_set_menu(const char *html, const char *css, bool modal)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   g_menu_modal = html && modal;
-   free(g_menu_html);
-   g_menu_html = html ? strdup(html) : NULL;
-   free(g_menu_css);
-   g_menu_css = html && css ? strdup(css) : NULL;
-   g_doc_dirty = true;             /* on both screens: the menu is over each */
-   pthread_mutex_unlock(&g_doc_lock);
-   luna_overlay_wake();
+  pthread_mutex_lock(&g_doc_lock);
+  g_menu_modal = html && modal;
+  free(g_menu_html);
+  g_menu_html = html ? strdup(html) : NULL;
+  free(g_menu_css);
+  g_menu_css = html && css ? strdup(css) : NULL;
+  g_doc_dirty = true;             /* on both screens: the menu is over each */
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
 }
 
 bool luna_overlay_menu_showing(void)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   const bool up = g_menu_html != NULL && g_menu_modal;
-   pthread_mutex_unlock(&g_doc_lock);
-   return up && !g_failed;
+  pthread_mutex_lock(&g_doc_lock);
+  const bool up = g_menu_html != NULL && g_menu_modal;
+  pthread_mutex_unlock(&g_doc_lock);
+  return up && !g_failed;
 }
 
-void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn) { g_menu_fn = fn; }
+void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn) {
+  g_menu_fn = fn;
+}
 
 /* The frame luna-ui last drew, as a PNG: what the launcher screen looks like,
  * for people who cannot see it (and for checking it without a screenshot
  * permission). */
-int luna_overlay_screenshot(const char *path) { return take_screenshot(path); }
+int luna_overlay_screenshot(const char *path) {
+  return take_screenshot(path);
+}
 
 bool luna_overlay_status_showing(void)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   bool showing = g_html == NULL && g_status_html != NULL;
-   pthread_mutex_unlock(&g_doc_lock);
-   return showing && !g_failed;
+  pthread_mutex_lock(&g_doc_lock);
+  bool showing = g_html == NULL && g_status_html != NULL;
+  pthread_mutex_unlock(&g_doc_lock);
+  return showing && !g_failed;
 }
 
 void luna_overlay_set_click_handler(luna_overlay_click_fn fn)
 {
-   g_click_fn = fn;
+  g_click_fn = fn;
 }
 
 void luna_overlay_set_scroll_handler(luna_overlay_scroll_fn fn)
 {
-   g_scroll_fn = fn;
+  g_scroll_fn = fn;
 }
 
 void luna_overlay_set_web_pointer_handler(luna_overlay_web_pointer_fn fn)
 {
-   g_web_pointer_fn = fn;
+  g_web_pointer_fn = fn;
 }
 
 void luna_overlay_set_web_text_handlers(luna_overlay_web_char_fn char_fn,
                                         luna_overlay_web_key_fn key_fn,
                                         luna_overlay_web_text_fn text_fn)
 {
-   g_web_char_fn = char_fn;
-   g_web_key_fn = key_fn;
-   g_web_text_fn = text_fn;
+  g_web_char_fn = char_fn;
+  g_web_key_fn = key_fn;
+  g_web_text_fn = text_fn;
 }
 
 bool luna_overlay_web_char(uint32_t codepoint)
 {
-   if (luna_guest_paused()) return true;
-   char id[sizeof g_web_focus];
-   pthread_mutex_lock(&g_ptr_lock);
-   memcpy(id, g_web_focus, sizeof id);
-   pthread_mutex_unlock(&g_ptr_lock);
-   if (!id[0] || !g_web_char_fn) return false;
-   g_web_char_fn(id, codepoint);
-   return true;
+  if (luna_guest_paused()) return true;
+  char id[sizeof g_web_focus];
+  pthread_mutex_lock(&g_ptr_lock);
+  memcpy(id, g_web_focus, sizeof id);
+  pthread_mutex_unlock(&g_ptr_lock);
+  if (!id[0] || !g_web_char_fn) return false;
+  g_web_char_fn(id, codepoint);
+  return true;
 }
 
 bool luna_overlay_web_text(const char *utf8)
 {
-   if (luna_guest_paused()) return true;
-   char id[sizeof g_web_focus];
-   pthread_mutex_lock(&g_ptr_lock);
-   memcpy(id, g_web_focus, sizeof id);
-   pthread_mutex_unlock(&g_ptr_lock);
-   if (!id[0] || !g_web_text_fn || !utf8) return false;
-   g_web_text_fn(id, utf8);
-   return true;
+  if (luna_guest_paused()) return true;
+  char id[sizeof g_web_focus];
+  pthread_mutex_lock(&g_ptr_lock);
+  memcpy(id, g_web_focus, sizeof id);
+  pthread_mutex_unlock(&g_ptr_lock);
+  if (!id[0] || !g_web_text_fn || !utf8) return false;
+  g_web_text_fn(id, utf8);
+  return true;
 }
 
 bool luna_overlay_web_key(int key, int action, int mods)
 {
-   if (luna_guest_paused()) return true;
-   char id[sizeof g_web_focus];
-   pthread_mutex_lock(&g_ptr_lock);
-   memcpy(id, g_web_focus, sizeof id);
-   pthread_mutex_unlock(&g_ptr_lock);
-   if (!id[0] || !g_web_key_fn) return false;
-   /* GLFW modifiers: control on Linux/Windows, command on macOS. Read the
-    * host clipboard on its window thread and commit it in one text event. */
+  if (luna_guest_paused()) return true;
+  char id[sizeof g_web_focus];
+  pthread_mutex_lock(&g_ptr_lock);
+  memcpy(id, g_web_focus, sizeof id);
+  pthread_mutex_unlock(&g_ptr_lock);
+  if (!id[0] || !g_web_key_fn) return false;
+  /* GLFW modifiers: control on Linux/Windows, command on macOS. Read the
+   * host clipboard on its window thread and commit it in one text event. */
 #ifdef __APPLE__
-   const int shortcut = mods & 8;
+  const int shortcut = mods & 8;
 #else
-   const int shortcut = mods & 2;
+  const int shortcut = mods & 2;
 #endif
-   if (shortcut && key == 86 && g_web_text_fn) {
-      if (action) {
-         char *text = arm_exec_clipboard_get();
-         if (text) { g_web_text_fn(id, text); free(text); }
+  if (shortcut && key == 86 && g_web_text_fn) {
+    if (action) {
+      char *text = arm_exec_clipboard_get();
+      if (text) {
+        g_web_text_fn(id, text);
+        free(text);
       }
-   } else g_web_key_fn(id, key, action, mods);
-   return true;
+    }
+  } else g_web_key_fn(id, key, action, mods);
+  return true;
 }
 
 void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
 {
-   g_frame_fn = fn;
+  g_frame_fn = fn;
 }
 
 /* luna-ui hands the clicked element back; its DOM id is the only thing the
  * widget layer needs to identify the guest View it stands for. */
 static void overlay_element_clicked(LunaElement *e)
 {
-   if (!e || !e->id[0]) return;
-   if (!strncmp(e->id, "luna-menu", 9)) {
-      if (g_menu_fn) g_menu_fn(e->id);
-      return;
-   }
-   if (luna_guest_paused()) return;
-   if (luna_ime_click(e->id)) return;
-   if (g_click_fn) g_click_fn(e->id);
+  if (!e || !e->id[0]) return;
+  if (!strncmp(e->id, "luna-menu", 9)) {
+    if (g_menu_fn) g_menu_fn(e->id);
+    return;
+  }
+  if (luna_guest_paused()) return;
+  if (luna_ime_click(e->id)) return;
+  if (g_click_fn) g_click_fn(e->id);
 }
 
 /* Every element the widget layer named is clickable from luna-ui's side; the
  * widget layer decides whether the View it stands for has a listener. */
 static void overlay_wire_clicks(void)
 {
-   /* Rebuilding the View document detaches old focused elements. */
-   pthread_mutex_lock(&g_ptr_lock);
-   if (g_web_focus[0]) {
-      LunaElement *focused = luna_element_at(luna_get_element_by_id(g_web_focus));
-      if (!focused || !strstr(focused->class_name, "lunaria-webview"))
-         g_web_focus[0] = 0;
-   }
-   pthread_mutex_unlock(&g_ptr_lock);
-   int n = luna_element_count();
-   for (int i = 0; i < n; ++i) {
-      LunaElement *e = luna_element_at(i);
-      if (e && e->id[0]) luna_set_on_click(i, overlay_element_clicked);
-   }
+  /* Rebuilding the View document detaches old focused elements. */
+  pthread_mutex_lock(&g_ptr_lock);
+  if (g_web_focus[0]) {
+    LunaElement *focused = luna_element_at(luna_get_element_by_id(g_web_focus));
+    if (!focused || !strstr(focused->class_name, "lunaria-webview"))
+      g_web_focus[0] = 0;
+  }
+  pthread_mutex_unlock(&g_ptr_lock);
+  int n = luna_element_count();
+  for (int i = 0; i < n; ++i) {
+    LunaElement *e = luna_element_at(i);
+    if (e && e->id[0]) luna_set_on_click(i, overlay_element_clicked);
+  }
 }
 
 /* Replays the queued pointer events on the presenting thread. */
 static void overlay_drain_pointer(void)
 {
-   struct overlay_pointer_event batch[64];
-   int n;
-   pthread_mutex_lock(&g_ptr_lock);
-   n = g_ptr_count;
-   memcpy(batch, g_ptr_queue, (size_t)n * sizeof batch[0]);
-   g_ptr_count = 0;
-   pthread_mutex_unlock(&g_ptr_lock);
-   for (int i = 0; i < n; ++i) {
-      bool framework_touch = false;
-      if (g_web_pointer_fn && !luna_guest_paused()) {
-         int hit = g_web_pointer_capture[0]
-            ? luna_get_element_by_id(g_web_pointer_capture)
-            : luna_element_at_point(batch[i].x, batch[i].y);
-         bool web_hit = false;
-         if (getenv("LUNARIA_TRACE_TOUCH")) { LunaElement *h = hit >= 0 ? luna_element_at(hit) : NULL; fprintf(stderr, "[ovl-hit] act=%d %d,%d hit=%d id=%s cls=%s\n", batch[i].action, (int)batch[i].x, (int)batch[i].y, hit, h ? h->id : "-", h ? h->class_name : "-"); }
-         for (int parent = hit; parent >= 0;
-              parent = luna_element_parent(parent)) {
-            LunaElement *e = luna_element_at(parent);
-            if (e && e->id[0] == 'v' &&
-                (strstr(e->class_name, "lunaria-webview") ||
-                 strstr(e->class_name, "lunaria-touchview"))) {
-               web_hit = true;
-               framework_touch = strstr(e->class_name, "lunaria-touchview") != NULL;
-               if (batch[i].action == 1) {
-                  pthread_mutex_lock(&g_ptr_lock);
-                  /* SurfaceView shares pointer forwarding with WebView,
-                   * but only WebView owns the browser keyboard channel. */
-                  if (strstr(e->class_name, "lunaria-webview"))
-                     snprintf(g_web_focus, sizeof g_web_focus, "%s", e->id);
-                  else
-                     g_web_focus[0] = 0;
-                  pthread_mutex_unlock(&g_ptr_lock);
-               }
-               /* A raster image represents a View subtree, not an input
-                * window. Start framework dispatch at its content root so
-                * ViewGroup interception and a parent's click handler still
-                * run when the painted child declines the gesture. WebView
-                * keeps its own browser-local input coordinates. */
-               LunaElement *receiver = e;
-               if (framework_touch) {
-                  for (int ancestor = luna_element_parent(parent); ancestor >= 0;
-                       ancestor = luna_element_parent(ancestor)) {
-                     LunaElement *candidate = luna_element_at(ancestor);
-                     if (candidate && candidate->id[0] == 'v') receiver = candidate;
-                  }
-               }
-               if (batch[i].action == 1)
-                  snprintf(g_web_pointer_capture,sizeof g_web_pointer_capture,"%s",receiver->id);
-               if (g_web_pointer_capture[0])
-                  g_web_pointer_fn(receiver->id,
-                     (int)(batch[i].x - receiver->x), (int)(batch[i].y - receiver->y),
-                     batch[i].action,batch[i].event_ms);
-               break;
-            }
-         }
-         if (batch[i].action == 1 && !web_hit) {
+  struct overlay_pointer_event batch[64];
+  int n;
+  pthread_mutex_lock(&g_ptr_lock);
+  n = g_ptr_count;
+  memcpy(batch, g_ptr_queue, (size_t)n * sizeof batch[0]);
+  g_ptr_count = 0;
+  pthread_mutex_unlock(&g_ptr_lock);
+  for (int i = 0; i < n; ++i) {
+    bool framework_touch = false;
+    if (g_web_pointer_fn && !luna_guest_paused()) {
+      int hit = g_web_pointer_capture[0]
+                ? luna_get_element_by_id(g_web_pointer_capture)
+                : luna_element_at_point(batch[i].x, batch[i].y);
+      bool web_hit = false;
+      if (getenv("LUNARIA_TRACE_TOUCH")) {
+        LunaElement *h = hit >= 0 ? luna_element_at(hit) : NULL;
+        fprintf(stderr, "[ovl-hit] act=%d %d,%d hit=%d id=%s cls=%s\n", batch[i].action, (int)batch[i].x, (int)batch[i].y, hit, h ? h->id : "-", h ? h->class_name : "-");
+      }
+      for (int parent = hit; parent >= 0;
+           parent = luna_element_parent(parent)) {
+        LunaElement *e = luna_element_at(parent);
+        if (e && e->id[0] == 'v' &&
+            (strstr(e->class_name, "lunaria-webview") ||
+             strstr(e->class_name, "lunaria-touchview"))) {
+          web_hit = true;
+          framework_touch = strstr(e->class_name, "lunaria-touchview") != NULL;
+          if (batch[i].action == 1) {
             pthread_mutex_lock(&g_ptr_lock);
-            g_web_focus[0] = 0;
+            /* SurfaceView shares pointer forwarding with WebView,
+             * but only WebView owns the browser keyboard channel. */
+            if (strstr(e->class_name, "lunaria-webview"))
+              snprintf(g_web_focus, sizeof g_web_focus, "%s", e->id);
+            else
+              g_web_focus[0] = 0;
             pthread_mutex_unlock(&g_ptr_lock);
-         }
-         if (batch[i].action == 0) g_web_pointer_capture[0] = 0;
-      }
-      /* A framework touch target owns the entire gesture. Sending the same
-       * release through host click detection would also call performClick. */
-      if (framework_touch) continue;
-      /* A press is held back until it is known not to be a drag: dragged past
-       * the slop it scrolls (and never reaches the element or selects text),
-       * released in place it is the click it always was. */
-      static bool pressed, dragging;
-      static double last_x, last_y, start_x, start_y;
-      if (g_scroll_fn && !luna_guest_paused()) {
-         if (batch[i].action == 1) {
-            pressed = true; dragging = false;
-            start_x = last_x = batch[i].x; start_y = last_y = batch[i].y;
-            continue;
-         }
-         if (batch[i].action < 0 && pressed) {
-            const double slop = 8.0;
-            if (!dragging && (fabs(batch[i].x - start_x) > slop || fabs(batch[i].y - start_y) > slop))
-               dragging = true;
-            if (dragging) {
-               g_scroll_fn(batch[i].x, batch[i].y, last_x - batch[i].x, last_y - batch[i].y);
-               last_x = batch[i].x; last_y = batch[i].y;
+          }
+          /* A raster image represents a View subtree, not an input
+           * window. Start framework dispatch at its content root so
+           * ViewGroup interception and a parent's click handler still
+           * run when the painted child declines the gesture. WebView
+           * keeps its own browser-local input coordinates. */
+          LunaElement *receiver = e;
+          if (framework_touch) {
+            for (int ancestor = luna_element_parent(parent); ancestor >= 0;
+                 ancestor = luna_element_parent(ancestor)) {
+              LunaElement *candidate = luna_element_at(ancestor);
+              if (candidate && candidate->id[0] == 'v') receiver = candidate;
             }
-            continue;
-         }
-         if (batch[i].action == 0 && pressed) {
-            const bool was_drag = dragging;
-            pressed = dragging = false;
-            if (was_drag) continue;
-            luna_mouse_move(start_x, start_y);
-            luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_PRESS, 0, start_x, start_y);
-            luna_mouse_move(batch[i].x, batch[i].y);
-            luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_RELEASE, 0, batch[i].x, batch[i].y);
-            continue;
-         }
+          }
+          if (batch[i].action == 1)
+            snprintf(g_web_pointer_capture,sizeof g_web_pointer_capture,"%s",receiver->id);
+          if (g_web_pointer_capture[0])
+            g_web_pointer_fn(receiver->id,
+                             (int)(batch[i].x - receiver->x), (int)(batch[i].y - receiver->y),
+                             batch[i].action,batch[i].event_ms);
+          break;
+        }
       }
-      if (batch[i].action < 0) {
-         luna_mouse_move(batch[i].x, batch[i].y);
-      } else {
-         /* A press has to move the pointer first: luna-ui hit-tests against
-          * the last known position, and a touchscreen never reported one. */
-         luna_mouse_move(batch[i].x, batch[i].y);
-         luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,
-                           batch[i].action ? LUNA_PRESS : LUNA_RELEASE, 0,
-                           batch[i].x, batch[i].y);
+      if (batch[i].action == 1 && !web_hit) {
+        pthread_mutex_lock(&g_ptr_lock);
+        g_web_focus[0] = 0;
+        pthread_mutex_unlock(&g_ptr_lock);
       }
-   }
+      if (batch[i].action == 0) g_web_pointer_capture[0] = 0;
+    }
+    /* A framework touch target owns the entire gesture. Sending the same
+     * release through host click detection would also call performClick. */
+    if (framework_touch) continue;
+    /* A press is held back until it is known not to be a drag: dragged past
+     * the slop it scrolls (and never reaches the element or selects text),
+     * released in place it is the click it always was. */
+    static bool pressed, dragging;
+    static double last_x, last_y, start_x, start_y;
+    if (g_scroll_fn && !luna_guest_paused()) {
+      if (batch[i].action == 1) {
+        pressed = true;
+        dragging = false;
+        start_x = last_x = batch[i].x;
+        start_y = last_y = batch[i].y;
+        continue;
+      }
+      if (batch[i].action < 0 && pressed) {
+        const double slop = 8.0;
+        if (!dragging && (fabs(batch[i].x - start_x) > slop || fabs(batch[i].y - start_y) > slop))
+          dragging = true;
+        if (dragging) {
+          g_scroll_fn(batch[i].x, batch[i].y, last_x - batch[i].x, last_y - batch[i].y);
+          last_x = batch[i].x;
+          last_y = batch[i].y;
+        }
+        continue;
+      }
+      if (batch[i].action == 0 && pressed) {
+        const bool was_drag = dragging;
+        pressed = dragging = false;
+        if (was_drag) continue;
+        luna_mouse_move(start_x, start_y);
+        luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_PRESS, 0, start_x, start_y);
+        luna_mouse_move(batch[i].x, batch[i].y);
+        luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT, LUNA_RELEASE, 0, batch[i].x, batch[i].y);
+        continue;
+      }
+    }
+    if (batch[i].action < 0) {
+      luna_mouse_move(batch[i].x, batch[i].y);
+    } else {
+      /* A press has to move the pointer first: luna-ui hit-tests against
+       * the last known position, and a touchscreen never reported one. */
+      luna_mouse_move(batch[i].x, batch[i].y);
+      luna_mouse_button(LUNA_MOUSE_BUTTON_LEFT,
+                        batch[i].action ? LUNA_PRESS : LUNA_RELEASE, 0,
+                        batch[i].x, batch[i].y);
+    }
+  }
 }
 
 /* LUNARIA_UI_TEST=1 puts a card on screen with no guest involvement.  The
@@ -1281,63 +1462,63 @@ static void overlay_drain_pointer(void)
  * worth being able to ask on its own, before any widget code exists. */
 static void overlay_maybe_test_card(void)
 {
-   static bool checked;
-   if (checked) return;
-   checked = true;
-   const char *e = getenv("LUNARIA_UI_TEST");
-   if (!e || !*e || !strcmp(e, "0")) return;
-   /* A path names a document to load instead of the built-in card, so a known
-    * good page can be put through this exact embedding. */
-   if (strchr(e, '/')) {
-      g_from_files = true;
-      luna_overlay_set_document("", NULL);
-      return;
-   }
-   luna_overlay_set_document(
-      "<body><div class=\"card\">"
-      "<div class=\"title\">Lunaria UI</div>"
-      "<div class=\"body\">overlay compositing over the guest frame</div>"
-      "</div></body>",
-      "body{margin:0;background:transparent;}"
-      ".card{position:absolute;left:40px;top:40px;width:380px;"
-      "padding:20px;border-radius:14px;background:rgba(16,22,38,0.92);"
-      "color:#e8eefc;font-size:18px;}"
-      ".title{font-size:22px;padding-bottom:8px;}"
-      ".body{font-size:15px;color:#9fb2d8;}");
+  static bool checked;
+  if (checked) return;
+  checked = true;
+  const char *e = getenv("LUNARIA_UI_TEST");
+  if (!e || !*e || !strcmp(e, "0")) return;
+  /* A path names a document to load instead of the built-in card, so a known
+   * good page can be put through this exact embedding. */
+  if (strchr(e, '/')) {
+    g_from_files = true;
+    luna_overlay_set_document("", NULL);
+    return;
+  }
+  luna_overlay_set_document(
+    "<body><div class=\"card\">"
+    "<div class=\"title\">Lunaria UI</div>"
+    "<div class=\"body\">overlay compositing over the guest frame</div>"
+    "</div></body>",
+    "body{margin:0;background:transparent;}"
+    ".card{position:absolute;left:40px;top:40px;width:380px;"
+    "padding:20px;border-radius:14px;background:rgba(16,22,38,0.92);"
+    "color:#e8eefc;font-size:18px;}"
+    ".title{font-size:22px;padding-bottom:8px;}"
+    ".body{font-size:15px;color:#9fb2d8;}");
 }
 
 bool luna_overlay_guest_window_up(void)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   bool up = g_html != NULL;
-   pthread_mutex_unlock(&g_doc_lock);
-   return up && !g_failed;
+  pthread_mutex_lock(&g_doc_lock);
+  bool up = g_html != NULL;
+  pthread_mutex_unlock(&g_doc_lock);
+  return up && !g_failed;
 }
 
 /* Published by the Android UI thread after resolving window focus. */
 void luna_overlay_set_native_input_focus(bool focused)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   g_native_input_focus = focused;
-   pthread_mutex_unlock(&g_doc_lock);
+  pthread_mutex_lock(&g_doc_lock);
+  g_native_input_focus = focused;
+  pthread_mutex_unlock(&g_doc_lock);
 }
 
 bool luna_overlay_guest_keys_captured(void)
 {
-   pthread_mutex_lock(&g_doc_lock);
-   bool captured = g_html != NULL && !g_native_input_focus;
-   pthread_mutex_unlock(&g_doc_lock);
-   return captured && !g_failed;
+  pthread_mutex_lock(&g_doc_lock);
+  bool captured = g_html != NULL && !g_native_input_focus;
+  pthread_mutex_unlock(&g_doc_lock);
+  return captured && !g_failed;
 }
 
 bool luna_overlay_active(void)
 {
-   overlay_maybe_test_card();
-   pthread_mutex_lock(&g_doc_lock);
-   bool up = g_html != NULL || g_status_html != NULL || g_ime_html != NULL ||
-             g_toast_html != NULL || g_menu_html != NULL;
-   pthread_mutex_unlock(&g_doc_lock);
-   return up && !g_failed;
+  overlay_maybe_test_card();
+  pthread_mutex_lock(&g_doc_lock);
+  bool up = g_html != NULL || g_status_html != NULL || g_ime_html != NULL ||
+            g_toast_html != NULL || g_menu_html != NULL;
+  pthread_mutex_unlock(&g_doc_lock);
+  return up && !g_failed;
 }
 
 /* luna-ui keeps its element tree, its layout and its GL objects in plain
@@ -1367,48 +1548,48 @@ static void overlay_present_locked(int w, int h);
 
 static bool overlay_present_screen(int w, int h, int screen)
 {
-   if (!luna_overlay_active() || w <= 0 || h <= 0) return true;
-   /* The two screens never share a frame.  While the card is up it is the
-    * only thing drawn; a guest swap that arrives meanwhile is presented as
-    * the guest drew it, with nothing of the emulator's on top. */
-   if (screen == OV_APP && overlay_boot_up()) return true;
-   if (screen == OV_BOOT && luna_overlay_guest_window_up()) return true;
-   /* The emulator's UI has one owner: with a compositor, its thread. */
-   if (atomic_load(&g_hosted) &&
-       (!atomic_load(&g_host_thread_set) ||
-        !pthread_equal(pthread_self(), g_host_thread)))
-      return true;
-   if (screen != g_screen) {
-      pthread_mutex_lock(&g_doc_lock);
-      g_screen = screen;
-      g_doc_dirty = true;   /* a different screen is a different document */
-      pthread_mutex_unlock(&g_doc_lock);
-   }
-   if (pthread_mutex_trylock(&g_present_lock) != 0) {
-      static unsigned long skipped;
-      if ((skipped++ % 256) == 0)
-         fprintf(stderr, "[overlay] another thread is compositing — skipping "
-                 "this one (%lu)\n", skipped);
-      return false;
-   }
-   overlay_present_locked(w, h);
-   pthread_mutex_unlock(&g_present_lock);
-   return true;
+  if (!luna_overlay_active() || w <= 0 || h <= 0) return true;
+  /* The two screens never share a frame.  While the card is up it is the
+   * only thing drawn; a guest swap that arrives meanwhile is presented as
+   * the guest drew it, with nothing of the emulator's on top. */
+  if (screen == OV_APP && overlay_boot_up()) return true;
+  if (screen == OV_BOOT && luna_overlay_guest_window_up()) return true;
+  /* The emulator's UI has one owner: with a compositor, its thread. */
+  if (atomic_load(&g_hosted) &&
+      (!atomic_load(&g_host_thread_set) ||
+       !pthread_equal(pthread_self(), g_host_thread)))
+    return true;
+  if (screen != g_screen) {
+    pthread_mutex_lock(&g_doc_lock);
+    g_screen = screen;
+    g_doc_dirty = true;   /* a different screen is a different document */
+    pthread_mutex_unlock(&g_doc_lock);
+  }
+  if (pthread_mutex_trylock(&g_present_lock) != 0) {
+    static unsigned long skipped;
+    if ((skipped++ % 256) == 0)
+      fprintf(stderr, "[overlay] another thread is compositing — skipping "
+                      "this one (%lu)\n", skipped);
+    return false;
+  }
+  overlay_present_locked(w, h);
+  pthread_mutex_unlock(&g_present_lock);
+  return true;
 }
 
 void luna_overlay_present_boot(int w, int h)
 {
-   overlay_present_screen(w, h, OV_BOOT);
+  overlay_present_screen(w, h, OV_BOOT);
 }
 
 void luna_overlay_present(int w, int h)
 {
-   overlay_present_screen(w, h, OV_APP);
+  overlay_present_screen(w, h, OV_APP);
 }
 
 bool luna_overlay_present_checked(int w,int h,bool boot)
 {
-   return overlay_present_screen(w,h,boot ? OV_BOOT : OV_APP);
+  return overlay_present_screen(w,h,boot ? OV_BOOT : OV_APP);
 }
 
 /* LUNARIA_OVERLAY_TAP="x,y@seconds[;x,y@seconds...]": taps the overlay at those
@@ -1416,294 +1597,334 @@ bool luna_overlay_present_checked(int w,int h,bool boot)
  * to drive a screen without a hand on the mouse: for tests and diagnosis. */
 static void overlay_scripted_tap(double now)
 {
-   static double start = -1, release_at = -1, rx, ry;
-   static const char *cursor;
-   static bool init;
-   if (!init) { init = true; cursor = getenv("LUNARIA_OVERLAY_TAP"); }
-   if (!cursor || !*cursor) return;
-   if (start < 0) start = now;
-   if (release_at >= 0) {
-      if (now >= release_at) { release_at = -1; (void)luna_overlay_pointer(rx, ry, 0); }
-      return;
-   }
-   double x, y, at;
-   int used = 0;
-   if (sscanf(cursor, "%lf,%lf@%lf%n", &x, &y, &at, &used) < 3) { cursor = NULL; return; }
-   if (now - start < at) return;
-   fprintf(stderr, "[overlay] scripted tap %.0f,%.0f\n", x, y);
-   cursor += used;
-   if (*cursor == ';') ++cursor;
-   rx = x; ry = y; release_at = now + 0.05;
-   (void)luna_overlay_pointer(x, y, 1);
+  static double start = -1, release_at = -1, rx, ry;
+  static const char *cursor;
+  static bool init;
+  if (!init) {
+    init = true;
+    cursor = getenv("LUNARIA_OVERLAY_TAP");
+  }
+  if (!cursor || !*cursor) return;
+  if (start < 0) start = now;
+  if (release_at >= 0) {
+    if (now >= release_at) {
+      release_at = -1;
+      (void)luna_overlay_pointer(rx, ry, 0);
+    }
+    return;
+  }
+  double x, y, at;
+  int used = 0;
+  if (sscanf(cursor, "%lf,%lf@%lf%n", &x, &y, &at, &used) < 3) {
+    cursor = NULL;
+    return;
+  }
+  if (now - start < at) return;
+  fprintf(stderr, "[overlay] scripted tap %.0f,%.0f\n", x, y);
+  cursor += used;
+  if (*cursor == ';') ++cursor;
+  rx = x;
+  ry = y;
+  release_at = now + 0.05;
+  (void)luna_overlay_pointer(x, y, 1);
 }
 
 static void overlay_present_locked(int w, int h)
 {
-   const bool prof = overlay_prof_on();
-   const uint64_t t_enter = prof ? overlay_ns() : 0;
-   uint64_t t_mark = t_enter;
+  const bool prof = overlay_prof_on();
+  const uint64_t t_enter = prof ? overlay_ns() : 0;
+  uint64_t t_mark = t_enter;
 
-   EGLDisplay dpy = eglGetCurrentDisplay();
-   EGLContext prev_ctx = eglGetCurrentContext();
-   EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
-   EGLSurface read = eglGetCurrentSurface(EGL_READ);
-   if (dpy == EGL_NO_DISPLAY || draw == EGL_NO_SURFACE) return;
+  EGLDisplay dpy = eglGetCurrentDisplay();
+  EGLContext prev_ctx = eglGetCurrentContext();
+  EGLSurface draw = eglGetCurrentSurface(EGL_DRAW);
+  EGLSurface read = eglGetCurrentSurface(EGL_READ);
+  if (dpy == EGL_NO_DISPLAY || draw == EGL_NO_SURFACE) return;
 
-   if (g_hosted) goto bound;
-   if (g_ov_ctx == EGL_NO_CONTEXT && !g_failed && !overlay_context_create()) {
-      fprintf(stderr, "[overlay] no context — emulator UI disabled\n");
-      g_failed = true;
+  if (g_hosted) goto bound;
+  if (g_ov_ctx == EGL_NO_CONTEXT && !g_failed && !overlay_context_create()) {
+    fprintf(stderr, "[overlay] no context — emulator UI disabled\n");
+    g_failed = true;
+    return;
+  }
+  if (!eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
+    EGLint err = eglGetError();
+    /* EGL_BAD_MATCH (0x3009): overlay context was built for a different
+     * config than this surface — recreate once and retry. */
+    if (err == 0x3009 && overlay_context_rebind() &&
+        eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
+      /* ok after rebind */
+    } else {
+      static unsigned long skipped;
+      if ((skipped++ % 120) == 0)
+        fprintf(stderr, "[overlay] makeCurrent failed (0x%04x) — skip present "
+                        "(%lu)\n", (unsigned)err, skipped);
       return;
-   }
-   if (!eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
-      EGLint err = eglGetError();
-      /* EGL_BAD_MATCH (0x3009): overlay context was built for a different
-       * config than this surface — recreate once and retry. */
-      if (err == 0x3009 && overlay_context_rebind() &&
-          eglMakeCurrent(dpy, draw, read, g_ov_ctx)) {
-         /* ok after rebind */
-      } else {
-         static unsigned long skipped;
-         if ((skipped++ % 120) == 0)
-            fprintf(stderr, "[overlay] makeCurrent failed (0x%04x) — skip present "
-                    "(%lu)\n", (unsigned)err, skipped);
-         return;
-      }
-   }
-   /* Previous binding is gone until we restore below. */
-   arm_exec_egl_invalidate_current();
-   /* The guest may have left a GL error pending on this share-group / the
-    * previous context.  Drain it so a later overlay_report_gl_errors does not
-    * blame luna-ui for a guest mistake, and so luna-ui does not start with a
-    * sticky INVALID_OPERATION. */
+    }
+  }
+  /* Previous binding is gone until we restore below. */
+  arm_exec_egl_invalidate_current();
+  /* The guest may have left a GL error pending on this share-group / the
+   * previous context.  Drain it so a later overlay_report_gl_errors does not
+   * blame luna-ui for a guest mistake, and so luna-ui does not start with a
+   * sticky INVALID_OPERATION. */
 bound:
-   while (glGetError() != GL_NO_ERROR) { }
-   if (prof) { const uint64_t n = overlay_ns();
-               g_prof.bind_ns += n - t_mark; t_mark = n; }
+  while (glGetError() != GL_NO_ERROR) { }
+  if (prof) {
+    const uint64_t n = overlay_ns();
+    g_prof.bind_ns += n - t_mark;
+    t_mark = n;
+  }
 
-   if (overlay_start(w, h)) {
-      struct timespec image_now;clock_gettime(CLOCK_MONOTONIC,&image_now);
-      luna_overlay_poll_image_sources((int64_t)image_now.tv_sec*1000000000+image_now.tv_nsec);
-      luna_set_persistent_texture_prefix("lunaria-bitmap-");
-      /* Absolute paths are the emulator's own files (a drawable unpacked from the
-       * package, a converted vector); the same file is the same picture. */
-      luna_set_persistent_texture_prefix("/");
-      luna_invalidate_gl_state();
-      if (w != g_w || h != g_h) {
-         g_w = w;
-         g_h = h;
-         luna_resize((float)w, (float)h);
+  if (overlay_start(w, h)) {
+    struct timespec image_now;
+    clock_gettime(CLOCK_MONOTONIC,&image_now);
+    luna_overlay_poll_image_sources((int64_t)image_now.tv_sec*1000000000+image_now.tv_nsec);
+    luna_set_persistent_texture_prefix("lunaria-bitmap-");
+    /* Absolute paths are the emulator's own files (a drawable unpacked from the
+     * package, a converted vector); the same file is the same picture. */
+    luna_set_persistent_texture_prefix("/");
+    luna_invalidate_gl_state();
+    if (w != g_w || h != g_h) {
+      g_w = w;
+      g_h = h;
+      luna_resize((float)w, (float)h);
+    }
+    /* The lock covers taking what the guest published, nothing more. Parsing
+     * a document and uploading pictures are the compositor's own work on its
+     * own copies: while they ran under the lock, every capture the widget
+     * layer published (with the interpreter lock held) waited on them. */
+    pthread_mutex_lock(&g_doc_lock);
+    /* The boot screen is the card and nothing else; the application screen
+     * is the guest's own widgets with the input method over them.  Which
+     * one this is was decided in overlay_present_screen(). */
+    const bool status_only = g_screen == OV_BOOT && g_status_html != NULL;
+    const bool reparsed = g_doc_dirty;
+    const bool from_files = g_from_files;
+    char *html = NULL, *css = NULL, *toast_html = NULL, *toast_css = NULL;
+    char *ime_html = NULL, *ime_css = NULL, *menu_html = NULL, *menu_css = NULL;
+    if (reparsed) {
+      const char *h = status_only ? g_status_html : g_html;
+      const char *c = status_only ? g_status_css : g_css;
+      html = h ? strdup(h) : NULL;
+      css = c ? strdup(c) : NULL;
+      if (g_toast_html && !status_only) {
+        toast_html = strdup(g_toast_html);
+        toast_css = g_toast_css ? strdup(g_toast_css) : NULL;
       }
-      /* The lock covers taking what the guest published, nothing more. Parsing
-       * a document and uploading pictures are the compositor's own work on its
-       * own copies: while they ran under the lock, every capture the widget
-       * layer published (with the interpreter lock held) waited on them. */
+      if (g_ime_html && !status_only) {
+        ime_html = strdup(g_ime_html);
+        ime_css = g_ime_css ? strdup(g_ime_css) : NULL;
+      }
+      if (g_menu_html) {
+        menu_html = strdup(g_menu_html);
+        menu_css = g_menu_css ? strdup(g_menu_css) : NULL;
+      }
+      g_doc_dirty = false;
+    }
+    char *changed_image_path = g_changed_image_path;
+    g_changed_image_path = NULL;
+    struct overlay_image_update *image_updates = g_image_updates;
+    g_image_updates = NULL;
+    struct overlay_move *moves = g_moves;
+    g_moves = NULL;
+    /* The store is what a partial update patches, so it takes the new
+     * picture while the lock is held; only the GL upload runs unlocked. */
+    for (struct overlay_image_update *u = image_updates; u; u = u->next)
+      if (!u->refresh) overlay_store_image(u->key, u->width, u->height, u->rgba);
+    pthread_mutex_unlock(&g_doc_lock);
+    if (reparsed) {
+      /* parse_html() appends, so the previous document has to be dropped
+       * first or every republish stacks another copy of the page behind the
+       * one on screen — with its ids, its click wiring and its animations
+       * still live. */
+      luna_reset_document();
+      /* Styles are resolved while the HTML is parsed, so the sheet has to
+       * be in place first. */
+      luna_reset_css();
+      if (from_files && html) {
+        const char *path = getenv("LUNARIA_UI_TEST");
+        char css_path[1024], base[1024];
+        snprintf(base, sizeof base, "%s", path);
+        char *slash = strrchr(base, '/');
+        if (slash) *slash = '\0';
+        luna_set_html_base_dir(base);
+        snprintf(css_path, sizeof css_path, "%s", path);
+        char *dot = strrchr(css_path, '.');
+        if (dot) snprintf(dot, sizeof css_path - (size_t)(dot - css_path),
+                            ".css");
+        if (!luna_load_css_file(css_path))
+          fprintf(stderr, "[overlay] no css at %s\n", css_path);
+        if (!luna_load_html_file(path))
+          fprintf(stderr, "[overlay] failed to load %s\n", path);
+      } else if (html) {
+        if (css) luna_parse_css(css);
+        luna_parse_html(html);
+      }
+      /* The input method is a window of its own on a device, composited
+       * over whatever the application has up — including a dialog.  There
+       * is one luna-ui document here, so "over" means last: appended after
+       * the layer below it, with its own sheet. */
+      /* A toast is a window of its own too: over the application and its
+       * dialogs, under the input method, and never touchable. */
+      if (toast_html) {
+        if (toast_css) luna_parse_css(toast_css);
+        luna_parse_html(toast_html);
+      }
+      if (ime_html) {
+        if (ime_css) luna_parse_css(ime_css);
+        luna_parse_html(ime_html);
+      }
+      /* The emulator's menu is above every window, the card included. */
+      if (menu_html) {
+        if (menu_css) luna_parse_css(menu_css);
+        luna_parse_html(menu_html);
+      }
+      luna_resize((float)w, (float)h);
+      g_surface_holes = false;
+      for (int i = 0; i < luna_element_count(); ++i) {
+        if (!element_has_class(luna_element_at(i), "lunaria-surface-hole")) continue;
+        luna_set_clear_before_paint(i, 1);
+        g_surface_holes = true;
+      }
       pthread_mutex_lock(&g_doc_lock);
-      /* The boot screen is the card and nothing else; the application screen
-       * is the guest's own widgets with the input method over them.  Which
-       * one this is was decided in overlay_present_screen(). */
-      const bool status_only = g_screen == OV_BOOT && g_status_html != NULL;
-      const bool reparsed = g_doc_dirty;
-      const bool from_files = g_from_files;
-      char *html = NULL, *css = NULL, *toast_html = NULL, *toast_css = NULL;
-      char *ime_html = NULL, *ime_css = NULL, *menu_html = NULL, *menu_css = NULL;
-      if (reparsed) {
-         const char *h = status_only ? g_status_html : g_html;
-         const char *c = status_only ? g_status_css : g_css;
-         html = h ? strdup(h) : NULL; css = c ? strdup(c) : NULL;
-         if (g_toast_html && !status_only) { toast_html = strdup(g_toast_html); toast_css = g_toast_css ? strdup(g_toast_css) : NULL; }
-         if (g_ime_html && !status_only) { ime_html = strdup(g_ime_html); ime_css = g_ime_css ? strdup(g_ime_css) : NULL; }
-         if (g_menu_html) { menu_html = strdup(g_menu_html); menu_css = g_menu_css ? strdup(g_menu_css) : NULL; }
-         g_doc_dirty = false;
-      }
-      char *changed_image_path = g_changed_image_path;
-      g_changed_image_path = NULL;
-      struct overlay_image_update *image_updates = g_image_updates;
-      g_image_updates = NULL;
-      struct overlay_move *moves = g_moves;
-      g_moves = NULL;
-      /* The store is what a partial update patches, so it takes the new
-       * picture while the lock is held; only the GL upload runs unlocked. */
-      for (struct overlay_image_update *u = image_updates; u; u = u->next)
-         if (!u->refresh) overlay_store_image(u->key, u->width, u->height, u->rgba);
+      overlay_restore_images();
       pthread_mutex_unlock(&g_doc_lock);
-      if (reparsed) {
-         /* parse_html() appends, so the previous document has to be dropped
-          * first or every republish stacks another copy of the page behind the
-          * one on screen — with its ids, its click wiring and its animations
-          * still live. */
-         luna_reset_document();
-         /* Styles are resolved while the HTML is parsed, so the sheet has to
-          * be in place first. */
-         luna_reset_css();
-         if (from_files && html) {
-            const char *path = getenv("LUNARIA_UI_TEST");
-            char css_path[1024], base[1024];
-            snprintf(base, sizeof base, "%s", path);
-            char *slash = strrchr(base, '/');
-            if (slash) *slash = '\0';
-            luna_set_html_base_dir(base);
-            snprintf(css_path, sizeof css_path, "%s", path);
-            char *dot = strrchr(css_path, '.');
-            if (dot) snprintf(dot, sizeof css_path - (size_t)(dot - css_path),
-                              ".css");
-            if (!luna_load_css_file(css_path))
-               fprintf(stderr, "[overlay] no css at %s\n", css_path);
-            if (!luna_load_html_file(path))
-               fprintf(stderr, "[overlay] failed to load %s\n", path);
-         } else if (html) {
-            if (css) luna_parse_css(css);
-            luna_parse_html(html);
-         }
-         /* The input method is a window of its own on a device, composited
-          * over whatever the application has up — including a dialog.  There
-          * is one luna-ui document here, so "over" means last: appended after
-          * the layer below it, with its own sheet. */
-         /* A toast is a window of its own too: over the application and its
-          * dialogs, under the input method, and never touchable. */
-         if (toast_html) {
-            if (toast_css) luna_parse_css(toast_css);
-            luna_parse_html(toast_html);
-         }
-         if (ime_html) {
-            if (ime_css) luna_parse_css(ime_css);
-            luna_parse_html(ime_html);
-         }
-         /* The emulator's menu is above every window, the card included. */
-         if (menu_html) {
-            if (menu_css) luna_parse_css(menu_css);
-            luna_parse_html(menu_html);
-         }
-         luna_resize((float)w, (float)h);
-         g_surface_holes = false;
-         for (int i = 0; i < luna_element_count(); ++i) {
-            if (!element_has_class(luna_element_at(i), "lunaria-surface-hole")) continue;
-            luna_set_clear_before_paint(i, 1);
-            g_surface_holes = true;
-         }
-         pthread_mutex_lock(&g_doc_lock);
-         overlay_restore_images();
-         pthread_mutex_unlock(&g_doc_lock);
-         overlay_wire_clicks();
-         /* One layout pass so a dump of element boxes is meaningful. */
-         luna_update(overlay_now(), 0.0);
-         /* A reparse is not a rare event — the input method's panel, a guest
-          * dialog and the status card all republish through it, and typing
-          * into a field republishes the document it lives in.  Printing
-          * thirteen lines every time turns a keystroke into a stderr flush
-          * storm on the presenting thread, which is the guest's own swap
-          * thread.  The count is cheap and stays; the element dump is a
-          * layout diagnostic and goes behind its own flag. */
-         {
-            static unsigned long parses;
-            const bool dump = getenv("LUNARIA_TRACE_OVERLAY") != NULL;
-            if (dump || parses < 4 || (parses % 256) == 0)
-               fprintf(stderr, "[overlay] parsed guest document: %d elements "
-                       "at %dx%d (#%lu)\n", luna_element_count(), w, h,
-                       parses);
-            if (dump) {
-               int n = luna_element_count();
-               for (int i = 0; i < n && i < 12; ++i) {
-                  LunaElement *e = luna_element_at(i);
-                  if (!e) continue;
-                  fprintf(stderr, "[overlay]   [%d] id=%s %.0fx%.0f @%.0f,%.0f "
-                          "pe_none=%d\n", i, e->id[0] ? e->id : "-",
-                          (double)e->w, (double)e->h, (double)e->x,
-                          (double)e->y, e->pointer_events_none);
-               }
-            }
-            ++parses;
-         }
+      overlay_wire_clicks();
+      /* One layout pass so a dump of element boxes is meaningful. */
+      luna_update(overlay_now(), 0.0);
+      /* A reparse is not a rare event — the input method's panel, a guest
+       * dialog and the status card all republish through it, and typing
+       * into a field republishes the document it lives in.  Printing
+       * thirteen lines every time turns a keystroke into a stderr flush
+       * storm on the presenting thread, which is the guest's own swap
+       * thread.  The count is cheap and stays; the element dump is a
+       * layout diagnostic and goes behind its own flag. */
+      {
+        static unsigned long parses;
+        const bool dump = getenv("LUNARIA_TRACE_OVERLAY") != NULL;
+        if (dump || parses < 4 || (parses % 256) == 0)
+          fprintf(stderr, "[overlay] parsed guest document: %d elements "
+                          "at %dx%d (#%lu)\n", luna_element_count(), w, h,
+                  parses);
+        if (dump) {
+          int n = luna_element_count();
+          for (int i = 0; i < n && i < 12; ++i) {
+            LunaElement *e = luna_element_at(i);
+            if (!e) continue;
+            fprintf(stderr, "[overlay]   [%d] id=%s %.0fx%.0f @%.0f,%.0f "
+                            "pe_none=%d\n", i, e->id[0] ? e->id : "-",
+                    (double)e->w, (double)e->h, (double)e->x,
+                    (double)e->y, e->pointer_events_none);
+          }
+        }
+        ++parses;
       }
-      free(html); free(css); free(toast_html); free(toast_css);
-      free(ime_html); free(ime_css); free(menu_html); free(menu_css);
-      if (changed_image_path) {
-         luna_invalidate_texture(changed_image_path);
-         free(changed_image_path);
-      }
-      for (struct overlay_move *m = moves; m; m = m->next) {
-         const int idx = luna_get_element_by_id(m->id);
-         if (idx >= 0) luna_set_position(idx, m->left, m->top);
-      }
-      overlay_moves_free(moves);
-      overlay_upload_image_list(image_updates);
-      if (prof) { const uint64_t n = overlay_ns();
-                  g_prof.parse_ns += n - t_mark; t_mark = n; }
-
-      overlay_drain_pointer();
-      /* Keystrokes go in and the field's contents come back out here: the
-       * document is parsed and luna-ui is live, which is the only state its
-       * element API may be called in. */
-      if (!luna_guest_paused()) luna_ime_frame(reparsed);
-      if (prof) { const uint64_t n = overlay_ns();
-                  g_prof.ime_ns += n - t_mark; t_mark = n; }
-
-      /* The document is parsed and luna-ui's state is live here, which is the
-       * only moment a caller may mutate it.  The boot card pushes its stage
-       * line and its progress through this instead of republishing the page:
-       * a reparse restarts every @keyframes timeline on it. */
-      if (g_frame_fn && !luna_guest_paused()) g_frame_fn();
-
-      /* Composited over the guest's finished frame: no clear, and the
-       * document's own background is whatever its CSS paints.  The status
-       * card is the whole frame before the guest has drawn anything, so it
-       * clears to its own ink first — otherwise the previous swap's undefined
-       * back buffer shows through.
-       *
-       * Bind with GL_FRAMEBUFFER, not the ES3 DRAW/READ split.  The overlay
-       * context is created as ES2 so it does not depend on the guest's ES3
-       * context; GL_DRAW_FRAMEBUFFER is not a legal target there and raised
-       * GL_INVALID_OPERATION (0x0502) on every present after a rebind. */
-      glBindFramebuffer(GL_FRAMEBUFFER, 0);
-      glViewport(0, 0, w, h);
-      if (status_only) {
-         glDisable(GL_SCISSOR_TEST);
-         glClearColor(0.043f, 0.059f, 0.078f, 1.f); /* #0b0f14 */
-         glClear(GL_COLOR_BUFFER_BIT);
-      }
-      /* Everything below is composited onto the guest's finished frame, so
-       * luna-ui must not start its pass by clearing the buffer — which it
-       * otherwise does, because for a window it owns the previous back buffer
-       * is undefined.  The status card is the exception: it *is* the whole
-       * frame, and has already cleared to its own ink above. */
-      luna_set_preserve_backdrop(!status_only);
-      glDisable(GL_DEPTH_TEST);
-      glDisable(GL_CULL_FACE);
-      glDisable(GL_SCISSOR_TEST);
-      glDepthMask(GL_FALSE);
-      glEnable(GL_BLEND);
-      glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
-      glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-                          GL_ONE_MINUS_SRC_ALPHA);
-
-      double now = overlay_now();
-      double dt = now - g_last_time;
-      g_last_time = now;
-      overlay_scripted_tap(now);
-      luna_update(now, dt);
-      overlay_render_windows(w, h);
-      overlay_maybe_dump_boot(w, h, status_only);
-      overlay_report_gl_errors("render");
-      if (prof) { const uint64_t n = overlay_ns();
-                  g_prof.render_ns += n - t_mark; t_mark = n; }
-   }
-
-   /* Hand the previous binding back. */
-   if (g_hosted) {
-      /* The compositor's own context stays current; nothing to restore. */
-   } else if (!eglMakeCurrent(dpy, draw, read, prev_ctx))
-      fprintf(stderr, "[overlay] failed to restore previous context (0x%04x)\n",
-              (unsigned)eglGetError());
-   else if (prev_ctx != EGL_NO_CONTEXT)
-      arm_exec_egl_note_current(prev_ctx, draw);
-
-   if (prof) {
+    }
+    free(html);
+    free(css);
+    free(toast_html);
+    free(toast_css);
+    free(ime_html);
+    free(ime_css);
+    free(menu_html);
+    free(menu_css);
+    if (changed_image_path) {
+      luna_invalidate_texture(changed_image_path);
+      free(changed_image_path);
+    }
+    for (struct overlay_move *m = moves; m; m = m->next) {
+      const int idx = luna_get_element_by_id(m->id);
+      if (idx >= 0) luna_set_position(idx, m->left, m->top);
+    }
+    overlay_moves_free(moves);
+    overlay_upload_image_list(image_updates);
+    if (prof) {
       const uint64_t n = overlay_ns();
-      g_prof.restore_ns += n - t_mark;
-      g_prof.total_ns += n - t_enter;
-      ++g_prof.frames;
-      overlay_prof_report();
-   }
+      g_prof.parse_ns += n - t_mark;
+      t_mark = n;
+    }
+
+    overlay_drain_pointer();
+    /* Keystrokes go in and the field's contents come back out here: the
+     * document is parsed and luna-ui is live, which is the only state its
+     * element API may be called in. */
+    if (!luna_guest_paused()) luna_ime_frame(reparsed);
+    if (prof) {
+      const uint64_t n = overlay_ns();
+      g_prof.ime_ns += n - t_mark;
+      t_mark = n;
+    }
+
+    /* The document is parsed and luna-ui's state is live here, which is the
+     * only moment a caller may mutate it.  The boot card pushes its stage
+     * line and its progress through this instead of republishing the page:
+     * a reparse restarts every @keyframes timeline on it. */
+    if (g_frame_fn && !luna_guest_paused()) g_frame_fn();
+
+    /* Composited over the guest's finished frame: no clear, and the
+     * document's own background is whatever its CSS paints.  The status
+     * card is the whole frame before the guest has drawn anything, so it
+     * clears to its own ink first — otherwise the previous swap's undefined
+     * back buffer shows through.
+     *
+     * Bind with GL_FRAMEBUFFER, not the ES3 DRAW/READ split.  The overlay
+     * context is created as ES2 so it does not depend on the guest's ES3
+     * context; GL_DRAW_FRAMEBUFFER is not a legal target there and raised
+     * GL_INVALID_OPERATION (0x0502) on every present after a rebind. */
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, w, h);
+    if (status_only) {
+      glDisable(GL_SCISSOR_TEST);
+      glClearColor(0.043f, 0.059f, 0.078f, 1.f); /* #0b0f14 */
+      glClear(GL_COLOR_BUFFER_BIT);
+    }
+    /* Everything below is composited onto the guest's finished frame, so
+     * luna-ui must not start its pass by clearing the buffer — which it
+     * otherwise does, because for a window it owns the previous back buffer
+     * is undefined.  The status card is the exception: it *is* the whole
+     * frame, and has already cleared to its own ink above. */
+    luna_set_preserve_backdrop(!status_only);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+                        GL_ONE_MINUS_SRC_ALPHA);
+
+    double now = overlay_now();
+    double dt = now - g_last_time;
+    g_last_time = now;
+    overlay_scripted_tap(now);
+    luna_update(now, dt);
+    overlay_render_windows(w, h);
+    overlay_maybe_dump_boot(w, h, status_only);
+    overlay_report_gl_errors("render");
+    if (prof) {
+      const uint64_t n = overlay_ns();
+      g_prof.render_ns += n - t_mark;
+      t_mark = n;
+    }
+  }
+
+  /* Hand the previous binding back. */
+  if (g_hosted) {
+    /* The compositor's own context stays current; nothing to restore. */
+  } else if (!eglMakeCurrent(dpy, draw, read, prev_ctx))
+    fprintf(stderr, "[overlay] failed to restore previous context (0x%04x)\n",
+            (unsigned)eglGetError());
+  else if (prev_ctx != EGL_NO_CONTEXT)
+    arm_exec_egl_note_current(prev_ctx, draw);
+
+  if (prof) {
+    const uint64_t n = overlay_ns();
+    g_prof.restore_ns += n - t_mark;
+    g_prof.total_ns += n - t_enter;
+    ++g_prof.frames;
+    overlay_prof_report();
+  }
 }
 
 /* A shown Android dialog is modal: the window above takes every touch, and
@@ -1711,463 +1932,594 @@ bound:
  * dialog — it must not eat the touches a title needs once it starts drawing. */
 bool luna_overlay_pointer(double x, double y, int action)
 {
-   if (getenv("LUNARIA_TRACE_TOUCH")) fprintf(stderr, "[ovl-in] %.0f,%.0f act=%d paused=%d\n", x, y, action, (int)luna_guest_paused());
-   pthread_mutex_lock(&g_doc_lock);
-   bool guest = g_html != NULL && !g_native_input_focus;
-   bool ime = g_ime_html != NULL;
-   bool menu = g_menu_html != NULL && g_menu_modal;
-   pthread_mutex_unlock(&g_doc_lock);
-   if (g_failed) return false;
-   if (menu) goto consume;    /* the emulator's menu is modal */
-   if (luna_guest_paused()) return true;
-   if (guest) goto consume;   /* a dialog is modal: it takes every touch */
-   if (!ime) return false;
-   /* The input method is not modal — the application below it keeps working,
-    * exactly as it does on a device — but the band it occupies is its own
-    * window, and a touch there is the keyboard's, not the game's.  Before the
-    * overlay has a size there is no band to be inside, so nothing is. */
-   if (g_h <= 0 || y < g_h - luna_ime_band_height(g_h)) return false;
+  if (getenv("LUNARIA_TRACE_TOUCH")) fprintf(stderr, "[ovl-in] %.0f,%.0f act=%d paused=%d\n", x, y, action, (int)luna_guest_paused());
+  pthread_mutex_lock(&g_doc_lock);
+  bool guest = g_html != NULL && !g_native_input_focus;
+  bool ime = g_ime_html != NULL;
+  bool menu = g_menu_html != NULL && g_menu_modal;
+  pthread_mutex_unlock(&g_doc_lock);
+  if (g_failed) return false;
+  if (menu) goto consume;    /* the emulator's menu is modal */
+  if (luna_guest_paused()) return true;
+  if (guest) goto consume;   /* a dialog is modal: it takes every touch */
+  if (!ime) return false;
+  /* The input method is not modal — the application below it keeps working,
+   * exactly as it does on a device — but the band it occupies is its own
+   * window, and a touch there is the keyboard's, not the game's.  Before the
+   * overlay has a size there is no band to be inside, so nothing is. */
+  if (g_h <= 0 || y < g_h - luna_ime_band_height(g_h)) return false;
 consume:
-   /* Say so.  Swallowing a touch here is invisible from the guest's side --
-    * it is indistinguishable from a button that does not respond -- and the
-    * overlay is above the application, so it is the first thing to rule out
-    * when a tap stops working.  Rate-limited, and the gate is named. */
-   {
-      static unsigned long taken;
-      if (taken == 0 || (taken % 64) == 0)
-         fprintf(stderr, "[overlay] took pointer %.0f,%.0f action=%d "
-                 "(%s) — the guest does not see this touch\n", x, y, action,
-                 menu ? "the emulator menu is up"
-                 : guest ? "a guest dialog is up and is modal"
-                       : "inside the input method's band");
-      ++taken;
-   }
-   pthread_mutex_lock(&g_ptr_lock);
-   if (g_ptr_count < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
-      g_ptr_queue[g_ptr_count].x = x;
-      g_ptr_queue[g_ptr_count].y = y;
-      g_ptr_queue[g_ptr_count].action = action;
-      g_ptr_queue[g_ptr_count].event_ms = (long long)(overlay_ns()/1000000u);
-      ++g_ptr_count;
-   }
-   pthread_mutex_unlock(&g_ptr_lock);
-   luna_overlay_wake();
-   return true;
+  /* Say so.  Swallowing a touch here is invisible from the guest's side --
+   * it is indistinguishable from a button that does not respond -- and the
+   * overlay is above the application, so it is the first thing to rule out
+   * when a tap stops working.  Rate-limited, and the gate is named. */
+  {
+    static unsigned long taken;
+    if (taken == 0 || (taken % 64) == 0)
+      fprintf(stderr, "[overlay] took pointer %.0f,%.0f action=%d "
+                      "(%s) — the guest does not see this touch\n", x, y, action,
+              menu ? "the emulator menu is up"
+              : guest ? "a guest dialog is up and is modal"
+              : "inside the input method's band");
+    ++taken;
+  }
+  pthread_mutex_lock(&g_ptr_lock);
+  if (g_ptr_count < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
+    g_ptr_queue[g_ptr_count].x = x;
+    g_ptr_queue[g_ptr_count].y = y;
+    g_ptr_queue[g_ptr_count].action = action;
+    g_ptr_queue[g_ptr_count].event_ms = (long long)(overlay_ns()/1000000u);
+    ++g_ptr_count;
+  }
+  pthread_mutex_unlock(&g_ptr_lock);
+  luna_overlay_wake();
+  return true;
 }
 
 void luna_overlay_shutdown(void)
 {
-   /* Blocking, unlike a present: tearing luna-ui down under a thread that is
-    * inside it is the race this lock exists for. */
-   pthread_mutex_lock(&g_present_lock);
-   if (g_ready) {
-      if (g_window_fbo) glDeleteFramebuffers(1, &g_window_fbo);
-      if (g_window_tex) glDeleteTextures(1, &g_window_tex);
-      if (g_window_program) glDeleteProgram(g_window_program);
-      luna_shutdown();
-   }
-   overlay_window_objects_forget();
-   g_ready = false;
-   free(g_html);
-   free(g_css);
-   free(g_status_html);
-   free(g_status_css);
-   free(g_ime_html);
-   free(g_ime_css);
-   free(g_toast_html);
-   free(g_toast_css);
-   free(g_menu_html);
-   free(g_menu_css);
-   overlay_source_remove_key(NULL);
-   pthread_mutex_lock(&g_doc_lock);
-   free(g_changed_image_path);
-   g_changed_image_path = NULL;
-   while(g_image_updates) {
-      struct overlay_image_update *entry=g_image_updates;g_image_updates=entry->next;
-      free(entry->rgba);free(entry);
-   }
-   pthread_mutex_unlock(&g_doc_lock);
-   g_toast_html = g_toast_css = NULL;
-   g_menu_html = g_menu_css = NULL;
-   g_html = g_css = g_status_html = g_status_css = NULL;
-   g_ime_html = g_ime_css = NULL;
-   pthread_mutex_unlock(&g_present_lock);
+  /* Blocking, unlike a present: tearing luna-ui down under a thread that is
+   * inside it is the race this lock exists for. */
+  pthread_mutex_lock(&g_present_lock);
+  if (g_ready) {
+    if (g_window_fbo) glDeleteFramebuffers(1, &g_window_fbo);
+    if (g_window_tex) glDeleteTextures(1, &g_window_tex);
+    if (g_window_program) glDeleteProgram(g_window_program);
+    luna_shutdown();
+  }
+  overlay_window_objects_forget();
+  g_ready = false;
+  free(g_html);
+  free(g_css);
+  free(g_status_html);
+  free(g_status_css);
+  free(g_ime_html);
+  free(g_ime_css);
+  free(g_toast_html);
+  free(g_toast_css);
+  free(g_menu_html);
+  free(g_menu_css);
+  overlay_source_remove_key(NULL);
+  pthread_mutex_lock(&g_doc_lock);
+  free(g_changed_image_path);
+  g_changed_image_path = NULL;
+  while(g_image_updates) {
+    struct overlay_image_update *entry=g_image_updates;
+    g_image_updates=entry->next;
+    free(entry->rgba);
+    free(entry);
+  }
+  pthread_mutex_unlock(&g_doc_lock);
+  g_toast_html = g_toast_css = NULL;
+  g_menu_html = g_menu_css = NULL;
+  g_html = g_css = g_status_html = g_status_css = NULL;
+  g_ime_html = g_ime_css = NULL;
+  pthread_mutex_unlock(&g_present_lock);
 }
 
 unsigned char *luna_overlay_image_decode(const void *data, size_t len,
-                                         int *w, int *h)
+    int *w, int *h)
 {
-   int ch = 0;
-   if (!data || !len || len > (size_t)INT_MAX) return NULL;
-   return stbi_load_from_memory((const stbi_uc *)data, (int)len, w, h, &ch, 4);
+  int ch = 0;
+  if (!data || !len || len > (size_t)INT_MAX) return NULL;
+  return stbi_load_from_memory((const stbi_uc *)data, (int)len, w, h, &ch, 4);
 }
 
 void luna_overlay_image_free(unsigned char *pixels)
 {
-   stbi_image_free(pixels);
+  stbi_image_free(pixels);
 }
 
 /* Private C HarfBuzz adapter. Loaded through the OS bridge, using the same
  * fonts and stb_truetype rasterizer as luna-ui. Caller holds g_present_lock.
  * Stable public HarfBuzz ABI types; no build-time or FreeType dependency. */
-struct text_hb_info {uint32_t glyph,mask,cluster,var1,var2;};
-struct text_hb_position {int32_t x_advance,y_advance,x_offset,y_offset;uint32_t var;};
+struct text_hb_info {
+  uint32_t glyph,mask,cluster,var1,var2;
+};
+struct text_hb_position {
+  int32_t x_advance,y_advance,x_offset,y_offset;
+  uint32_t var;
+};
 _Static_assert(sizeof(struct text_hb_info)==20,"HarfBuzz glyph info ABI");
 _Static_assert(sizeof(struct text_hb_position)==20,"HarfBuzz glyph position ABI");
 struct text_hb_api {
- void *library;
- void *(*blob_create)(const char *,unsigned,int,void *,void (*)(void *));
- void *(*face_create_for_tables)(void *(*)(void *,uint32_t,void *),void *,void (*)(void *));
- void (*face_destroy)(void *);
- void *(*font_create)(void *);
- void (*font_destroy)(void *);
- void (*ot_font_set_funcs)(void *);
- void (*font_set_scale)(void *,int,int);
- void *(*buffer_create)(void);
- void (*buffer_destroy)(void *);
- void (*buffer_add_utf16)(void *,const uint16_t *,int,unsigned,int);
- void (*buffer_guess_segment_properties)(void *);
- void (*buffer_set_direction)(void *,int);
- void (*shape)(void *,void *,const void *,unsigned);
- struct text_hb_info *(*buffer_get_glyph_infos)(void *,unsigned *);
- struct text_hb_position *(*buffer_get_glyph_positions)(void *,unsigned *);
- int (*buffer_allocation_successful)(void *);
+  void *library;
+  void *(*blob_create)(const char *,unsigned,int,void *,void (*)(void *));
+  void *(*face_create_for_tables)(void *(*)(void *,uint32_t,void *),void *,void (*)(void *));
+  void (*face_destroy)(void *);
+  void *(*font_create)(void *);
+  void (*font_destroy)(void *);
+  void (*ot_font_set_funcs)(void *);
+  void (*font_set_scale)(void *,int,int);
+  void *(*buffer_create)(void);
+  void (*buffer_destroy)(void *);
+  void (*buffer_add_utf16)(void *,const uint16_t *,int,unsigned,int);
+  void (*buffer_guess_segment_properties)(void *);
+  void (*buffer_set_direction)(void *,int);
+  void (*shape)(void *,void *,const void *,unsigned);
+  struct text_hb_info *(*buffer_get_glyph_infos)(void *,unsigned *);
+  struct text_hb_position *(*buffer_get_glyph_positions)(void *,unsigned *);
+  int (*buffer_allocation_successful)(void *);
 };
 static struct text_hb_api text_hb;
-struct text_hb_face {stbtt_fontinfo *info;const unsigned char *data;long size;int offset;void *font;};
+struct text_hb_face {
+  stbtt_fontinfo *info;
+  const unsigned char *data;
+  long size;
+  int offset;
+  void *font;
+};
 static struct text_hb_face text_hb_faces[6];
 struct text_custom_face {
- struct text_custom_face *next;
- uint32_t handle;
- size_t size;
- int index;
- unsigned char *bytes;
- stbtt_fontinfo info;
- struct text_hb_face hb;
+  struct text_custom_face *next;
+  uint32_t handle;
+  size_t size;
+  int index;
+  unsigned char *bytes;
+  stbtt_fontinfo info;
+  struct text_hb_face hb;
 };
 static struct text_custom_face *text_custom_faces;
 static uint32_t text_custom_count;
 static struct text_custom_face *text_custom_find(uint32_t handle)
 {
- for(struct text_custom_face *f=text_custom_faces;f;f=f->next)
-  if(f->handle==handle) return f;
- return NULL;
+  for(struct text_custom_face *f=text_custom_faces; f; f=f->next)
+    if(f->handle==handle) return f;
+  return NULL;
 }
 static void text_hb_shutdown(void)
 {
- while(text_custom_faces) {
-  struct text_custom_face *f=text_custom_faces;text_custom_faces=f->next;
-  if(f->hb.font) text_hb.font_destroy(f->hb.font);
-  free(f->bytes);free(f);
- }
- text_custom_count=0;
- for(size_t i=0;i<6;++i) if(text_hb_faces[i].font) {text_hb.font_destroy(text_hb_faces[i].font);text_hb_faces[i].font=NULL;}
- if(text_hb.library) {luna_os_library_close(text_hb.library);text_hb.library=NULL;}
+  while(text_custom_faces) {
+    struct text_custom_face *f=text_custom_faces;
+    text_custom_faces=f->next;
+    if(f->hb.font) text_hb.font_destroy(f->hb.font);
+    free(f->bytes);
+    free(f);
+  }
+  text_custom_count=0;
+  for(size_t i=0; i<6; ++i) if(text_hb_faces[i].font) {
+      text_hb.font_destroy(text_hb_faces[i].font);
+      text_hb_faces[i].font=NULL;
+    }
+  if(text_hb.library) {
+    luna_os_library_close(text_hb.library);
+    text_hb.library=NULL;
+  }
 }
 static bool text_hb_load(void)
 {
- if(text_hb.library) return true;
- const char *names[]={
+  if(text_hb.library) return true;
+  const char *names[]= {
 #if defined(_WIN32)
- "libharfbuzz-0.dll","harfbuzz.dll",
+    "libharfbuzz-0.dll","harfbuzz.dll",
 #elif defined(__APPLE__)
- "@rpath/libharfbuzz.0.dylib","libharfbuzz.0.dylib","/opt/homebrew/lib/libharfbuzz.0.dylib","/usr/local/lib/libharfbuzz.0.dylib",
+    "@rpath/libharfbuzz.0.dylib","libharfbuzz.0.dylib","/opt/homebrew/lib/libharfbuzz.0.dylib","/usr/local/lib/libharfbuzz.0.dylib",
 #else
- "libharfbuzz.so.0","libharfbuzz.so",
+    "libharfbuzz.so.0","libharfbuzz.so",
 #endif
- NULL};
- void *library=NULL;for(int i=0;names[i] && !library;++i) library=luna_os_library_open_local(names[i]);
- if(!library) return false;
+    NULL
+  };
+  void *library=NULL;
+  for(int i=0; names[i] && !library; ++i) library=luna_os_library_open_local(names[i]);
+  if(!library) return false;
 #define TEXT_HB_BIND(name) do {void *symbol=luna_os_library_symbol(library,"hb_" #name); \
  if(!symbol) {luna_os_library_close(library);memset(&text_hb,0,sizeof text_hb);return false;} \
  _Static_assert(sizeof text_hb.name==sizeof symbol,"host function pointer size");memcpy(&text_hb.name,&symbol,sizeof symbol);} while(0)
- TEXT_HB_BIND(blob_create);TEXT_HB_BIND(face_create_for_tables);TEXT_HB_BIND(face_destroy);
- TEXT_HB_BIND(font_create);TEXT_HB_BIND(font_destroy);TEXT_HB_BIND(ot_font_set_funcs);TEXT_HB_BIND(font_set_scale);
- TEXT_HB_BIND(buffer_create);TEXT_HB_BIND(buffer_destroy);TEXT_HB_BIND(buffer_add_utf16);
- TEXT_HB_BIND(buffer_guess_segment_properties);TEXT_HB_BIND(buffer_set_direction);TEXT_HB_BIND(shape);
- TEXT_HB_BIND(buffer_get_glyph_infos);TEXT_HB_BIND(buffer_get_glyph_positions);TEXT_HB_BIND(buffer_allocation_successful);
+  TEXT_HB_BIND(blob_create);
+  TEXT_HB_BIND(face_create_for_tables);
+  TEXT_HB_BIND(face_destroy);
+  TEXT_HB_BIND(font_create);
+  TEXT_HB_BIND(font_destroy);
+  TEXT_HB_BIND(ot_font_set_funcs);
+  TEXT_HB_BIND(font_set_scale);
+  TEXT_HB_BIND(buffer_create);
+  TEXT_HB_BIND(buffer_destroy);
+  TEXT_HB_BIND(buffer_add_utf16);
+  TEXT_HB_BIND(buffer_guess_segment_properties);
+  TEXT_HB_BIND(buffer_set_direction);
+  TEXT_HB_BIND(shape);
+  TEXT_HB_BIND(buffer_get_glyph_infos);
+  TEXT_HB_BIND(buffer_get_glyph_positions);
+  TEXT_HB_BIND(buffer_allocation_successful);
 #undef TEXT_HB_BIND
- text_hb.library=library;atexit(text_hb_shutdown);return true;
+  text_hb.library=library;
+  atexit(text_hb_shutdown);
+  return true;
 }
 static uint32_t text_be32(const unsigned char *p)
-{return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];}
+{
+  return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3];
+}
 static void *text_hb_table(void *face,uint32_t tag,void *data)
 {
- (void)face;const struct text_hb_face *source=data;
- if(source->size<12 || source->offset<0 || (size_t)source->offset>(size_t)source->size-12) return NULL;
- const unsigned char *dir=source->data+source->offset;unsigned count=((unsigned)dir[4]<<8)|dir[5];
- if(count>((size_t)source->size-source->offset-12)/16) return NULL;
- for(unsigned i=0;i<count;++i) {
-  const unsigned char *table=dir+12+16*i;if(text_be32(table)!=tag) continue;
-  uint32_t offset=text_be32(table+8),length=text_be32(table+12);
-  if(offset>(size_t)source->size || length>(size_t)source->size-offset) return NULL;
-  /* Duplicate tables: font reload/shutdown may release luna-ui's backing file. */
-  return text_hb.blob_create((const char *)source->data+offset,length,0,NULL,NULL);
- }
- return NULL;
+  (void)face;
+  const struct text_hb_face *source=data;
+  if(source->size<12 || source->offset<0 || (size_t)source->offset>(size_t)source->size-12) return NULL;
+  const unsigned char *dir=source->data+source->offset;
+  unsigned count=((unsigned)dir[4]<<8)|dir[5];
+  if(count>((size_t)source->size-source->offset-12)/16) return NULL;
+  for(unsigned i=0; i<count; ++i) {
+    const unsigned char *table=dir+12+16*i;
+    if(text_be32(table)!=tag) continue;
+    uint32_t offset=text_be32(table+8),length=text_be32(table+12);
+    if(offset>(size_t)source->size || length>(size_t)source->size-offset) return NULL;
+    /* Duplicate tables: font reload/shutdown may release luna-ui's backing file. */
+    return text_hb.blob_create((const char *)source->data+offset,length,0,NULL,NULL);
+  }
+  return NULL;
 }
 static void *text_hb_font(stbtt_fontinfo *info)
 {
- stbtt_fontinfo *fonts[]={&g_font_info,&g_bold_font_info,&g_cjk_font_info,&g_mono_font_info,&g_icon_font_info,&g_brand_font_info};
- size_t slot=0;while(slot<6 && fonts[slot]!=info) ++slot;
- struct text_hb_face *source=NULL;
- if(slot<6) source=&text_hb_faces[slot];
- else for(struct text_custom_face *f=text_custom_faces;f;f=f->next)
-  if(&f->info==info) {source=&f->hb;break;}
- if(!source) return NULL;
- if(source->font && (source->data!=info->data || source->offset!=info->fontstart)) {
-  text_hb.font_destroy(source->font);source->font=NULL;
- }
- if(!source->font) {
-  source->info=info;source->data=info->data;source->offset=info->fontstart;source->size=slot<6 ? g_font_blob_sizes[slot] : source->size;
-  void *face=text_hb.face_create_for_tables(text_hb_table,source,NULL);if(!face) return NULL;
-  source->font=text_hb.font_create(face);text_hb.face_destroy(face);if(!source->font) return NULL;
-  text_hb.ot_font_set_funcs(source->font);
- }
- return source->font;
+  stbtt_fontinfo *fonts[]= {&g_font_info,&g_bold_font_info,&g_cjk_font_info,&g_mono_font_info,&g_icon_font_info,&g_brand_font_info};
+  size_t slot=0;
+  while(slot<6 && fonts[slot]!=info) ++slot;
+  struct text_hb_face *source=NULL;
+  if(slot<6) source=&text_hb_faces[slot];
+  else for(struct text_custom_face *f=text_custom_faces; f; f=f->next)
+      if(&f->info==info) {
+        source=&f->hb;
+        break;
+      }
+  if(!source) return NULL;
+  if(source->font && (source->data!=info->data || source->offset!=info->fontstart)) {
+    text_hb.font_destroy(source->font);
+    source->font=NULL;
+  }
+  if(!source->font) {
+    source->info=info;
+    source->data=info->data;
+    source->offset=info->fontstart;
+    source->size=slot<6 ? g_font_blob_sizes[slot] : source->size;
+    void *face=text_hb.face_create_for_tables(text_hb_table,source,NULL);
+    if(!face) return NULL;
+    source->font=text_hb.font_create(face);
+    text_hb.face_destroy(face);
+    if(!source->font) return NULL;
+    text_hb.ot_font_set_funcs(source->font);
+  }
+  return source->font;
 }
 static uint32_t text_codepoint(const uint16_t *text,size_t length,size_t *offset)
 {
- uint32_t cp=text[(*offset)++];
- if(cp>=0xd800 && cp<=0xdbff && *offset<length && text[*offset]>=0xdc00 && text[*offset]<=0xdfff)
-  cp=0x10000+((cp-0xd800)<<10)+(text[(*offset)++]-0xdc00);
- else if(cp>=0xd800 && cp<=0xdfff) cp=0xfffd;
- return cp;
+  uint32_t cp=text[(*offset)++];
+  if(cp>=0xd800 && cp<=0xdbff && *offset<length && text[*offset]>=0xdc00 && text[*offset]<=0xdfff)
+    cp=0x10000+((cp-0xd800)<<10)+(text[(*offset)++]-0xdc00);
+  else if(cp>=0xd800 && cp<=0xdfff) cp=0xfffd;
+  return cp;
 }
 static bool text_shape_locked(const uint16_t *text,size_t length,size_t start,size_t item_count,float px,bool bold,stbtt_fontinfo *custom,int direction,struct luna_text_run *out)
 {
- memset(out,0,sizeof *out);
- if(length>INT_MAX || start>length || item_count>length-start || !isfinite(px) || px<0 || px>32768 || (!text && length)) return false;
- if(!item_count || px==0) return true;
- /* No HarfBuzz on this host (macOS ships none): lay out one glyph per code
-  * point with stb's advances.  No ligatures/kerning/RTL reordering, but the
-  * guest's own dialogs (terms of service, ...) still measure and draw. */
- bool use_hb=text_hb_load();
- int previous_bold=g_font_bold_hint;g_font_bold_hint=bold ? 1 : 0;
- bool good=true;size_t begin=start,limit=start+item_count,capacity=0;
- while(begin<limit && good) {
-  size_t end=begin;uint32_t cp=text_codepoint(text,limit,&end);stbtt_fontinfo *info=custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp);
-  if(!info) {good=false;break;}
-  int ascent,descent,gap;
-  stbtt_GetFontVMetrics(info,&ascent,&descent,&gap);
-  float metric_scale=stbtt_ScaleForMappingEmToPixels(info,px);
-  out->ascent=fminf(out->ascent,-ascent*metric_scale);
-  out->descent=fmaxf(out->descent,-descent*metric_scale);
-  while(end<limit) {size_t next=end;cp=text_codepoint(text,limit,&next);if((custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp))!=info) break;end=next;}
-  if(!use_hb) {
-   size_t at=begin;
-   while(at<end) {
-    size_t from=at;uint32_t c=text_codepoint(text,end,&at);
-    int index=stbtt_FindGlyphIndex(info,(int)c),adv=0,lsb=0;
-    stbtt_GetGlyphHMetrics(info,index,&adv,&lsb);
-    if(out->count==capacity) {
-     capacity=capacity ? capacity*2 : 16;struct luna_text_glyph *grown=realloc(out->glyphs,capacity*sizeof *grown);
-     if(!grown) {good=false;break;}
-     out->glyphs=grown;
+  memset(out,0,sizeof *out);
+  if(length>INT_MAX || start>length || item_count>length-start || !isfinite(px) || px<0 || px>32768 || (!text && length)) return false;
+  if(!item_count || px==0) return true;
+  /* No HarfBuzz on this host (macOS ships none): lay out one glyph per code
+   * point with stb's advances.  No ligatures/kerning/RTL reordering, but the
+   * guest's own dialogs (terms of service, ...) still measure and draw. */
+  bool use_hb=text_hb_load();
+  int previous_bold=g_font_bold_hint;
+  g_font_bold_hint=bold ? 1 : 0;
+  bool good=true;
+  size_t begin=start,limit=start+item_count,capacity=0;
+  while(begin<limit && good) {
+    size_t end=begin;
+    uint32_t cp=text_codepoint(text,limit,&end);
+    stbtt_fontinfo *info=custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp);
+    if(!info) {
+      good=false;
+      break;
     }
-    struct luna_text_glyph *g=&out->glyphs[out->count++];
-    *g=(struct luna_text_glyph){.font=info,.font_data=info->data,.glyph=(uint32_t)index,.cluster=(uint32_t)(from-start),
-       .x=out->width,.y=0,.advance=adv*metric_scale};
-    out->width+=g->advance;out->missing=out->missing || !g->glyph;
-   }
-   begin=end;continue;
+    int ascent,descent,gap;
+    stbtt_GetFontVMetrics(info,&ascent,&descent,&gap);
+    float metric_scale=stbtt_ScaleForMappingEmToPixels(info,px);
+    out->ascent=fminf(out->ascent,-ascent*metric_scale);
+    out->descent=fmaxf(out->descent,-descent*metric_scale);
+    while(end<limit) {
+      size_t next=end;
+      cp=text_codepoint(text,limit,&next);
+      if((custom && stbtt_FindGlyphIndex(custom,(int)cp) ? custom : font_for_codepoint((int)cp))!=info) break;
+      end=next;
+    }
+    if(!use_hb) {
+      size_t at=begin;
+      while(at<end) {
+        size_t from=at;
+        uint32_t c=text_codepoint(text,end,&at);
+        int index=stbtt_FindGlyphIndex(info,(int)c),adv=0,lsb=0;
+        stbtt_GetGlyphHMetrics(info,index,&adv,&lsb);
+        if(out->count==capacity) {
+          capacity=capacity ? capacity*2 : 16;
+          struct luna_text_glyph *grown=realloc(out->glyphs,capacity*sizeof *grown);
+          if(!grown) {
+            good=false;
+            break;
+          }
+          out->glyphs=grown;
+        }
+        struct luna_text_glyph *g=&out->glyphs[out->count++];
+        *g=(struct luna_text_glyph) {
+          .font=info,.font_data=info->data,.glyph=(uint32_t)index,.cluster=(uint32_t)(from-start),
+                                                                  .x=out->width,.y=0,.advance=adv*metric_scale
+        };
+        out->width+=g->advance;
+        out->missing=out->missing || !g->glyph;
+      }
+      begin=end;
+      continue;
+    }
+    void *font=text_hb_font(info),*buffer=text_hb.buffer_create();
+    if(!font || !buffer) {
+      if(buffer) text_hb.buffer_destroy(buffer);
+      good=false;
+      break;
+    }
+    int scale=(int)floorf(px*64+.5f);
+    text_hb.font_set_scale(font,scale,scale);
+    text_hb.buffer_add_utf16(buffer,text,(int)length,(unsigned)begin,(int)(end-begin));
+    if(direction) text_hb.buffer_set_direction(buffer,direction==2 ? 5 : 4);
+    text_hb.buffer_guess_segment_properties(buffer);
+    text_hb.shape(font,buffer,NULL,0);
+    unsigned count=0,positions_count=0;
+    struct text_hb_info *glyphs=text_hb.buffer_get_glyph_infos(buffer,&count);
+    struct text_hb_position *positions=text_hb.buffer_get_glyph_positions(buffer,&positions_count);
+    if(!text_hb.buffer_allocation_successful(buffer) || positions_count!=count || count>SIZE_MAX/sizeof *out->glyphs-out->count) good=false;
+    if(good && out->count+count>capacity) {
+      capacity=out->count+count;
+      struct luna_text_glyph *grown=realloc(out->glyphs,capacity*sizeof *grown);
+      if(!grown) good=false;
+      else out->glyphs=grown;
+    }
+    for(unsigned i=0; good && i<count; ++i) {
+      struct luna_text_glyph *g=&out->glyphs[out->count++];
+      *g=(struct luna_text_glyph) {
+        .font=info,.font_data=info->data,.glyph=glyphs[i].glyph,.cluster=(uint32_t)(glyphs[i].cluster-start),
+                                                                .x=out->width+positions[i].x_offset/64.f,.y=-positions[i].y_offset/64.f,.advance=positions[i].x_advance/64.f
+      };
+      out->width+=g->advance;
+      out->missing=out->missing || !g->glyph;
+    }
+    text_hb.buffer_destroy(buffer);
+    begin=end;
   }
-  void *font=text_hb_font(info),*buffer=text_hb.buffer_create();
-  if(!font || !buffer) {if(buffer) text_hb.buffer_destroy(buffer);good=false;break;}
-  int scale=(int)floorf(px*64+.5f);text_hb.font_set_scale(font,scale,scale);
-  text_hb.buffer_add_utf16(buffer,text,(int)length,(unsigned)begin,(int)(end-begin));
-  if(direction) text_hb.buffer_set_direction(buffer,direction==2 ? 5 : 4);
-  text_hb.buffer_guess_segment_properties(buffer);text_hb.shape(font,buffer,NULL,0);
-  unsigned count=0,positions_count=0;
-  struct text_hb_info *glyphs=text_hb.buffer_get_glyph_infos(buffer,&count);
-  struct text_hb_position *positions=text_hb.buffer_get_glyph_positions(buffer,&positions_count);
-  if(!text_hb.buffer_allocation_successful(buffer) || positions_count!=count || count>SIZE_MAX/sizeof *out->glyphs-out->count) good=false;
-  if(good && out->count+count>capacity) {
-   capacity=out->count+count;struct luna_text_glyph *grown=realloc(out->glyphs,capacity*sizeof *grown);
-   if(!grown) good=false;else out->glyphs=grown;
+  g_font_bold_hint=previous_bold;
+  if(!good) {
+    free(out->glyphs);
+    memset(out,0,sizeof *out);
   }
-  for(unsigned i=0;good && i<count;++i) {
-   struct luna_text_glyph *g=&out->glyphs[out->count++];
-   *g=(struct luna_text_glyph){.font=info,.font_data=info->data,.glyph=glyphs[i].glyph,.cluster=(uint32_t)(glyphs[i].cluster-start),
-      .x=out->width+positions[i].x_offset/64.f,.y=-positions[i].y_offset/64.f,.advance=positions[i].x_advance/64.f};
-   out->width+=g->advance;out->missing=out->missing || !g->glyph;
-  }
-  text_hb.buffer_destroy(buffer);begin=end;
- }
- g_font_bold_hint=previous_bold;
- if(!good) {free(out->glyphs);memset(out,0,sizeof *out);}
- return good;
+  return good;
 }
 #include "luna_unicode.h"
 
 bool luna_overlay_text_breaks(const uint16_t *text,size_t length,const char *locale,unsigned char *breaks)
 {
- (void)locale;
- return luna_uc_breaks_utf16(text,length,breaks);
+  (void)locale;
+  return luna_uc_breaks_utf16(text,length,breaks);
 }
 
 /* Check the SFNT directory and every table range before handing data to stb.
  * Font parsing follows the same trusted-font model as the platform fonts. */
 uint32_t luna_overlay_font_load(const void *data,size_t size,int index)
 {
- if(!data || size<12 || size>INT_MAX || index<0) return 0;
- const unsigned char *bytes=data;size_t offset=0;
- if(!memcmp(bytes,"ttcf",4)) {
-  uint32_t count=text_be32(bytes+8);
-  if(count>(size-12)/4 || (uint32_t)index>=count) return 0;
-  offset=text_be32(bytes+12+4*(size_t)index);
- } else if(index) return 0;
- if(offset>size-12) return 0;
- const unsigned char *dir=bytes+offset;
- if(text_be32(dir)!=0x00010000 && memcmp(dir,"OTTO",4) && memcmp(dir,"true",4)) return 0;
- unsigned count=((unsigned)dir[4]<<8)|dir[5];
- if(!count || count>(size-offset-12)/16) return 0;
- for(unsigned i=0;i<count;++i) {
-  const unsigned char *t=dir+12+16*i;size_t pos=text_be32(t+8),length=text_be32(t+12);
-  if(pos>size || length>size-pos) return 0;
- }
- pthread_mutex_lock(&g_present_lock);
- for(struct text_custom_face *f=text_custom_faces;f;f=f->next)
-  if(f->size==size && f->index==index && !memcmp(f->bytes,data,size)) {
-   uint32_t handle=f->handle;pthread_mutex_unlock(&g_present_lock);return handle;
+  if(!data || size<12 || size>INT_MAX || index<0) return 0;
+  const unsigned char *bytes=data;
+  size_t offset=0;
+  if(!memcmp(bytes,"ttcf",4)) {
+    uint32_t count=text_be32(bytes+8);
+    if(count>(size-12)/4 || (uint32_t)index>=count) return 0;
+    offset=text_be32(bytes+12+4*(size_t)index);
+  } else if(index) return 0;
+  if(offset>size-12) return 0;
+  const unsigned char *dir=bytes+offset;
+  if(text_be32(dir)!=0x00010000 && memcmp(dir,"OTTO",4) && memcmp(dir,"true",4)) return 0;
+  unsigned count=((unsigned)dir[4]<<8)|dir[5];
+  if(!count || count>(size-offset-12)/16) return 0;
+  for(unsigned i=0; i<count; ++i) {
+    const unsigned char *t=dir+12+16*i;
+    size_t pos=text_be32(t+8),length=text_be32(t+12);
+    if(pos>size || length>size-pos) return 0;
   }
- struct text_custom_face *f=calloc(1,sizeof *f);
- if(!f || text_custom_count==UINT32_MAX) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
- f->bytes=malloc(size);
- if(!f->bytes) {free(f);pthread_mutex_unlock(&g_present_lock);return 0;}
- memcpy(f->bytes,data,size);
- if(!stbtt_InitFont(&f->info,f->bytes,(int)offset)) {
-  free(f->bytes);free(f);pthread_mutex_unlock(&g_present_lock);return 0;
- }
- f->size=size;f->index=index;f->hb.size=(long)size;f->handle=++text_custom_count;
- f->next=text_custom_faces;text_custom_faces=f;
- uint32_t handle=f->handle;pthread_mutex_unlock(&g_present_lock);return handle;
+  pthread_mutex_lock(&g_present_lock);
+  for(struct text_custom_face *f=text_custom_faces; f; f=f->next)
+    if(f->size==size && f->index==index && !memcmp(f->bytes,data,size)) {
+      uint32_t handle=f->handle;
+      pthread_mutex_unlock(&g_present_lock);
+      return handle;
+    }
+  struct text_custom_face *f=calloc(1,sizeof *f);
+  if(!f || text_custom_count==UINT32_MAX) {
+    free(f);
+    pthread_mutex_unlock(&g_present_lock);
+    return 0;
+  }
+  f->bytes=malloc(size);
+  if(!f->bytes) {
+    free(f);
+    pthread_mutex_unlock(&g_present_lock);
+    return 0;
+  }
+  memcpy(f->bytes,data,size);
+  if(!stbtt_InitFont(&f->info,f->bytes,(int)offset)) {
+    free(f->bytes);
+    free(f);
+    pthread_mutex_unlock(&g_present_lock);
+    return 0;
+  }
+  f->size=size;
+  f->index=index;
+  f->hb.size=(long)size;
+  f->handle=++text_custom_count;
+  f->next=text_custom_faces;
+  text_custom_faces=f;
+  uint32_t handle=f->handle;
+  pthread_mutex_unlock(&g_present_lock);
+  return handle;
 }
 
 bool luna_overlay_shape_font_context(uint32_t handle,const uint16_t *text,size_t length,size_t start,size_t count,float px,bool bold,int direction,struct luna_text_run *run)
 {
- if(!run) return false;
- pthread_mutex_lock(&g_present_lock);
- if(!g_ready) luna_overlay_prepare_platform();
- struct text_custom_face *face=text_custom_find(handle);
- bool good=(!handle || face) && luna_prepare_font_metrics() &&
-  text_shape_locked(text,length,start,count,px,bold,face ? &face->info : NULL,direction,run);
- if(!good) memset(run,0,sizeof *run);
- pthread_mutex_unlock(&g_present_lock);return good;
+  if(!run) return false;
+  pthread_mutex_lock(&g_present_lock);
+  if(!g_ready) luna_overlay_prepare_platform();
+  struct text_custom_face *face=text_custom_find(handle);
+  bool good=(!handle || face) && luna_prepare_font_metrics() &&
+            text_shape_locked(text,length,start,count,px,bold,face ? &face->info : NULL,direction,run);
+  if(!good) memset(run,0,sizeof *run);
+  pthread_mutex_unlock(&g_present_lock);
+  return good;
 }
 bool luna_overlay_shape_font_direction(uint32_t handle,const uint16_t *text,size_t length,float px,bool bold,int direction,struct luna_text_run *run)
-{return luna_overlay_shape_font_context(handle,text,length,0,length,px,bold,direction,run);}
+{
+  return luna_overlay_shape_font_context(handle,text,length,0,length,px,bold,direction,run);
+}
 bool luna_overlay_shape_font(uint32_t handle,const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
-{return luna_overlay_shape_font_direction(handle,text,length,px,bold,0,run);}
+{
+  return luna_overlay_shape_font_direction(handle,text,length,px,bold,0,run);
+}
 bool luna_overlay_shape_text(const uint16_t *text,size_t length,float px,bool bold,struct luna_text_run *run)
-{return luna_overlay_shape_font(0,text,length,px,bold,run);}
+{
+  return luna_overlay_shape_font(0,text,length,px,bold,run);
+}
 /* Coverage bitmaps are shared: a screen of text is the same few hundred
  * (glyph, size) pairs every frame, and rasterizing them is the expensive part.
  * Direct-mapped; an entry still held by a caller is never replaced, the new
  * glyph is handed out uncached instead. */
 #define GLYPH_CACHE_SLOTS 4096
 struct glyph_slot {
- const void *font,*font_data;
- uint32_t glyph;
- uint32_t px_bits;
- unsigned char *coverage;
- int width,height,left,top;
- unsigned refs;
- bool used;
+  const void *font,*font_data;
+  uint32_t glyph;
+  uint32_t px_bits;
+  unsigned char *coverage;
+  int width,height,left,top;
+  unsigned refs;
+  bool used;
 };
 static struct glyph_slot g_glyph_cache[GLYPH_CACHE_SLOTS];
 
 bool luna_overlay_raster_glyph(const struct luna_text_glyph *glyph,float px,struct luna_text_bitmap *bitmap)
 {
- if(!glyph || !bitmap || !isfinite(px) || px<0 || px>32768) return false;
- memset(bitmap,0,sizeof *bitmap);pthread_mutex_lock(&g_present_lock);
- const stbtt_fontinfo *info=glyph->font;
- bool good=info && info->data==glyph->font_data && glyph->glyph<(uint32_t)info->numGlyphs;
- if(good && px>0) {
-  uint32_t px_bits;memcpy(&px_bits,&px,sizeof px_bits);
-  uint32_t h=((uint32_t)(uintptr_t)glyph->font_data>>4)*2654435761u^glyph->glyph*40503u^px_bits*2246822519u;
-  struct glyph_slot *slot=&g_glyph_cache[(h^(h>>15))&(GLYPH_CACHE_SLOTS-1)];
-  if(slot->used && slot->font==glyph->font && slot->font_data==glyph->font_data &&
-     slot->glyph==glyph->glyph && slot->px_bits==px_bits) {
-   __atomic_fetch_add(&slot->refs,1,__ATOMIC_RELAXED);
-   bitmap->coverage=slot->coverage;bitmap->width=slot->width;bitmap->height=slot->height;
-   bitmap->left=slot->left;bitmap->top=slot->top;bitmap->cache=slot;
-   pthread_mutex_unlock(&g_present_lock);return true;
+  if(!glyph || !bitmap || !isfinite(px) || px<0 || px>32768) return false;
+  memset(bitmap,0,sizeof *bitmap);
+  pthread_mutex_lock(&g_present_lock);
+  const stbtt_fontinfo *info=glyph->font;
+  bool good=info && info->data==glyph->font_data && glyph->glyph<(uint32_t)info->numGlyphs;
+  if(good && px>0) {
+    uint32_t px_bits;
+    memcpy(&px_bits,&px,sizeof px_bits);
+    uint32_t h=((uint32_t)(uintptr_t)glyph->font_data>>4)*2654435761u^glyph->glyph*40503u^px_bits*2246822519u;
+    struct glyph_slot *slot=&g_glyph_cache[(h^(h>>15))&(GLYPH_CACHE_SLOTS-1)];
+    if(slot->used && slot->font==glyph->font && slot->font_data==glyph->font_data &&
+        slot->glyph==glyph->glyph && slot->px_bits==px_bits) {
+      __atomic_fetch_add(&slot->refs,1,__ATOMIC_RELAXED);
+      bitmap->coverage=slot->coverage;
+      bitmap->width=slot->width;
+      bitmap->height=slot->height;
+      bitmap->left=slot->left;
+      bitmap->top=slot->top;
+      bitmap->cache=slot;
+      pthread_mutex_unlock(&g_present_lock);
+      return true;
+    }
+    float scale=stbtt_ScaleForMappingEmToPixels(info,px);
+    int x0,y0,x1,y1;
+    stbtt_GetGlyphBitmapBox(info,(int)glyph->glyph,scale,scale,&x0,&y0,&x1,&y1);
+    if(x1-x0>8192 || y1-y0>8192 || x1<x0 || y1<y0) good=false;
+    else if(x1>x0 && y1>y0) {
+      bitmap->coverage=stbtt_GetGlyphBitmap(info,scale,scale,(int)glyph->glyph,&bitmap->width,&bitmap->height,&bitmap->left,&bitmap->top);
+      good=bitmap->coverage!=NULL;
+      if(good && !__atomic_load_n(&slot->refs,__ATOMIC_ACQUIRE) && x1-x0<=256 && y1-y0<=256) {
+        if(slot->used) stbtt_FreeBitmap(slot->coverage,NULL);
+        *slot=(struct glyph_slot) {
+          glyph->font,glyph->font_data,glyph->glyph,px_bits,bitmap->coverage,
+                bitmap->width,bitmap->height,bitmap->left,bitmap->top,1,true
+        };
+        bitmap->cache=slot;
+      }
+    }
   }
-  float scale=stbtt_ScaleForMappingEmToPixels(info,px);int x0,y0,x1,y1;
-  stbtt_GetGlyphBitmapBox(info,(int)glyph->glyph,scale,scale,&x0,&y0,&x1,&y1);
-  if(x1-x0>8192 || y1-y0>8192 || x1<x0 || y1<y0) good=false;
-  else if(x1>x0 && y1>y0) {
-   bitmap->coverage=stbtt_GetGlyphBitmap(info,scale,scale,(int)glyph->glyph,&bitmap->width,&bitmap->height,&bitmap->left,&bitmap->top);
-   good=bitmap->coverage!=NULL;
-   if(good && !__atomic_load_n(&slot->refs,__ATOMIC_ACQUIRE) && x1-x0<=256 && y1-y0<=256) {
-    if(slot->used) stbtt_FreeBitmap(slot->coverage,NULL);
-    *slot=(struct glyph_slot){glyph->font,glyph->font_data,glyph->glyph,px_bits,bitmap->coverage,
-     bitmap->width,bitmap->height,bitmap->left,bitmap->top,1,true};
-    bitmap->cache=slot;
-   }
-  }
- }
- pthread_mutex_unlock(&g_present_lock);return good;
+  pthread_mutex_unlock(&g_present_lock);
+  return good;
 }
 void luna_overlay_free_glyph(struct luna_text_bitmap *bitmap)
 {
- if(!bitmap) return;
- if(bitmap->cache) {
-  struct glyph_slot *slot=bitmap->cache;
-  __atomic_fetch_sub(&slot->refs,1,__ATOMIC_RELEASE);
- } else stbtt_FreeBitmap(bitmap->coverage,NULL);
- memset(bitmap,0,sizeof *bitmap);
+  if(!bitmap) return;
+  if(bitmap->cache) {
+    struct glyph_slot *slot=bitmap->cache;
+    __atomic_fetch_sub(&slot->refs,1,__ATOMIC_RELEASE);
+  } else stbtt_FreeBitmap(bitmap->coverage,NULL);
+  memset(bitmap,0,sizeof *bitmap);
 }
 
 float luna_overlay_text_width(const char *text, float px, bool bold)
 {
-   if (!text || !*text || px <= 0.f) return 0.f;
-   pthread_mutex_lock(&g_present_lock);
-   if (!g_ready) luna_overlay_prepare_platform();
-   bool ready=luna_prepare_font_metrics()!=0;
-   float w=ready ? luna_measure_text(text,px,bold ? 1 : 0) : 0.f;
-   pthread_mutex_unlock(&g_present_lock);
-   return w;
+  if (!text || !*text || px <= 0.f) return 0.f;
+  pthread_mutex_lock(&g_present_lock);
+  if (!g_ready) luna_overlay_prepare_platform();
+  bool ready=luna_prepare_font_metrics()!=0;
+  float w=ready ? luna_measure_text(text,px,bold ? 1 : 0) : 0.f;
+  pthread_mutex_unlock(&g_present_lock);
+  return w;
 }
 
 float luna_overlay_line_height(float px)
 {
-   return luna_line_height(px > 0.f ? px : 14.f);
+  return luna_line_height(px > 0.f ? px : 14.f);
 }
 
 bool luna_overlay_font_metrics(uint32_t handle,float px, bool bold,
-                                  struct luna_overlay_font_metrics *metrics)
+                               struct luna_overlay_font_metrics *metrics)
 {
-   if (!metrics || !isfinite(px) || px<0 || px>32768) return false;
-   memset(metrics, 0, sizeof *metrics);
-   pthread_mutex_lock(&g_present_lock);
-   if (!g_ready) luna_overlay_prepare_platform();
-   LunaFontMetrics face;
-   struct text_custom_face *custom=text_custom_find(handle);
-   bool ready=false;
-   if(custom) {
-      int ascent,descent,gap,x0,y0,x1,y1;
-      stbtt_GetFontVMetrics(&custom->info,&ascent,&descent,&gap);
-      stbtt_GetFontBoundingBox(&custom->info,&x0,&y0,&x1,&y1);
-      float scale=stbtt_ScaleForMappingEmToPixels(&custom->info,px);
-      face=(LunaFontMetrics){.top=-y1*scale,.ascent=-ascent*scale,.descent=-descent*scale,
-                            .bottom=-y0*scale,.leading=gap*scale};
-      ready=true;
-   } else if(!handle) ready=luna_prepare_font_metrics() && luna_get_font_metrics(px,bold ? 1 : 0,&face);
-   if (ready) {
-      metrics->top = face.top;
-      metrics->ascent = face.ascent;
-      metrics->descent = face.descent;
-      metrics->bottom = face.bottom;
-      metrics->leading = face.leading;
-   }
-   pthread_mutex_unlock(&g_present_lock);
-   return ready;
+  if (!metrics || !isfinite(px) || px<0 || px>32768) return false;
+  memset(metrics, 0, sizeof *metrics);
+  pthread_mutex_lock(&g_present_lock);
+  if (!g_ready) luna_overlay_prepare_platform();
+  LunaFontMetrics face;
+  struct text_custom_face *custom=text_custom_find(handle);
+  bool ready=false;
+  if(custom) {
+    int ascent,descent,gap,x0,y0,x1,y1;
+    stbtt_GetFontVMetrics(&custom->info,&ascent,&descent,&gap);
+    stbtt_GetFontBoundingBox(&custom->info,&x0,&y0,&x1,&y1);
+    float scale=stbtt_ScaleForMappingEmToPixels(&custom->info,px);
+    face=(LunaFontMetrics) {
+      .top=-y1*scale,.ascent=-ascent*scale,.descent=-descent*scale,
+                                           .bottom=-y0*scale,.leading=gap*scale
+    };
+    ready=true;
+  } else if(!handle) ready=luna_prepare_font_metrics() && luna_get_font_metrics(px,bold ? 1 : 0,&face);
+  if (ready) {
+    metrics->top = face.top;
+    metrics->ascent = face.ascent;
+    metrics->descent = face.descent;
+    metrics->bottom = face.bottom;
+    metrics->leading = face.leading;
+  }
+  pthread_mutex_unlock(&g_present_lock);
+  return ready;
 }
 
 bool luna_overlay_get_font_metrics(float px,bool bold,struct luna_overlay_font_metrics *metrics)
-{return luna_overlay_font_metrics(0,px,bold,metrics);}
+{
+  return luna_overlay_font_metrics(0,px,bold,metrics);
+}
 
 /* ======================================================================== *
  * The emulator's menu (right click)
@@ -2187,11 +2539,11 @@ static pthread_mutex_t g_menu_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_bool g_guest_paused;
 bool luna_guest_paused(void)
 {
-   return atomic_load_explicit(&g_guest_paused, memory_order_relaxed);
+  return atomic_load_explicit(&g_guest_paused, memory_order_relaxed);
 }
 void luna_guest_set_paused(bool paused)
 {
-   atomic_store_explicit(&g_guest_paused, paused, memory_order_relaxed);
+  atomic_store_explicit(&g_guest_paused, paused, memory_order_relaxed);
 }
 static bool   g_menu_open;
 static double g_menu_x, g_menu_y;
@@ -2203,25 +2555,29 @@ static int g_graphics_choice = -1;
 static char g_google_choice[65];
 static int g_gl_identity_choice = -1;
 static int g_locale_choice = -1;
-static const struct { const char *tag, *label; } g_locales[] = {
-   {NULL,"System Default"}, {"ja-JP","日本語 (日本)"},
-   {"en-US","English (United States)"}, {"ko-KR","한국어 (대한민국)"},
-   {"zh-CN","简体中文 (中国)"}, {"zh-TW","繁體中文 (台灣)"},
-   {"de-DE","Deutsch (Deutschland)"}, {"fr-FR","Français (France)"},
-   {"es-ES","Español (España)"}, {"pt-BR","Português (Brasil)"}
+static const struct {
+  const char *tag, *label;
+} g_locales[] = {
+  {NULL,"System Default"}, {"ja-JP","日本語 (日本)"},
+  {"en-US","English (United States)"}, {"ko-KR","한국어 (대한민국)"},
+  {"zh-CN","简体中文 (中国)"}, {"zh-TW","繁體中文 (台灣)"},
+  {"de-DE","Deutsch (Deutschland)"}, {"fr-FR","Français (France)"},
+  {"es-ES","Español (España)"}, {"pt-BR","Português (Brasil)"}
 };
 static int locale_choice(void)
 {
-   if (g_locale_choice>=0) return g_locale_choice;
-   const char *tag=getenv("LUNARIA_LOCALE");
-   if (!tag || !*tag) return 0;
-   for (size_t i=1; i<sizeof g_locales/sizeof *g_locales; ++i)
-      if (!strcmp(tag,g_locales[i].tag)) return (int)i;
-   return -1;
+  if (g_locale_choice>=0) return g_locale_choice;
+  const char *tag=getenv("LUNARIA_LOCALE");
+  if (!tag || !*tag) return 0;
+  for (size_t i=1; i<sizeof g_locales/sizeof *g_locales; ++i)
+    if (!strcmp(tag,g_locales[i].tag)) return (int)i;
+  return -1;
 }
-struct resolution { int width, height; };
+struct resolution {
+  int width, height;
+};
 static const struct resolution g_resolutions[] = {
-   {800, 450}, {1024, 576}, {1280, 720}, {1600, 900}, {1920, 1080}, {1024, 768}
+  {800, 450}, {1024, 576}, {1280, 720}, {1600, 900}, {1920, 1080}, {1024, 768}
 };
 static int g_settings_resolution = -1;
 static int g_saved_resolution = -1;
@@ -2229,41 +2585,55 @@ static bool g_settings_loaded;
 static bool g_resolution_dirty;
 static void resolution_values(int index, int *width, int *height)
 {
-   *width = g_resolutions[index].width; *height = g_resolutions[index].height;
-   if (g_menu_h > g_menu_w) { int t = *width; *width = *height; *height = t; }
+  *width = g_resolutions[index].width;
+  *height = g_resolutions[index].height;
+  if (g_menu_h > g_menu_w) {
+    int t = *width;
+    *width = *height;
+    *height = t;
+  }
 }
-struct menu_setting { const char *key, *label; int value, initial; const int *choices; size_t count; };
+struct menu_setting {
+  const char *key, *label;
+  int value, initial;
+  const int *choices;
+  size_t count;
+};
 static const int ram_choices[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
 static const int cpu_choices[] = {1, 2, 4, 6, 8, 12, 16};
 static const int engine_choices[] = {0, 1, 2, 3, 4, 6, 8};
 static const int dpi_choices[] = {0, 160, 240, 320, 420, 480, 640};
 #define SETTING(key, label, choices) {key, label, 0, 0, choices, sizeof choices / sizeof choices[0]}
 static struct menu_setting g_settings[] = {
-   SETTING("LUNARIA_MEM_TOTAL_MB", "Memory reported to Android (MiB)", ram_choices),
-   SETTING("LUNARIA_CPU_COUNT", "CPU cores reported to Android", cpu_choices),
-   SETTING("LUNARIA_A64_ENGINES", "Parallel execution engines", engine_choices),
-   SETTING("LUNARIA_DPI", "Screen density (DPI)", dpi_choices),
+  SETTING("LUNARIA_MEM_TOTAL_MB", "Memory reported to Android (MiB)", ram_choices),
+  SETTING("LUNARIA_CPU_COUNT", "CPU cores reported to Android", cpu_choices),
+  SETTING("LUNARIA_A64_ENGINES", "Parallel execution engines", engine_choices),
+  SETTING("LUNARIA_DPI", "Screen density (DPI)", dpi_choices),
 };
 #undef SETTING
 static void settings_load(void)
 {
-   g_settings_resolution = g_saved_resolution; g_resolution_dirty = false;
-   for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
-      struct menu_setting *v = &g_settings[i];
-      if (!g_settings_loaded) {
-         const char *env = getenv(v->key);
-         v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
-      }
-      v->value = v->initial;
-   }
-   g_settings_loaded = true;
+  g_settings_resolution = g_saved_resolution;
+  g_resolution_dirty = false;
+  for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
+    struct menu_setting *v = &g_settings[i];
+    if (!g_settings_loaded) {
+      const char *env = getenv(v->key);
+      v->initial = env ? atoi(env) : i == 0 ? 6144 : i == 1 ? 4 : 0;
+    }
+    v->value = v->initial;
+  }
+  g_settings_loaded = true;
 }
 static char   g_menu_dev_name[MAX_DEVICES][128], g_menu_dev_desc[MAX_DEVICES][128];
 static int    g_menu_ndev;
 static char   g_menu_notice[256];
 static double g_menu_notice_until;
 #define KEYMAP_PAGE 10
-struct keymap_file { char name[256]; int directory; };
+struct keymap_file {
+  char name[256];
+  int directory;
+};
 static struct keymap_file *g_keyfiles;
 static int g_keyfiles_cap;
 static char g_keydir[4096];
@@ -2271,502 +2641,546 @@ static int g_nkeyfiles, g_keypage;
 static bool g_keydir_error;
 static int keyfile_compare(const void *a, const void *b)
 {
-   const struct keymap_file *x = a, *y = b;
-   return x->directory != y->directory ? y->directory - x->directory : strcmp(x->name, y->name);
+  const struct keymap_file *x = a, *y = b;
+  return x->directory != y->directory ? y->directory - x->directory : strcmp(x->name, y->name);
 }
 static bool keyfile_path(char *out, size_t cap, const char *name)
 {
-   return snprintf(out, cap, "%s%s%s", g_keydir, !strcmp(g_keydir, "/") ? "" : "/", name) < (int)cap;
+  return snprintf(out, cap, "%s%s%s", g_keydir, !strcmp(g_keydir, "/") ? "" : "/", name) < (int)cap;
 }
 static void keyfiles_read(void)
 {
-   g_nkeyfiles = 0; g_keypage = 0;
-   if (!g_keydir[0]) {
-      char path[4096]; luna_keymap_current(path, sizeof path);
-      if (strcmp(path, "off")) snprintf(g_keydir, sizeof g_keydir, "%s", path);
-      else if (luna_os_executable_path(g_keydir, sizeof g_keydir) < 0) strcpy(g_keydir, ".");
-      char *slash = strrchr(g_keydir, '/');
-      if (slash) {
-         *slash = 0;
-         if (!strcmp(path, "off")) {
-            size_t n = strlen(g_keydir);
-            if (n + 9 < sizeof g_keydir) strcpy(g_keydir + n, "/keymaps");
-         }
-      } else strcpy(g_keydir, ".");
-      if (!g_keydir[0]) strcpy(g_keydir, "/");
-   }
-   char resolved[4096];
-   if (luna_file_realpath(g_keydir, resolved, sizeof resolved)) snprintf(g_keydir, sizeof g_keydir, "%s", resolved);
-   DIR *dir = opendir(g_keydir);
-   g_keydir_error = !dir;
-   if (!dir) return;
-   struct dirent *entry;
-   while ((entry = readdir(dir))) {
-      if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-      char path[4096]; struct stat st;
-      if (!keyfile_path(path, sizeof path, entry->d_name) || stat(path, &st) ||
-          (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) continue;
-      if (g_nkeyfiles == g_keyfiles_cap) {
-         int cap = g_keyfiles_cap ? g_keyfiles_cap * 2 : 32;
-         void *files = realloc(g_keyfiles, (size_t)cap * sizeof g_keyfiles[0]);
-         if (!files) { g_keydir_error = true; break; }
-         g_keyfiles = files; g_keyfiles_cap = cap;
+  g_nkeyfiles = 0;
+  g_keypage = 0;
+  if (!g_keydir[0]) {
+    char path[4096];
+    luna_keymap_current(path, sizeof path);
+    if (strcmp(path, "off")) snprintf(g_keydir, sizeof g_keydir, "%s", path);
+    else if (luna_os_executable_path(g_keydir, sizeof g_keydir) < 0) strcpy(g_keydir, ".");
+    char *slash = strrchr(g_keydir, '/');
+    if (slash) {
+      *slash = 0;
+      if (!strcmp(path, "off")) {
+        size_t n = strlen(g_keydir);
+        if (n + 9 < sizeof g_keydir) strcpy(g_keydir + n, "/keymaps");
       }
-      struct keymap_file *f = &g_keyfiles[g_nkeyfiles++];
-      snprintf(f->name, sizeof f->name, "%s", entry->d_name);
-      f->directory = S_ISDIR(st.st_mode);
-   }
-   closedir(dir);
-   qsort(g_keyfiles, g_nkeyfiles, sizeof g_keyfiles[0], keyfile_compare);
+    } else strcpy(g_keydir, ".");
+    if (!g_keydir[0]) strcpy(g_keydir, "/");
+  }
+  char resolved[4096];
+  if (luna_file_realpath(g_keydir, resolved, sizeof resolved)) snprintf(g_keydir, sizeof g_keydir, "%s", resolved);
+  DIR *dir = opendir(g_keydir);
+  g_keydir_error = !dir;
+  if (!dir) return;
+  struct dirent *entry;
+  while ((entry = readdir(dir))) {
+    if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+    char path[4096];
+    struct stat st;
+    if (!keyfile_path(path, sizeof path, entry->d_name) || stat(path, &st) ||
+        (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) continue;
+    if (g_nkeyfiles == g_keyfiles_cap) {
+      int cap = g_keyfiles_cap ? g_keyfiles_cap * 2 : 32;
+      void *files = realloc(g_keyfiles, (size_t)cap * sizeof g_keyfiles[0]);
+      if (!files) {
+        g_keydir_error = true;
+        break;
+      }
+      g_keyfiles = files;
+      g_keyfiles_cap = cap;
+    }
+    struct keymap_file *f = &g_keyfiles[g_nkeyfiles++];
+    snprintf(f->name, sizeof f->name, "%s", entry->d_name);
+    f->directory = S_ISDIR(st.st_mode);
+  }
+  closedir(dir);
+  qsort(g_keyfiles, g_nkeyfiles, sizeof g_keyfiles[0], keyfile_compare);
 }
 
 
 /* macOS context-menu look: a translucent vibrancy panel, 13px system text,
  * rounded selection in the accent blue, hairline separators. */
 static const char g_menu_style[] =
-   "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;"
-   "background:transparent;}"
-   ".lm{position:absolute;width:" "248" "px;padding:5px;border-radius:10px;"
-   "background:rgba(242,242,246,0.80);backdrop-filter:blur(24px) saturate(1.8);"
-   "border:1px solid rgba(0,0,0,0.14);box-shadow:0 12px 36px rgba(0,0,0,0.30);"
-   "font-size:13px;color:#1d1d1f;}"
-   ".li{position:relative;height:24px;line-height:24px;padding:0 12px 0 24px;"
-   "border-radius:5px;white-space:nowrap;overflow:hidden;cursor:pointer;}"
-   ".li:hover{background:#0a64d8;color:#ffffff;}"
-   ".li.dis{color:#a1a1a6;cursor:default;}"
-   ".li.dis:hover{background:transparent;color:#a1a1a6;}"
-   /* the checkmark is drawn, not a glyph: every font has a box */
-   ".ck{display:block;position:absolute;left:10px;top:6px;width:4px;height:9px;"
-   "border-right:2px solid #1d1d1f;border-bottom:2px solid #1d1d1f;transform:rotate(45deg);}"
-   ".li:hover .ck{border-right:2px solid #ffffff;border-bottom:2px solid #ffffff;}"
-   ".kb{position:absolute;right:12px;top:0;color:#8e8e93;font-size:12px;}"
-   ".li:hover .kb{color:#ffffff;}"
-   ".sep{height:1px;margin:5px 10px;background:rgba(0,0,0,0.13);}"
-   ".hd{height:22px;line-height:22px;padding:0 12px;font-size:11px;"
-   "font-weight:bold;color:#8e8e93;}"
-   ".hud{position:absolute;left:50%;top:18px;transform:translate(-50%,0);"
-   "padding:8px 16px;border-radius:10px;background:rgba(30,30,32,0.78);"
-   "backdrop-filter:blur(20px);color:#ffffff;font-size:13px;white-space:nowrap;"
-   "pointer-events:none;}";
+  "#luna-menu-backdrop{position:absolute;left:0;top:0;right:0;bottom:0;"
+  "background:transparent;}"
+  ".lm{position:absolute;width:" "248" "px;padding:5px;border-radius:10px;"
+  "background:rgba(242,242,246,0.80);backdrop-filter:blur(24px) saturate(1.8);"
+  "border:1px solid rgba(0,0,0,0.14);box-shadow:0 12px 36px rgba(0,0,0,0.30);"
+  "font-size:13px;color:#1d1d1f;}"
+  ".li{position:relative;height:24px;line-height:24px;padding:0 12px 0 24px;"
+  "border-radius:5px;white-space:nowrap;overflow:hidden;cursor:pointer;}"
+  ".li:hover{background:#0a64d8;color:#ffffff;}"
+  ".li.dis{color:#a1a1a6;cursor:default;}"
+  ".li.dis:hover{background:transparent;color:#a1a1a6;}"
+  /* the checkmark is drawn, not a glyph: every font has a box */
+  ".ck{display:block;position:absolute;left:10px;top:6px;width:4px;height:9px;"
+  "border-right:2px solid #1d1d1f;border-bottom:2px solid #1d1d1f;transform:rotate(45deg);}"
+  ".li:hover .ck{border-right:2px solid #ffffff;border-bottom:2px solid #ffffff;}"
+  ".kb{position:absolute;right:12px;top:0;color:#8e8e93;font-size:12px;}"
+  ".li:hover .kb{color:#ffffff;}"
+  ".sep{height:1px;margin:5px 10px;background:rgba(0,0,0,0.13);}"
+  ".hd{height:22px;line-height:22px;padding:0 12px;font-size:11px;"
+  "font-weight:bold;color:#8e8e93;}"
+  ".hud{position:absolute;left:50%;top:18px;transform:translate(-50%,0);"
+  "padding:8px 16px;border-radius:10px;background:rgba(30,30,32,0.78);"
+  "backdrop-filter:blur(20px);color:#ffffff;font-size:13px;white-space:nowrap;"
+  "pointer-events:none;}";
 
 static double menu_now(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-struct menu_buf { char *p; size_t len, cap; };
+struct menu_buf {
+  char *p;
+  size_t len, cap;
+};
 
 static void menu_put(struct menu_buf *b, const char *s)
 {
-   size_t n = strlen(s);
-   if (b->len + n + 1 > b->cap) {
-      size_t cap = b->cap ? b->cap * 2 : 4096;
-      while (cap < b->len + n + 1) cap *= 2;
-      char *g = realloc(b->p, cap);
-      if (!g) return;
-      b->p = g;
-      b->cap = cap;
-   }
-   memcpy(b->p + b->len, s, n + 1);
-   b->len += n;
+  size_t n = strlen(s);
+  if (b->len + n + 1 > b->cap) {
+    size_t cap = b->cap ? b->cap * 2 : 4096;
+    while (cap < b->len + n + 1) cap *= 2;
+    char *g = realloc(b->p, cap);
+    if (!g) return;
+    b->p = g;
+    b->cap = cap;
+  }
+  memcpy(b->p + b->len, s, n + 1);
+  b->len += n;
 }
 
 static void menu_putf(struct menu_buf *b, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void menu_putf(struct menu_buf *b, const char *fmt, ...)
 {
-   char tmp[1024];
-   va_list ap;
-   va_start(ap, fmt);
-   vsnprintf(tmp, sizeof tmp, fmt, ap);
-   va_end(ap);
-   menu_put(b, tmp);
+  char tmp[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(tmp, sizeof tmp, fmt, ap);
+  va_end(ap);
+  menu_put(b, tmp);
 }
 
 static void menu_put_text(struct menu_buf *b, const char *s)
 {
-   char one[2] = { 0, 0 };
-   for (; *s; ++s) {
-      if (*s == '<') menu_put(b, "&lt;");
-      else if (*s == '>') menu_put(b, "&gt;");
-      else if (*s == '&') menu_put(b, "&amp;");
-      else if (*s == '"') menu_put(b, "&quot;");
-      else { one[0] = *s; menu_put(b, one); }
-   }
+  char one[2] = { 0, 0 };
+  for (; *s; ++s) {
+    if (*s == '<') menu_put(b, "&lt;");
+    else if (*s == '>') menu_put(b, "&gt;");
+    else if (*s == '&') menu_put(b, "&amp;");
+    else if (*s == '"') menu_put(b, "&quot;");
+    else {
+      one[0] = *s;
+      menu_put(b, one);
+    }
+  }
 }
 
 /* One row.  id NULL: disabled.  check: a ✓ in the gutter.  key: the
  * right-hand hint (a shortcut, a value, or ▸ for a submenu). */
 static int menu_item(struct menu_buf *b, const char *id, const char *label, bool check, const char *key)
 {
-   if (id) menu_putf(b, "<div id=\"luna-menu-%s\" class=\"li\">", id);
-   else menu_put(b, "<div class=\"li dis\">");
-   if (check) menu_put(b, "<span class=\"ck\"></span>");
-   menu_put_text(b, label);
-   if (key && *key) { menu_put(b, "<span class=\"kb\">"); menu_put_text(b, key); menu_put(b, "</span>"); }
-   menu_put(b, "</div>");
-   return ROW_H;
+  if (id) menu_putf(b, "<div id=\"luna-menu-%s\" class=\"li\">", id);
+  else menu_put(b, "<div class=\"li dis\">");
+  if (check) menu_put(b, "<span class=\"ck\"></span>");
+  menu_put_text(b, label);
+  if (key && *key) {
+    menu_put(b, "<span class=\"kb\">");
+    menu_put_text(b, key);
+    menu_put(b, "</span>");
+  }
+  menu_put(b, "</div>");
+  return ROW_H;
 }
 
-static int menu_sep(struct menu_buf *b) { menu_put(b, "<div class=\"sep\"></div>"); return SEP_H; }
+static int menu_sep(struct menu_buf *b) {
+  menu_put(b, "<div class=\"sep\"></div>");
+  return SEP_H;
+}
 
 static int menu_header(struct menu_buf *b, const char *label)
 {
-   menu_put(b, "<div class=\"hd\">");
-   menu_put_text(b, label);
-   menu_put(b, "</div>");
-   return 22;
+  menu_put(b, "<div class=\"hd\">");
+  menu_put_text(b, label);
+  menu_put(b, "</div>");
+  return 22;
 }
 
-static int menu_clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static int menu_clampi(int v, int lo, int hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
 
 /* The main panel's rows; returns its height and records the top of each
  * group's row in parent_y[], where its panel is anchored. */
 static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
 {
-   static const char arrow[] = "\xe2\x80\xba";
-   int y = PAD;
-   y += menu_item(b, "back", "Back", false, "Esc");
-   y += menu_item(b, "pause", luna_guest_paused() ? "Resume" : "Pause", false, NULL);
-   y += menu_sep(b);
-   parent_y[SUB_INPUT] = y;
-   y += menu_item(b, "sub-input", "Input", false, arrow);
-   parent_y[SUB_DISPLAY] = y;
-   y += menu_item(b, "sub-display", "Display", false, arrow);
-   parent_y[SUB_GRAPHICS] = y;
-   y += menu_item(b, "sub-graphics", "Graphics API", false, arrow);
-   parent_y[SUB_SOUND] = y;
-   y += menu_item(b, "sub-sound", "Sound", false, arrow);
-   parent_y[SUB_LOCALE] = y;
-   y += menu_item(b, "sub-locale", "Language", false, arrow);
-   const bool network = arm_exec_network_enabled() != 0;
-   y += menu_item(b, "network", "Network", network, network ? "On" : "Off");
-   y += menu_sep(b);
-   parent_y[SUB_WEBVIEW] = y;
-   y += menu_item(b, "sub-webview", "WebView", false, arrow);
-   y += menu_item(b, "settings", "Settings...", false, NULL);
-   y += menu_sep(b);
-   if (getenv("ANDROID_PACKAGE_NAME")) {
-      parent_y[SUB_GOOGLE] = y;
-      y += menu_item(b, "sub-google", "Google services", false, arrow);
-      parent_y[SUB_PROFILE] = y;
-      char label[256];
-      snprintf(label, sizeof label, "%s", luna_apk_profile_current());
-      y += menu_item(b, "sub-profile", "Profile", false, label);
-      y += menu_item(b, "restart", "Restart", false, NULL);
-      y += menu_item(b, "launcher", "Back to launcher", false, NULL);
-   }
-   y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
-   return y + PAD;
+  static const char arrow[] = "\xe2\x80\xba";
+  int y = PAD;
+  y += menu_item(b, "back", "Back", false, "Esc");
+  y += menu_item(b, "pause", luna_guest_paused() ? "Resume" : "Pause", false, NULL);
+  y += menu_sep(b);
+  parent_y[SUB_INPUT] = y;
+  y += menu_item(b, "sub-input", "Input", false, arrow);
+  parent_y[SUB_DISPLAY] = y;
+  y += menu_item(b, "sub-display", "Display", false, arrow);
+  parent_y[SUB_GRAPHICS] = y;
+  y += menu_item(b, "sub-graphics", "Graphics API", false, arrow);
+  parent_y[SUB_SOUND] = y;
+  y += menu_item(b, "sub-sound", "Sound", false, arrow);
+  parent_y[SUB_LOCALE] = y;
+  y += menu_item(b, "sub-locale", "Language", false, arrow);
+  const bool network = arm_exec_network_enabled() != 0;
+  y += menu_item(b, "network", "Network", network, network ? "On" : "Off");
+  y += menu_sep(b);
+  parent_y[SUB_WEBVIEW] = y;
+  y += menu_item(b, "sub-webview", "WebView", false, arrow);
+  y += menu_item(b, "settings", "Settings...", false, NULL);
+  y += menu_sep(b);
+  if (getenv("ANDROID_PACKAGE_NAME")) {
+    parent_y[SUB_GOOGLE] = y;
+    y += menu_item(b, "sub-google", "Google services", false, arrow);
+    parent_y[SUB_PROFILE] = y;
+    char label[256];
+    snprintf(label, sizeof label, "%s", luna_apk_profile_current());
+    y += menu_item(b, "sub-profile", "Profile", false, label);
+    y += menu_item(b, "restart", "Restart", false, NULL);
+    y += menu_item(b, "launcher", "Back to launcher", false, NULL);
+  }
+  y += menu_item(b, "quit", "Quit Lunaria", false, NULL);
+  return y + PAD;
 }
 
 /* One row of the keyboard-layout page size: what fits under the fixed rows. */
 static int menu_keymap_page(void)
 {
-   const int fit = (g_menu_h - 330) / ROW_H;
-   return fit < 4 ? 4 : fit > KEYMAP_PAGE ? KEYMAP_PAGE : fit;
+  const int fit = (g_menu_h - 330) / ROW_H;
+  return fit < 4 ? 4 : fit > KEYMAP_PAGE ? KEYMAP_PAGE : fit;
 }
 
 static int menu_sub_rows(struct menu_buf *b)
 {
-   int y = PAD;
-   char id[80];
-   const int page = menu_keymap_page();
-   if (g_menu_sub == SUB_INPUT) {
-      y += menu_item(b, "paste", "Paste Clipboard as Typing", false, NULL);
-      y += menu_item(b, "record", "Record Input", luna_record_active() != 0, "F9");
-      {
-         char last[8];
-         luna_record_last_path(last, sizeof last);
-         y += menu_item(b, last[0] || getenv("LUNARIA_PLAY") || luna_play_active() ? "play" : NULL,
-                        "Play Recording", luna_play_active() != 0, "F10");
-      }
+  int y = PAD;
+  char id[80];
+  const int page = menu_keymap_page();
+  if (g_menu_sub == SUB_INPUT) {
+    y += menu_item(b, "paste", "Paste Clipboard as Typing", false, NULL);
+    y += menu_item(b, "record", "Record Input", luna_record_active() != 0, "F9");
+    {
+      char last[8];
+      luna_record_last_path(last, sizeof last);
+      y += menu_item(b, last[0] || getenv("LUNARIA_PLAY") || luna_play_active() ? "play" : NULL,
+                     "Play Recording", luna_play_active() != 0, "F10");
+    }
+    y += menu_sep(b);
+    char current[4096];
+    luna_keymap_current(current, sizeof current);
+    y += menu_header(b, "KEYBOARD CONTROLS");
+    y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
+    y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
+    y += menu_sep(b);
+    y += menu_item(b, "km-up", "Parent Folder", false, "..");
+    const char *base = strrchr(g_keydir, '/');
+    y += menu_header(b, base && base[1] ? base + 1 : g_keydir);
+    for (int i = g_keypage * page; i < g_nkeyfiles && i < (g_keypage + 1) * page; ++i) {
+      char path[4096];
+      keyfile_path(path, sizeof path, g_keyfiles[i].name);
+      snprintf(id, sizeof id, "km-file-%d", i);
+      y += menu_item(b, id, g_keyfiles[i].name, !strcmp(current, path), g_keyfiles[i].directory ? "\xe2\x80\xba" : NULL);
+    }
+    if (!g_nkeyfiles) y += menu_item(b, NULL, g_keydir_error ? "Cannot read folder" : "No files", false, NULL);
+    if (g_nkeyfiles > page) {
       y += menu_sep(b);
-      char current[4096]; luna_keymap_current(current, sizeof current);
-      y += menu_header(b, "KEYBOARD CONTROLS");
-      y += menu_item(b, "km-off", "Off", !strcmp(current, "off"), NULL);
-      y += menu_item(b, strcmp(current, "off") ? "km-reload" : NULL, "Reload Current File", false, NULL);
-      y += menu_sep(b);
-      y += menu_item(b, "km-up", "Parent Folder", false, "..");
-      const char *base = strrchr(g_keydir, '/');
-      y += menu_header(b, base && base[1] ? base + 1 : g_keydir);
-      for (int i = g_keypage * page; i < g_nkeyfiles && i < (g_keypage + 1) * page; ++i) {
-         char path[4096]; keyfile_path(path, sizeof path, g_keyfiles[i].name);
-         snprintf(id, sizeof id, "km-file-%d", i);
-         y += menu_item(b, id, g_keyfiles[i].name, !strcmp(current, path), g_keyfiles[i].directory ? "\xe2\x80\xba" : NULL);
-      }
-      if (!g_nkeyfiles) y += menu_item(b, NULL, g_keydir_error ? "Cannot read folder" : "No files", false, NULL);
-      if (g_nkeyfiles > page) {
-         y += menu_sep(b);
-         y += menu_item(b, g_keypage ? "km-prev" : NULL, "Previous Page", false, NULL);
-         y += menu_item(b, (g_keypage + 1) * page < g_nkeyfiles ? "km-next" : NULL, "Next Page", false, NULL);
-      }
-   } else if (g_menu_sub == SUB_DISPLAY) {
-      y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen", false, NULL);
-      y += menu_item(b, "rotate-device", g_menu_h > g_menu_w ? "Switch to Landscape" : "Switch to Portrait", false, NULL);
-      y += menu_item(b, "shot", "Take Screenshot", false, "F12");
-      y += menu_sep(b);
-      y += menu_header(b, "RESOLUTION");
-      for (size_t i = 0; i < sizeof g_resolutions / sizeof g_resolutions[0]; ++i) {
-         int width, height; char label[32]; resolution_values((int)i, &width, &height);
-         snprintf(id, sizeof id, "res-%zu", i);
-         snprintf(label, sizeof label, "%d x %d", width, height);
-         y += menu_item(b, id, label, width == g_menu_w && height == g_menu_h, NULL);
-      }
-   } else if (g_menu_sub == SUB_GRAPHICS) {
-      if (g_graphics_choice < 0) {
-         const char *env = getenv("LUNARIA_VULKAN");
-         g_graphics_choice = !env || env[0] != '0';
-      }
-      y += menu_header(b, "GRAPHICS API");
-      y += menu_item(b, "gfx-vulkan", "Vulkan (default)", g_graphics_choice == 1, NULL);
-      y += menu_item(b, "gfx-opengl", "OpenGL ES", g_graphics_choice == 0, NULL);
-      y += menu_sep(b);
-      if (g_gl_identity_choice < 0) {
-         const char *env = getenv("LUNARIA_GL_IDENTITY");
-         g_gl_identity_choice = env && !strcmp(env, "host");
-      }
-      y += menu_header(b, "GL IDENTITY");
-      y += menu_item(b, "glid-device", "Device: ARM / Mali-G78", g_gl_identity_choice == 0, NULL);
-      y += menu_item(b, "glid-host", "Host driver", g_gl_identity_choice == 1, NULL);
-      y += menu_sep(b);
-      y += menu_item(b, NULL, "Restart the app to apply", false, NULL);
-   } else if (g_menu_sub == SUB_SOUND) {
-      char v[16];
-      snprintf(v, sizeof v, "%d%%", (int)(luna_os_audio_volume() * 100.0f + 0.5f));
-      y += menu_item(b, "volup", "Volume Up", false, v);
-      y += menu_item(b, "voldown", "Volume Down", false, NULL);
-      y += menu_item(b, "mute", "Mute", luna_os_audio_muted() != 0, NULL);
-      y += menu_sep(b);
-      y += menu_header(b, "SOUND OUTPUT");
-      const char *cur = luna_os_audio_device();
-      /* "None" closes the playback device so another program can open the
-       * card.  Mute only zeros samples and still holds the PCM. */
-      y += menu_item(b, "dev-off", "None", cur && !strcmp(cur, "off"), NULL);
-      y += menu_sep(b);
-      for (int i = 0; i < g_menu_ndev; ++i) {
-         snprintf(id, sizeof id, "dev-%d", i);
-         y += menu_item(b, id, g_menu_dev_desc[i], cur && !strcmp(cur, g_menu_dev_name[i]), NULL);
-      }
-      if (!g_menu_ndev) y += menu_item(b, NULL, "No output devices", false, NULL);
-   } else if (g_menu_sub == SUB_LOCALE) {
-      y += menu_header(b,"DEVICE LANGUAGE");
-      y += menu_item(b,NULL,"Applies on restart",false,NULL);
-      for (size_t i=0; i<sizeof g_locales/sizeof *g_locales; ++i) {
-         snprintf(id,sizeof id,"locale-%zu",i);
-         y += menu_item(b,id,g_locales[i].label,locale_choice()==(int)i,NULL);
-      }
-   } else if (g_menu_sub == SUB_WEBVIEW) {
-      y += menu_item(b, dvm_webview_count() ? "reload" : NULL, "Reload WebView", false, NULL);
-      y += menu_sep(b);
-      {
+      y += menu_item(b, g_keypage ? "km-prev" : NULL, "Previous Page", false, NULL);
+      y += menu_item(b, (g_keypage + 1) * page < g_nkeyfiles ? "km-next" : NULL, "Next Page", false, NULL);
+    }
+  } else if (g_menu_sub == SUB_DISPLAY) {
+    y += menu_item(b, "full", arm_exec_is_fullscreen() ? "Exit Full Screen" : "Enter Full Screen", false, NULL);
+    y += menu_item(b, "rotate-device", g_menu_h > g_menu_w ? "Switch to Landscape" : "Switch to Portrait", false, NULL);
+    y += menu_item(b, "shot", "Take Screenshot", false, "F12");
+    y += menu_sep(b);
+    y += menu_header(b, "RESOLUTION");
+    for (size_t i = 0; i < sizeof g_resolutions / sizeof g_resolutions[0]; ++i) {
+      int width, height;
+      char label[32];
+      resolution_values((int)i, &width, &height);
+      snprintf(id, sizeof id, "res-%zu", i);
+      snprintf(label, sizeof label, "%d x %d", width, height);
+      y += menu_item(b, id, label, width == g_menu_w && height == g_menu_h, NULL);
+    }
+    y += menu_sep(b);
+    y += menu_header(b, "SCREEN DENSITY (DPI)");
+    if (!g_settings_loaded) settings_load();
+    int dpi = 0;
+    for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i)
+      if (!strcmp(g_settings[i].key, "LUNARIA_DPI")) dpi = g_settings[i].initial;
+    for (size_t i = 0; i < sizeof dpi_choices / sizeof dpi_choices[0]; ++i) {
+      char label[32];
+      snprintf(id, sizeof id, "dpi-%zu", i);
+      snprintf(label, sizeof label, "%d DPI", dpi_choices[i]);
+      y += menu_item(b, id, dpi_choices[i] ? label : "Automatic (device default)",
+                     dpi == dpi_choices[i], NULL);
+    }
+    y += menu_item(b, NULL, "Applies on restart", false, NULL);
+  } else if (g_menu_sub == SUB_GRAPHICS) {
+    if (g_graphics_choice < 0) {
+      const char *env = getenv("LUNARIA_VULKAN");
+      g_graphics_choice = !env || env[0] != '0';
+    }
+    y += menu_header(b, "GRAPHICS API");
+    y += menu_item(b, "gfx-vulkan", "Vulkan (default)", g_graphics_choice == 1, NULL);
+    y += menu_item(b, "gfx-opengl", "OpenGL ES", g_graphics_choice == 0, NULL);
+    y += menu_sep(b);
+    if (g_gl_identity_choice < 0) {
+      const char *env = getenv("LUNARIA_GL_IDENTITY");
+      g_gl_identity_choice = env && !strcmp(env, "host");
+    }
+    y += menu_header(b, "GL IDENTITY");
+    y += menu_item(b, "glid-device", "Device: ARM / Mali-G78", g_gl_identity_choice == 0, NULL);
+    y += menu_item(b, "glid-host", "Host driver", g_gl_identity_choice == 1, NULL);
+    y += menu_sep(b);
+    y += menu_item(b, NULL, "Restart the app to apply", false, NULL);
+  } else if (g_menu_sub == SUB_SOUND) {
+    char v[16];
+    snprintf(v, sizeof v, "%d%%", (int)(luna_os_audio_volume() * 100.0f + 0.5f));
+    y += menu_item(b, "volup", "Volume Up", false, v);
+    y += menu_item(b, "voldown", "Volume Down", false, NULL);
+    y += menu_item(b, "mute", "Mute", luna_os_audio_muted() != 0, NULL);
+    y += menu_sep(b);
+    y += menu_header(b, "SOUND OUTPUT");
+    const char *cur = luna_os_audio_device();
+    /* "None" closes the playback device so another program can open the
+     * card.  Mute only zeros samples and still holds the PCM. */
+    y += menu_item(b, "dev-off", "None", cur && !strcmp(cur, "off"), NULL);
+    y += menu_sep(b);
+    for (int i = 0; i < g_menu_ndev; ++i) {
+      snprintf(id, sizeof id, "dev-%d", i);
+      y += menu_item(b, id, g_menu_dev_desc[i], cur && !strcmp(cur, g_menu_dev_name[i]), NULL);
+    }
+    if (!g_menu_ndev) y += menu_item(b, NULL, "No output devices", false, NULL);
+  } else if (g_menu_sub == SUB_LOCALE) {
+    y += menu_header(b,"DEVICE LANGUAGE");
+    y += menu_item(b,NULL,"Applies on restart",false,NULL);
+    for (size_t i=0; i<sizeof g_locales/sizeof *g_locales; ++i) {
+      snprintf(id,sizeof id,"locale-%zu",i);
+      y += menu_item(b,id,g_locales[i].label,locale_choice()==(int)i,NULL);
+    }
+  } else if (g_menu_sub == SUB_WEBVIEW) {
+    y += menu_item(b, dvm_webview_count() ? "reload" : NULL, "Reload WebView", false, NULL);
+    y += menu_sep(b);
+    {
       static const int pct[] = { 75, 100, 125, 150, 175, 200, 250, 300 };
       const int cur = (int)(dvm_webview_zoom() * 100.0f + 0.5f);
       y += menu_header(b, "WEBVIEW ZOOM");
       y += menu_item(b, "zoom-0", "Device Density", false, NULL);
       y += menu_sep(b);
       for (size_t i = 0; i < sizeof pct / sizeof pct[0]; ++i) {
-         char label[16];
-         snprintf(id, sizeof id, "zoom-%d", pct[i] * 10);
-         snprintf(label, sizeof label, "%d%%", pct[i]);
-         y += menu_item(b, id, label, cur == pct[i], NULL);
+        char label[16];
+        snprintf(id, sizeof id, "zoom-%d", pct[i] * 10);
+        snprintf(label, sizeof label, "%d%%", pct[i]);
+        y += menu_item(b, id, label, cur == pct[i], NULL);
       }
-      }
-      y += menu_sep(b);
-      {
+    }
+    y += menu_sep(b);
+    {
       static const char *const names[] = { "auto", "chrome", "luna", "off" };
       static const char *const labels[] = { "Automatic", "Chrome / Chromium",
-                                            "luna-browser", "Off" };
+                                            "luna-browser", "Off"
+                                          };
       const char *cur = dvm_webview_engine();
       y += menu_header(b, "WEBVIEW ENGINE");
       for (int i = 0; i < 4; ++i) {
-         snprintf(id, sizeof id, "eng-%s", names[i]);
-         y += menu_item(b, id, labels[i], cur && !strcmp(cur, names[i]), NULL);
+        snprintf(id, sizeof id, "eng-%s", names[i]);
+        y += menu_item(b, id, labels[i], cur && !strcmp(cur, names[i]), NULL);
       }
-      }
-   } else if (g_menu_sub == SUB_GOOGLE) {
-      const bool installed = luna_apk_google_services_installed() != 0;
-      const bool busy = luna_apk_google_services_busy() != 0;
-      if (!g_google_choice[0]) snprintf(g_google_choice, sizeof g_google_choice, "%s", luna_google_profile_current());
-      y += menu_header(b, "GOOGLE SERVICES");
-      y += menu_item(b, NULL, installed ? "Play services installed" : "Play services not installed", false, NULL);
-      y += menu_item(b, NULL, luna_apk_google_package_installed("com.android.vending") ? "Play Store installed" : "Play Store missing", false, NULL);
-      y += menu_item(b, NULL, luna_apk_google_package_installed("com.google.android.gsf") ? "Services Framework installed" : "Services Framework missing", false, NULL);
-      y += menu_item(b, busy ? NULL : "google-install", "Install Google APK / XAPK...", false, NULL);
-      y += menu_item(b, installed && !busy ? "google-new" : NULL, "Sign in to a new environment...", false, NULL);
-      y += menu_item(b, installed && !busy ? "google-signin" : NULL, "Sign in to selected environment...", false, NULL);
-      y += menu_sep(b);
-      y += menu_header(b, "SAVED ENVIRONMENTS");
-      char profiles[PROFILE_MAX][65];
-      const int count = luna_apk_google_profile_list(profiles, PROFILE_MAX);
-      for (int i = 0; i < count; ++i) {
-         char label[128];
-         int accounts = luna_apk_google_profile_accounts(profiles[i]);
-         snprintf(id, sizeof id, "google-use-%s", profiles[i]);
-         snprintf(label, sizeof label, "%s (%d saved account%s)", profiles[i], accounts, accounts == 1 ? "" : "s");
-         y += menu_item(b, id, label, !strcmp(profiles[i], g_google_choice), NULL);
-      }
-      y += menu_sep(b);
-      y += menu_item(b, NULL, busy ? "Google services window is open" : "Uses this app's data folder", false, NULL);
-      y += menu_item(b, NULL, "Restart app to apply changes", false, NULL);
-   } else if (g_menu_sub == SUB_PROFILE) {
-      char names[PROFILE_MAX][65];
-      const int n = luna_apk_profile_list(names, PROFILE_MAX);
-      const char *cur = luna_apk_profile_current();
-      y += menu_header(b, "PROFILE");
-      y += menu_item(b, "profile-new", "New Profile", false, NULL);
-      y += menu_sep(b);
-      for (int i = 0; i < n; ++i) {
-         snprintf(id, sizeof id, "profile-id-%s", names[i]);
-         y += menu_item(b, id, names[i], !strcmp(names[i], cur), NULL);
-      }
-      y += menu_item(b, NULL, "Switching restarts the app", false, NULL);
-   }
-   return y + PAD;
+    }
+  } else if (g_menu_sub == SUB_GOOGLE) {
+    const bool installed = luna_apk_google_services_installed() != 0;
+    const bool busy = luna_apk_google_services_busy() != 0;
+    if (!g_google_choice[0]) snprintf(g_google_choice, sizeof g_google_choice, "%s", luna_google_profile_current());
+    y += menu_header(b, "GOOGLE SERVICES");
+    y += menu_item(b, NULL, installed ? "Play services installed" : "Play services not installed", false, NULL);
+    y += menu_item(b, NULL, luna_apk_google_package_installed("com.android.vending") ? "Play Store installed" : "Play Store missing", false, NULL);
+    y += menu_item(b, NULL, luna_apk_google_package_installed("com.google.android.gsf") ? "Services Framework installed" : "Services Framework missing", false, NULL);
+    y += menu_item(b, busy ? NULL : "google-install", "Install Google APK / XAPK...", false, NULL);
+    y += menu_item(b, installed && !busy ? "google-new" : NULL, "Sign in to a new environment...", false, NULL);
+    y += menu_item(b, installed && !busy ? "google-signin" : NULL, "Sign in to selected environment...", false, NULL);
+    y += menu_sep(b);
+    y += menu_header(b, "SAVED ENVIRONMENTS");
+    char profiles[PROFILE_MAX][65];
+    const int count = luna_apk_google_profile_list(profiles, PROFILE_MAX);
+    for (int i = 0; i < count; ++i) {
+      char label[128];
+      int accounts = luna_apk_google_profile_accounts(profiles[i]);
+      snprintf(id, sizeof id, "google-use-%s", profiles[i]);
+      snprintf(label, sizeof label, "%s (%d saved account%s)", profiles[i], accounts, accounts == 1 ? "" : "s");
+      y += menu_item(b, id, label, !strcmp(profiles[i], g_google_choice), NULL);
+    }
+    y += menu_sep(b);
+    y += menu_item(b, NULL, busy ? "Google services window is open" : "Uses this app's data folder", false, NULL);
+    y += menu_item(b, NULL, "Restart app to apply changes", false, NULL);
+  } else if (g_menu_sub == SUB_PROFILE) {
+    char names[PROFILE_MAX][65];
+    const int n = luna_apk_profile_list(names, PROFILE_MAX);
+    const char *cur = luna_apk_profile_current();
+    y += menu_header(b, "PROFILE");
+    y += menu_item(b, "profile-new", "New Profile", false, NULL);
+    y += menu_sep(b);
+    for (int i = 0; i < n; ++i) {
+      snprintf(id, sizeof id, "profile-id-%s", names[i]);
+      y += menu_item(b, id, names[i], !strcmp(names[i], cur), NULL);
+    }
+    y += menu_item(b, NULL, "Switching restarts the app", false, NULL);
+  }
+  return y + PAD;
 }
 
 /* Publishes the current state; g_menu_lock held. */
 static void menu_publish_locked(void)
 {
-   if (!g_menu_open) {
-      if (g_menu_notice[0]) {
-         struct menu_buf b = { 0 };
-         menu_put(&b, "<div class=\"hud\">");
-         menu_put_text(&b, g_menu_notice);
-         menu_put(&b, "</div>");
-         luna_overlay_set_menu(b.p, g_menu_style, false);
-         free(b.p);
-      } else luna_overlay_set_menu(NULL, NULL, false);
-      return;
-   }
-   if (g_settings_open) {
-      struct menu_buf doc = {0};
-      const int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
-      menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
-      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
-                (g_menu_w - width) / 2, menu_clampi((g_menu_h - 310) / 2, 8, g_menu_h), width);
-      menu_header(&doc, "SETTINGS — THIS APP");
-      menu_item(&doc, NULL, "Resolution applies now; other changes on restart.", false, NULL);
-      menu_sep(&doc);
-      for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
-         char id[32], value[32];
-         snprintf(id, sizeof id, "setting-%zu", i);
-         snprintf(value, sizeof value, "%d", g_settings[i].value);
-         menu_item(&doc, id, g_settings[i].label, false, g_settings[i].value ? value : "Automatic");
-      }
-      char resolution[32];
-      int rw = g_menu_w, rh = g_menu_h;
-      if (g_settings_resolution >= 0) resolution_values(g_settings_resolution, &rw, &rh);
-      snprintf(resolution, sizeof resolution, "%d x %d", rw, rh);
-      menu_item(&doc, "settings-resolution", "Resolution", false, resolution);
-      menu_item(&doc, NULL, "Click a value to choose the next preset.", false, NULL);
-      menu_item(&doc, NULL, "Global config / environment overrides take priority.", false, NULL);
-      menu_sep(&doc);
-      menu_item(&doc, "settings-save", "Save", false, NULL);
-      menu_item(&doc, "settings-cancel", "Cancel", false, NULL);
-      if (g_menu_notice[0]) menu_item(&doc, NULL, g_menu_notice, false, NULL);
-      menu_put(&doc, "</div>");
-      luna_overlay_set_menu(doc.p, g_menu_style, true);
-      free(doc.p);
-      return;
-   }
-   struct menu_buf rows = { 0 }, sub = { 0 }, doc = { 0 };
-   int parent_y[SUB_COUNT] = { 0 };
-   const int room = g_menu_h - 8;               /* a panel never outgrows the window */
-   const int natural_h = menu_main_rows(&rows, parent_y);
-   int h = natural_h;
-   const int mx = menu_clampi((int)g_menu_x, 4, g_menu_w - MENU_W - 4 > 4 ? g_menu_w - MENU_W - 4 : 4);
-   if (h > room) h = room;
-   const int my = menu_clampi((int)g_menu_y, 4, g_menu_h - h - 4 > 4 ? g_menu_h - h - 4 : 4);
-   menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
-   /* Only a panel that cannot fit is given a height and scrolls; one that
-    * fits is left to size itself, since the rows' sum is a little short of
-    * what the layout makes of them. */
-   if (natural_h > room)
-      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;max-height:%dpx;overflow-y:auto;\">", mx, my, h - 2 * PAD);
-   else
-      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", mx, my);
-   menu_put(&doc, rows.p ? rows.p : "");
-   menu_put(&doc, "</div>");
-   if (g_menu_sub != SUB_NONE) {
-      const int sub_natural = menu_sub_rows(&sub);
-      int sh = sub_natural > room ? room : sub_natural;
-      /* To the right of the menu, the parent row at its first item; to the
-       * left when that would leave the surface. */
-      int sx = mx + MENU_W - 4;
-      if (sx + MENU_W > g_menu_w - 4) sx = mx - MENU_W + 4;
-      const int sy = menu_clampi(my + parent_y[g_menu_sub] - PAD - 22, 4, g_menu_h - sh - 4 > 4 ? g_menu_h - sh - 4 : 4);
-      if (sub_natural > room)
-         menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;max-height:%dpx;overflow-y:auto;\">", sx, sy, sh - 2 * PAD);
-      else
-         menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", sx, sy);
-      menu_put(&doc, sub.p ? sub.p : "");
-      menu_put(&doc, "</div>");
-   }
-   if (g_menu_notice[0]) {
-      menu_put(&doc, "<div class=\"hud\">");
-      menu_put_text(&doc, g_menu_notice);
-      menu_put(&doc, "</div>");
-   }
-   luna_overlay_set_menu(doc.p, g_menu_style, true);
-   free(rows.p);
-   free(sub.p);
-   free(doc.p);
+  if (!g_menu_open) {
+    if (g_menu_notice[0]) {
+      struct menu_buf b = { 0 };
+      menu_put(&b, "<div class=\"hud\">");
+      menu_put_text(&b, g_menu_notice);
+      menu_put(&b, "</div>");
+      luna_overlay_set_menu(b.p, g_menu_style, false);
+      free(b.p);
+    } else luna_overlay_set_menu(NULL, NULL, false);
+    return;
+  }
+  if (g_settings_open) {
+    struct menu_buf doc = {0};
+    const int width = g_menu_w < 488 ? g_menu_w - 16 : 472;
+    menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
+    menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;width:%dpx;\">",
+              (g_menu_w - width) / 2, menu_clampi((g_menu_h - 310) / 2, 8, g_menu_h), width);
+    menu_header(&doc, "SETTINGS — THIS APP");
+    menu_item(&doc, NULL, "Resolution applies now; other changes on restart.", false, NULL);
+    menu_sep(&doc);
+    for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
+      char id[32], value[32];
+      snprintf(id, sizeof id, "setting-%zu", i);
+      snprintf(value, sizeof value, "%d", g_settings[i].value);
+      menu_item(&doc, id, g_settings[i].label, false, g_settings[i].value ? value : "Automatic");
+    }
+    char resolution[32];
+    int rw = g_menu_w, rh = g_menu_h;
+    if (g_settings_resolution >= 0) resolution_values(g_settings_resolution, &rw, &rh);
+    snprintf(resolution, sizeof resolution, "%d x %d", rw, rh);
+    menu_item(&doc, "settings-resolution", "Resolution", false, resolution);
+    menu_item(&doc, NULL, "Click a value to choose the next preset.", false, NULL);
+    menu_item(&doc, NULL, "Global config / environment overrides take priority.", false, NULL);
+    menu_sep(&doc);
+    menu_item(&doc, "settings-save", "Save", false, NULL);
+    menu_item(&doc, "settings-cancel", "Cancel", false, NULL);
+    if (g_menu_notice[0]) menu_item(&doc, NULL, g_menu_notice, false, NULL);
+    menu_put(&doc, "</div>");
+    luna_overlay_set_menu(doc.p, g_menu_style, true);
+    free(doc.p);
+    return;
+  }
+  struct menu_buf rows = { 0 }, sub = { 0 }, doc = { 0 };
+  int parent_y[SUB_COUNT] = { 0 };
+  const int room = g_menu_h - 8;               /* a panel never outgrows the window */
+  const int natural_h = menu_main_rows(&rows, parent_y);
+  int h = natural_h;
+  const int mx = menu_clampi((int)g_menu_x, 4, g_menu_w - MENU_W - 4 > 4 ? g_menu_w - MENU_W - 4 : 4);
+  if (h > room) h = room;
+  const int my = menu_clampi((int)g_menu_y, 4, g_menu_h - h - 4 > 4 ? g_menu_h - h - 4 : 4);
+  menu_put(&doc, "<div id=\"luna-menu-backdrop\"></div>");
+  /* Only a panel that cannot fit is given a height and scrolls; one that
+   * fits is left to size itself, since the rows' sum is a little short of
+   * what the layout makes of them. */
+  if (natural_h > room)
+    menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;max-height:%dpx;overflow-y:auto;\">", mx, my, h - 2 * PAD);
+  else
+    menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", mx, my);
+  menu_put(&doc, rows.p ? rows.p : "");
+  menu_put(&doc, "</div>");
+  if (g_menu_sub != SUB_NONE) {
+    const int sub_natural = menu_sub_rows(&sub);
+    int sh = sub_natural > room ? room : sub_natural;
+    /* To the right of the menu, the parent row at its first item; to the
+     * left when that would leave the surface. */
+    int sx = mx + MENU_W - 4;
+    if (sx + MENU_W > g_menu_w - 4) sx = mx - MENU_W + 4;
+    const int sy = menu_clampi(my + parent_y[g_menu_sub] - PAD - 22, 4, g_menu_h - sh - 4 > 4 ? g_menu_h - sh - 4 : 4);
+    if (sub_natural > room)
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;max-height:%dpx;overflow-y:auto;\">", sx, sy, sh - 2 * PAD);
+    else
+      menu_putf(&doc, "<div class=\"lm\" style=\"left:%dpx;top:%dpx;\">", sx, sy);
+    menu_put(&doc, sub.p ? sub.p : "");
+    menu_put(&doc, "</div>");
+  }
+  if (g_menu_notice[0]) {
+    menu_put(&doc, "<div class=\"hud\">");
+    menu_put_text(&doc, g_menu_notice);
+    menu_put(&doc, "</div>");
+  }
+  luna_overlay_set_menu(doc.p, g_menu_style, true);
+  free(rows.p);
+  free(sub.p);
+  free(doc.p);
 }
 
 static void menu_notice_locked(const char *msg)
 {
-   snprintf(g_menu_notice, sizeof g_menu_notice, "%s", msg);
-   g_menu_notice_until = menu_now() + 2.5;
+  snprintf(g_menu_notice, sizeof g_menu_notice, "%s", msg);
+  g_menu_notice_until = menu_now() + 2.5;
 }
 
 /* The clipboard, typed into whatever has the text focus: the emulator's
  * input method, or a WebView page. */
 static int menu_paste_clipboard(void)
 {
-   char *text = arm_exec_clipboard_get();
-   if (!text) return -1;
-   const bool ime = luna_ime_active();
-   if (!ime && luna_overlay_web_text(text)) {
-      const int typed = text[0] != 0;
-      free(text);
-      return typed;
-   }
-   int typed = 0;
-   for (const unsigned char *p = (const unsigned char *)text; *p; ) {
-      uint32_t cp = *p;
-      int n = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
-      cp &= n == 3 ? 7u : n == 2 ? 15u : n == 1 ? 31u : 127u;
-      ++p;
-      while (n-- > 0 && (*p & 0xc0) == 0x80) cp = (cp << 6) | (*p++ & 63u);
-      if (cp == '\r') continue;
-      if (ime) { luna_ime_char(cp); ++typed; }
-      else if (luna_overlay_web_char(cp)) ++typed;
-      else break;
-   }
-   free(text);
-   return typed;
+  char *text = arm_exec_clipboard_get();
+  if (!text) return -1;
+  const bool ime = luna_ime_active();
+  if (!ime && luna_overlay_web_text(text)) {
+    const int typed = text[0] != 0;
+    free(text);
+    return typed;
+  }
+  int typed = 0;
+  for (const unsigned char *p = (const unsigned char *)text; *p; ) {
+    uint32_t cp = *p;
+    int n = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+    cp &= n == 3 ? 7u : n == 2 ? 15u : n == 1 ? 31u : 127u;
+    ++p;
+    while (n-- > 0 && (*p & 0xc0) == 0x80) cp = (cp << 6) | (*p++ & 63u);
+    if (cp == '\r') continue;
+    if (ime) {
+      luna_ime_char(cp);
+      ++typed;
+    }
+    else if (luna_overlay_web_char(cp)) ++typed;
+    else break;
+  }
+  free(text);
+  return typed;
 }
 
 static void menu_stamp_path(char *out, size_t cap, const char *folder, const char *ext)
 {
-   const char *home = getenv("HOME");
-   char dir[512];
-   struct stat st;
-   snprintf(dir, sizeof dir, "%s/%s", home && *home ? home : ".", folder);
-   if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
-      snprintf(dir, sizeof dir, "%s", home && *home ? home : ".");
-   time_t t = time(NULL);
-   struct tm tm = {0};
-   luna_localtime(&t, &tm);
-   snprintf(out, cap, "%s/Lunaria %04d-%02d-%02d %02d.%02d.%02d.%s", dir,
-            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ext);
+  const char *home = getenv("HOME");
+  char dir[512];
+  struct stat st;
+  snprintf(dir, sizeof dir, "%s/%s", home && *home ? home : ".", folder);
+  if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
+    snprintf(dir, sizeof dir, "%s", home && *home ? home : ".");
+  time_t t = time(NULL);
+  struct tm tm = {0};
+  luna_localtime(&t, &tm);
+  snprintf(out, cap, "%s/Lunaria %04d-%02d-%02d %02d.%02d.%02d.%s", dir,
+           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, ext);
 }
 
 static void menu_screenshot_path(char *out, size_t cap)
 {
-   menu_stamp_path(out, cap, "Pictures", "png");
+  menu_stamp_path(out, cap, "Pictures", "png");
 }
 
 /* Record / replay of touch input (F9 / F10 and the menu).  The recording is
@@ -2774,49 +3188,51 @@ static void menu_screenshot_path(char *out, size_t cap)
  * or a macro.  LUNARIA_PLAY names a recording to replay when none was made. */
 static const char *input_play_path(char *out, size_t cap)
 {
-   luna_record_last_path(out, cap);
-   if (!out[0]) {
-      const char *env = getenv("LUNARIA_PLAY");
-      snprintf(out, cap, "%s", env ? env : "");
-   }
-   return out[0] ? out : NULL;
+  luna_record_last_path(out, cap);
+  if (!out[0]) {
+    const char *env = getenv("LUNARIA_PLAY");
+    snprintf(out, cap, "%s", env ? env : "");
+  }
+  return out[0] ? out : NULL;
 }
 
 void luna_input_record_toggle(void)
 {
-   char path[4096], msg[4300];
-   if (luna_record_active()) {
-      luna_record_stop();
-      luna_record_last_path(path, sizeof path);
-      snprintf(msg, sizeof msg, "Recording saved: %s", path);
-   } else {
-      menu_stamp_path(path, sizeof path, "Documents", "rec");
-      if (luna_play_active()) luna_play_stop();
-      snprintf(msg, sizeof msg, luna_record_start(path) ? "Recording input: %s" : "Cannot record to %s", path);
-   }
-   fprintf(stderr, "[input] %s\n", msg);
-   pthread_mutex_lock(&g_menu_lock);
-   menu_notice_locked(msg);
-   pthread_mutex_unlock(&g_menu_lock);
+  char path[4096], msg[4300];
+  if (luna_record_active()) {
+    luna_record_stop();
+    luna_record_last_path(path, sizeof path);
+    snprintf(msg, sizeof msg, "Recording saved: %s", path);
+  } else {
+    menu_stamp_path(path, sizeof path, "Documents", "rec");
+    if (luna_play_active()) luna_play_stop();
+    snprintf(msg, sizeof msg, luna_record_start(path) ? "Recording input: %s" : "Cannot record to %s", path);
+  }
+  fprintf(stderr, "[input] %s\n", msg);
+  pthread_mutex_lock(&g_menu_lock);
+  menu_notice_locked(msg);
+  pthread_mutex_unlock(&g_menu_lock);
 }
 
 void luna_input_play_toggle(void)
 {
-   char path[4096], msg[4300];
-   if (luna_play_active()) {
-      luna_play_stop();
-      snprintf(msg, sizeof msg, "Replay stopped");
-   } else if (!input_play_path(path, sizeof path)) {
-      snprintf(msg, sizeof msg, "No recording to play (record with F9)");
-   } else {
-      if (luna_record_active()) { luna_record_stop(); }
-      const char *loop = getenv("LUNARIA_PLAY_LOOP");
-      snprintf(msg, sizeof msg, luna_play_start(path, loop && *loop && *loop != '0') ? "Replaying: %s" : "Cannot replay %s", path);
-   }
-   fprintf(stderr, "[input] %s\n", msg);
-   pthread_mutex_lock(&g_menu_lock);
-   menu_notice_locked(msg);
-   pthread_mutex_unlock(&g_menu_lock);
+  char path[4096], msg[4300];
+  if (luna_play_active()) {
+    luna_play_stop();
+    snprintf(msg, sizeof msg, "Replay stopped");
+  } else if (!input_play_path(path, sizeof path)) {
+    snprintf(msg, sizeof msg, "No recording to play (record with F9)");
+  } else {
+    if (luna_record_active()) {
+      luna_record_stop();
+    }
+    const char *loop = getenv("LUNARIA_PLAY_LOOP");
+    snprintf(msg, sizeof msg, luna_play_start(path, loop && *loop && *loop != '0') ? "Replaying: %s" : "Cannot replay %s", path);
+  }
+  fprintf(stderr, "[input] %s\n", msg);
+  pthread_mutex_lock(&g_menu_lock);
+  menu_notice_locked(msg);
+  pthread_mutex_unlock(&g_menu_lock);
 }
 
 /* The right-click menu writes into the running package's block of
@@ -2825,482 +3241,573 @@ void luna_input_play_toggle(void)
  * is how "follow the device density" is stored: the name is simply absent. */
 static bool menu_conf_write(const char *key, const char *value, bool apply)
 {
-   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   const char *path = getenv("LUNARIA_CONF");
-   char **lines = NULL;
-   int n = 0, cap = 0, sec = -1, end = -1, hit = -1, i, bad = 0;
-   bool saved = false;
-   FILE *in;
-   if (!pkg || !*pkg || !path || !*path || !key || !*key) return false;
-   if (strchr(pkg, '\n') || strchr(pkg, ']') || strchr(key, '\n') || strchr(key, '=')) return false;
-   if (value && (strchr(value, '\n') || strchr(value, '\r'))) return false;
+  const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+  const char *path = getenv("LUNARIA_CONF");
+  char **lines = NULL;
+  int n = 0, cap = 0, sec = -1, end = -1, hit = -1, i, bad = 0;
+  bool saved = false;
+  FILE *in;
+  if (!pkg || !*pkg || !path || !*path || !key || !*key) return false;
+  if (strchr(pkg, '\n') || strchr(pkg, ']') || strchr(key, '\n') || strchr(key, '=')) return false;
+  if (value && (strchr(value, '\n') || strchr(value, '\r'))) return false;
 
-   in = fopen(path, "r");
-   if (in) {
-      char buf[4096];
-      while (fgets(buf, sizeof buf, in)) {
-         size_t L;
-         char *copy;
-         if (!strchr(buf, '\n') && !feof(in)) { bad = 1; break; }
-         L = strlen(buf);
-         while (L && (buf[L - 1] == '\n' || buf[L - 1] == '\r')) buf[--L] = 0;
-         copy = (char *)malloc(L + 1);
-         if (!copy) { bad = 1; break; }
-         memcpy(copy, buf, L + 1);
-         if (n == cap) {
-            int ncap = cap ? cap * 2 : 64;
-            char **grown = (char **)realloc(lines, (size_t)ncap * sizeof *lines);
-            if (!grown) { free(copy); bad = 1; break; }
-            lines = grown;
-            cap = ncap;
-         }
-         lines[n++] = copy;
+  in = fopen(path, "r");
+  if (in) {
+    char buf[4096];
+    while (fgets(buf, sizeof buf, in)) {
+      size_t L;
+      char *copy;
+      if (!strchr(buf, '\n') && !feof(in)) {
+        bad = 1;
+        break;
       }
-      fclose(in);
-   }
-   if (bad) {
-      fprintf(stderr, "[menu] leaving %s unchanged (unreadable or too long a line)\n", path);
-      goto done;
-   }
+      L = strlen(buf);
+      while (L && (buf[L - 1] == '\n' || buf[L - 1] == '\r')) buf[--L] = 0;
+      copy = (char *)malloc(L + 1);
+      if (!copy) {
+        bad = 1;
+        break;
+      }
+      memcpy(copy, buf, L + 1);
+      if (n == cap) {
+        int ncap = cap ? cap * 2 : 64;
+        char **grown = (char **)realloc(lines, (size_t)ncap * sizeof *lines);
+        if (!grown) {
+          free(copy);
+          bad = 1;
+          break;
+        }
+        lines = grown;
+        cap = ncap;
+      }
+      lines[n++] = copy;
+    }
+    fclose(in);
+  }
+  if (bad) {
+    fprintf(stderr, "[menu] leaving %s unchanged (unreadable or too long a line)\n", path);
+    goto done;
+  }
 
-   for (i = 0; i < n; ++i) {
-      const char *s = lines[i];
-      size_t a = 0, b;
-      while (s[a] == ' ' || s[a] == '\t') ++a;
-      b = strlen(s);
-      while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) --b;
-      if (s[a] == '[') {
-         int match = b > a + 1 && s[b - 1] == ']'
+  for (i = 0; i < n; ++i) {
+    const char *s = lines[i];
+    size_t a = 0, b;
+    while (s[a] == ' ' || s[a] == '\t') ++a;
+    b = strlen(s);
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == '\t')) --b;
+    if (s[a] == '[') {
+      int match = b > a + 1 && s[b - 1] == ']'
                   && (size_t)(b - a - 2) == strlen(pkg)
                   && memcmp(s + a + 1, pkg, strlen(pkg)) == 0;
-         if (sec < 0) {
-            if (match) { sec = i; end = n; }
-         } else if (i > sec) {
-            end = i;
-            break;
-         }
+      if (sec < 0) {
+        if (match) {
+          sec = i;
+          end = n;
+        }
+      } else if (i > sec) {
+        end = i;
+        break;
       }
-   }
-   if (sec >= 0) {
-      size_t klen = strlen(key);
-      for (i = sec + 1; i < end; ++i) {
-         if (strncmp(lines[i], key, klen) == 0 && lines[i][klen] == '=') { hit = i; break; }
+    }
+  }
+  if (sec >= 0) {
+    size_t klen = strlen(key);
+    for (i = sec + 1; i < end; ++i) {
+      if (strncmp(lines[i], key, klen) == 0 && lines[i][klen] == '=') {
+        hit = i;
+        break;
       }
-   }
+    }
+  }
 
-   if (!value) {
-      if (hit >= 0) {
-         free(lines[hit]);
-         memmove(&lines[hit], &lines[hit + 1], (size_t)(n - hit - 1) * sizeof *lines);
-         --n;
+  if (!value) {
+    if (hit >= 0) {
+      free(lines[hit]);
+      memmove(&lines[hit], &lines[hit + 1], (size_t)(n - hit - 1) * sizeof *lines);
+      --n;
+    }
+  } else {
+    size_t need = strlen(key) + 1 + strlen(value) + 1;
+    char *row = (char *)malloc(need);
+    if (!row) goto done;
+    snprintf(row, need, "%s=%s", key, value);
+    if (hit >= 0) {
+      free(lines[hit]);
+      lines[hit] = row;
+    } else if (sec >= 0) {
+      int at = sec + 1;
+      if (n == cap) {
+        char **grown = (char **)realloc(lines, (size_t)(cap + 1) * sizeof *lines);
+        if (!grown) {
+          free(row);
+          goto done;
+        }
+        lines = grown;
+        ++cap;
       }
-   } else {
-      size_t need = strlen(key) + 1 + strlen(value) + 1;
-      char *row = (char *)malloc(need);
-      if (!row) goto done;
-      snprintf(row, need, "%s=%s", key, value);
-      if (hit >= 0) {
-         free(lines[hit]);
-         lines[hit] = row;
-      } else if (sec >= 0) {
-         int at = sec + 1;
-         if (n == cap) {
-            char **grown = (char **)realloc(lines, (size_t)(cap + 1) * sizeof *lines);
-            if (!grown) { free(row); goto done; }
-            lines = grown;
-            ++cap;
-         }
-         memmove(&lines[at + 1], &lines[at], (size_t)(n - at) * sizeof *lines);
-         lines[at] = row;
-         ++n;
-      } else {
-         char *hdr;
-         int add = n > 0 ? 3 : 2; /* blank line, [pkg], key */
-         if (n + add > cap) {
-            char **grown = (char **)realloc(lines, (size_t)(n + add) * sizeof *lines);
-            if (!grown) { free(row); goto done; }
-            lines = grown;
-            cap = n + add;
-         }
-         if (n > 0 && lines[n - 1][0] != 0) {
-            char *blank = strdup("");
-            if (!blank) { free(row); goto done; }
-            lines[n++] = blank;
-         }
-         hdr = (char *)malloc(strlen(pkg) + 3);
-         if (!hdr) { free(row); goto done; }
-         snprintf(hdr, strlen(pkg) + 3, "[%s]", pkg);
-         lines[n++] = hdr;
-         lines[n++] = row;
+      memmove(&lines[at + 1], &lines[at], (size_t)(n - at) * sizeof *lines);
+      lines[at] = row;
+      ++n;
+    } else {
+      char *hdr;
+      int add = n > 0 ? 3 : 2; /* blank line, [pkg], key */
+      if (n + add > cap) {
+        char **grown = (char **)realloc(lines, (size_t)(n + add) * sizeof *lines);
+        if (!grown) {
+          free(row);
+          goto done;
+        }
+        lines = grown;
+        cap = n + add;
       }
-   }
+      if (n > 0 && lines[n - 1][0] != 0) {
+        char *blank = strdup("");
+        if (!blank) {
+          free(row);
+          goto done;
+        }
+        lines[n++] = blank;
+      }
+      hdr = (char *)malloc(strlen(pkg) + 3);
+      if (!hdr) {
+        free(row);
+        goto done;
+      }
+      snprintf(hdr, strlen(pkg) + 3, "[%s]", pkg);
+      lines[n++] = hdr;
+      lines[n++] = row;
+    }
+  }
 
-   {
-      char tmp[4096];
-      FILE *out;
-      if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) goto done;
-      out = fopen(tmp, "w");
-      if (!out) {
-         fprintf(stderr, "[menu] cannot write %s\n", tmp);
-         goto done;
+  {
+    char tmp[4096];
+    FILE *out;
+    if (snprintf(tmp, sizeof tmp, "%s.tmp", path) >= (int)sizeof tmp) goto done;
+    out = fopen(tmp, "w");
+    if (!out) {
+      fprintf(stderr, "[menu] cannot write %s\n", tmp);
+      goto done;
+    }
+    for (i = 0; i < n; ++i) {
+      if (fputs(lines[i], out) < 0 || fputc('\n', out) == EOF) {
+        fclose(out);
+        unlink(tmp);
+        fprintf(stderr, "[menu] cannot write %s\n", tmp);
+        goto done;
       }
-      for (i = 0; i < n; ++i) {
-         if (fputs(lines[i], out) < 0 || fputc('\n', out) == EOF) {
-            fclose(out);
-            unlink(tmp);
-            fprintf(stderr, "[menu] cannot write %s\n", tmp);
-            goto done;
-         }
-      }
-      if (fclose(out) != 0 || rename(tmp, path) != 0) {
-         unlink(tmp);
-         fprintf(stderr, "[menu] cannot replace %s\n", path);
-      } else saved = true;
-   }
+    }
+    if (fclose(out) != 0 || rename(tmp, path) != 0) {
+      unlink(tmp);
+      fprintf(stderr, "[menu] cannot replace %s\n", path);
+    } else saved = true;
+  }
 done:
-   for (i = 0; i < n; ++i) free(lines[i]);
-   free(lines);
-   if (saved && apply) {
-      if (value) luna_os_setenv(key, value, 1);
-      else luna_os_unsetenv(key);
-   }
-   return saved;
+  for (i = 0; i < n; ++i) free(lines[i]);
+  free(lines);
+  if (saved && apply) {
+    if (value) luna_os_setenv(key, value, 1);
+    else luna_os_unsetenv(key);
+  }
+  return saved;
 }
 
 static void menu_conf_set(const char *key, const char *value)
 {
-   if (!menu_conf_write(key, value, true)) menu_notice_locked("Cannot save settings");
+  if (!menu_conf_write(key, value, true)) menu_notice_locked("Cannot save settings");
 }
 
 static bool resolution_save(int index)
 {
-   int width, height; char w[16], h[16]; resolution_values(index, &width, &height);
-   snprintf(w, sizeof w, "%d", width); snprintf(h, sizeof h, "%d", height);
-   bool saved_w = menu_conf_write("LUNARIA_WIDTH", w, false);
-   bool saved_h = menu_conf_write("LUNARIA_HEIGHT", h, false);
-   if (saved_w && saved_h) {
-      g_saved_resolution = index;
-      arm_exec_request_view_resize(width, height);
-   }
-   return saved_w && saved_h;
+  int width, height;
+  char w[16], h[16];
+  resolution_values(index, &width, &height);
+  snprintf(w, sizeof w, "%d", width);
+  snprintf(h, sizeof h, "%d", height);
+  bool saved_w = menu_conf_write("LUNARIA_WIDTH", w, false);
+  bool saved_h = menu_conf_write("LUNARIA_HEIGHT", h, false);
+  if (saved_w && saved_h) {
+    g_saved_resolution = index;
+    arm_exec_request_view_resize(width, height);
+  }
+  return saved_w && saved_h;
 }
 
 static void menu_clicked(const char *id)
 {
-   if (strncmp(id, "luna-menu", 9)) return;
-   id += 9;
-   if (*id == '-') ++id;
-   pthread_mutex_lock(&g_menu_lock);
-   bool keep_open = false;
-   if (!strncmp(id, "google-use-", 11)) {
-      const char *profile = id + 11;
-      char names[PROFILE_MAX][65];
-      int count = luna_apk_google_profile_list(names, PROFILE_MAX);
-      bool found = false;
-      for (int i = 0; i < count; ++i) if (!strcmp(profile, names[i])) found = true;
-      if (found && menu_conf_write("LUNARIA_GMS_PROFILE", profile, false)) {
-         snprintf(g_google_choice, sizeof g_google_choice, "%s", profile);
-         menu_notice_locked("GMS environment selected; restart the app to apply");
-      } else menu_notice_locked("Cannot save GMS environment");
+  if (strncmp(id, "luna-menu", 9)) return;
+  id += 9;
+  if (*id == '-') ++id;
+  pthread_mutex_lock(&g_menu_lock);
+  bool keep_open = false;
+  if (!strncmp(id, "google-use-", 11)) {
+    const char *profile = id + 11;
+    char names[PROFILE_MAX][65];
+    int count = luna_apk_google_profile_list(names, PROFILE_MAX);
+    bool found = false;
+    for (int i = 0; i < count; ++i) if (!strcmp(profile, names[i])) found = true;
+    if (found && menu_conf_write("LUNARIA_GMS_PROFILE", profile, false)) {
+      snprintf(g_google_choice, sizeof g_google_choice, "%s", profile);
+      menu_notice_locked("GMS environment selected; restart the app to apply");
+    } else menu_notice_locked("Cannot save GMS environment");
+    keep_open = true;
+  } else if (!strcmp(id, "google-install") || !strcmp(id, "google-signin") || !strcmp(id, "google-new")) {
+    char fresh[65];
+    const char *profile = g_google_choice[0] ? g_google_choice : luna_google_profile_current();
+    int result = 0;
+    if (!strcmp(id, "google-new")) {
+      result = luna_apk_google_profile_create(fresh, sizeof fresh);
+      profile = fresh;
+      if (!result) {
+        if (menu_conf_write("LUNARIA_GMS_PROFILE", profile, false))
+          snprintf(g_google_choice, sizeof g_google_choice, "%s", profile);
+        else result = -1;
+      }
+    }
+    if (!result && !luna_apk_google_services_open(!strcmp(id, "google-install"), profile))
+      menu_notice_locked("Opening Google services...");
+    else {
+      menu_notice_locked("Cannot open Google services");
       keep_open = true;
-   } else if (!strcmp(id, "google-install") || !strcmp(id, "google-signin") || !strcmp(id, "google-new")) {
-      char fresh[65];
-      const char *profile = g_google_choice[0] ? g_google_choice : luna_google_profile_current();
-      int result = 0;
-      if (!strcmp(id, "google-new")) {
-         result = luna_apk_google_profile_create(fresh, sizeof fresh);
-         profile = fresh;
-         if (!result) {
-            if (menu_conf_write("LUNARIA_GMS_PROFILE", profile, false))
-               snprintf(g_google_choice, sizeof g_google_choice, "%s", profile);
-            else result = -1;
-         }
+    }
+  } else if (!strcmp(id, "pause")) {
+    const bool paused = !luna_guest_paused();
+    luna_guest_set_paused(paused);
+    menu_notice_locked(paused ? "Paused" : "Resumed");
+  } else if (!strcmp(id, "settings")) {
+    settings_load();
+    g_settings_open = true;
+    g_menu_sub = SUB_NONE;
+    keep_open = true;
+  } else if (!strncmp(id, "setting-", 8)) {
+    char *end = NULL;
+    long i = strtol(id + 8, &end, 10);
+    if (g_settings_open && end != id + 8 && !*end && i >= 0 && (size_t)i < sizeof g_settings / sizeof g_settings[0]) {
+      struct menu_setting *v = &g_settings[i];
+      size_t next = 0;
+      while (next < v->count && v->choices[next] <= v->value) ++next;
+      v->value = v->choices[next == v->count ? 0 : next];
+    }
+    keep_open = true;
+  } else if (!strcmp(id, "settings-resolution")) {
+    g_settings_resolution = (g_settings_resolution + 1) % (sizeof g_resolutions / sizeof g_resolutions[0]);
+    g_resolution_dirty = true;
+    keep_open = true;
+  } else if (!strncmp(id,"locale-",7)) {
+    char *end=NULL;
+    long i=strtol(id+7,&end,10);
+    if (end!=id+7 && !*end && i>=0 && (size_t)i<sizeof g_locales/sizeof *g_locales) {
+      bool saved=menu_conf_write("LUNARIA_LOCALE",g_locales[i].tag,false);
+      if (saved) g_locale_choice=(int)i;
+      menu_notice_locked(saved ? "言語を保存しました。再起動すると反映されます。" : "言語の設定を保存できません。");
+      keep_open=!saved;
+    }
+  } else if (!strncmp(id, "dpi-", 4)) {
+    char *end = NULL;
+    long i = strtol(id + 4, &end, 10);
+    if (end != id + 4 && !*end && i >= 0 && (size_t)i < sizeof dpi_choices / sizeof dpi_choices[0]) {
+      char value[16];
+      snprintf(value, sizeof value, "%d", dpi_choices[i]);
+      bool saved = menu_conf_write("LUNARIA_DPI", dpi_choices[i] ? value : NULL, false);
+      if (saved) {
+        if (!g_settings_loaded) settings_load();
+        for (size_t j = 0; j < sizeof g_settings / sizeof g_settings[0]; ++j)
+          if (!strcmp(g_settings[j].key, "LUNARIA_DPI"))
+            g_settings[j].value = g_settings[j].initial = dpi_choices[i];
       }
-      if (!result && !luna_apk_google_services_open(!strcmp(id, "google-install"), profile))
-         menu_notice_locked("Opening Google services...");
-      else { menu_notice_locked("Cannot open Google services"); keep_open = true; }
-   } else if (!strcmp(id, "pause")) {
-      const bool paused = !luna_guest_paused();
-      luna_guest_set_paused(paused);
-      menu_notice_locked(paused ? "Paused" : "Resumed");
-   } else if (!strcmp(id, "settings")) {
-      settings_load(); g_settings_open = true; g_menu_sub = SUB_NONE; keep_open = true;
-   } else if (!strncmp(id, "setting-", 8)) {
-      char *end = NULL; long i = strtol(id + 8, &end, 10);
-      if (g_settings_open && end != id + 8 && !*end && i >= 0 && (size_t)i < sizeof g_settings / sizeof g_settings[0]) {
-         struct menu_setting *v = &g_settings[i];
-         size_t next = 0;
-         while (next < v->count && v->choices[next] <= v->value) ++next;
-         v->value = v->choices[next == v->count ? 0 : next];
-      }
+      menu_notice_locked(saved ? "Screen density saved. Restart to apply." : "Cannot save screen density");
+      keep_open = !saved;
+    }
+  } else if (!strncmp(id, "res-", 4)) {
+    char *end = NULL;
+    long i = strtol(id + 4, &end, 10);
+    if (end != id + 4 && !*end && i >= 0 && (size_t)i < sizeof g_resolutions / sizeof g_resolutions[0]) {
+      bool saved = resolution_save((int)i);
+      menu_notice_locked(saved ? "Resolution changed and saved." : "Cannot save resolution");
+      keep_open = !saved;
+    }
+  } else if (!strcmp(id, "settings-save")) {
+    bool saved = true, restart_required = false;
+    for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
+      struct menu_setting *v = &g_settings[i];
+      char value[32];
+      if (v->value == v->initial) continue;
+      restart_required = true;
+      snprintf(value, sizeof value, "%d", v->value);
+      if (menu_conf_write(v->key, v->value ? value : NULL, false)) v->initial = v->value;
+      else saved = false;
+    }
+    if (g_resolution_dirty) {
+      if (resolution_save(g_settings_resolution)) g_resolution_dirty = false;
+      else saved = false;
+    }
+    g_settings_open = !saved;
+    keep_open = !saved;
+    menu_notice_locked(saved ? (restart_required ? "Settings saved. Restart to apply hardware settings." : "Settings saved. Resolution applies now.") : "Cannot save settings; check lunaria.conf");
+  } else if (!strcmp(id, "settings-cancel")) {
+    g_settings_open = false;
+  } else if (!strcmp(id, "backdrop")) {
+    g_settings_open = false;
+    /* a click outside: close (a submenu first) */
+    if (g_menu_sub != SUB_NONE) {
+      g_menu_sub = SUB_NONE;
       keep_open = true;
-   } else if (!strcmp(id, "settings-resolution")) {
-      g_settings_resolution = (g_settings_resolution + 1) % (sizeof g_resolutions / sizeof g_resolutions[0]);
-      g_resolution_dirty = true; keep_open = true;
-   } else if (!strncmp(id,"locale-",7)) {
-      char *end=NULL; long i=strtol(id+7,&end,10);
-      if (end!=id+7 && !*end && i>=0 && (size_t)i<sizeof g_locales/sizeof *g_locales) {
-         bool saved=menu_conf_write("LUNARIA_LOCALE",g_locales[i].tag,false);
-         if (saved) g_locale_choice=(int)i;
-         menu_notice_locked(saved ? "言語を保存しました。再起動すると反映されます。" : "言語の設定を保存できません。");
-         keep_open=!saved;
+    }
+  } else if (!strcmp(id, "shot")) {
+    char path[600];
+    menu_screenshot_path(path, sizeof path);
+    arm_exec_request_screenshot(path);
+    const char *base = strrchr(path, '/');
+    char msg[256];
+    snprintf(msg, sizeof msg, "Screenshot saved: %s", base ? base + 1 : path);
+    menu_notice_locked(msg);
+  } else if (!strcmp(id, "paste")) {
+    pthread_mutex_unlock(&g_menu_lock);
+    const int typed = menu_paste_clipboard();
+    pthread_mutex_lock(&g_menu_lock);
+    if (typed <= 0) menu_notice_locked("No text field has the focus");
+  } else if (!strcmp(id, "back")) {
+    arm_exec_android_key(4 /* AKEYCODE_BACK */);
+  } else if (!strcmp(id, "rotate-device")) {
+    const int width = arm_exec_fb_height(), height = arm_exec_fb_width();
+    char w[16], h[16];
+    snprintf(w, sizeof w, "%d", width);
+    snprintf(h, sizeof h, "%d", height);
+    const bool saved_w = menu_conf_write("LUNARIA_WIDTH", w, false);
+    const bool saved_h = menu_conf_write("LUNARIA_HEIGHT", h, false);
+    arm_exec_request_view_resize(width, height);
+    g_menu_w = width;
+    g_menu_h = height;
+    menu_notice_locked(saved_w && saved_h ? "Device orientation changed and saved."
+                       : "Device orientation changed; cannot save settings.");
+  } else if (!strcmp(id, "network")) {
+    const int enabled = !arm_exec_network_enabled();
+    pthread_mutex_unlock(&g_menu_lock);
+    arm_exec_set_network_enabled(enabled);
+    pthread_mutex_lock(&g_menu_lock);
+    const bool saved = menu_conf_write("LUNARIA_NET", enabled ? "1" : "0", false);
+    menu_notice_locked(saved ? (enabled ? "Network on" : "Network off")
+                       : "Network changed; cannot save settings");
+    keep_open = true;
+  } else if (!strcmp(id, "volup") || !strcmp(id, "voldown")) {
+    float v = luna_os_audio_volume() + (id[3] == 'u' ? 0.1f : -0.1f);
+    char saved[16];
+    luna_os_audio_set_volume(v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v);
+    if (luna_os_audio_muted()) luna_os_audio_set_muted(0);
+    snprintf(saved, sizeof saved, "%.2f", luna_os_audio_volume());
+    menu_conf_set("LUNARIA_AUDIO_VOLUME", saved);
+    menu_conf_set("LUNARIA_AUDIO_MUTE", "0");
+    keep_open = true;
+  } else if (!strcmp(id, "mute")) {
+    luna_os_audio_set_muted(!luna_os_audio_muted());
+    menu_conf_set("LUNARIA_AUDIO_MUTE", luna_os_audio_muted() ? "1" : "0");
+    menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
+  } else if (!strncmp(id, "sub-", 4)) {
+    static const struct {
+      const char *name;
+      int sub;
+    } groups[] = {
+      { "input", SUB_INPUT }, { "display", SUB_DISPLAY }, { "graphics", SUB_GRAPHICS },
+      { "sound", SUB_SOUND }, { "locale", SUB_LOCALE }, { "webview", SUB_WEBVIEW },
+      { "profile", SUB_PROFILE },
+      { "google", SUB_GOOGLE },
+    };
+    int sub = SUB_NONE;
+    for (size_t i = 0; i < sizeof groups / sizeof groups[0]; ++i)
+      if (!strcmp(id + 4, groups[i].name)) sub = groups[i].sub;
+    g_menu_sub = g_menu_sub == sub ? SUB_NONE : sub;
+    if (g_menu_sub == SUB_INPUT) {
+      g_keypage = 0;
+      keyfiles_read();
+    }
+    if (g_menu_sub == SUB_SOUND) g_menu_ndev = luna_os_audio_devices(g_menu_dev_name, g_menu_dev_desc, MAX_DEVICES);
+    keep_open = true;
+  } else if (!strcmp(id, "km-up")) {
+    char *slash = strrchr(g_keydir, '/');
+    if (slash) {
+      if (slash == g_keydir) slash[1] = 0;
+      else *slash = 0;
+    }
+    else snprintf(g_keydir, sizeof g_keydir, "..");
+    keyfiles_read();
+    keep_open = true;
+  } else if (!strcmp(id, "km-next") || !strcmp(id, "km-prev")) {
+    if (id[3] == 'n' && (g_keypage + 1) * menu_keymap_page() < g_nkeyfiles) ++g_keypage;
+    else if (id[3] == 'p' && g_keypage) --g_keypage;
+    keep_open = true;
+  } else if (!strncmp(id, "km-file-", 8)) {
+    int i = atoi(id + 8);
+    char path[4096];
+    if (i >= 0 && i < g_nkeyfiles && keyfile_path(path, sizeof path, g_keyfiles[i].name)) {
+      if (g_keyfiles[i].directory) {
+        snprintf(g_keydir, sizeof g_keydir, "%s", path);
+        keyfiles_read();
+        keep_open = true;
+      } else if (luna_keymap_select(path)) {
+        menu_conf_set("LUNARIA_KEYMAP", path);
+        menu_notice_locked("Keyboard controls loaded");
+      } else {
+        menu_notice_locked("Cannot load keymap file");
+        keep_open = true;
       }
-   } else if (!strncmp(id, "res-", 4)) {
-      char *end = NULL; long i = strtol(id + 4, &end, 10);
-      if (end != id + 4 && !*end && i >= 0 && (size_t)i < sizeof g_resolutions / sizeof g_resolutions[0]) {
-         bool saved = resolution_save((int)i);
-         menu_notice_locked(saved ? "Resolution changed and saved." : "Cannot save resolution");
-         keep_open = !saved;
-      }
-   } else if (!strcmp(id, "settings-save")) {
-      bool saved = true, restart_required = false;
-      for (size_t i = 0; i < sizeof g_settings / sizeof g_settings[0]; ++i) {
-         struct menu_setting *v = &g_settings[i]; char value[32];
-         if (v->value == v->initial) continue;
-         restart_required = true;
-         snprintf(value, sizeof value, "%d", v->value);
-         if (menu_conf_write(v->key, v->value ? value : NULL, false)) v->initial = v->value;
-         else saved = false;
-      }
-      if (g_resolution_dirty) {
-         if (resolution_save(g_settings_resolution)) g_resolution_dirty = false;
-         else saved = false;
-      }
-      g_settings_open = !saved; keep_open = !saved;
-      menu_notice_locked(saved ? (restart_required ? "Settings saved. Restart to apply hardware settings." : "Settings saved. Resolution applies now.") : "Cannot save settings; check lunaria.conf");
-   } else if (!strcmp(id, "settings-cancel")) {
-      g_settings_open = false;
-   } else if (!strcmp(id, "backdrop")) {
-      g_settings_open = false;
-      /* a click outside: close (a submenu first) */
-      if (g_menu_sub != SUB_NONE) { g_menu_sub = SUB_NONE; keep_open = true; }
-   } else if (!strcmp(id, "shot")) {
-      char path[600];
-      menu_screenshot_path(path, sizeof path);
-      arm_exec_request_screenshot(path);
-      const char *base = strrchr(path, '/');
+    } else keep_open = true;
+  } else if (!strcmp(id, "km-off") || !strcmp(id, "km-reload")) {
+    char path[4096];
+    luna_keymap_current(path, sizeof path);
+    if (!strcmp(id, "km-off")) strcpy(path, "off");
+    if (luna_keymap_select(path)) {
+      if (!strcmp(id, "km-off")) menu_conf_set("LUNARIA_KEYMAP", "off");
+      menu_notice_locked(!strcmp(path, "off") ? "Keyboard controls off" : "Keyboard controls reloaded");
+    } else {
+      menu_notice_locked("Cannot load keymap file");
+      keep_open = true;
+    }
+  } else if (!strcmp(id, "dev-off")) {
+    if (luna_os_audio_select_device("off") == 0) {
+      menu_conf_set("LUNARIA_ALSA_DEVICE", "off");
+      menu_notice_locked("Sound output off");
+    } else menu_notice_locked("Cannot turn sound output off");
+  } else if (!strncmp(id, "dev-", 4)) {
+    const int i = atoi(id + 4);
+    if (i >= 0 && i < g_menu_ndev) {
       char msg[256];
-      snprintf(msg, sizeof msg, "Screenshot saved: %s", base ? base + 1 : path);
+      if (luna_os_audio_select_device(g_menu_dev_name[i]) == 0) {
+        menu_conf_set("LUNARIA_ALSA_DEVICE", g_menu_dev_name[i]);
+        snprintf(msg, sizeof msg, "Switching sound output: %s", g_menu_dev_desc[i]);
+      } else snprintf(msg, sizeof msg, "Cannot use %s", g_menu_dev_desc[i]);
       menu_notice_locked(msg);
-   } else if (!strcmp(id, "paste")) {
-      pthread_mutex_unlock(&g_menu_lock);
-      const int typed = menu_paste_clipboard();
-      pthread_mutex_lock(&g_menu_lock);
-      if (typed <= 0) menu_notice_locked("No text field has the focus");
-   } else if (!strcmp(id, "back")) {
-      arm_exec_android_key(4 /* AKEYCODE_BACK */);
-   } else if (!strcmp(id, "rotate-device")) {
-      const int width = arm_exec_fb_height(), height = arm_exec_fb_width();
-      char w[16], h[16];
-      snprintf(w, sizeof w, "%d", width);
-      snprintf(h, sizeof h, "%d", height);
-      const bool saved_w = menu_conf_write("LUNARIA_WIDTH", w, false);
-      const bool saved_h = menu_conf_write("LUNARIA_HEIGHT", h, false);
-      arm_exec_request_view_resize(width, height);
-      g_menu_w = width; g_menu_h = height;
-      menu_notice_locked(saved_w && saved_h ? "Device orientation changed and saved."
-                                           : "Device orientation changed; cannot save settings.");
-   } else if (!strcmp(id, "network")) {
-      const int enabled = !arm_exec_network_enabled();
-      pthread_mutex_unlock(&g_menu_lock);
-      arm_exec_set_network_enabled(enabled);
-      pthread_mutex_lock(&g_menu_lock);
-      const bool saved = menu_conf_write("LUNARIA_NET", enabled ? "1" : "0", false);
-      menu_notice_locked(saved ? (enabled ? "Network on" : "Network off")
-                               : "Network changed; cannot save settings");
-      keep_open = true;
-   } else if (!strcmp(id, "volup") || !strcmp(id, "voldown")) {
-      float v = luna_os_audio_volume() + (id[3] == 'u' ? 0.1f : -0.1f);
+    }
+  } else if (!strncmp(id, "zoom-", 5)) {
+    /* zoom-0 is "use the device density": the name is omitted, because a
+     * stored 0 would read back as a zoom.  The getter never returns 0, it
+     * answers the density in that case, so the choice is the menu id. */
+    dvm_webview_set_zoom((float)atoi(id + 5) / 1000.0f);
+    if (!strcmp(id, "zoom-0")) menu_conf_set("LUNARIA_WEB_ZOOM", NULL);
+    else {
       char saved[16];
-      luna_os_audio_set_volume(v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v);
-      if (luna_os_audio_muted()) luna_os_audio_set_muted(0);
-      snprintf(saved, sizeof saved, "%.2f", luna_os_audio_volume());
-      menu_conf_set("LUNARIA_AUDIO_VOLUME", saved);
-      menu_conf_set("LUNARIA_AUDIO_MUTE", "0");
-      keep_open = true;
-   } else if (!strcmp(id, "mute")) {
-      luna_os_audio_set_muted(!luna_os_audio_muted());
-      menu_conf_set("LUNARIA_AUDIO_MUTE", luna_os_audio_muted() ? "1" : "0");
-      menu_notice_locked(luna_os_audio_muted() ? "Sound muted" : "Sound on");
-   } else if (!strncmp(id, "sub-", 4)) {
-      static const struct { const char *name; int sub; } groups[] = {
-         { "input", SUB_INPUT }, { "display", SUB_DISPLAY }, { "graphics", SUB_GRAPHICS },
-         { "sound", SUB_SOUND }, { "locale", SUB_LOCALE }, { "webview", SUB_WEBVIEW },
-         { "profile", SUB_PROFILE },
-         { "google", SUB_GOOGLE },
-      };
-      int sub = SUB_NONE;
-      for (size_t i = 0; i < sizeof groups / sizeof groups[0]; ++i)
-         if (!strcmp(id + 4, groups[i].name)) sub = groups[i].sub;
-      g_menu_sub = g_menu_sub == sub ? SUB_NONE : sub;
-      if (g_menu_sub == SUB_INPUT) { g_keypage = 0; keyfiles_read(); }
-      if (g_menu_sub == SUB_SOUND) g_menu_ndev = luna_os_audio_devices(g_menu_dev_name, g_menu_dev_desc, MAX_DEVICES);
-      keep_open = true;
-   } else if (!strcmp(id, "km-up")) {
-      char *slash = strrchr(g_keydir, '/');
-      if (slash) { if (slash == g_keydir) slash[1] = 0; else *slash = 0; }
-      else snprintf(g_keydir, sizeof g_keydir, "..");
-      keyfiles_read(); keep_open = true;
-   } else if (!strcmp(id, "km-next") || !strcmp(id, "km-prev")) {
-      if (id[3] == 'n' && (g_keypage + 1) * menu_keymap_page() < g_nkeyfiles) ++g_keypage;
-      else if (id[3] == 'p' && g_keypage) --g_keypage;
-      keep_open = true;
-   } else if (!strncmp(id, "km-file-", 8)) {
-      int i = atoi(id + 8); char path[4096];
-      if (i >= 0 && i < g_nkeyfiles && keyfile_path(path, sizeof path, g_keyfiles[i].name)) {
-         if (g_keyfiles[i].directory) {
-            snprintf(g_keydir, sizeof g_keydir, "%s", path); keyfiles_read(); keep_open = true;
-         } else if (luna_keymap_select(path)) {
-            menu_conf_set("LUNARIA_KEYMAP", path);
-            menu_notice_locked("Keyboard controls loaded");
-         } else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
-      } else keep_open = true;
-   } else if (!strcmp(id, "km-off") || !strcmp(id, "km-reload")) {
-      char path[4096]; luna_keymap_current(path, sizeof path);
-      if (!strcmp(id, "km-off")) strcpy(path, "off");
-      if (luna_keymap_select(path)) {
-         if (!strcmp(id, "km-off")) menu_conf_set("LUNARIA_KEYMAP", "off");
-         menu_notice_locked(!strcmp(path, "off") ? "Keyboard controls off" : "Keyboard controls reloaded");
-      } else { menu_notice_locked("Cannot load keymap file"); keep_open = true; }
-   } else if (!strcmp(id, "dev-off")) {
-      if (luna_os_audio_select_device("off") == 0) {
-         menu_conf_set("LUNARIA_ALSA_DEVICE", "off");
-         menu_notice_locked("Sound output off");
-      } else menu_notice_locked("Cannot turn sound output off");
-   } else if (!strncmp(id, "dev-", 4)) {
-      const int i = atoi(id + 4);
-      if (i >= 0 && i < g_menu_ndev) {
-         char msg[256];
-         if (luna_os_audio_select_device(g_menu_dev_name[i]) == 0) {
-            menu_conf_set("LUNARIA_ALSA_DEVICE", g_menu_dev_name[i]);
-            snprintf(msg, sizeof msg, "Switching sound output: %s", g_menu_dev_desc[i]);
-         } else snprintf(msg, sizeof msg, "Cannot use %s", g_menu_dev_desc[i]);
-         menu_notice_locked(msg);
-      }
-   } else if (!strncmp(id, "zoom-", 5)) {
-      /* zoom-0 is "use the device density": the name is omitted, because a
-       * stored 0 would read back as a zoom.  The getter never returns 0, it
-       * answers the density in that case, so the choice is the menu id. */
-      dvm_webview_set_zoom((float)atoi(id + 5) / 1000.0f);
-      if (!strcmp(id, "zoom-0")) menu_conf_set("LUNARIA_WEB_ZOOM", NULL);
-      else {
-         char saved[16];
-         snprintf(saved, sizeof saved, "%.3f", (float)atoi(id + 5) / 1000.0f);
-         menu_conf_set("LUNARIA_WEB_ZOOM", saved);
-      }
-      char msg[64];
-      snprintf(msg, sizeof msg, "WebView zoom %d%%", (int)(dvm_webview_zoom() * 100.0f + 0.5f));
-      menu_notice_locked(msg);
-   } else if (!strcmp(id, "gfx-vulkan") || !strcmp(id, "gfx-opengl")) {
-      const int vulkan = !strcmp(id, "gfx-vulkan");
-      if (menu_conf_write("LUNARIA_VULKAN", vulkan ? "1" : "0", false)) {
-         g_graphics_choice = vulkan;
-         menu_notice_locked(vulkan ? "Vulkan selected: restart the app"
-                                  : "OpenGL ES selected: restart the app");
-      } else menu_notice_locked("Cannot save graphics settings");
-      keep_open = true;
-   } else if (!strcmp(id, "glid-device") || !strcmp(id, "glid-host")) {
-      const int host = !strcmp(id, "glid-host");
-      if (menu_conf_write("LUNARIA_GL_IDENTITY", host ? "host" : "device", false)) {
-         g_gl_identity_choice = host;
-         menu_notice_locked("GL identity saved: restart the app to apply");
-      } else menu_notice_locked("Cannot save GL identity settings");
-      keep_open = true;
-   } else if (!strncmp(id, "eng-", 4)) {
-      dvm_webview_set_engine(id + 4);
-      menu_conf_set("LUNARIA_WEB_ENGINE", id + 4);
-      char msg[64];
-      snprintf(msg, sizeof msg, "WebView engine: %s", id + 4);
-      menu_notice_locked(msg);
-   } else if (!strcmp(id, "reload")) {
-      dvm_webview_reload();
-   } else if (!strcmp(id, "full")) {
-      /* The toggle lands on the window thread after this returns, so the
-       * value to keep is the one the window is on its way to. */
-      menu_conf_set("LUNARIA_FULLSCREEN", arm_exec_is_fullscreen() ? "0" : "1");
-      arm_exec_toggle_fullscreen();
-   } else if (!strcmp(id, "restart") || !strcmp(id, "profile-new") ||
-              !strncmp(id, "profile-id-", 11)) {
-      /* Starting over is this command line again under the chosen profile.
-       * A new profile is only a name until the app starts under it. */
-      char names[PROFILE_MAX][65], fresh[65];
-      const char *profile = NULL;
-      if (!strcmp(id, "profile-new")) {
-         if (luna_apk_profile_new_name(fresh, sizeof fresh) == 0) profile = fresh;
-      } else if (id[0] == 'p') {
-         const int n = luna_apk_profile_list(names, PROFILE_MAX);
-         for (int i = 0; i < n; ++i)
-            if (!strcmp(id + 11, names[i])) { profile = names[i]; break; }
-      } else profile = luna_apk_profile_current();
-      if (profile) {
-         pthread_mutex_unlock(&g_menu_lock);
-         luna_apk_restart(profile);
-         pthread_mutex_lock(&g_menu_lock);
-      }
-      menu_notice_locked("Cannot restart");
-      keep_open = true;
-   } else if (!strcmp(id, "launcher")) {
+      snprintf(saved, sizeof saved, "%.3f", (float)atoi(id + 5) / 1000.0f);
+      menu_conf_set("LUNARIA_WEB_ZOOM", saved);
+    }
+    char msg[64];
+    snprintf(msg, sizeof msg, "WebView zoom %d%%", (int)(dvm_webview_zoom() * 100.0f + 0.5f));
+    menu_notice_locked(msg);
+  } else if (!strcmp(id, "gfx-vulkan") || !strcmp(id, "gfx-opengl")) {
+    const int vulkan = !strcmp(id, "gfx-vulkan");
+    if (menu_conf_write("LUNARIA_VULKAN", vulkan ? "1" : "0", false)) {
+      g_graphics_choice = vulkan;
+      menu_notice_locked(vulkan ? "Vulkan selected: restart the app"
+                         : "OpenGL ES selected: restart the app");
+    } else menu_notice_locked("Cannot save graphics settings");
+    keep_open = true;
+  } else if (!strcmp(id, "glid-device") || !strcmp(id, "glid-host")) {
+    const int host = !strcmp(id, "glid-host");
+    if (menu_conf_write("LUNARIA_GL_IDENTITY", host ? "host" : "device", false)) {
+      g_gl_identity_choice = host;
+      menu_notice_locked("GL identity saved: restart the app to apply");
+    } else menu_notice_locked("Cannot save GL identity settings");
+    keep_open = true;
+  } else if (!strncmp(id, "eng-", 4)) {
+    dvm_webview_set_engine(id + 4);
+    menu_conf_set("LUNARIA_WEB_ENGINE", id + 4);
+    char msg[64];
+    snprintf(msg, sizeof msg, "WebView engine: %s", id + 4);
+    menu_notice_locked(msg);
+  } else if (!strcmp(id, "reload")) {
+    dvm_webview_reload();
+  } else if (!strcmp(id, "full")) {
+    /* The toggle lands on the window thread after this returns, so the
+     * value to keep is the one the window is on its way to. */
+    menu_conf_set("LUNARIA_FULLSCREEN", arm_exec_is_fullscreen() ? "0" : "1");
+    arm_exec_toggle_fullscreen();
+  } else if (!strcmp(id, "restart") || !strcmp(id, "profile-new") ||
+             !strncmp(id, "profile-id-", 11)) {
+    /* Starting over is this command line again under the chosen profile.
+     * A new profile is only a name until the app starts under it. */
+    char names[PROFILE_MAX][65], fresh[65];
+    const char *profile = NULL;
+    if (!strcmp(id, "profile-new")) {
+      if (luna_apk_profile_new_name(fresh, sizeof fresh) == 0) profile = fresh;
+    } else if (id[0] == 'p') {
+      const int n = luna_apk_profile_list(names, PROFILE_MAX);
+      for (int i = 0; i < n; ++i)
+        if (!strcmp(id + 11, names[i])) {
+          profile = names[i];
+          break;
+        }
+    } else profile = luna_apk_profile_current();
+    if (profile) {
       pthread_mutex_unlock(&g_menu_lock);
-      luna_apk_restart_launcher();
+      luna_apk_restart(profile);
       pthread_mutex_lock(&g_menu_lock);
-      menu_notice_locked("Cannot return to the launcher");
-      keep_open = true;
-   } else if (!strcmp(id, "record") || !strcmp(id, "play")) {
-      pthread_mutex_unlock(&g_menu_lock);
-      if (id[0] == 'r') luna_input_record_toggle(); else luna_input_play_toggle();
-      pthread_mutex_lock(&g_menu_lock);
-   } else if (!strcmp(id, "quit")) {
-      arm_exec_request_quit();
-   } else keep_open = true;
-   g_menu_open = keep_open;
-   if (!g_menu_open) { g_menu_sub = SUB_NONE; }
-   menu_publish_locked();
-   pthread_mutex_unlock(&g_menu_lock);
+    }
+    menu_notice_locked("Cannot restart");
+    keep_open = true;
+  } else if (!strcmp(id, "launcher")) {
+    pthread_mutex_unlock(&g_menu_lock);
+    luna_apk_restart_launcher();
+    pthread_mutex_lock(&g_menu_lock);
+    menu_notice_locked("Cannot return to the launcher");
+    keep_open = true;
+  } else if (!strcmp(id, "record") || !strcmp(id, "play")) {
+    pthread_mutex_unlock(&g_menu_lock);
+    if (id[0] == 'r') luna_input_record_toggle();
+    else luna_input_play_toggle();
+    pthread_mutex_lock(&g_menu_lock);
+  } else if (!strcmp(id, "quit")) {
+    arm_exec_request_quit();
+  } else keep_open = true;
+  g_menu_open = keep_open;
+  if (!g_menu_open) {
+    g_menu_sub = SUB_NONE;
+  }
+  menu_publish_locked();
+  pthread_mutex_unlock(&g_menu_lock);
 }
 
 void luna_menu_open(double x, double y, int w, int h)
 {
-   luna_overlay_set_menu_handler(menu_clicked);
-   pthread_mutex_lock(&g_menu_lock);
-   g_menu_open = true;
-   g_settings_open = false;
-   g_menu_sub = SUB_NONE;
-   g_menu_x = x;
-   g_menu_y = y;
-   g_menu_w = w > 0 ? w : 1024;
-   g_menu_h = h > 0 ? h : 576;
-   menu_publish_locked();
-   pthread_mutex_unlock(&g_menu_lock);
+  luna_overlay_set_menu_handler(menu_clicked);
+  pthread_mutex_lock(&g_menu_lock);
+  g_menu_open = true;
+  g_settings_open = false;
+  g_menu_sub = SUB_NONE;
+  g_menu_x = x;
+  g_menu_y = y;
+  g_menu_w = w > 0 ? w : 1024;
+  g_menu_h = h > 0 ? h : 576;
+  menu_publish_locked();
+  pthread_mutex_unlock(&g_menu_lock);
 }
 
 void luna_menu_close(void)
 {
-   pthread_mutex_lock(&g_menu_lock);
-   g_menu_open = false;
-   g_settings_open = false;
-   g_menu_sub = SUB_NONE;
-   menu_publish_locked();
-   pthread_mutex_unlock(&g_menu_lock);
+  pthread_mutex_lock(&g_menu_lock);
+  g_menu_open = false;
+  g_settings_open = false;
+  g_menu_sub = SUB_NONE;
+  menu_publish_locked();
+  pthread_mutex_unlock(&g_menu_lock);
 }
 
 void luna_menu_tick(void)
 {
-   pthread_mutex_lock(&g_menu_lock);
-   if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
-      g_menu_notice[0] = '\0';
-      menu_publish_locked();
-   }
-   pthread_mutex_unlock(&g_menu_lock);
+  pthread_mutex_lock(&g_menu_lock);
+  if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
+    g_menu_notice[0] = '\0';
+    menu_publish_locked();
+  }
+  pthread_mutex_unlock(&g_menu_lock);
 }
 
 /* No editable host menu fields currently consume keyboard input. */
 bool luna_overlay_host_char(uint32_t cp)
 {
-   (void)cp;
-   return false;
+  (void)cp;
+  return false;
 }
 bool luna_overlay_host_key(int key, int action, int mods)
 {
-   (void)key; (void)action; (void)mods;
-   return false;
+  (void)key;
+  (void)action;
+  (void)mods;
+  return false;
 }

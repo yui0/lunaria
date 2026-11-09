@@ -1,3 +1,11 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 /* Host-independent parser for the IEEE-754 binary128 value used by AArch64
  * long double.  Some hosts (notably arm64 macOS) have only a 64-bit host long
  * double, so converting through a host floating type loses both range and
@@ -9,8 +17,8 @@
 #include <wchar.h>
 
 typedef struct luna_binary128 {
-   uint64_t lo;
-   uint64_t hi;
+  uint64_t lo;
+  uint64_t hi;
 } luna_binary128;
 
 #ifdef __cplusplus

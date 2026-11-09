@@ -41,27 +41,27 @@ static _Thread_local uint64_t g_jni_monitor_token;
 /* Pending exceptions belong to the attached thread, even though VM object
  * handles and metadata are shared. */
 struct jvm_exception_state {
-   struct jvm *owner;
-   uint64_t token;
-   jthrowable pending_exception;
-   bool pending_owned;
-   char pending_exception_class[128];
-   char pending_exception_msg[256];
+  struct jvm *owner;
+  uint64_t token;
+  jthrowable pending_exception;
+  bool pending_owned;
+  char pending_exception_class[128];
+  char pending_exception_msg[256];
 };
 static _Thread_local struct jvm_exception_state g_jni_exception;
 static struct jvm_exception_state g_guest_jni_exceptions[256];
 extern uint64_t arm_exec_jni_thread_token(void) __attribute__((weak));
 static struct jvm_exception_state *jvm_exception_state(struct jvm *vm)
 {
-   const uint64_t token = arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
-   struct jvm_exception_state *state = token
-       ? &g_guest_jni_exceptions[(token - 1u) & 255u] : &g_jni_exception;
-   if (state->owner != vm || state->token != token) {
-      memset(state, 0, sizeof *state);
-      state->owner = vm;
-      state->token = token;
-   }
-   return state;
+  const uint64_t token = arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
+  struct jvm_exception_state *state = token
+                                      ? &g_guest_jni_exceptions[(token - 1u) & 255u] : &g_jni_exception;
+  if (state->owner != vm || state->token != token) {
+    memset(state, 0, sizeof *state);
+    state->owner = vm;
+    state->token = token;
+  }
+  return state;
 }
 
 /* Classes, method/field IDs and the wrapper cache are process-wide VM
@@ -74,189 +74,193 @@ static pthread_mutex_t g_jvm_meta_mutex;
 
 static void jvm_meta_mutex_init(void)
 {
-   pthread_mutexattr_t attr;
-   pthread_mutexattr_init(&attr);
-   pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-   pthread_mutex_init(&g_jvm_meta_mutex, &attr);
-   pthread_mutexattr_destroy(&attr);
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+  pthread_mutex_init(&g_jvm_meta_mutex, &attr);
+  pthread_mutexattr_destroy(&attr);
 }
 
 static void jvm_meta_lock(void)
 {
-   pthread_once(&g_jvm_meta_once, jvm_meta_mutex_init);
-   pthread_mutex_lock(&g_jvm_meta_mutex);
+  pthread_once(&g_jvm_meta_once, jvm_meta_mutex_init);
+  pthread_mutex_lock(&g_jvm_meta_mutex);
 }
 
 static void jvm_meta_unlock(void)
 {
-   pthread_mutex_unlock(&g_jvm_meta_mutex);
+  pthread_mutex_unlock(&g_jvm_meta_mutex);
 }
 
 static uint64_t jni_monitor_token(void)
 {
-   if (arm_exec_jni_thread_token) {
-      uint64_t guest = arm_exec_jni_thread_token();
-      if (guest) return guest;
-   }
-   if (!g_jni_monitor_token)
-      g_jni_monitor_token = atomic_fetch_add_explicit(
-         &g_next_jni_monitor_token, 1, memory_order_relaxed);
-   return g_jni_monitor_token | (UINT64_C(1) << 63);
+  if (arm_exec_jni_thread_token) {
+    uint64_t guest = arm_exec_jni_thread_token();
+    if (guest) return guest;
+  }
+  if (!g_jni_monitor_token)
+    g_jni_monitor_token = atomic_fetch_add_explicit(
+                            &g_next_jni_monitor_token, 1, memory_order_relaxed);
+  return g_jni_monitor_token | (UINT64_C(1) << 63);
 }
 
 static inline char*
 ccopy(const char *str, const size_t len, const bool null_terminate)
 {
-   assert(str);
-   char *cpy = calloc(1, len + null_terminate);
-   return (cpy ? memcpy(cpy, str, len) : NULL);
+  assert(str);
+  char *cpy = calloc(1, len + null_terminate);
+  return (cpy ? memcpy(cpy, str, len) : NULL);
 }
 
 static void
 jvm_string_release(struct jvm_string *string)
 {
-   if (!string)
-      return;
+  if (!string)
+    return;
 
-   if (string->heap)
-      free((char*)string->data);
+  if (string->heap)
+    free((char*)string->data);
 
-   *string = (struct jvm_string){0};
+  *string = (struct jvm_string) {
+    0
+  };
 }
 
 static bool
 jvm_string_set_cstr_with_length(struct jvm_string *string, const char *data, const size_t len, const bool heap)
 {
-   assert(string);
+  assert(string);
 
-   char *copy = (char*)data;
-   if (heap && data && len > 0 && !(copy = ccopy(data, len, true)))
-      return false;
+  char *copy = (char*)data;
+  if (heap && data && len > 0 && !(copy = ccopy(data, len, true)))
+    return false;
 
-   jvm_string_release(string);
-   string->heap = heap;
-   string->data = (len > 0 ? copy : NULL);
-   string->size = len;
-   return true;
+  jvm_string_release(string);
+  string->heap = heap;
+  string->data = (len > 0 ? copy : NULL);
+  string->size = len;
+  return true;
 }
 
 static bool
 jvm_string_set_cstr(struct jvm_string *string, const char *data, const bool heap)
 {
-   assert(string);
-   return jvm_string_set_cstr_with_length(string, data, (data ? strlen(data) : 0), heap);
+  assert(string);
+  return jvm_string_set_cstr_with_length(string, data, (data ? strlen(data) : 0), heap);
 }
 
 static inline bool
 jvm_string_eq(const struct jvm_string *a, const struct jvm_string *b)
 {
-   return (a->data == b->data) || (a->size == b->size && !memcmp(a->data, b->data, a->size));
+  return (a->data == b->data) || (a->size == b->size && !memcmp(a->data, b->data, a->size));
 }
 
 static void
 release_array(struct jvm_object *o)
 {
-   assert(o);
-   free(o->array.data);
+  assert(o);
+  free(o->array.data);
 }
 
 static void
 release_method(struct jvm_object *o)
 {
-   assert(o);
-   jvm_string_release(&o->method.name);
-   jvm_string_release(&o->method.signature);
+  assert(o);
+  jvm_string_release(&o->method.name);
+  jvm_string_release(&o->method.signature);
 }
 
 static void
 release_class(struct jvm_object *o)
 {
-   assert(o);
-   jvm_string_release(&o->klass.name);
+  assert(o);
+  jvm_string_release(&o->klass.name);
 }
 
 static void
 release_string(struct jvm_object *o)
 {
-   assert(o);
-   jvm_string_release(&o->string);
+  assert(o);
+  jvm_string_release(&o->string);
 }
 
 static void
 jvm_object_release(struct jvm_object *o)
 {
-   if (!o || o->type == JVM_OBJECT_NONE)
-      return;
+  if (!o || o->type == JVM_OBJECT_NONE)
+    return;
 
-   void (*destructor[JVM_OBJECT_LAST])(struct jvm_object *o) = {
-      NULL,
-      NULL,
-      release_array,
-      release_method,
-      release_class,
-      release_string,
-   };
+  void (*destructor[JVM_OBJECT_LAST])(struct jvm_object *o) = {
+    NULL,
+    NULL,
+    release_array,
+    release_method,
+    release_class,
+    release_string,
+  };
 
-   assert(o->type < JVM_OBJECT_LAST);
+  assert(o->type < JVM_OBJECT_LAST);
 
-   if (destructor[o->type])
-      destructor[o->type](o);
+  if (destructor[o->type])
+    destructor[o->type](o);
 
-   *o = (struct jvm_object){0};
+  *o = (struct jvm_object) {
+    0
+  };
 }
 
 static bool
 compare_opaque(const struct jvm_object *a, const struct jvm_object *b)
 {
-   assert(a && b);
-   return (a->this_klass == b->this_klass);
+  assert(a && b);
+  return (a->this_klass == b->this_klass);
 }
 
 static bool
 compare_array(const struct jvm_object *a, const struct jvm_object *b)
 {
-   assert(a && b);
-   const size_t a_sz = a->array.size * a->array.element_sz;
-   const size_t b_sz = b->array.size * b->array.element_sz;
-   return (a_sz == b_sz && !memcmp(a->array.data, b->array.data, a_sz));
+  assert(a && b);
+  const size_t a_sz = a->array.size * a->array.element_sz;
+  const size_t b_sz = b->array.size * b->array.element_sz;
+  return (a_sz == b_sz && !memcmp(a->array.data, b->array.data, a_sz));
 }
 
 static bool
 compare_method(const struct jvm_object *a, const struct jvm_object *b)
 {
-   assert(a && b);
-   return a->method.klass == b->method.klass &&
-          jvm_string_eq(&a->method.name, &b->method.name) &&
-          jvm_string_eq(&a->method.signature, &b->method.signature);
+  assert(a && b);
+  return a->method.klass == b->method.klass &&
+         jvm_string_eq(&a->method.name, &b->method.name) &&
+         jvm_string_eq(&a->method.signature, &b->method.signature);
 }
 
 static bool
 compare_class(const struct jvm_object *a, const struct jvm_object *b)
 {
-   assert(a && b);
-   return jvm_string_eq(&a->klass.name, &b->klass.name);
+  assert(a && b);
+  return jvm_string_eq(&a->klass.name, &b->klass.name);
 }
 
 static bool
 compare_string(const struct jvm_object *a, const struct jvm_object *b)
 {
-   assert(a && b);
-   return jvm_string_eq(&a->string, &b->string);
+  assert(a && b);
+  return jvm_string_eq(&a->string, &b->string);
 }
 
 static bool
 compare_motion(const struct jvm_object *a, const struct jvm_object *b)
 {
-   assert(a && b);
-   if (a->motion.action != b->motion.action ||
-       a->motion.event_ms != b->motion.event_ms ||
-       a->motion.down_ms != b->motion.down_ms ||
-       luna_event_count(&a->motion) != luna_event_count(&b->motion)) return false;
-   for (int i = 0; i < luna_event_count(&a->motion); ++i)
-      if (luna_event_id(&a->motion, i) != luna_event_id(&b->motion, i) ||
-          luna_event_x(&a->motion, i) != luna_event_x(&b->motion, i) ||
-          luna_event_y(&a->motion, i) != luna_event_y(&b->motion, i)) return false;
-   return true;
+  assert(a && b);
+  if (a->motion.action != b->motion.action ||
+      a->motion.event_ms != b->motion.event_ms ||
+      a->motion.down_ms != b->motion.down_ms ||
+      luna_event_count(&a->motion) != luna_event_count(&b->motion)) return false;
+  for (int i = 0; i < luna_event_count(&a->motion); ++i)
+    if (luna_event_id(&a->motion, i) != luna_event_id(&b->motion, i) ||
+        luna_event_x(&a->motion, i) != luna_event_x(&b->motion, i) ||
+        luna_event_y(&a->motion, i) != luna_event_y(&b->motion, i)) return false;
+  return true;
 }
 
 /* Classes, methods, strings and opaque singletons are looked up by a key that
@@ -266,43 +270,43 @@ compare_motion(const struct jvm_object *a, const struct jvm_object *b)
 static bool
 jvm_object_interned(const struct jvm_object *o)
 {
-   return o->type == JVM_OBJECT_OPAQUE || o->type == JVM_OBJECT_METHOD ||
-          o->type == JVM_OBJECT_CLASS || o->type == JVM_OBJECT_STRING;
+  return o->type == JVM_OBJECT_OPAQUE || o->type == JVM_OBJECT_METHOD ||
+         o->type == JVM_OBJECT_CLASS || o->type == JVM_OBJECT_STRING;
 }
 
 static uint32_t
 jvm_hash_bytes(uint32_t h, const void *data, size_t n)
 {
-   const unsigned char *p = data;
-   for (size_t i = 0; i < n; ++i)
-      h = (h ^ p[i]) * 16777619u;
-   return (h ^ (uint32_t)n) * 16777619u;
+  const unsigned char *p = data;
+  for (size_t i = 0; i < n; ++i)
+    h = (h ^ p[i]) * 16777619u;
+  return (h ^ (uint32_t)n) * 16777619u;
 }
 
 static uint32_t
 jvm_hash_word(uint32_t h, uintptr_t v)
 {
-   return jvm_hash_bytes(h, &v, sizeof v);
+  return jvm_hash_bytes(h, &v, sizeof v);
 }
 
 static uint32_t
 jvm_object_hash(const struct jvm_object *o)
 {
-   uint32_t h = 2166136261u ^ (uint32_t)o->type;
-   switch (o->type) {
-      case JVM_OBJECT_OPAQUE:
-         return jvm_hash_word(h, (uintptr_t)o->this_klass);
-      case JVM_OBJECT_CLASS:
-         return jvm_hash_bytes(h, o->klass.name.data, o->klass.name.size);
-      case JVM_OBJECT_STRING:
-         return jvm_hash_bytes(h, o->string.data, o->string.size);
-      case JVM_OBJECT_METHOD:
-         h = jvm_hash_word(h, (uintptr_t)o->method.klass);
-         h = jvm_hash_bytes(h, o->method.name.data, o->method.name.size);
-         return jvm_hash_bytes(h, o->method.signature.data, o->method.signature.size);
-      default:
-         return h;
-   }
+  uint32_t h = 2166136261u ^ (uint32_t)o->type;
+  switch (o->type) {
+  case JVM_OBJECT_OPAQUE:
+    return jvm_hash_word(h, (uintptr_t)o->this_klass);
+  case JVM_OBJECT_CLASS:
+    return jvm_hash_bytes(h, o->klass.name.data, o->klass.name.size);
+  case JVM_OBJECT_STRING:
+    return jvm_hash_bytes(h, o->string.data, o->string.size);
+  case JVM_OBJECT_METHOD:
+    h = jvm_hash_word(h, (uintptr_t)o->method.klass);
+    h = jvm_hash_bytes(h, o->method.name.data, o->method.name.size);
+    return jvm_hash_bytes(h, o->method.signature.data, o->method.signature.size);
+  default:
+    return h;
+  }
 }
 
 #define JVM_INTERN_MASK ((uint32_t)(ARRAY_SIZE(((struct jvm *)0)->intern_head) - 1))
@@ -310,69 +314,69 @@ jvm_object_hash(const struct jvm_object *o)
 static void
 jvm_index_add(struct jvm *jvm, uintptr_t i)
 {
-   if (!jvm_object_interned(&jvm->objects[i]))
-      return;
-   const uint32_t h = jvm_object_hash(&jvm->objects[i]);
-   jvm->intern_hash[i] = h;
-   jvm->intern_next[i] = jvm->intern_head[h & JVM_INTERN_MASK];
-   jvm->intern_head[h & JVM_INTERN_MASK] = (uint32_t)(i + 1);
+  if (!jvm_object_interned(&jvm->objects[i]))
+    return;
+  const uint32_t h = jvm_object_hash(&jvm->objects[i]);
+  jvm->intern_hash[i] = h;
+  jvm->intern_next[i] = jvm->intern_head[h & JVM_INTERN_MASK];
+  jvm->intern_head[h & JVM_INTERN_MASK] = (uint32_t)(i + 1);
 }
 
 static void
 jvm_index_remove(struct jvm *jvm, uintptr_t i)
 {
-   if (!jvm_object_interned(&jvm->objects[i]))
+  if (!jvm_object_interned(&jvm->objects[i]))
+    return;
+  uint32_t *link = &jvm->intern_head[jvm->intern_hash[i] & JVM_INTERN_MASK];
+  while (*link) {
+    if (*link == (uint32_t)(i + 1)) {
+      *link = jvm->intern_next[i];
+      jvm->intern_next[i] = 0;
       return;
-   uint32_t *link = &jvm->intern_head[jvm->intern_hash[i] & JVM_INTERN_MASK];
-   while (*link) {
-      if (*link == (uint32_t)(i + 1)) {
-         *link = jvm->intern_next[i];
-         jvm->intern_next[i] = 0;
-         return;
-      }
-      link = &jvm->intern_next[*link - 1];
-   }
+    }
+    link = &jvm->intern_next[*link - 1];
+  }
 }
 
 static jobject
 jvm_find_object(struct jvm *jvm, const struct jvm_object *o)
 {
-   assert(jvm && o && o->type != JVM_OBJECT_NONE);
+  assert(jvm && o && o->type != JVM_OBJECT_NONE);
 
-   bool (*comparator[])(const struct jvm_object *a, const struct jvm_object *b) = {
-      NULL,
-      compare_opaque,
-      compare_array,
-      compare_method,
-      compare_class,
-      compare_string,
-      compare_motion,
-   };
-   assert(o->type < JVM_OBJECT_LAST);
+  bool (*comparator[])(const struct jvm_object *a, const struct jvm_object *b) = {
+    NULL,
+    compare_opaque,
+    compare_array,
+    compare_method,
+    compare_class,
+    compare_string,
+    compare_motion,
+  };
+  assert(o->type < JVM_OBJECT_LAST);
 
-   if (jvm_object_interned(o)) {
-      /* Duplicates can exist, and the linear scan this replaced answered with
-       * the lowest slot, so keep doing that. */
-      const uint32_t h = jvm_object_hash(o);
-      uintptr_t best = 0;
-      for (uint32_t n = jvm->intern_head[h & JVM_INTERN_MASK]; n; n = jvm->intern_next[n - 1]) {
-         if (jvm->intern_hash[n - 1] != h || (best && n >= best) ||
-             o->type != jvm->objects[n - 1].type)
-            continue;
-         if (comparator[o->type](o, &jvm->objects[n - 1]))
-            best = n;
-      }
-      return (jobject)best;
-   }
+  if (jvm_object_interned(o)) {
+    /* Duplicates can exist, and the linear scan this replaced answered with
+     * the lowest slot, so keep doing that. */
+    const uint32_t h = jvm_object_hash(o);
+    uintptr_t best = 0;
+    for (uint32_t n = jvm->intern_head[h & JVM_INTERN_MASK]; n; n = jvm->intern_next[n - 1]) {
+      if (jvm->intern_hash[n - 1] != h || (best && n >= best) ||
+          o->type != jvm->objects[n - 1].type)
+        continue;
+      if (comparator[o->type](o, &jvm->objects[n - 1]))
+        best = n;
+    }
+    return (jobject)best;
+  }
 
-   for (uintptr_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i) {
-      if (o->type != jvm->objects[i].type)
-         continue;
-      if (comparator[o->type](o, &jvm->objects[i]))
-         return (jobject)(i + 1);
-   }
+  for (uintptr_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i) {
+    if (o->type != jvm->objects[i].type)
+      continue;
+    if (comparator[o->type](o, &jvm->objects[i]))
+      return (jobject)(i + 1);
+  }
 
-   return NULL;
+  return NULL;
 }
 
 static jclass
@@ -381,36 +385,36 @@ jvm_make_class(struct jvm *jvm, const char *name);
 static void
 jvm_assign_default_class(struct jvm *jvm, struct jvm_object *o)
 {
-   assert(jvm && o);
+  assert(jvm && o);
 
-   switch (o->type) {
-      case JVM_OBJECT_METHOD:
-         o->this_klass = jvm_make_class(jvm,
-            o->method.signature.data && o->method.signature.data[0] != '('
-               ? "java/lang/reflect/Field"
-               : o->method.name.data && !strcmp(o->method.name.data, "<init>")
-                  ? "java/lang/reflect/Constructor" : "java/lang/reflect/Method");
-         break;
+  switch (o->type) {
+  case JVM_OBJECT_METHOD:
+    o->this_klass = jvm_make_class(jvm,
+                                   o->method.signature.data && o->method.signature.data[0] != '('
+                                   ? "java/lang/reflect/Field"
+                                   : o->method.name.data && !strcmp(o->method.name.data, "<init>")
+                                   ? "java/lang/reflect/Constructor" : "java/lang/reflect/Method");
+    break;
 
-      case JVM_OBJECT_STRING:
-         o->this_klass = jvm_make_class(jvm, "java/lang/String");
-         break;
+  case JVM_OBJECT_STRING:
+    o->this_klass = jvm_make_class(jvm, "java/lang/String");
+    break;
 
-      case JVM_OBJECT_MOTION:
-         o->this_klass = jvm_make_class(jvm, "android/view/MotionEvent");
-         break;
+  case JVM_OBJECT_MOTION:
+    o->this_klass = jvm_make_class(jvm, "android/view/MotionEvent");
+    break;
 
-      case JVM_OBJECT_NONE:
-      case JVM_OBJECT_OPAQUE:
-      case JVM_OBJECT_ARRAY:
-      case JVM_OBJECT_CLASS:
-      case JVM_OBJECT_LAST:
-         // opaque objects should always have `this_class`.
-         // arrays have unique classes which is handled on `jvm_new_array`
-         // `jvm_make_class` points class's `this_class` to first object, which is class definition for a class
-         assert(0 && "epic failure");
-         break;
-   }
+  case JVM_OBJECT_NONE:
+  case JVM_OBJECT_OPAQUE:
+  case JVM_OBJECT_ARRAY:
+  case JVM_OBJECT_CLASS:
+  case JVM_OBJECT_LAST:
+    // opaque objects should always have `this_class`.
+    // arrays have unique classes which is handled on `jvm_new_array`
+    // `jvm_make_class` points class's `this_class` to first object, which is class definition for a class
+    assert(0 && "epic failure");
+    break;
+  }
 }
 
 static struct jvm_object*
@@ -421,86 +425,90 @@ static bool jvm_forget_local(struct jvm *jvm, jobject object);
 static jobject
 jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 {
-   assert(jvm && o);
-   jvm_meta_lock();
+  assert(jvm && o);
+  jvm_meta_lock();
 
-   /* Resume the scan where the last allocation stopped: restarting at 0 every
-    * time made allocation O(n) in a 65536-entry table, which shows up as a
-    * hard slowdown once a few thousand objects are live. */
-   uintptr_t i = jvm->next_object;
-   if (i >= ARRAY_SIZE(jvm->objects))
+  /* Resume the scan where the last allocation stopped: restarting at 0 every
+   * time made allocation O(n) in a 65536-entry table, which shows up as a
+   * hard slowdown once a few thousand objects are live. */
+  uintptr_t i = jvm->next_object;
+  if (i >= ARRAY_SIZE(jvm->objects))
+    i = 0;
+  uintptr_t scanned = 0;
+  while (scanned < ARRAY_SIZE(jvm->objects) &&
+         jvm->objects[i].type != JVM_OBJECT_NONE) {
+    if (++i >= ARRAY_SIZE(jvm->objects))
       i = 0;
-   uintptr_t scanned = 0;
-   while (scanned < ARRAY_SIZE(jvm->objects) &&
-          jvm->objects[i].type != JVM_OBJECT_NONE) {
-      if (++i >= ARRAY_SIZE(jvm->objects))
-         i = 0;
-      ++scanned;
-   }
-   if (scanned >= ARRAY_SIZE(jvm->objects)) {
-      size_t n[JVM_OBJECT_LAST] = {0};
-      for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k)
-         n[jvm->objects[k].type]++;
-      fprintf(stderr, "[jvm] object table full (%zu slots): opaque=%zu array=%zu "
-              "method=%zu class=%zu string=%zu — a JNI reference is leaking\n",
-              ARRAY_SIZE(jvm->objects), n[JVM_OBJECT_OPAQUE], n[JVM_OBJECT_ARRAY],
-              n[JVM_OBJECT_METHOD], n[JVM_OBJECT_CLASS], n[JVM_OBJECT_STRING]);
-      /* Which class the leaked handles belong to.  "65,000 opaque objects"
-       * names the symptom; the class names the caller. */
-      {
-         struct { const char *name; size_t n, bridge, arrays; unsigned long long refs, globals; } tally[256] = {0};
-         size_t ntally = 0;
-         for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k) {
-            if (jvm->objects[k].type != JVM_OBJECT_OPAQUE) continue;
-            struct jvm_object *ko =
-               jvm_get_object(jvm, jvm->objects[k].this_klass);
-            const char *nm = (ko && ko->type == JVM_OBJECT_CLASS &&
-                              ko->klass.name.data) ? ko->klass.name.data : "?";
-            size_t t = 0;
-            while (t < ntally && strcmp(tally[t].name, nm)) ++t;
-            if (t == ntally) {
-               if (ntally == ARRAY_SIZE(tally)) continue;
-               tally[ntally++].name = nm;
-            }
-            ++tally[t].n;
-            tally[t].bridge += jvm->objects[k].bridge_owned;
-            tally[t].arrays += jvm->objects[k].array_refs > 0;
-            tally[t].globals += (unsigned)jvm->objects[k].global_refs;
-            if (jvm->objects[k].refs > 0) tally[t].refs += (unsigned)jvm->objects[k].refs;
-         }
-         for (size_t shown = 0; shown < 12; ++shown) {
-            size_t best = 0;
-            for (size_t t = 1; t < ntally; ++t)
-               if (tally[t].n > tally[best].n) best = t;
-            if (!ntally || !tally[best].n) break;
-            fprintf(stderr, "[jvm]   %8zu  %s (bridge=%zu array-owned=%zu total-refs=%llu global-refs=%llu)\n",
-                    tally[best].n, tally[best].name, tally[best].bridge,
-                    tally[best].arrays, tally[best].refs,tally[best].globals);
-            tally[best].n = 0;
-         }
+    ++scanned;
+  }
+  if (scanned >= ARRAY_SIZE(jvm->objects)) {
+    size_t n[JVM_OBJECT_LAST] = {0};
+    for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k)
+      n[jvm->objects[k].type]++;
+    fprintf(stderr, "[jvm] object table full (%zu slots): opaque=%zu array=%zu "
+                    "method=%zu class=%zu string=%zu — a JNI reference is leaking\n",
+            ARRAY_SIZE(jvm->objects), n[JVM_OBJECT_OPAQUE], n[JVM_OBJECT_ARRAY],
+            n[JVM_OBJECT_METHOD], n[JVM_OBJECT_CLASS], n[JVM_OBJECT_STRING]);
+    /* Which class the leaked handles belong to.  "65,000 opaque objects"
+     * names the symptom; the class names the caller. */
+    {
+      struct {
+        const char *name;
+        size_t n, bridge, arrays;
+        unsigned long long refs, globals;
+      } tally[256] = {0};
+      size_t ntally = 0;
+      for (size_t k = 0; k < ARRAY_SIZE(jvm->objects); ++k) {
+        if (jvm->objects[k].type != JVM_OBJECT_OPAQUE) continue;
+        struct jvm_object *ko =
+          jvm_get_object(jvm, jvm->objects[k].this_klass);
+        const char *nm = (ko && ko->type == JVM_OBJECT_CLASS &&
+                          ko->klass.name.data) ? ko->klass.name.data : "?";
+        size_t t = 0;
+        while (t < ntally && strcmp(tally[t].name, nm)) ++t;
+        if (t == ntally) {
+          if (ntally == ARRAY_SIZE(tally)) continue;
+          tally[ntally++].name = nm;
+        }
+        ++tally[t].n;
+        tally[t].bridge += jvm->objects[k].bridge_owned;
+        tally[t].arrays += jvm->objects[k].array_refs > 0;
+        tally[t].globals += (unsigned)jvm->objects[k].global_refs;
+        if (jvm->objects[k].refs > 0) tally[t].refs += (unsigned)jvm->objects[k].refs;
       }
-      /* An allocation failure, not a reason to kill the host: the caller gets
-       * NULL, as NewObject does when the heap is exhausted. */
-      fprintf(stderr, "[jvm] object limit reached: allocation fails\n");
-      jvm_meta_unlock();
-      return NULL;
-   }
-   jvm->next_object = i + 1;
-   jvm->objects[i] = *o;
-   ++jvm->object_generation[i];
-   jvm->objects[i].refs = 1;
-   /* Slots are recycled, so a stale stub pointer from the previous tenant
-    * would otherwise be handed to a different method. */
-   jvm->wrap_cached[i] = false;
-   jvm->wrap_cache[i] = NULL;
-   jvm_index_add(jvm, i);
+      for (size_t shown = 0; shown < 12; ++shown) {
+        size_t best = 0;
+        for (size_t t = 1; t < ntally; ++t)
+          if (tally[t].n > tally[best].n) best = t;
+        if (!ntally || !tally[best].n) break;
+        fprintf(stderr, "[jvm]   %8zu  %s (bridge=%zu array-owned=%zu total-refs=%llu global-refs=%llu)\n",
+                tally[best].n, tally[best].name, tally[best].bridge,
+                tally[best].arrays, tally[best].refs,tally[best].globals);
+        tally[best].n = 0;
+      }
+    }
+    /* An allocation failure, not a reason to kill the host: the caller gets
+     * NULL, as NewObject does when the heap is exhausted. */
+    fprintf(stderr, "[jvm] object limit reached: allocation fails\n");
+    jvm_meta_unlock();
+    return NULL;
+  }
+  jvm->next_object = i + 1;
+  jvm->objects[i] = *o;
+  ++jvm->object_generation[i];
+  jvm->objects[i].refs = 1;
+  /* Slots are recycled, so a stale stub pointer from the previous tenant
+   * would otherwise be handed to a different method. */
+  jvm->wrap_cached[i] = false;
+  jvm->wrap_cache[i] = NULL;
+  jvm_index_add(jvm, i);
 
-   if (!jvm->objects[i].this_klass)
-      jvm_assign_default_class(jvm, &jvm->objects[i]);
+  if (!jvm->objects[i].this_klass)
+    jvm_assign_default_class(jvm, &jvm->objects[i]);
 
-   jobject result = jvm_record_local(jvm,(jobject)(i + 1));
-   jvm_meta_unlock();
-   return result;
+  jobject result = jvm_record_local(jvm,(jobject)(i + 1));
+  jvm_meta_unlock();
+  return result;
 }
 
 /* Add a reference to an existing handle (NewGlobalRef / NewLocalRef, or a
@@ -508,13 +516,13 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
 static jobject
 jvm_ref_object(struct jvm *jvm, jobject object)
 {
-   jvm_meta_lock();
-   object = jvm_resolve_reference(jvm, object);
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   if (o && o->type != JVM_OBJECT_NONE)
-      ++o->refs;
-   jvm_meta_unlock();
-   return object;
+  jvm_meta_lock();
+  object = jvm_resolve_reference(jvm, object);
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  if (o && o->type != JVM_OBJECT_NONE)
+    ++o->refs;
+  jvm_meta_unlock();
+  return object;
 }
 
 static void jvm_deref_object(struct jvm *jvm, jobject object);
@@ -524,17 +532,17 @@ static void jvm_deref_object(struct jvm *jvm, jobject object);
  * GetObjectArrayElement. Clear edges before descending into nested arrays. */
 static void jvm_array_release_refs(struct jvm *jvm, struct jvm_object *o)
 {
-   if (o->type != JVM_OBJECT_ARRAY || !o->array.reference_elements) return;
-   jobject *elements = o->array.data;
-   for (size_t i = 0; i < o->array.size; ++i) {
-      jobject element = elements[i];
-      elements[i] = NULL;
-      if (element) {
-         struct jvm_object *child = jvm_get_object(jvm, element);
-         if (child && child->array_refs > 0) --child->array_refs;
-         jvm_deref_object(jvm, element);
-      }
-   }
+  if (o->type != JVM_OBJECT_ARRAY || !o->array.reference_elements) return;
+  jobject *elements = o->array.data;
+  for (size_t i = 0; i < o->array.size; ++i) {
+    jobject element = elements[i];
+    elements[i] = NULL;
+    if (element) {
+      struct jvm_object *child = jvm_get_object(jvm, element);
+      if (child && child->array_refs > 0) --child->array_refs;
+      jvm_deref_object(jvm, element);
+    }
+  }
 }
 
 /* Drop a reference (DeleteLocalRef / DeleteGlobalRef).  Only arrays and
@@ -544,32 +552,32 @@ static void jvm_array_release_refs(struct jvm *jvm, struct jvm_object *o)
 static void
 jvm_deref_object(struct jvm *jvm, jobject object)
 {
-   jvm_meta_lock();
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   if (!o || o->type == JVM_OBJECT_NONE) {
-      jvm_meta_unlock();
-      return;
-   }
-   if (o->refs > 0)
-      --o->refs;
-   if (o->refs > 0) {
-      jvm_meta_unlock();
-      return;
-   }
-   if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
-       o->type != JVM_OBJECT_MOTION &&
-       !(o->type == JVM_OBJECT_OPAQUE && o->bridge_owned)) {
-      o->refs = 1; /* pinned for the process lifetime */
-      jvm_meta_unlock();
-      return;
-   }
-   uintptr_t idx = (uintptr_t)object - 1;
-   jvm_index_remove(jvm, idx);
-   jvm_array_release_refs(jvm, o);
-   jvm_object_release(o);
-   if (idx < jvm->next_object)
-      jvm->next_object = idx;
-   jvm_meta_unlock();
+  jvm_meta_lock();
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  if (!o || o->type == JVM_OBJECT_NONE) {
+    jvm_meta_unlock();
+    return;
+  }
+  if (o->refs > 0)
+    --o->refs;
+  if (o->refs > 0) {
+    jvm_meta_unlock();
+    return;
+  }
+  if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
+      o->type != JVM_OBJECT_MOTION &&
+      !(o->type == JVM_OBJECT_OPAQUE && o->bridge_owned)) {
+    o->refs = 1; /* pinned for the process lifetime */
+    jvm_meta_unlock();
+    return;
+  }
+  uintptr_t idx = (uintptr_t)object - 1;
+  jvm_index_remove(jvm, idx);
+  jvm_array_release_refs(jvm, o);
+  jvm_object_release(o);
+  if (idx < jvm->next_object)
+    jvm->next_object = idx;
+  jvm_meta_unlock();
 }
 
 /* Mark only newly created bridge handles. Their lifetime follows JNI and
@@ -577,28 +585,28 @@ jvm_deref_object(struct jvm *jvm, jobject object)
 void
 jvm_mark_bridge_local(struct jvm *jvm, jobject object)
 {
-   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects)) return;
-   jvm_meta_lock();
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   if (o && o->type == JVM_OBJECT_OPAQUE) o->bridge_owned = true;
-   /* The conversion bridge assumes ownership of this local reference. */
-   jvm_forget_local(jvm,object);
-   if (o && o->type != JVM_OBJECT_NONE) ++o->bridge_pending;
-   jvm_meta_unlock();
+  if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects)) return;
+  jvm_meta_lock();
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  if (o && o->type == JVM_OBJECT_OPAQUE) o->bridge_owned = true;
+  /* The conversion bridge assumes ownership of this local reference. */
+  jvm_forget_local(jvm,object);
+  if (o && o->type != JVM_OBJECT_NONE) ++o->bridge_pending;
+  jvm_meta_unlock();
 }
 
 int
 jvm_bridge_ref_count(struct jvm *jvm, jobject object)
 {
-   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
-      return 0;
-   jvm_meta_lock();
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   /* Array elements are owning Java references too. A native frame may drop
-    * its local while an array still retains the same object and VM payload. */
-   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs;
-   jvm_meta_unlock();
-   return refs;
+  if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+    return 0;
+  jvm_meta_lock();
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  /* Array elements are owning Java references too. A native frame may drop
+   * its local while an array still retains the same object and VM payload. */
+  int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs;
+  jvm_meta_unlock();
+  return refs;
 }
 
 /* Which tenant of a handle slot this is: the slot's allocation count.  A
@@ -608,219 +616,219 @@ jvm_bridge_ref_count(struct jvm *jvm, jobject object)
 uint32_t
 jvm_handle_epoch(struct jvm *jvm, jobject object)
 {
-   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
-      return 0;
-   jvm_meta_lock();
-   const uint32_t generation = jvm->object_generation[(uintptr_t)object - 1];
-   jvm_meta_unlock();
-   return generation;
+  if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+    return 0;
+  jvm_meta_lock();
+  const uint32_t generation = jvm->object_generation[(uintptr_t)object - 1];
+  jvm_meta_unlock();
+  return generation;
 }
 
 bool
 jvm_bridge_take_pending(struct jvm *jvm, jobject object)
 {
-   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
-      return false;
-   jvm_meta_lock();
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   bool had = o->type != JVM_OBJECT_NONE && o->bridge_pending > 0;
-   if (had) --o->bridge_pending;
-   jvm_meta_unlock();
-   return had;
+  if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+    return false;
+  jvm_meta_lock();
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  bool had = o->type != JVM_OBJECT_NONE && o->bridge_pending > 0;
+  if (had) --o->bridge_pending;
+  jvm_meta_unlock();
+  return had;
 }
 
 bool
 jvm_release_bridge_local(struct jvm *jvm, jobject object)
 {
-   if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
-      return false;
-   jvm_meta_lock();
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   /* Method and field ids and classes are not locals of a call: JNI keeps them
-    * valid until the class unloads, and native code caches them. */
-   if (o->type == JVM_OBJECT_NONE || o->type == JVM_OBJECT_METHOD ||
-       o->type == JVM_OBJECT_CLASS || o->refs - o->array_refs != 1) {
-      jvm_meta_unlock();
-      return false;
-   }
-   jvm_forget_local(jvm,object);
-   if (o->array_refs) {
-      --o->refs; /* Release the local; array edges still keep the object live. */
-      jvm_meta_unlock();
-      return false;
-   }
-   uintptr_t idx = (uintptr_t)object - 1;
-   jvm_index_remove(jvm, idx);
-   jvm_array_release_refs(jvm, o);
-   jvm_object_release(o);
-   jvm->wrap_cached[idx] = false;
-   jvm->wrap_cache[idx] = NULL;
-   if (idx < jvm->next_object) jvm->next_object = idx;
-   jvm_meta_unlock();
-   return true;
+  if (!jvm || !object || (uintptr_t)object > ARRAY_SIZE(jvm->objects))
+    return false;
+  jvm_meta_lock();
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  /* Method and field ids and classes are not locals of a call: JNI keeps them
+   * valid until the class unloads, and native code caches them. */
+  if (o->type == JVM_OBJECT_NONE || o->type == JVM_OBJECT_METHOD ||
+      o->type == JVM_OBJECT_CLASS || o->refs - o->array_refs != 1) {
+    jvm_meta_unlock();
+    return false;
+  }
+  jvm_forget_local(jvm,object);
+  if (o->array_refs) {
+    --o->refs; /* Release the local; array edges still keep the object live. */
+    jvm_meta_unlock();
+    return false;
+  }
+  uintptr_t idx = (uintptr_t)object - 1;
+  jvm_index_remove(jvm, idx);
+  jvm_array_release_refs(jvm, o);
+  jvm_object_release(o);
+  jvm->wrap_cached[idx] = false;
+  jvm->wrap_cache[idx] = NULL;
+  if (idx < jvm->next_object) jvm->next_object = idx;
+  jvm_meta_unlock();
+  return true;
 }
 
 static jobject
 jvm_add_object_if_not_there(struct jvm *jvm, struct jvm_object *needle)
 {
-   assert(jvm && needle);
-   jvm_meta_lock();
+  assert(jvm && needle);
+  jvm_meta_lock();
 
-   jobject o;
-   if ((o = jvm_find_object(jvm, needle))) {
-      jvm_object_release(needle);
-      o = jvm_record_local(jvm,jvm_ref_object(jvm, o));
-      jvm_meta_unlock();
-      return o;
-   }
+  jobject o;
+  if ((o = jvm_find_object(jvm, needle))) {
+    jvm_object_release(needle);
+    o = jvm_record_local(jvm,jvm_ref_object(jvm, o));
+    jvm_meta_unlock();
+    return o;
+  }
 
-   o = jvm_add_object(jvm, needle);
-   jvm_meta_unlock();
-   return o;
+  o = jvm_add_object(jvm, needle);
+  jvm_meta_unlock();
+  return o;
 }
 
 static struct jvm_object*
 jvm_get_object(struct jvm *jvm, const jobject o)
 {
-   jobject target = jvm_resolve_reference(jvm, o);
-   return target ? &jvm->objects[(uintptr_t)target - 1] : NULL;
+  jobject target = jvm_resolve_reference(jvm, o);
+  return target ? &jvm->objects[(uintptr_t)target - 1] : NULL;
 }
 
 jobject jvm_resolve_reference(struct jvm *jvm, jobject object)
 {
-   assert(jvm);
-   uintptr_t h = (uintptr_t)object;
-   if (h <= ARRAY_SIZE(jvm->objects)) return object;
-   jvm_meta_lock();
-   size_t i = h - ARRAY_SIZE(jvm->objects) - 1;
-   jobject target = NULL;
-   if (i < jvm->weak_capacity && jvm->weak_refs[i].used) {
-      struct jvm_weak_ref *w = &jvm->weak_refs[i];
-      uintptr_t slot = (uintptr_t)w->target;
-      if (slot && slot <= ARRAY_SIZE(jvm->objects) &&
-          jvm->objects[slot - 1].type != JVM_OBJECT_NONE &&
-          jvm->object_generation[slot - 1] == w->generation)
-         target = w->target;
-   }
-   jvm_meta_unlock();
-   return target;
+  assert(jvm);
+  uintptr_t h = (uintptr_t)object;
+  if (h <= ARRAY_SIZE(jvm->objects)) return object;
+  jvm_meta_lock();
+  size_t i = h - ARRAY_SIZE(jvm->objects) - 1;
+  jobject target = NULL;
+  if (i < jvm->weak_capacity && jvm->weak_refs[i].used) {
+    struct jvm_weak_ref *w = &jvm->weak_refs[i];
+    uintptr_t slot = (uintptr_t)w->target;
+    if (slot && slot <= ARRAY_SIZE(jvm->objects) &&
+        jvm->objects[slot - 1].type != JVM_OBJECT_NONE &&
+        jvm->object_generation[slot - 1] == w->generation)
+      target = w->target;
+  }
+  jvm_meta_unlock();
+  return target;
 }
 
 bool jvm_is_weak_reference(struct jvm *jvm, jobject object)
 {
-   uintptr_t h = (uintptr_t)object;
-   if (h <= ARRAY_SIZE(jvm->objects)) return false;
-   jvm_meta_lock();
-   size_t i = h - ARRAY_SIZE(jvm->objects) - 1;
-   bool weak = i < jvm->weak_capacity && jvm->weak_refs[i].used;
-   jvm_meta_unlock();
-   return weak;
+  uintptr_t h = (uintptr_t)object;
+  if (h <= ARRAY_SIZE(jvm->objects)) return false;
+  jvm_meta_lock();
+  size_t i = h - ARRAY_SIZE(jvm->objects) - 1;
+  bool weak = i < jvm->weak_capacity && jvm->weak_refs[i].used;
+  jvm_meta_unlock();
+  return weak;
 }
 
 static void
 jvm_object_print(struct jvm *jvm, const struct jvm_object *obj)
 {
 #ifndef VERBOSE_FUNCTIONS
-   return;
+  return;
 #endif
 
-   if (!obj) {
-      verbose("[NULL]");
-      return;
-   }
+  if (!obj) {
+    verbose("[NULL]");
+    return;
+  }
 
-   switch (obj->type) {
-      case JVM_OBJECT_OPAQUE:
-         verbose("[OPAQUE] %s", jvm_get_object(jvm, obj->this_klass)->klass.name.data);
-         break;
-      case JVM_OBJECT_ARRAY:
-         verbose("[ARRAY] element_sz: %zu size: %zu", obj->array.element_sz, obj->array.size);
-         break;
-      case JVM_OBJECT_METHOD:
-         verbose("[METHOD] %s::%s::%s", jvm_get_object(jvm, obj->method.klass)->klass.name.data, obj->method.name.data, obj->method.signature.data);
-         break;
-      case JVM_OBJECT_CLASS:
-         verbose("[CLASS] %s", obj->klass.name.data);
-         break;
-      case JVM_OBJECT_STRING:
-         verbose("[STRING] (%d) %s (%zu)", obj->string.heap, obj->string.data, obj->string.size);
-         break;
-      case JVM_OBJECT_MOTION:
-         verbose("[MOTION] action=%d (%.1f,%.1f) event=%lld down=%lld",
-                 obj->motion.action, (double)obj->motion.x, (double)obj->motion.y,
-                 (long long)obj->motion.event_ms, (long long)obj->motion.down_ms);
-         break;
+  switch (obj->type) {
+  case JVM_OBJECT_OPAQUE:
+    verbose("[OPAQUE] %s", jvm_get_object(jvm, obj->this_klass)->klass.name.data);
+    break;
+  case JVM_OBJECT_ARRAY:
+    verbose("[ARRAY] element_sz: %zu size: %zu", obj->array.element_sz, obj->array.size);
+    break;
+  case JVM_OBJECT_METHOD:
+    verbose("[METHOD] %s::%s::%s", jvm_get_object(jvm, obj->method.klass)->klass.name.data, obj->method.name.data, obj->method.signature.data);
+    break;
+  case JVM_OBJECT_CLASS:
+    verbose("[CLASS] %s", obj->klass.name.data);
+    break;
+  case JVM_OBJECT_STRING:
+    verbose("[STRING] (%d) %s (%zu)", obj->string.heap, obj->string.data, obj->string.size);
+    break;
+  case JVM_OBJECT_MOTION:
+    verbose("[MOTION] action=%d (%.1f,%.1f) event=%lld down=%lld",
+            obj->motion.action, (double)obj->motion.x, (double)obj->motion.y,
+            (long long)obj->motion.event_ms, (long long)obj->motion.down_ms);
+    break;
 
-      case JVM_OBJECT_NONE:
-      case JVM_OBJECT_LAST:
-         verbose("[INVALID OBJECT]");
-         break;
-   }
+  case JVM_OBJECT_NONE:
+  case JVM_OBJECT_LAST:
+    verbose("[INVALID OBJECT]");
+    break;
+  }
 }
 
 static struct jvm_object*
 jvm_get_object_of_type(struct jvm *jvm, const jobject o, const enum jvm_object_type type)
 {
-   struct jvm_object *obj = jvm_get_object(jvm, o);
-   if (obj && obj->type != type) {
-      static struct jvm_object dummy; // acts as zero initialized memory, so in practice we return NULLs and 0
-      verbose("object handle: %p", o);
-      verbose("expected object of type %d, but got object of type %d instead", type, obj->type);
-      jvm_object_print(jvm, obj);
-      return &dummy;
-   }
-   return obj;
+  struct jvm_object *obj = jvm_get_object(jvm, o);
+  if (obj && obj->type != type) {
+    static struct jvm_object dummy; // acts as zero initialized memory, so in practice we return NULLs and 0
+    verbose("object handle: %p", o);
+    verbose("expected object of type %d, but got object of type %d instead", type, obj->type);
+    jvm_object_print(jvm, obj);
+    return &dummy;
+  }
+  return obj;
 }
 
 struct jvm*
 jnienv_get_jvm(JNIEnv *env)
 {
-   return container_of(env, struct jvm, env);
+  return container_of(env, struct jvm, env);
 }
 
 static struct jvm*
 javavm_get_jvm(JavaVM *vm)
 {
-   return container_of(vm, struct jvm, vm);
+  return container_of(vm, struct jvm, vm);
 }
 
 static jint
 JNIEnv_GetVersion(JNIEnv * p0)
 {
-   assert(p0);
-   return JNI_VERSION_1_6;
+  assert(p0);
+  return JNI_VERSION_1_6;
 }
 
 static jclass
 JNIEnv_DefineClass(JNIEnv* p0, const char* p1, jobject p2, const jbyte* p3, jsize p4)
 {
-   assert(p0 && p1 && p2);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+  assert(p0 && p1 && p2);
+  JVM_UNIMPLEMENTED();
+  return NULL;
 }
 
 static void
 cstr_replace(char *cstr, const char *replace, const char with)
 {
-   assert(cstr && replace);
-   char *s = cstr;
-   for (size_t i; *s && (i = strcspn(s, replace)) && s[i]; s += (i + 1))
-      s[i] = with;
+  assert(cstr && replace);
+  char *s = cstr;
+  for (size_t i; *s && (i = strcspn(s, replace)) && s[i]; s += (i + 1))
+    s[i] = with;
 }
 
 static jclass
 jvm_make_class(struct jvm *jvm, const char *name)
 {
-   assert(jvm && name);
-   struct jvm_object o = { .this_klass = (jclass)1, .type = JVM_OBJECT_CLASS };
-   jvm_string_set_cstr(&o.klass.name, name, true);
-   cstr_replace((char*)o.klass.name.data, "/", '.');
-   return jvm_add_object_if_not_there(jvm, &o);
+  assert(jvm && name);
+  struct jvm_object o = { .this_klass = (jclass)1, .type = JVM_OBJECT_CLASS };
+  jvm_string_set_cstr(&o.klass.name, name, true);
+  cstr_replace((char*)o.klass.name.data, "/", '.');
+  return jvm_add_object_if_not_there(jvm, &o);
 }
 
 jclass jvm_primitive_class(struct jvm *jvm, const char *descriptor)
 {
-   return luna_java_primitive_name(descriptor) ? jvm_make_class(jvm, descriptor) : NULL;
+  return luna_java_primitive_name(descriptor) ? jvm_make_class(jvm, descriptor) : NULL;
 }
 
 /* LUNARIA_TRACE_JNIEXC=1: each exception that becomes pending, with the
@@ -829,55 +837,55 @@ jclass jvm_primitive_class(struct jvm *jvm, const char *descriptor)
 static void
 jvm_trace_pending(const char *how, const char *cls, const char *msg)
 {
-   static int on = -1;
-   if (on < 0) on = getenv("LUNARIA_TRACE_JNIEXC") != NULL;
-   if (on)
-      fprintf(stderr, "[jvm-exc] %s %s: %s\n", how, cls ? cls : "?", msg ? msg : "");
+  static int on = -1;
+  if (on < 0) on = getenv("LUNARIA_TRACE_JNIEXC") != NULL;
+  if (on)
+    fprintf(stderr, "[jvm-exc] %s %s: %s\n", how, cls ? cls : "?", msg ? msg : "");
 }
 
 static jclass
 JNIEnv_FindClass(JNIEnv* p0, const char* p1)
 {
-   assert(p0 && p1);
-   verbose("%s", p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   if (!dvm_jni_class_exists(p1)) {
-      static int reported;
-      if (reported++ < 64)
-         fprintf(stderr, "[jvm] FindClass(%s): NoClassDefFoundError\n", p1);
-      jvm_throw_new(jvm, "java/lang/NoClassDefFoundError", p1);
-      return NULL;
-   }
-   return jvm_make_class(jvm, p1);
+  assert(p0 && p1);
+  verbose("%s", p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  if (!dvm_jni_class_exists(p1)) {
+    static int reported;
+    if (reported++ < 64)
+      fprintf(stderr, "[jvm] FindClass(%s): NoClassDefFoundError\n", p1);
+    jvm_throw_new(jvm, "java/lang/NoClassDefFoundError", p1);
+    return NULL;
+  }
+  return jvm_make_class(jvm, p1);
 }
 
 static jmethodID
 JNIEnv_FromReflectedMethod(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   /* JNI: a null java.lang.reflect.Method yields a null jmethodID.  Aborting
-    * here turned a failed ReflectionHelper.getMethodID (NoSuchMethodError /
-    * null Member) into a host process kill before the guest could catch it. */
-   if (!p1) return NULL;
-   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   return p1;
+  assert(p0);
+  /* JNI: a null java.lang.reflect.Method yields a null jmethodID.  Aborting
+   * here turned a failed ReflectionHelper.getMethodID (NoSuchMethodError /
+   * null Member) into a host process kill before the guest could catch it. */
+  if (!p1) return NULL;
+  jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+  return p1;
 }
 
 static jfieldID
 JNIEnv_FromReflectedField(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   if (!p1) return NULL;
-   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   return p1;
+  assert(p0);
+  if (!p1) return NULL;
+  jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+  return p1;
 }
 
 static jobject
 JNIEnv_ToReflectedMethod(JNIEnv* p0, jclass p1, jmethodID p2, jboolean p3)
 {
-   assert(p0 && p1 && p2);
-   (void)p3;
-   return (*p0)->NewLocalRef(p0, (jobject)p2);
+  assert(p0 && p1 && p2);
+  (void)p3;
+  return (*p0)->NewLocalRef(p0, (jobject)p2);
 }
 
 static const char *jvm_framework_super(const char *name);
@@ -887,24 +895,24 @@ static const char *jvm_framework_super(const char *name);
 static bool
 jvm_name_eq(const char *a, const char *b)
 {
-   if (!a || !b)
+  if (!a || !b)
+    return false;
+  for (; *a && *b; ++a, ++b) {
+    char ca = (*a == '.') ? '/' : *a;
+    char cb = (*b == '.') ? '/' : *b;
+    if (ca != cb)
       return false;
-   for (; *a && *b; ++a, ++b) {
-      char ca = (*a == '.') ? '/' : *a;
-      char cb = (*b == '.') ? '/' : *b;
-      if (ca != cb)
-         return false;
-   }
-   return !*a && !*b;
+  }
+  return !*a && !*b;
 }
 
 static void
 jvm_name_slashed(const char *name, char *out, size_t n)
 {
-   size_t i = 0;
-   for (; name && name[i] && i + 1 < n; ++i)
-      out[i] = (name[i] == '.') ? '/' : name[i];
-   out[i] = '\0';
+  size_t i = 0;
+  for (; name && name[i] && i + 1 < n; ++i)
+    out[i] = (name[i] == '.') ? '/' : name[i];
+  out[i] = '\0';
 }
 
 /* One hop up the hierarchy: the dex for the app's own classes, the framework
@@ -912,12 +920,12 @@ jvm_name_slashed(const char *name, char *out, size_t n)
 static const char *
 jvm_super_of(const char *name)
 {
-   char slashed[512];
-   jvm_name_slashed(name, slashed, sizeof slashed);
-   const char *super = dvm_jni_super_name(slashed);
-   if (!super)
-      super = jvm_framework_super(slashed);
-   return super;
+  char slashed[512];
+  jvm_name_slashed(name, slashed, sizeof slashed);
+  const char *super = dvm_jni_super_name(slashed);
+  if (!super)
+    super = jvm_framework_super(slashed);
+  return super;
 }
 
 /* `sub instanceof sup`, decided from the declared hierarchy rather than from
@@ -928,421 +936,445 @@ jvm_super_of(const char *name)
 static bool
 jvm_name_assignable(const char *sub, const char *sup)
 {
-   if (!sub || !sup)
-      return false;
-   if (jvm_name_eq(sup, "java/lang/Object"))
+  if (!sub || !sup)
+    return false;
+  if (jvm_name_eq(sup, "java/lang/Object"))
+    return true;
+  char sub_s[512], sup_s[512];
+  jvm_name_slashed(sub, sub_s, sizeof sub_s);
+  jvm_name_slashed(sup, sup_s, sizeof sup_s);
+  /* Interfaces only exist in the dex's view, so ask the VM first. */
+  if (dvm_jni_class_assignable(sub_s, sup_s))
+    return true;
+  const char *name = sub_s;
+  for (int hops = 0; name && hops < 32; ++hops) {
+    if (jvm_name_eq(name, sup_s))
       return true;
-   char sub_s[512], sup_s[512];
-   jvm_name_slashed(sub, sub_s, sizeof sub_s);
-   jvm_name_slashed(sup, sup_s, sizeof sup_s);
-   /* Interfaces only exist in the dex's view, so ask the VM first. */
-   if (dvm_jni_class_assignable(sub_s, sup_s))
-      return true;
-   const char *name = sub_s;
-   for (int hops = 0; name && hops < 32; ++hops) {
-      if (jvm_name_eq(name, sup_s))
-         return true;
-      name = jvm_super_of(name);
-   }
-   return false;
+    name = jvm_super_of(name);
+  }
+  return false;
 }
 
 static jclass
 JNIEnv_GetSuperclass(JNIEnv* p0, jclass p1)
 {
-   assert(p0 && p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   struct jvm_object *ko = jvm_get_object(jvm, p1);
-   const char *name = ko ? ko->klass.name.data : NULL;
-   const char *super = name ? jvm_super_of(name) : NULL;
-   /* java/lang/Object (and an interface) has no superclass — that is NULL by
-    * the JNI spec, not a failure. */
-   if (!super)
-      return NULL;
-   return jvm_make_class(jvm, super);
+  assert(p0 && p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  struct jvm_object *ko = jvm_get_object(jvm, p1);
+  const char *name = ko ? ko->klass.name.data : NULL;
+  const char *super = name ? jvm_super_of(name) : NULL;
+  /* java/lang/Object (and an interface) has no superclass — that is NULL by
+   * the JNI spec, not a failure. */
+  if (!super)
+    return NULL;
+  return jvm_make_class(jvm, super);
 }
 
 static jboolean
 JNIEnv_IsAssignableFrom(JNIEnv* p0, jclass p1, jclass p2)
 {
-   assert(p0 && p1 && p2);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   struct jvm_object *from = jvm_get_object(jvm, p1);
-   struct jvm_object *to = jvm_get_object(jvm, p2);
-   if (p1 == p2)
-      return true;
-   if (!from || !to)
-      return false;
-   return jvm_name_assignable(from->klass.name.data, to->klass.name.data);
+  assert(p0 && p1 && p2);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  struct jvm_object *from = jvm_get_object(jvm, p1);
+  struct jvm_object *to = jvm_get_object(jvm, p2);
+  if (p1 == p2)
+    return true;
+  if (!from || !to)
+    return false;
+  return jvm_name_assignable(from->klass.name.data, to->klass.name.data);
 }
 
 static jobject
 JNIEnv_ToReflectedField(JNIEnv* p0, jclass p1, jfieldID p2, jboolean p3)
 {
-   assert(p0 && p1 && p2);
-   (void)p3;
-   return (*p0)->NewLocalRef(p0, (jobject)p2);
+  assert(p0 && p1 && p2);
+  (void)p3;
+  return (*p0)->NewLocalRef(p0, (jobject)p2);
 }
 
 static void jvm_clear_pending(struct jvm *jvm)
 {
-   struct jvm_exception_state *e=jvm_exception_state(jvm);
-   if (e->pending_owned) jvm_deref_object(jvm,e->pending_exception);
-   e->pending_owned=false;
-   e->pending_exception=NULL;
-   e->pending_exception_class[0]='\0';
-   e->pending_exception_msg[0]='\0';
+  struct jvm_exception_state *e=jvm_exception_state(jvm);
+  if (e->pending_owned) jvm_deref_object(jvm,e->pending_exception);
+  e->pending_owned=false;
+  e->pending_exception=NULL;
+  e->pending_exception_class[0]='\0';
+  e->pending_exception_msg[0]='\0';
 }
 
 static jint
 JNIEnv_Throw(JNIEnv* p0, jthrowable p1)
 {
-   assert(p0 && p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   p1 = jvm_ref_object(jvm,p1);
-   jvm_clear_pending(jvm);
-   jvm_exception_state(jvm)->pending_exception = p1;
-   jvm_exception_state(jvm)->pending_owned = true;
-   const char *cls = jvm_get_class_name(jvm, p1);
-   jvm_trace_pending("Throw", cls, "");
-   snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
-            "%s", cls ? cls : "java/lang/Throwable");
-   jvm_exception_state(jvm)->pending_exception_msg[0] = '\0';
-   return 0;
+  assert(p0 && p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  p1 = jvm_ref_object(jvm,p1);
+  jvm_clear_pending(jvm);
+  jvm_exception_state(jvm)->pending_exception = p1;
+  jvm_exception_state(jvm)->pending_owned = true;
+  const char *cls = jvm_get_class_name(jvm, p1);
+  jvm_trace_pending("Throw", cls, "");
+  snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
+           "%s", cls ? cls : "java/lang/Throwable");
+  jvm_exception_state(jvm)->pending_exception_msg[0] = '\0';
+  return 0;
 }
 
 static jint
 JNIEnv_ThrowNew(JNIEnv* p0, jclass p1, const char* p2)
 {
-   assert(p0 && p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jobject e = p0[0]->AllocObject(p0, p1);
-   /* AllocObject can only fail if the class handle is bad; the exception
-    * still has to become pending, so fall back to the class object itself. */
-   jobject root=jvm_ref_object(jvm,e ? e : (jthrowable)p1);
-   jvm_clear_pending(jvm);
-   jvm_exception_state(jvm)->pending_exception = root;
-   jvm_exception_state(jvm)->pending_owned = true;
-   if (e) {
-      jvm_meta_lock();
-      jvm_forget_local(jvm,e); jvm_deref_object(jvm,e);
-      jvm_meta_unlock();
-   }
-   const char *cls = jvm_get_class_name(jvm, p1);
-   jvm_trace_pending("ThrowNew", cls, p2);
-   snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
-            "%s", cls ? cls : "java/lang/Throwable");
-   snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
-            "%s", p2 ? p2 : "");
-   return 0;
+  assert(p0 && p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jobject e = p0[0]->AllocObject(p0, p1);
+  /* AllocObject can only fail if the class handle is bad; the exception
+   * still has to become pending, so fall back to the class object itself. */
+  jobject root=jvm_ref_object(jvm,e ? e : (jthrowable)p1);
+  jvm_clear_pending(jvm);
+  jvm_exception_state(jvm)->pending_exception = root;
+  jvm_exception_state(jvm)->pending_owned = true;
+  if (e) {
+    jvm_meta_lock();
+    jvm_forget_local(jvm,e);
+    jvm_deref_object(jvm,e);
+    jvm_meta_unlock();
+  }
+  const char *cls = jvm_get_class_name(jvm, p1);
+  jvm_trace_pending("ThrowNew", cls, p2);
+  snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
+           "%s", cls ? cls : "java/lang/Throwable");
+  snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
+           "%s", p2 ? p2 : "");
+  return 0;
 }
 
 void
 jvm_throw_new(struct jvm *jvm, const char *class_name, const char *msg)
 {
-   if (!jvm || !class_name) return;
-   JNIEnv *env = &jvm->env;
-   /* FindClass itself reports resolution failure through this helper.
-    * Do not recursively resolve another missing exception class. */
-   jclass cls = dvm_jni_class_exists(class_name)
-      ? jvm_make_class(jvm, class_name) : NULL;
-   if (cls) {
-      JNIEnv_ThrowNew(env, cls, msg);
-      return;
-   }
-   jvm_trace_pending("throw_new", class_name, msg);
-   jvm_clear_pending(jvm);
-   jvm_exception_state(jvm)->pending_exception = (jthrowable)(uintptr_t)1;
-   snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
-            "%s", class_name);
-   snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
-            "%s", msg ? msg : "");
+  if (!jvm || !class_name) return;
+  JNIEnv *env = &jvm->env;
+  /* FindClass itself reports resolution failure through this helper.
+   * Do not recursively resolve another missing exception class. */
+  jclass cls = dvm_jni_class_exists(class_name)
+               ? jvm_make_class(jvm, class_name) : NULL;
+  if (cls) {
+    JNIEnv_ThrowNew(env, cls, msg);
+    return;
+  }
+  jvm_trace_pending("throw_new", class_name, msg);
+  jvm_clear_pending(jvm);
+  jvm_exception_state(jvm)->pending_exception = (jthrowable)(uintptr_t)1;
+  snprintf(jvm_exception_state(jvm)->pending_exception_class, sizeof jvm_exception_state(jvm)->pending_exception_class,
+           "%s", class_name);
+  snprintf(jvm_exception_state(jvm)->pending_exception_msg, sizeof jvm_exception_state(jvm)->pending_exception_msg,
+           "%s", msg ? msg : "");
 }
 
 bool
 jvm_take_pending_exception(struct jvm *jvm, jthrowable *object,
                            char *cls, size_t cls_cap, char *msg, size_t msg_cap)
 {
-   struct jvm_exception_state *e = jvm_exception_state(jvm);
-   if (!e->pending_exception)
-      return false;
-   if (object) *object = e->pending_owned
-      ? jvm_record_local(jvm,e->pending_exception) : NULL;
-   else if (e->pending_owned) jvm_deref_object(jvm,e->pending_exception);
-   e->pending_owned=false;
-   if (cls && cls_cap) {
-      snprintf(cls, cls_cap, "%s", e->pending_exception_class);
-      for (char *c = cls; *c; ++c) if (*c == '.') *c = '/';
-   }
-   if (msg && msg_cap) snprintf(msg, msg_cap, "%s", e->pending_exception_msg);
-   e->pending_exception = NULL;
-   e->pending_exception_class[0] = '\0';
-   e->pending_exception_msg[0] = '\0';
-   return true;
+  struct jvm_exception_state *e = jvm_exception_state(jvm);
+  if (!e->pending_exception)
+    return false;
+  if (object) *object = e->pending_owned
+                          ? jvm_record_local(jvm,e->pending_exception) : NULL;
+  else if (e->pending_owned) jvm_deref_object(jvm,e->pending_exception);
+  e->pending_owned=false;
+  if (cls && cls_cap) {
+    snprintf(cls, cls_cap, "%s", e->pending_exception_class);
+    for (char *c = cls; *c; ++c) if (*c == '.') *c = '/';
+  }
+  if (msg && msg_cap) snprintf(msg, msg_cap, "%s", e->pending_exception_msg);
+  e->pending_exception = NULL;
+  e->pending_exception_class[0] = '\0';
+  e->pending_exception_msg[0] = '\0';
+  return true;
 }
 
 static jthrowable
 JNIEnv_ExceptionOccurred(JNIEnv* p0)
 {
-   assert(p0);
-   struct jvm *jvm=jnienv_get_jvm(p0);
-   struct jvm_exception_state *e=jvm_exception_state(jvm);
-   return e->pending_owned
-      ? jvm_record_local(jvm,jvm_ref_object(jvm,e->pending_exception)) : NULL;
+  assert(p0);
+  struct jvm *jvm=jnienv_get_jvm(p0);
+  struct jvm_exception_state *e=jvm_exception_state(jvm);
+  return e->pending_owned
+         ? jvm_record_local(jvm,jvm_ref_object(jvm,e->pending_exception)) : NULL;
 }
 
 static void
 JNIEnv_ExceptionDescribe(JNIEnv* p0)
 {
-   assert(p0);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   if (!jvm_exception_state(jvm)->pending_exception) return;
-   fprintf(stderr, "[jvm] exception: %s%s%s\n", jvm_exception_state(jvm)->pending_exception_class,
-           jvm_exception_state(jvm)->pending_exception_msg[0] ? ": " : "",
-           jvm_exception_state(jvm)->pending_exception_msg);
+  assert(p0);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  if (!jvm_exception_state(jvm)->pending_exception) return;
+  fprintf(stderr, "[jvm] exception: %s%s%s\n", jvm_exception_state(jvm)->pending_exception_class,
+          jvm_exception_state(jvm)->pending_exception_msg[0] ? ": " : "",
+          jvm_exception_state(jvm)->pending_exception_msg);
 }
 
 static void
 JNIEnv_ExceptionClear(JNIEnv* p0)
 {
-   assert(p0);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_clear_pending(jvm);
+  assert(p0);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jvm_clear_pending(jvm);
 }
 
 static void
 JNIEnv_FatalError(JNIEnv* p0, const char* p1)
 {
-   assert(p0 && p1);
-   verbose("FatalError: %s", p1);
+  assert(p0 && p1);
+  verbose("FatalError: %s", p1);
 }
 
 struct jvm_local_frame {
-   struct jvm_local_frame *prev;
-   jobject *items;
-   size_t count, capacity;
+  struct jvm_local_frame *prev;
+  jobject *items;
+  size_t count, capacity;
 };
 struct jvm_local_state {
-   struct jvm_local_state *next;
-   uint64_t token;
-   pthread_t host;
-   struct jvm_local_frame *top;
+  struct jvm_local_state *next;
+  uint64_t token;
+  pthread_t host;
+  struct jvm_local_frame *top;
 };
 /* Guest tokens include the pthread generation and survive engine migration. */
 static struct jvm_local_state *jvm_local_state(struct jvm *jvm, bool create)
 {
-   uint64_t token=arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
-   pthread_t host=pthread_self();
-   struct jvm_local_state *s=jvm->local_states;
-   for (;s;s=s->next)
-      if (s->token==token && (token || pthread_equal(s->host,host))) return s;
-   if (!create) return NULL;
-   s=calloc(1,sizeof *s);
-   if (!s) return NULL;
-   s->token=token; s->host=host; s->next=jvm->local_states; jvm->local_states=s;
-   return s;
+  uint64_t token=arm_exec_jni_thread_token ? arm_exec_jni_thread_token() : 0;
+  pthread_t host=pthread_self();
+  struct jvm_local_state *s=jvm->local_states;
+  for (; s; s=s->next)
+    if (s->token==token && (token || pthread_equal(s->host,host))) return s;
+  if (!create) return NULL;
+  s=calloc(1,sizeof *s);
+  if (!s) return NULL;
+  s->token=token;
+  s->host=host;
+  s->next=jvm->local_states;
+  jvm->local_states=s;
+  return s;
 }
 static jobject jvm_record_local(struct jvm *jvm, jobject object)
 {
-   if (!object) return NULL;
-   jvm_meta_lock();
-   struct jvm_object *o=jvm_get_object(jvm,object);
-   struct jvm_local_state *s=jvm_local_state(jvm,false);
-   struct jvm_local_frame *f=s ? s->top : NULL;
-   /* Class definitions and IDs are interned metadata in this compact VM. */
-   if (!f || !o || o->type==JVM_OBJECT_CLASS || o->type==JVM_OBJECT_METHOD) {
-      jvm_meta_unlock(); return object;
-   }
-   if (f->count==f->capacity) {
-      size_t cap=f->capacity ? f->capacity*2 : 16;
-      jobject *items=cap>=f->capacity && cap<=SIZE_MAX/sizeof *items
-         ? realloc(f->items,cap*sizeof *items) : NULL;
-      if (!items) {
-         s->top=NULL; /* ThrowNew itself must not recurse into a failed frame. */
-         jvm_deref_object(jvm,object);
-         jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI local references");
-         s->top=f; jvm_meta_unlock(); return NULL;
-      }
-      f->items=items; f->capacity=cap;
-   }
-   f->items[f->count++]=object;
-   if (o->type==JVM_OBJECT_OPAQUE) o->bridge_owned=true;
-   jvm_meta_unlock(); return object;
+  if (!object) return NULL;
+  jvm_meta_lock();
+  struct jvm_object *o=jvm_get_object(jvm,object);
+  struct jvm_local_state *s=jvm_local_state(jvm,false);
+  struct jvm_local_frame *f=s ? s->top : NULL;
+  /* Class definitions and IDs are interned metadata in this compact VM. */
+  if (!f || !o || o->type==JVM_OBJECT_CLASS || o->type==JVM_OBJECT_METHOD) {
+    jvm_meta_unlock();
+    return object;
+  }
+  if (f->count==f->capacity) {
+    size_t cap=f->capacity ? f->capacity*2 : 16;
+    jobject *items=cap>=f->capacity && cap<=SIZE_MAX/sizeof *items
+                   ? realloc(f->items,cap*sizeof *items) : NULL;
+    if (!items) {
+      s->top=NULL; /* ThrowNew itself must not recurse into a failed frame. */
+      jvm_deref_object(jvm,object);
+      jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI local references");
+      s->top=f;
+      jvm_meta_unlock();
+      return NULL;
+    }
+    f->items=items;
+    f->capacity=cap;
+  }
+  f->items[f->count++]=object;
+  if (o->type==JVM_OBJECT_OPAQUE) o->bridge_owned=true;
+  jvm_meta_unlock();
+  return object;
 }
 static bool jvm_forget_local(struct jvm *jvm, jobject object)
 {
-   struct jvm_local_state *s=jvm_local_state(jvm,false);
-   for (struct jvm_local_frame *f=s ? s->top : NULL;f;f=f->prev)
-      for (size_t i=f->count;i>0;--i)
-         if (f->items[i-1]==object) { f->items[i-1]=NULL; return true; }
-   return false;
+  struct jvm_local_state *s=jvm_local_state(jvm,false);
+  for (struct jvm_local_frame *f=s ? s->top : NULL; f; f=f->prev)
+    for (size_t i=f->count; i>0; --i)
+      if (f->items[i-1]==object) {
+        f->items[i-1]=NULL;
+        return true;
+      }
+  return false;
 }
 static jint JNIEnv_PushLocalFrame(JNIEnv *env, jint capacity)
 {
-   struct jvm *jvm=jnienv_get_jvm(env);
-   if (capacity<0) return JNI_ERR;
-   jvm_meta_lock();
-   struct jvm_local_state *s=jvm_local_state(jvm,true);
-   struct jvm_local_frame *f=calloc(1,sizeof *f);
-   size_t n=capacity>16 ? (size_t)capacity : 16;
-   if (f && n<=SIZE_MAX/sizeof *f->items) {
-      f->items=calloc(n,sizeof *f->items); f->capacity=n;
-   }
-   if (!s || !f || !f->items) {
-      if (f) { free(f->items); free(f); }
-      jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI local frame");
-      jvm_meta_unlock(); return JNI_ERR;
-   }
-   f->prev=s->top; s->top=f;
-   jvm_meta_unlock(); return JNI_OK;
+  struct jvm *jvm=jnienv_get_jvm(env);
+  if (capacity<0) return JNI_ERR;
+  jvm_meta_lock();
+  struct jvm_local_state *s=jvm_local_state(jvm,true);
+  struct jvm_local_frame *f=calloc(1,sizeof *f);
+  size_t n=capacity>16 ? (size_t)capacity : 16;
+  if (f && n<=SIZE_MAX/sizeof *f->items) {
+    f->items=calloc(n,sizeof *f->items);
+    f->capacity=n;
+  }
+  if (!s || !f || !f->items) {
+    if (f) {
+      free(f->items);
+      free(f);
+    }
+    jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI local frame");
+    jvm_meta_unlock();
+    return JNI_ERR;
+  }
+  f->prev=s->top;
+  s->top=f;
+  jvm_meta_unlock();
+  return JNI_OK;
 }
 static jobject JNIEnv_PopLocalFrame(JNIEnv *env, jobject result)
 {
-   struct jvm *jvm=jnienv_get_jvm(env);
-   jvm_meta_lock();
-   struct jvm_local_state *s=jvm_local_state(jvm,false);
-   struct jvm_local_frame *f=s ? s->top : NULL;
-   if (!f) { jvm_meta_unlock(); return result; }
-   /* Keep result alive before releasing any aliases in the popped frame. */
-   if (result) result=jvm_ref_object(jvm,result);
-   s->top=f->prev;
-   for (size_t i=f->count;i>0;--i)
-      if (f->items[i-1]) jvm_deref_object(jvm,f->items[i-1]);
-   free(f->items); free(f);
-   result=jvm_record_local(jvm,result);
-   jvm_meta_unlock(); return result;
+  struct jvm *jvm=jnienv_get_jvm(env);
+  jvm_meta_lock();
+  struct jvm_local_state *s=jvm_local_state(jvm,false);
+  struct jvm_local_frame *f=s ? s->top : NULL;
+  if (!f) {
+    jvm_meta_unlock();
+    return result;
+  }
+  /* Keep result alive before releasing any aliases in the popped frame. */
+  if (result) result=jvm_ref_object(jvm,result);
+  s->top=f->prev;
+  for (size_t i=f->count; i>0; --i)
+    if (f->items[i-1]) jvm_deref_object(jvm,f->items[i-1]);
+  free(f->items);
+  free(f);
+  result=jvm_record_local(jvm,result);
+  jvm_meta_unlock();
+  return result;
 }
 
 /* Enter after the guest thread identity is installed, and leave before it
  * is restored. The returned reference belongs to the calling Java bridge. */
 void *jvm_native_frame_begin(struct jvm *jvm)
 {
-   if (JNIEnv_PushLocalFrame(&jvm->env,16)!=JNI_OK) return NULL;
-   jvm_meta_lock();
-   struct jvm_local_state *s=jvm_local_state(jvm,false);
-   void *frame=s->top;
-   jvm_meta_unlock();
-   return frame;
+  if (JNIEnv_PushLocalFrame(&jvm->env,16)!=JNI_OK) return NULL;
+  jvm_meta_lock();
+  struct jvm_local_state *s=jvm_local_state(jvm,false);
+  void *frame=s->top;
+  jvm_meta_unlock();
+  return frame;
 }
 jobject jvm_native_frame_end(struct jvm *jvm, void *frame, jobject result)
 {
-   jvm_meta_lock();
-   struct jvm_local_state *s=jvm_local_state(jvm,false);
-   struct jvm_local_frame *f=s ? s->top : NULL;
-   while (f && f!=frame) f=f->prev;
-   if (f) {
-      /* Also unwind explicit frames left open by the native method. */
-      while (s->top!=frame) result=JNIEnv_PopLocalFrame(&jvm->env,result);
-      result=JNIEnv_PopLocalFrame(&jvm->env,result);
-   }
-   jvm_meta_unlock();
-   return result;
+  jvm_meta_lock();
+  struct jvm_local_state *s=jvm_local_state(jvm,false);
+  struct jvm_local_frame *f=s ? s->top : NULL;
+  while (f && f!=frame) f=f->prev;
+  if (f) {
+    /* Also unwind explicit frames left open by the native method. */
+    while (s->top!=frame) result=JNIEnv_PopLocalFrame(&jvm->env,result);
+    result=JNIEnv_PopLocalFrame(&jvm->env,result);
+  }
+  jvm_meta_unlock();
+  return result;
 }
 
 /* Bounded, opt-in ownership traces for diagnosing retained bridge locals. */
 static void jvm_trace_bridge_ref(struct jvm *jvm, jobject object, unsigned kind)
 {
-   static _Thread_local int enabled;
-   static _Thread_local unsigned counts[5];
-   static const char *const names[]={"NewGlobalRef","NewLocalRef","GetObjectArrayElement","DeleteGlobalRef","DeleteLocalRef"};
-   if (!enabled) enabled=getenv("LUNARIA_TRACE_JNI_REFS") ? 1 : -1;
-   if (enabled < 0 || !object || kind >= 5 || counts[kind] >= 8) return;
-   jvm_meta_lock();
-   struct jvm_object *o=jvm_get_object(jvm,object);
-   bool trace=o && o->type==JVM_OBJECT_OPAQUE && o->bridge_owned;
-   if (trace) {
-      ++counts[kind];
-      struct jvm_object *c=jvm_get_object(jvm,o->this_klass);
-      fprintf(stderr,"[jni-ref] %s handle=%p class=%s refs=%d array=%d global=%d\n",
-              names[kind],(void *)object,
-              c && c->type==JVM_OBJECT_CLASS ? c->klass.name.data : "?",
-              o->refs,o->array_refs,o->global_refs);
-   }
-   jvm_meta_unlock();
-   if (trace) {
-      void *frames[16];
-      int n=luna_os_backtrace(frames,16);
-      luna_os_backtrace_print(frames,n);
-   }
+  static _Thread_local int enabled;
+  static _Thread_local unsigned counts[5];
+  static const char *const names[]= {"NewGlobalRef","NewLocalRef","GetObjectArrayElement","DeleteGlobalRef","DeleteLocalRef"};
+  if (!enabled) enabled=getenv("LUNARIA_TRACE_JNI_REFS") ? 1 : -1;
+  if (enabled < 0 || !object || kind >= 5 || counts[kind] >= 8) return;
+  jvm_meta_lock();
+  struct jvm_object *o=jvm_get_object(jvm,object);
+  bool trace=o && o->type==JVM_OBJECT_OPAQUE && o->bridge_owned;
+  if (trace) {
+    ++counts[kind];
+    struct jvm_object *c=jvm_get_object(jvm,o->this_klass);
+    fprintf(stderr,"[jni-ref] %s handle=%p class=%s refs=%d array=%d global=%d\n",
+            names[kind],(void *)object,
+            c && c->type==JVM_OBJECT_CLASS ? c->klass.name.data : "?",
+            o->refs,o->array_refs,o->global_refs);
+  }
+  jvm_meta_unlock();
+  if (trace) {
+    void *frames[16];
+    int n=luna_os_backtrace(frames,16);
+    luna_os_backtrace_print(frames,n);
+  }
 }
 
 static jobject
 JNIEnv_NewGlobalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   if (!p1) return NULL;
-   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,0);
-   struct jvm *jvm=jnienv_get_jvm(p0);
-   jvm_meta_lock();
-   jobject result=jvm_ref_object(jvm,p1);
-   struct jvm_object *o=jvm_get_object(jvm,p1);
-   if (o && o->type != JVM_OBJECT_NONE) ++o->global_refs;
-   jvm_meta_unlock();
-   return result;
+  assert(p0);
+  if (!p1) return NULL;
+  jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+  jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,0);
+  struct jvm *jvm=jnienv_get_jvm(p0);
+  jvm_meta_lock();
+  jobject result=jvm_ref_object(jvm,p1);
+  struct jvm_object *o=jvm_get_object(jvm,p1);
+  if (o && o->type != JVM_OBJECT_NONE) ++o->global_refs;
+  jvm_meta_unlock();
+  return result;
 }
 
 static void
 JNIEnv_DeleteGlobalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,3);
-   struct jvm *jvm=jnienv_get_jvm(p0);
-   jvm_meta_lock();
-   struct jvm_object *o=jvm_get_object(jvm,p1);
-   if (o && o->global_refs > 0) --o->global_refs;
-   jvm_deref_object(jvm,p1);
-   jvm_meta_unlock();
+  assert(p0);
+  jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+  jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,3);
+  struct jvm *jvm=jnienv_get_jvm(p0);
+  jvm_meta_lock();
+  struct jvm_object *o=jvm_get_object(jvm,p1);
+  if (o && o->global_refs > 0) --o->global_refs;
+  jvm_deref_object(jvm,p1);
+  jvm_meta_unlock();
 }
 
 static void
 JNIEnv_DeleteLocalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,4);
-   jvm_meta_lock();
-   /* A handle native code never recorded is the bridge's incoming local, so
-    * deleting it consumes the bridge's reference (JNI: callee may delete its
-    * argument locals) and the bridge must not release it again. */
-   if (!jvm_forget_local(jnienv_get_jvm(p0),p1) && p1) {
-      struct jvm_object *o = jvm_get_object(jnienv_get_jvm(p0), p1);
-      if (o->type != JVM_OBJECT_NONE && o->bridge_pending > 0) --o->bridge_pending;
-   }
-   jvm_deref_object(jnienv_get_jvm(p0), p1);
-   jvm_meta_unlock();
+  assert(p0);
+  jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+  jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,4);
+  jvm_meta_lock();
+  /* A handle native code never recorded is the bridge's incoming local, so
+   * deleting it consumes the bridge's reference (JNI: callee may delete its
+   * argument locals) and the bridge must not release it again. */
+  if (!jvm_forget_local(jnienv_get_jvm(p0),p1) && p1) {
+    struct jvm_object *o = jvm_get_object(jnienv_get_jvm(p0), p1);
+    if (o->type != JVM_OBJECT_NONE && o->bridge_pending > 0) --o->bridge_pending;
+  }
+  jvm_deref_object(jnienv_get_jvm(p0), p1);
+  jvm_meta_unlock();
 }
 
 static jboolean
 JNIEnv_IsSameObject(JNIEnv* p0, jobject p1, jobject p2)
 {
-   assert(p0);
-   jvm_meta_lock();
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jboolean same = jvm_resolve_reference(jvm,p1) == jvm_resolve_reference(jvm,p2);
-   jvm_meta_unlock();
-   return same;
+  assert(p0);
+  jvm_meta_lock();
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jboolean same = jvm_resolve_reference(jvm,p1) == jvm_resolve_reference(jvm,p2);
+  jvm_meta_unlock();
+  return same;
 }
 
 static jobject
 JNIEnv_NewLocalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   /* NULL is a valid argument: NewLocalRef(NULL) returns NULL.  Unity reaches
-    * this with the result of ExceptionOccurred() when no exception is
-    * pending, so asserting here aborted the process on a normal code path. */
-   if (!p1) return NULL;
-   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
-   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,1);
-   return jvm_record_local(jnienv_get_jvm(p0),jvm_ref_object(jnienv_get_jvm(p0), p1));
+  assert(p0);
+  /* NULL is a valid argument: NewLocalRef(NULL) returns NULL.  Unity reaches
+   * this with the result of ExceptionOccurred() when no exception is
+   * pending, so asserting here aborted the process on a normal code path. */
+  if (!p1) return NULL;
+  jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
+  jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,1);
+  return jvm_record_local(jnienv_get_jvm(p0),jvm_ref_object(jnienv_get_jvm(p0), p1));
 }
 
 static jint
 JNIEnv_EnsureLocalCapacity(JNIEnv* p0, jint p1)
 {
-   assert(p0);
-   return 0;
+  assert(p0);
+  return 0;
 }
 
 /* Defined below, next to the other call paths. */
@@ -1353,112 +1385,114 @@ static bool jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id,
 static jobject
 JNIEnv_AllocObject(JNIEnv* p0, jclass p1)
 {
-   assert(p0);
-   /* Limp mode: an unimplemented stub upstream may have handed the guest a
-    * NULL class.  Substitute a generic java/lang/Object class instead of
-    * asserting so engine init keeps making progress (same policy as
-    * GetObjectClass below). */
-   if (!p1) {
-      verbose("AllocObject: NULL class (unimplemented stub?) — using generic Object class");
-      p1 = jvm_make_class(jnienv_get_jvm(p0), "java/lang/Object");
-   }
-   /* Every allocation denotes a new Java object.  Opaque objects used to go
-    * through the value-interning path, whose equality key is just type and
-    * class.  That made every File share one identity (and therefore one path)
-    * and every Proxy share one native callback — and every X509Certificate
-    * from getAcceptedIssuers() collapse to one handle, so getEncoded() could
-    * not find the DER bytes UnityTLS needs.  Classes and method IDs are
-    * interned values; ordinary object instances must never be. */
-   struct jvm_object o = { .this_klass = p1, .type = JVM_OBJECT_OPAQUE };
-   return jvm_add_object(jnienv_get_jvm(p0), &o);
+  assert(p0);
+  /* Limp mode: an unimplemented stub upstream may have handed the guest a
+   * NULL class.  Substitute a generic java/lang/Object class instead of
+   * asserting so engine init keeps making progress (same policy as
+   * GetObjectClass below). */
+  if (!p1) {
+    verbose("AllocObject: NULL class (unimplemented stub?) — using generic Object class");
+    p1 = jvm_make_class(jnienv_get_jvm(p0), "java/lang/Object");
+  }
+  /* Every allocation denotes a new Java object.  Opaque objects used to go
+   * through the value-interning path, whose equality key is just type and
+   * class.  That made every File share one identity (and therefore one path)
+   * and every Proxy share one native callback — and every X509Certificate
+   * from getAcceptedIssuers() collapse to one handle, so getEncoded() could
+   * not find the DER bytes UnityTLS needs.  Classes and method IDs are
+   * interned values; ordinary object instances must never be. */
+  struct jvm_object o = { .this_klass = p1, .type = JVM_OBJECT_OPAQUE };
+  return jvm_add_object(jnienv_get_jvm(p0), &o);
 }
 
 struct jvm_cached_ref {
-   jobject *slot;
-   struct jvm_cached_ref *next;
+  jobject *slot;
+  struct jvm_cached_ref *next;
 };
 
 /* Called under the metadata lock. Cache slots are host storage, not Java
  * roots by themselves; remember them for both ownership and JVM teardown. */
 static bool jvm_register_cache(struct jvm *jvm, jobject *slot)
 {
-   for (struct jvm_cached_ref *r = jvm->cached_refs; r; r = r->next)
-      if (r->slot == slot) return true;
-   struct jvm_cached_ref *r = malloc(sizeof *r);
-   if (!r) return false;
-   *r = (struct jvm_cached_ref){ .slot = slot, .next = jvm->cached_refs };
-   jvm->cached_refs = r;
-   return true;
+  for (struct jvm_cached_ref *r = jvm->cached_refs; r; r = r->next)
+    if (r->slot == slot) return true;
+  struct jvm_cached_ref *r = malloc(sizeof *r);
+  if (!r) return false;
+  *r = (struct jvm_cached_ref) {
+    .slot = slot, .next = jvm->cached_refs
+  };
+  jvm->cached_refs = r;
+  return true;
 }
 
 bool jvm_cache_reference(JNIEnv *env, jobject *slot, jobject value)
 {
-   if (!env || !slot) return false;
-   struct jvm *jvm = jnienv_get_jvm(env);
-   jvm_meta_lock();
-   if (!jvm_register_cache(jvm, slot)) {
-      jvm_meta_unlock();
-      jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "framework JNI cache");
-      return false;
-   }
-   jobject owned = value ? JNIEnv_NewGlobalRef(env, value) : NULL;
-   jobject old = *slot;
-   *slot = owned;
-   if (old) JNIEnv_DeleteGlobalRef(env, old);
-   jvm_meta_unlock();
-   return !value || owned != NULL;
+  if (!env || !slot) return false;
+  struct jvm *jvm = jnienv_get_jvm(env);
+  jvm_meta_lock();
+  if (!jvm_register_cache(jvm, slot)) {
+    jvm_meta_unlock();
+    jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "framework JNI cache");
+    return false;
+  }
+  jobject owned = value ? JNIEnv_NewGlobalRef(env, value) : NULL;
+  jobject old = *slot;
+  *slot = owned;
+  if (old) JNIEnv_DeleteGlobalRef(env, old);
+  jvm_meta_unlock();
+  return !value || owned != NULL;
 }
 
 jobject jvm_cached_object_init(JNIEnv *env, jobject *slot, const char *class_name,
                                void (*initialize)(JNIEnv *, jobject, void *), void *data)
 {
-   if (!env || !slot) return NULL;
-   struct jvm *jvm = jnienv_get_jvm(env);
-   jvm_meta_lock();
-   if (*slot) {
-      jobject result = JNIEnv_NewLocalRef(env, *slot);
-      jvm_meta_unlock();
-      return result;
-   }
-   jvm_meta_unlock();
+  if (!env || !slot) return NULL;
+  struct jvm *jvm = jnienv_get_jvm(env);
+  jvm_meta_lock();
+  if (*slot) {
+    jobject result = JNIEnv_NewLocalRef(env, *slot);
+    jvm_meta_unlock();
+    return result;
+  }
+  jvm_meta_unlock();
 
-   /* Class resolution may acquire the interpreter lock. Keep it outside the
-    * metadata lock and recheck the cache after allocation for racing callers. */
-   jclass cls = JNIEnv_FindClass(env, class_name);
-   if (!cls) return NULL;
-   jobject created = JNIEnv_AllocObject(env, cls);
-   if (!created) return NULL;
-   if (initialize) initialize(env, created, data);
-   if ((*env)->ExceptionCheck(env)) {
-      JNIEnv_DeleteLocalRef(env, created);
-      return NULL;
-   }
-   jvm_meta_lock();
-   bool good = *slot || jvm_register_cache(jvm, slot);
-   if (good && !*slot) *slot = JNIEnv_NewGlobalRef(env, created);
-   jobject result = good ? JNIEnv_NewLocalRef(env, *slot) : NULL;
-   jvm_meta_unlock();
-   JNIEnv_DeleteLocalRef(env, created);
-   if (!good) jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "framework JNI cache");
-   return result;
+  /* Class resolution may acquire the interpreter lock. Keep it outside the
+   * metadata lock and recheck the cache after allocation for racing callers. */
+  jclass cls = JNIEnv_FindClass(env, class_name);
+  if (!cls) return NULL;
+  jobject created = JNIEnv_AllocObject(env, cls);
+  if (!created) return NULL;
+  if (initialize) initialize(env, created, data);
+  if ((*env)->ExceptionCheck(env)) {
+    JNIEnv_DeleteLocalRef(env, created);
+    return NULL;
+  }
+  jvm_meta_lock();
+  bool good = *slot || jvm_register_cache(jvm, slot);
+  if (good && !*slot) *slot = JNIEnv_NewGlobalRef(env, created);
+  jobject result = good ? JNIEnv_NewLocalRef(env, *slot) : NULL;
+  jvm_meta_unlock();
+  JNIEnv_DeleteLocalRef(env, created);
+  if (!good) jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "framework JNI cache");
+  return result;
 }
 
 jobject jvm_cached_object(JNIEnv *env, jobject *slot, const char *class_name)
 {
-   return jvm_cached_object_init(env, slot, class_name, NULL, NULL);
+  return jvm_cached_object_init(env, slot, class_name, NULL, NULL);
 }
 
 static bool
 jvm_class_is(struct jvm *jvm, jclass cls, const char *name)
 {
-   if (!jvm || !cls || !name)
-      return false;
-   struct jvm_object *ko = jvm_get_object(jvm, cls);
-   if(!ko || ko->type!=JVM_OBJECT_CLASS || !ko->klass.name.data)return false;
-   const char *stored=ko->klass.name.data;
-   for(;*stored && *name;++stored,++name)
-      if((*stored=='/' ? '.' : *stored)!=(*name=='/' ? '.' : *name))return false;
-   return !*stored && !*name;
+  if (!jvm || !cls || !name)
+    return false;
+  struct jvm_object *ko = jvm_get_object(jvm, cls);
+  if(!ko || ko->type!=JVM_OBJECT_CLASS || !ko->klass.name.data)return false;
+  const char *stored=ko->klass.name.data;
+  for(; *stored && *name; ++stored,++name)
+    if((*stored=='/' ? '.' : *stored)!=(*name=='/' ? '.' : *name))return false;
+  return !*stored && !*name;
 }
 
 /* NewObject is AllocObject *plus the constructor*.  Skipping the second half
@@ -1474,107 +1508,107 @@ jvm_class_is(struct jvm *jvm, jclass cls, const char *name)
 static jobject
 JNIEnv_NewObjectV(JNIEnv *p0, jclass p1, jmethodID p2, va_list p3)
 {
-   assert(p0);
-   jobject o = JNIEnv_AllocObject(p0, p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   if (jvm_class_is(jvm, p1, "java/io/File")) {
-      va_list ap2;
-      va_copy(ap2, p3);
-      jni_file_bind_ctor(p0, o, p2, ap2);
-      va_end(ap2);
-      return o;
-   }
-   jvalue rv;
-   va_list copy;
-   va_copy(copy, p3);
-   (void)jvm_dvm_try(p0, o, p2, false, &copy, NULL, &rv);
-   va_end(copy);
-   return o;
+  assert(p0);
+  jobject o = JNIEnv_AllocObject(p0, p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  if (jvm_class_is(jvm, p1, "java/io/File")) {
+    va_list ap2;
+    va_copy(ap2, p3);
+    jni_file_bind_ctor(p0, o, p2, ap2);
+    va_end(ap2);
+    return o;
+  }
+  jvalue rv;
+  va_list copy;
+  va_copy(copy, p3);
+  (void)jvm_dvm_try(p0, o, p2, false, &copy, NULL, &rv);
+  va_end(copy);
+  return o;
 }
 
 static jobject
 JNIEnv_NewObject(JNIEnv* p0, jclass p1, jmethodID p2, ...)
 {
-   va_list ap;
-   va_start(ap, p2);
-   const jobject r = JNIEnv_NewObjectV(p0, p1, p2, ap);
-   va_end(ap);
-   return r;
+  va_list ap;
+  va_start(ap, p2);
+  const jobject r = JNIEnv_NewObjectV(p0, p1, p2, ap);
+  va_end(ap);
+  return r;
 }
 
 static jobject
 JNIEnv_NewObjectA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
 {
-   assert(p0);
-   jobject o = JNIEnv_AllocObject(p0, p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   if (jvm_class_is(jvm, p1, "java/io/File")) {
-      jni_file_bind_ctor_a(p0, o, p2, p3);
-      return o;
-   }
-   jvalue rv;
-   (void)jvm_dvm_try(p0, o, p2, false, NULL, p3, &rv);
-   return o;
+  assert(p0);
+  jobject o = JNIEnv_AllocObject(p0, p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  if (jvm_class_is(jvm, p1, "java/io/File")) {
+    jni_file_bind_ctor_a(p0, o, p2, p3);
+    return o;
+  }
+  jvalue rv;
+  (void)jvm_dvm_try(p0, o, p2, false, NULL, p3, &rv);
+  return o;
 }
 
 static jclass
 JNIEnv_GetObjectClass(JNIEnv* env, jobject p1)
 {
-   assert(env);
-   /* Limp mode: unimplemented stubs hand back NULL objects.  Aborting the whole
-    * process on the first one prevents the engine from making any further
-    * progress.  We don't know the real class of a NULL object, so hand back a
-    * generic java/lang/Object class — that keeps the downstream reflection
-    * (GetMethodID/GetSuperclass/…) from cascading into NULL-pointer asserts. */
-   if (!p1) {
-      verbose("GetObjectClass: NULL object (unimplemented stub?) — returning generic Object class");
-      return jvm_make_class(jnienv_get_jvm(env), "java/lang/Object");
-   }
-   verbose("%u", (uint32_t)(uintptr_t)p1);
-   {
-      struct jvm_object *o = jvm_get_object(jnienv_get_jvm(env), p1);
-      if (!o->this_klass)
-         fprintf(stderr, "[jvm] GetObjectClass: handle %p has no class (type %d refs %d global %d bridge_owned %d)\n",
-                 (void *)p1, (int)o->type, o->refs, o->global_refs, (int)o->bridge_owned);
-      return o->this_klass;
-   }
+  assert(env);
+  /* Limp mode: unimplemented stubs hand back NULL objects.  Aborting the whole
+   * process on the first one prevents the engine from making any further
+   * progress.  We don't know the real class of a NULL object, so hand back a
+   * generic java/lang/Object class — that keeps the downstream reflection
+   * (GetMethodID/GetSuperclass/…) from cascading into NULL-pointer asserts. */
+  if (!p1) {
+    verbose("GetObjectClass: NULL object (unimplemented stub?) — returning generic Object class");
+    return jvm_make_class(jnienv_get_jvm(env), "java/lang/Object");
+  }
+  verbose("%u", (uint32_t)(uintptr_t)p1);
+  {
+    struct jvm_object *o = jvm_get_object(jnienv_get_jvm(env), p1);
+    if (!o->this_klass)
+      fprintf(stderr, "[jvm] GetObjectClass: handle %p has no class (type %d refs %d global %d bridge_owned %d)\n",
+              (void *)p1, (int)o->type, o->refs, o->global_refs, (int)o->bridge_owned);
+    return o->this_klass;
+  }
 }
 
 static jboolean
 JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
 {
-   assert(p0);
-   /* A NULL class is a caller bug (CheckJNI aborts the same way), but the
-    * dispatcher has already named the call site; answer false instead of
-    * killing the host so the guest's own failure handling can run. */
-   if (!p2) return JNI_FALSE;
-   /* JNI permits a null object: it can be cast to every reference class. */
-   if (!p1) return JNI_TRUE;
-   verbose("%u, %u", (uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2);
-   {
-      struct jvm_object *po = jvm_get_object(jnienv_get_jvm(p0), p1);
-      if (!po || !po->this_klass || po->type == JVM_OBJECT_NONE) {
-         fprintf(stderr, "[jvm] IsInstanceOf: handle %p is %s (type %d, class handle %p); class arg %p\n",
-                 (void *)p1, po && po->type != JVM_OBJECT_NONE ? "classless" : "a released slot",
-                 po ? (int)po->type : -1, po ? (void *)po->this_klass : NULL, (void *)p2);
-         abort();
-      }
-   }
-   const char *oc = jvm_get_object(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass)->klass.name.data;
-   const char *tc = jvm_get_object(jnienv_get_jvm(p0), p2)->klass.name.data;
-   verbose("%s instanceof %s", oc, tc);
-   if (getenv("LUNARIA_TOUCH_DIAG") && (strstr(oc, "Event") || strstr(tc, "Event")))
-      fprintf(stderr, "[motion-jni] instanceof %s -> %s = %d\n", oc, tc,
-              jvm_name_eq(oc, tc) || jvm_name_assignable(oc, tc));
+  assert(p0);
+  /* A NULL class is a caller bug (CheckJNI aborts the same way), but the
+   * dispatcher has already named the call site; answer false instead of
+   * killing the host so the guest's own failure handling can run. */
+  if (!p2) return JNI_FALSE;
+  /* JNI permits a null object: it can be cast to every reference class. */
+  if (!p1) return JNI_TRUE;
+  verbose("%u, %u", (uint32_t)(uintptr_t)p1, (uint32_t)(uintptr_t)p2);
+  {
+    struct jvm_object *po = jvm_get_object(jnienv_get_jvm(p0), p1);
+    if (!po || !po->this_klass || po->type == JVM_OBJECT_NONE) {
+      fprintf(stderr, "[jvm] IsInstanceOf: handle %p is %s (type %d, class handle %p); class arg %p\n",
+              (void *)p1, po && po->type != JVM_OBJECT_NONE ? "classless" : "a released slot",
+              po ? (int)po->type : -1, po ? (void *)po->this_klass : NULL, (void *)p2);
+      abort();
+    }
+  }
+  const char *oc = jvm_get_object(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass)->klass.name.data;
+  const char *tc = jvm_get_object(jnienv_get_jvm(p0), p2)->klass.name.data;
+  verbose("%s instanceof %s", oc, tc);
+  if (getenv("LUNARIA_TOUCH_DIAG") && (strstr(oc, "Event") || strstr(tc, "Event")))
+    fprintf(stderr, "[motion-jni] instanceof %s -> %s = %d\n", oc, tc,
+            jvm_name_eq(oc, tc) || jvm_name_assignable(oc, tc));
 
-   if (jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass == p2 || jvm_name_eq(oc, tc))
-      return true;
-   /* The declared hierarchy — dex for the app's classes, the framework table
-    * for the platform's.  Never a substring match on the names: Unity's
-    * nativeInjectEvent asks `event instanceof KeyEvent` FIRST, and one false
-    * positive there routed every touch down the key-event path so getX/getY
-    * were never read and taps did nothing. */
-   return jvm_name_assignable(oc, tc);
+  if (jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass == p2 || jvm_name_eq(oc, tc))
+    return true;
+  /* The declared hierarchy — dex for the app's classes, the framework table
+   * for the platform's.  Never a substring match on the names: Unity's
+   * nativeInjectEvent asks `event instanceof KeyEvent` FIRST, and one false
+   * positive there routed every touch down the key-event path so getX/getY
+   * were never read and taps did nothing. */
+  return jvm_name_assignable(oc, tc);
 }
 
 /* ---- java.lang.StringBuilder (built into libjvm.so so dlsym always finds it) ----
@@ -1585,87 +1619,88 @@ JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
 #define SB_CAP  4096
 
 static struct {
-   jobject handle;
-   char    buf[SB_CAP];
-   size_t  len;
+  jobject handle;
+  char    buf[SB_CAP];
+  size_t  len;
 } sb_pool[SB_POOL];
 
 static int sb_find(jobject obj)
 {
-   for (int i = 0; i < SB_POOL; i++)
-      if (sb_pool[i].handle == obj) return i;
-   return -1;
+  for (int i = 0; i < SB_POOL; i++)
+    if (sb_pool[i].handle == obj) return i;
+  return -1;
 }
 
 static int sb_get_or_alloc(jobject obj)
 {
-   int i = sb_find(obj);
-   if (i >= 0) return i;
-   for (i = 0; i < SB_POOL; i++) {
-      if (!sb_pool[i].handle) {
-         sb_pool[i].handle = obj;
-         sb_pool[i].len = 0;
-         sb_pool[i].buf[0] = '\0';
-         return i;
-      }
-   }
-   return -1;
+  int i = sb_find(obj);
+  if (i >= 0) return i;
+  for (i = 0; i < SB_POOL; i++) {
+    if (!sb_pool[i].handle) {
+      sb_pool[i].handle = obj;
+      sb_pool[i].len = 0;
+      sb_pool[i].buf[0] = '\0';
+      return i;
+    }
+  }
+  return -1;
 }
 
 static void sb_append_cstr(int i, const char *s)
 {
-   if (i < 0 || !s) return;
-   size_t add = strlen(s);
-   size_t rem = SB_CAP - 1 - sb_pool[i].len;
-   if (add > rem) add = rem;
-   memcpy(sb_pool[i].buf + sb_pool[i].len, s, add);
-   sb_pool[i].len += add;
-   sb_pool[i].buf[sb_pool[i].len] = '\0';
+  if (i < 0 || !s) return;
+  size_t add = strlen(s);
+  size_t rem = SB_CAP - 1 - sb_pool[i].len;
+  if (add > rem) add = rem;
+  memcpy(sb_pool[i].buf + sb_pool[i].len, s, add);
+  sb_pool[i].len += add;
+  sb_pool[i].buf[sb_pool[i].len] = '\0';
 }
 
 void java_lang_StringBuilder__init_(JNIEnv *env, jobject obj, va_list args)
 {
-   (void)env; (void)args;
-   sb_get_or_alloc(obj);
+  (void)env;
+  (void)args;
+  sb_get_or_alloc(obj);
 }
 
 jobject java_lang_StringBuilder_append(JNIEnv *env, jobject obj, va_list args)
 {
-   int i = sb_get_or_alloc(obj);
-   if (i >= 0 && JVM_VA_HAS_ARGS(args)) {
-      uintptr_t raw = va_arg(args, uintptr_t);
-      if (raw > 0 && raw <= 65536) {
-         const char *s = (*env)->GetStringUTFChars(env, (jstring)(void*)raw, NULL);
-         sb_append_cstr(i, s ? s : "(null)");
-      } else {
-         char tmp[32];
-         snprintf(tmp, sizeof(tmp), "%ld", (long)raw);
-         sb_append_cstr(i, tmp);
-      }
-   }
-   return obj;
+  int i = sb_get_or_alloc(obj);
+  if (i >= 0 && JVM_VA_HAS_ARGS(args)) {
+    uintptr_t raw = va_arg(args, uintptr_t);
+    if (raw > 0 && raw <= 65536) {
+      const char *s = (*env)->GetStringUTFChars(env, (jstring)(void*)raw, NULL);
+      sb_append_cstr(i, s ? s : "(null)");
+    } else {
+      char tmp[32];
+      snprintf(tmp, sizeof(tmp), "%ld", (long)raw);
+      sb_append_cstr(i, tmp);
+    }
+  }
+  return obj;
 }
 
 jstring java_lang_StringBuilder_toString(JNIEnv *env, jobject obj, va_list args)
 {
-   (void)args;
-   int i = sb_find(obj);
-   const char *s = (i >= 0) ? sb_pool[i].buf : "";
-   jstring result = (*env)->NewStringUTF(env, s);
-   if (i >= 0) {
-      sb_pool[i].handle = NULL;
-      sb_pool[i].len = 0;
-   }
-   return result;
+  (void)args;
+  int i = sb_find(obj);
+  const char *s = (i >= 0) ? sb_pool[i].buf : "";
+  jstring result = (*env)->NewStringUTF(env, s);
+  if (i >= 0) {
+    sb_pool[i].handle = NULL;
+    sb_pool[i].len = 0;
+  }
+  return result;
 }
 
 static void
 jvm_form_symbol(struct jvm *jvm, const struct jvm_method *method, char *symbol, const size_t symbol_sz)
 {
-   assert(jvm && method);
-   verbose("%s::%s::%s", jvm_get_object_of_type(jvm, method->klass, JVM_OBJECT_CLASS)->klass.name.data, method->name.data, method->signature.data);
-   snprintf(symbol, symbol_sz, "%s_%s", jvm_get_object_of_type(jvm, method->klass, JVM_OBJECT_CLASS)->klass.name.data, method->name.data);
-   cstr_replace(symbol, "./$", '_');
+  assert(jvm && method);
+  verbose("%s::%s::%s", jvm_get_object_of_type(jvm, method->klass, JVM_OBJECT_CLASS)->klass.name.data, method->name.data, method->signature.data);
+  snprintf(symbol, symbol_sz, "%s_%s", jvm_get_object_of_type(jvm, method->klass, JVM_OBJECT_CLASS)->klass.name.data, method->name.data);
+  cstr_replace(symbol, "./$", '_');
 }
 
 /* The Android framework hierarchy for the base classes whose methods this file
@@ -1678,104 +1713,106 @@ jvm_form_symbol(struct jvm *jvm, const struct jvm_method *method, char *symbol, 
 static const char *
 jvm_framework_super(const char *name)
 {
-   static const struct { const char *cls, *super; } chain[] = {
-      { "android/app/NativeActivity",       "android/app/Activity" },
-      { "android/app/ListActivity",         "android/app/Activity" },
-      { "android/app/Activity",             "android/view/ContextThemeWrapper" },
-      { "android/view/ContextThemeWrapper", "android/content/ContextWrapper" },
-      { "android/app/Application",          "android/content/ContextWrapper" },
-      { "android/app/Service",              "android/content/ContextWrapper" },
-      { "android/content/ContextWrapper",   "android/content/Context" },
-      { "android/content/Context",          "java/lang/Object" },
-      { "android/view/MotionEvent",         "android/view/InputEvent" },
-      { "android/view/KeyEvent",            "android/view/InputEvent" },
-      { "android/view/InputEvent",          "java/lang/Object" },
-      { "android/view/SurfaceView",         "android/view/View" },
-      { "android/view/View",                "java/lang/Object" },
-      { "android/os/Bundle",                "android/os/BaseBundle" },
-      { "android/os/BaseBundle",            "java/lang/Object" },
-      { "java/lang/String",                 "java/lang/Object" },
-      { "java/lang/Integer",                "java/lang/Number" },
-      { "java/lang/Long",                   "java/lang/Number" },
-      { "java/lang/Short",                  "java/lang/Number" },
-      { "java/lang/Byte",                   "java/lang/Number" },
-      { "java/lang/Float",                  "java/lang/Number" },
-      { "java/lang/Double",                 "java/lang/Number" },
-      { "java/lang/Number",                 "java/lang/Object" },
-   };
-   /* jvm_make_class() stores names dotted, the dex and this table use slashes;
-    * compare with both separators treated as the same character. */
-   for (size_t i = 0; i < sizeof chain / sizeof chain[0]; ++i) {
-      const char *a = name, *b = chain[i].cls;
-      for (; *a && *b; ++a, ++b) {
-         char ca = (*a == '.') ? '/' : *a;
-         if (ca != *b) break;
-      }
-      if (!*a && !*b)
-         return chain[i].super;
-   }
-   return NULL;
+  static const struct {
+    const char *cls, *super;
+  } chain[] = {
+    { "android/app/NativeActivity",       "android/app/Activity" },
+    { "android/app/ListActivity",         "android/app/Activity" },
+    { "android/app/Activity",             "android/view/ContextThemeWrapper" },
+    { "android/view/ContextThemeWrapper", "android/content/ContextWrapper" },
+    { "android/app/Application",          "android/content/ContextWrapper" },
+    { "android/app/Service",              "android/content/ContextWrapper" },
+    { "android/content/ContextWrapper",   "android/content/Context" },
+    { "android/content/Context",          "java/lang/Object" },
+    { "android/view/MotionEvent",         "android/view/InputEvent" },
+    { "android/view/KeyEvent",            "android/view/InputEvent" },
+    { "android/view/InputEvent",          "java/lang/Object" },
+    { "android/view/SurfaceView",         "android/view/View" },
+    { "android/view/View",                "java/lang/Object" },
+    { "android/os/Bundle",                "android/os/BaseBundle" },
+    { "android/os/BaseBundle",            "java/lang/Object" },
+    { "java/lang/String",                 "java/lang/Object" },
+    { "java/lang/Integer",                "java/lang/Number" },
+    { "java/lang/Long",                   "java/lang/Number" },
+    { "java/lang/Short",                  "java/lang/Number" },
+    { "java/lang/Byte",                   "java/lang/Number" },
+    { "java/lang/Float",                  "java/lang/Number" },
+    { "java/lang/Double",                 "java/lang/Number" },
+    { "java/lang/Number",                 "java/lang/Object" },
+  };
+  /* jvm_make_class() stores names dotted, the dex and this table use slashes;
+   * compare with both separators treated as the same character. */
+  for (size_t i = 0; i < sizeof chain / sizeof chain[0]; ++i) {
+    const char *a = name, *b = chain[i].cls;
+    for (; *a && *b; ++a, ++b) {
+      char ca = (*a == '.') ? '/' : *a;
+      if (ca != *b) break;
+    }
+    if (!*a && !*b)
+      return chain[i].super;
+  }
+  return NULL;
 }
 
 static void*
 jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
 {
-   char symbol[255];
-   {
-      struct jvm_object *mo = jvm_get_object(jvm, method_id);
-      if (!mo || mo->type != JVM_OBJECT_METHOD)
-         fprintf(stderr, "[jvm] DIAG method id %p is type %d\n", (void*)method_id, mo ? (int)mo->type : -1);
-   }
-   struct jvm_method method = jvm_get_object_of_type(jvm, method_id, JVM_OBJECT_METHOD)->method;
-   struct jvm_object *owner = jvm_get_object_of_type(jvm, method.klass, JVM_OBJECT_CLASS);
-   /* A host fallback must not replace Java supplied by the application.
-    * Cache this decision with the DEX epoch, including the NULL result, so
-    * JNI dispatch reaches bytecode without repeating hierarchy searches. */
-   if (owner && method.name.data && method.signature.data &&
-       dvm_jni_method_in_dex(owner->klass.name.data, method.name.data,
-                             method.signature.data))
-      return NULL;
-   jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
+  char symbol[255];
+  {
+    struct jvm_object *mo = jvm_get_object(jvm, method_id);
+    if (!mo || mo->type != JVM_OBJECT_METHOD)
+      fprintf(stderr, "[jvm] DIAG method id %p is type %d\n", (void*)method_id, mo ? (int)mo->type : -1);
+  }
+  struct jvm_method method = jvm_get_object_of_type(jvm, method_id, JVM_OBJECT_METHOD)->method;
+  struct jvm_object *owner = jvm_get_object_of_type(jvm, method.klass, JVM_OBJECT_CLASS);
+  /* A host fallback must not replace Java supplied by the application.
+   * Cache this decision with the DEX epoch, including the NULL result, so
+   * JNI dispatch reaches bytecode without repeating hierarchy searches. */
+  if (owner && method.name.data && method.signature.data &&
+      dvm_jni_method_in_dex(owner->klass.name.data, method.name.data,
+                            method.signature.data))
+    return NULL;
+  jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
-   void *sym;
-   if (!strcmp(method.signature.data, "(I)F")) {
-      char indexed[260];
-      snprintf(indexed, sizeof indexed, "%s__I", symbol);
-      if ((sym = wrapper_create(indexed, luna_os_library_symbol(NULL, indexed))))
-         return sym;
-   }
-   if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
+  void *sym;
+  if (!strcmp(method.signature.data, "(I)F")) {
+    char indexed[260];
+    snprintf(indexed, sizeof indexed, "%s__I", symbol);
+    if ((sym = wrapper_create(indexed, luna_os_library_symbol(NULL, indexed))))
       return sym;
+  }
+  if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
+    return sym;
 
-   /* Walk up to the class that declares the method. */
-   {
-      struct jvm_object *ko =
-         jvm_get_object_of_type(jvm, method.klass, JVM_OBJECT_CLASS);
-      const char *name = ko ? ko->klass.name.data : NULL;
-      for (int hops = 0; name && hops < 16; ++hops) {
-         const char *super = dvm_jni_super_name(name);
-         if (!super)
-            super = jvm_framework_super(name);
-         if (!super || !strcmp(super, "java/lang/Object"))
-            break;
-         method.klass = jvm_make_class(jvm, super);
-         jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
-         if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
-            return sym;
-         name = super;
-      }
-   }
+  /* Walk up to the class that declares the method. */
+  {
+    struct jvm_object *ko =
+      jvm_get_object_of_type(jvm, method.klass, JVM_OBJECT_CLASS);
+    const char *name = ko ? ko->klass.name.data : NULL;
+    for (int hops = 0; name && hops < 16; ++hops) {
+      const char *super = dvm_jni_super_name(name);
+      if (!super)
+        super = jvm_framework_super(name);
+      if (!super || !strcmp(super, "java/lang/Object"))
+        break;
+      method.klass = jvm_make_class(jvm, super);
+      jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
+      if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
+        return sym;
+      name = super;
+    }
+  }
 
-   method.klass = jvm_make_class(jvm, "java/lang/Object");
-   jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
+  method.klass = jvm_make_class(jvm, "java/lang/Object");
+  jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
-   if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
-      return sym;
+  if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
+    return sym;
 
-   /* Class methods belong to Class instances, not arbitrary receivers that
-    * happen to use the same method name. An unrelated getName(), for example
-    * HttpCookie.getName(), must reach its own VM implementation. */
-   return NULL;
+  /* Class methods belong to Class instances, not arbitrary receivers that
+   * happen to use the same method name. An unrelated getName(), for example
+   * HttpCookie.getName(), must reach its own VM implementation. */
+  return NULL;
 }
 
 /* How much work the cache is saving: resolves that actually ran, the time they
@@ -1787,62 +1824,62 @@ static unsigned long long g_wrap_resolves, g_wrap_resolve_ns, g_wrap_hits;
 void jvm_wrap_stats(unsigned long long *resolves, unsigned long long *ns,
                     unsigned long long *hits)
 {
-   if (resolves) *resolves = g_wrap_resolves;
-   if (ns)       *ns       = g_wrap_resolve_ns;
-   if (hits)     *hits     = g_wrap_hits;
+  if (resolves) *resolves = g_wrap_resolves;
+  if (ns)       *ns       = g_wrap_resolve_ns;
+  if (hits)     *hits     = g_wrap_hits;
 }
 
 static unsigned long long wrap_now_ns(void)
 {
-   struct timespec t;
-   clock_gettime(CLOCK_MONOTONIC, &t);
-   return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
 }
 
 /* See jvm::wrap_cache. */
 static void*
 jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
 {
-   jvm_meta_lock();
-   const uintptr_t idx = (uintptr_t)method_id;
-   /* LUNARIA_JNI_WRAP_CACHE=0 goes back to resolving on every call — the
-    * comparison point if a title ever behaves differently with the cache. */
-   static int off = -1;
-   if (off < 0) {
-      const char *e = getenv("LUNARIA_JNI_WRAP_CACHE");
-      off = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) ? 1 : 0;
-   }
-   const bool cacheable = !off && jvm && idx > 0 && idx <= ARRAY_SIZE(jvm->objects);
-   if (cacheable) {
-      const unsigned epoch = dvm_jni_dex_epoch();
-      if (jvm->wrap_epoch != epoch) {
-         memset(jvm->wrap_cached, 0, sizeof jvm->wrap_cached);
-         jvm->wrap_epoch = epoch;
-      }
-      if (jvm->wrap_cached[idx - 1]) {
-         ++g_wrap_hits;
-         void *r = jvm->wrap_cache[idx - 1];
-         jvm_meta_unlock();
-         return r;
-      }
-   }
-   /* Resolution walks the dex hierarchy and therefore takes the DVM GIL.
-    * Do not hold the metadata lock across it: bytecode threads may already
-    * hold that GIL while entering JNI for another lookup.  Two threads may
-    * resolve the same immutable method concurrently; publication below is
-    * serialized and either identical answer is valid. */
-   jvm_meta_unlock();
-   const unsigned long long t0 = wrap_now_ns();
-   void *r = jvm_wrap_method_uncached(jvm, method_id);
-   jvm_meta_lock();
-   g_wrap_resolve_ns += wrap_now_ns() - t0;
-   ++g_wrap_resolves;
-   if (cacheable) {
-      jvm->wrap_cache[idx - 1] = r;
-      jvm->wrap_cached[idx - 1] = true;
-   }
-   jvm_meta_unlock();
-   return r;
+  jvm_meta_lock();
+  const uintptr_t idx = (uintptr_t)method_id;
+  /* LUNARIA_JNI_WRAP_CACHE=0 goes back to resolving on every call — the
+   * comparison point if a title ever behaves differently with the cache. */
+  static int off = -1;
+  if (off < 0) {
+    const char *e = getenv("LUNARIA_JNI_WRAP_CACHE");
+    off = (e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N')) ? 1 : 0;
+  }
+  const bool cacheable = !off && jvm && idx > 0 && idx <= ARRAY_SIZE(jvm->objects);
+  if (cacheable) {
+    const unsigned epoch = dvm_jni_dex_epoch();
+    if (jvm->wrap_epoch != epoch) {
+      memset(jvm->wrap_cached, 0, sizeof jvm->wrap_cached);
+      jvm->wrap_epoch = epoch;
+    }
+    if (jvm->wrap_cached[idx - 1]) {
+      ++g_wrap_hits;
+      void *r = jvm->wrap_cache[idx - 1];
+      jvm_meta_unlock();
+      return r;
+    }
+  }
+  /* Resolution walks the dex hierarchy and therefore takes the DVM GIL.
+   * Do not hold the metadata lock across it: bytecode threads may already
+   * hold that GIL while entering JNI for another lookup.  Two threads may
+   * resolve the same immutable method concurrently; publication below is
+   * serialized and either identical answer is valid. */
+  jvm_meta_unlock();
+  const unsigned long long t0 = wrap_now_ns();
+  void *r = jvm_wrap_method_uncached(jvm, method_id);
+  jvm_meta_lock();
+  g_wrap_resolve_ns += wrap_now_ns() - t0;
+  ++g_wrap_resolves;
+  if (cacheable) {
+    jvm->wrap_cache[idx - 1] = r;
+    jvm->wrap_cached[idx - 1] = true;
+  }
+  jvm_meta_unlock();
+  return r;
 }
 
 /* Hands the call to the Dalvik bytecode emulator when the APK's own dex
@@ -1851,34 +1888,38 @@ jvm_wrap_method(struct jvm *jvm, jmethodID method_id)
  * carries the arguments. */
 static bool
 jvm_dvm_try_mode(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
-            va_list *ap, const jvalue *jargs, jvalue *out, bool nonvirtual)
+                 va_list *ap, const jvalue *jargs, jvalue *out, bool nonvirtual)
 {
-   if (dvm_jni_mode() == DVM_JNI_OFF || !method_id)
-      return false;
+  if (dvm_jni_mode() == DVM_JNI_OFF || !method_id)
+    return false;
 
-   struct jvm *jvm = jnienv_get_jvm(env);
-   struct jvm_object *mo = jvm_get_object(jvm, method_id);
-   if (!mo || mo->type != JVM_OBJECT_METHOD)
-      return false;
+  struct jvm *jvm = jnienv_get_jvm(env);
+  struct jvm_object *mo = jvm_get_object(jvm, method_id);
+  if (!mo || mo->type != JVM_OBJECT_METHOD)
+    return false;
 
-   struct jvm_object *ko = jvm_get_object_of_type(jvm, mo->method.klass, JVM_OBJECT_CLASS);
-   if (!ko)
-      return false;
+  struct jvm_object *ko = jvm_get_object_of_type(jvm, mo->method.klass, JVM_OBJECT_CLASS);
+  if (!ko)
+    return false;
 
-   return (nonvirtual ? dvm_jni_invoke_nonvirtual : dvm_jni_invoke)(env, ko->klass.name.data, mo->method.name.data,
-                         mo->method.signature.data, self, is_static,
-                         ap, jargs, out);
+  return (nonvirtual ? dvm_jni_invoke_nonvirtual : dvm_jni_invoke)(env, ko->klass.name.data, mo->method.name.data,
+         mo->method.signature.data, self, is_static,
+         ap, jargs, out);
 }
 
 static bool
 jvm_dvm_try(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
             va_list *ap, const jvalue *jargs, jvalue *out)
-{ return jvm_dvm_try_mode(env, self, method_id, is_static, ap, jargs, out, false); }
+{
+  return jvm_dvm_try_mode(env, self, method_id, is_static, ap, jargs, out, false);
+}
 
 static bool
 jvm_dvm_try_nonvirtual(JNIEnv *env, jobject self, jmethodID method_id, bool is_static,
-            va_list *ap, const jvalue *jargs, jvalue *out)
-{ return jvm_dvm_try_mode(env, self, method_id, is_static, ap, jargs, out, true); }
+                       va_list *ap, const jvalue *jargs, jvalue *out)
+{
+  return jvm_dvm_try_mode(env, self, method_id, is_static, ap, jargs, out, true);
+}
 
 /* The host stubs in jni_stubs.c all take their arguments as a `va_list` —
  * that is the shape the JNI *V* entry points hand them.  The *A* entry points
@@ -1892,33 +1933,41 @@ jvm_dvm_try_nonvirtual(JNIEnv *env, jobject self, jmethodID method_id, bool is_s
  * array by declaring the register save areas already exhausted and pointing the
  * overflow area at it; va_arg() then reads consecutive 8-byte slots, which is
  * what a jvalue array is. */
-struct jvm_va_wrap { va_list ap; };
+struct jvm_va_wrap {
+  va_list ap;
+};
 
 static void
 jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
 {
-   memset(v, 0, sizeof *v);
+  memset(v, 0, sizeof *v);
 #if defined(__APPLE__)
-   /* Darwin defines va_list as a simple char pointer on both supported host
-    * architectures.  Treating it as the Linux AArch64 four-field structure
-    * wrote 32 bytes through an 8-byte field, corrupting the caller's stack;
-    * every Call*MethodA that reached a host stub could damage unrelated JNI
-    * state.  A jvalue is one aligned 8-byte vararg slot, so the cursor begins
-    * directly at the array. */
-   v->ap = (va_list)(uintptr_t)args;
+  /* Darwin defines va_list as a simple char pointer on both supported host
+   * architectures.  Treating it as the Linux AArch64 four-field structure
+   * wrote 32 bytes through an 8-byte field, corrupting the caller's stack;
+   * every Call*MethodA that reached a host stub could damage unrelated JNI
+   * state.  A jvalue is one aligned 8-byte vararg slot, so the cursor begins
+   * directly at the array. */
+  v->ap = (va_list)(uintptr_t)args;
 #elif defined(__x86_64__)
-   struct { unsigned gp_offset, fp_offset; void *overflow, *reg_save; } *t =
-      (void *)&v->ap;
-   t->gp_offset = 6 * 8;         /* all 6 GP argument registers consumed */
-   t->fp_offset = 6 * 8 + 8 * 16;/* all 8 SSE argument registers consumed */
-   t->overflow = (void *)(uintptr_t)args;
-   t->reg_save = NULL;
+  struct {
+    unsigned gp_offset, fp_offset;
+    void *overflow, *reg_save;
+  } *t =
+    (void *)&v->ap;
+  t->gp_offset = 6 * 8;         /* all 6 GP argument registers consumed */
+  t->fp_offset = 6 * 8 + 8 * 16;/* all 8 SSE argument registers consumed */
+  t->overflow = (void *)(uintptr_t)args;
+  t->reg_save = NULL;
 #elif defined(__aarch64__)
-   struct { void *stack, *gr_top, *vr_top; int gr_offs, vr_offs; } *t =
-      (void *)&v->ap;
-   t->stack = (void *)(uintptr_t)args;
-   t->gr_offs = 0;               /* 0 == no general regs left */
-   t->vr_offs = 0;               /* 0 == no vector regs left */
+  struct {
+    void *stack, *gr_top, *vr_top;
+    int gr_offs, vr_offs;
+  } *t =
+    (void *)&v->ap;
+  t->stack = (void *)(uintptr_t)args;
+  t->gr_offs = 0;               /* 0 == no general regs left */
+  t->vr_offs = 0;               /* 0 == no vector regs left */
 #else
 #  error "jvm_va_from_jvalues: unsupported host ABI"
 #endif
@@ -1960,127 +2009,136 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
 static void
 JNIEnv_CallStaticVoidMethodV(JNIEnv* p0, jclass p1, jmethodID p2, va_list p3)
 {
-   assert(p0 && p1 && p2);
-   union { jobject (*fun)(JNIEnv*, jclass, va_list); void *ptr; } f;
-   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
-   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
-      jvalue rv;
-      va_list copy;
-      va_copy(copy, p3);
-      bool done = jvm_dvm_try(p0, (jobject)p1, p2, true, &copy, NULL, &rv);
-      va_end(copy);
-      if (done)
-         return;
-   }
-   if (f.ptr)
-      f.fun(p0, p1, p3);
+  assert(p0 && p1 && p2);
+  union {
+    jobject (*fun)(JNIEnv*, jclass, va_list);
+    void *ptr;
+  } f;
+  f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+  if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+    jvalue rv;
+    va_list copy;
+    va_copy(copy, p3);
+    bool done = jvm_dvm_try(p0, (jobject)p1, p2, true, &copy, NULL, &rv);
+    va_end(copy);
+    if (done)
+      return;
+  }
+  if (f.ptr)
+    f.fun(p0, p1, p3);
 }
 
 static void
 JNIEnv_CallStaticVoidMethod(JNIEnv* p0, jclass p1, jmethodID p2, ...)
 {
-   va_list ap;
-   va_start(ap, p2);
-   JNIEnv_CallStaticVoidMethodV(p0, p1, p2, ap);
-   va_end(ap);
+  va_list ap;
+  va_start(ap, p2);
+  JNIEnv_CallStaticVoidMethodV(p0, p1, p2, ap);
+  va_end(ap);
 }
 
 static void
 JNIEnv_CallStaticVoidMethodA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
 {
-   assert(p0 && p1 && p2);
-   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
-   if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
-      jvalue rv;
-      if (jvm_dvm_try(p0, (jobject)p1, p2, true, NULL, p3, &rv))
-         return;
-   }
-   if (fp)
-      (void)JVM_CALL_A(fp, jobject, jclass, p0, p1, p3);
+  assert(p0 && p1 && p2);
+  void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+  if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
+    jvalue rv;
+    if (jvm_dvm_try(p0, (jobject)p1, p2, true, NULL, p3, &rv))
+      return;
+  }
+  if (fp)
+    (void)JVM_CALL_A(fp, jobject, jclass, p0, p1, p3);
 }
 
 static void
 JNIEnv_CallVoidMethodV(JNIEnv* p0, jobject p1, jmethodID p2, va_list p3)
 {
-   assert(p0 && p1 && p2);
-   union { jobject (*fun)(JNIEnv*, jobject, va_list); void *ptr; } f;
-   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
-   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
-      jvalue rv;
-      va_list copy;
-      va_copy(copy, p3);
-      bool done = jvm_dvm_try(p0, p1, p2, false, &copy, NULL, &rv);
-      va_end(copy);
-      if (done)
-         return;
-   }
-   if (f.ptr)
-      f.fun(p0, p1, p3);
+  assert(p0 && p1 && p2);
+  union {
+    jobject (*fun)(JNIEnv*, jobject, va_list);
+    void *ptr;
+  } f;
+  f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+  if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+    jvalue rv;
+    va_list copy;
+    va_copy(copy, p3);
+    bool done = jvm_dvm_try(p0, p1, p2, false, &copy, NULL, &rv);
+    va_end(copy);
+    if (done)
+      return;
+  }
+  if (f.ptr)
+    f.fun(p0, p1, p3);
 }
 
 static void
 JNIEnv_CallVoidMethod(JNIEnv* p0, jobject p1, jmethodID p2, ...)
 {
-   va_list ap;
-   va_start(ap, p2);
-   JNIEnv_CallVoidMethodV(p0, p1, p2, ap);
-   va_end(ap);
+  va_list ap;
+  va_start(ap, p2);
+  JNIEnv_CallVoidMethodV(p0, p1, p2, ap);
+  va_end(ap);
 }
 
 static void
 JNIEnv_CallVoidMethodA(JNIEnv* p0, jobject p1, jmethodID p2, jvalue* p3)
 {
-   assert(p0 && p1 && p2);
-   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
-   if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
-      jvalue rv;
-      if (jvm_dvm_try(p0, p1, p2, false, NULL, p3, &rv))
-         return;
-   }
-   if (fp)
-      (void)JVM_CALL_A(fp, jobject, jobject, p0, p1, p3);
+  assert(p0 && p1 && p2);
+  void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p2);
+  if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
+    jvalue rv;
+    if (jvm_dvm_try(p0, p1, p2, false, NULL, p3, &rv))
+      return;
+  }
+  if (fp)
+    (void)JVM_CALL_A(fp, jobject, jobject, p0, p1, p3);
 }
 
 static void
 JNIEnv_CallNonvirtualVoidMethodV(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3, va_list p4)
 {
-   assert(p0 && p1 && p2 && p3);
-   union { void (*fun)(JNIEnv*, jobject, jclass, va_list); void *ptr; } f;
-   f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p3);
-   if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
-      jvalue rv;
-      va_list copy;
-      va_copy(copy, p4);
-      bool done = jvm_dvm_try_nonvirtual(p0, p1, p3, false, &copy, NULL, &rv);
-      va_end(copy);
-      if (done)
-         return;
-   }
-   if (f.ptr)
-      f.fun(p0, p1, p2, p4);
+  assert(p0 && p1 && p2 && p3);
+  union {
+    void (*fun)(JNIEnv*, jobject, jclass, va_list);
+    void *ptr;
+  } f;
+  f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), p3);
+  if (!f.ptr || dvm_jni_mode() == DVM_JNI_PREFER) {
+    jvalue rv;
+    va_list copy;
+    va_copy(copy, p4);
+    bool done = jvm_dvm_try_nonvirtual(p0, p1, p3, false, &copy, NULL, &rv);
+    va_end(copy);
+    if (done)
+      return;
+  }
+  if (f.ptr)
+    f.fun(p0, p1, p2, p4);
 }
 
 static void
 JNIEnv_CallNonvirtualVoidMethod(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3, ...)
 {
-   va_list ap;
-   va_start(ap, p3);
-   JNIEnv_CallNonvirtualVoidMethodV(p0, p1, p2, p3, ap);
-   va_end(ap);
+  va_list ap;
+  va_start(ap, p3);
+  JNIEnv_CallNonvirtualVoidMethodV(p0, p1, p2, p3, ap);
+  va_end(ap);
 }
 
 static void
 JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3, jvalue* p4)
 {
-   assert(p0 && p1 && p2 && p3);
-   void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p3);
-   if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
-      jvalue rv;
-      if (jvm_dvm_try_nonvirtual(p0, p1, p3, false, NULL, p4, &rv))
-         return;
-   }
-   if (fp)
-      (void)JVM_CALL_NV_A(fp, jobject, p0, p1, p2, p4);
+  assert(p0 && p1 && p2 && p3);
+  void *fp = jvm_wrap_method(jnienv_get_jvm(p0), p3);
+  if (!fp || dvm_jni_mode() == DVM_JNI_PREFER) {
+    jvalue rv;
+    if (jvm_dvm_try_nonvirtual(p0, p1, p3, false, NULL, p4, &rv))
+      return;
+  }
+  if (fp)
+    (void)JVM_CALL_NV_A(fp, jobject, p0, p1, p2, p4);
 }
 
 // N == Call method type convention (Long, Float, StaticLong, StaticFloat, etc...)
@@ -2184,10 +2242,10 @@ gen_jnienv_method(Float, jfloat, 0, f)
 gen_jnienv_method(Double, jdouble, 0, d)
 
 struct jvm_stored_field {
-   struct jvm *jvm;
-   jobject object;
-   jfieldID field;
-   uint64_t bits;
+  struct jvm *jvm;
+  jobject object;
+  jfieldID field;
+  uint64_t bits;
 };
 static struct jvm_stored_field stored_fields[1024];
 static size_t stored_field_count;
@@ -2195,35 +2253,35 @@ static size_t stored_field_count;
 static bool
 jvm_get_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t *bits)
 {
-   if (!jvm || !object || !field || !bits)
-      return false;
-   for (size_t i = 0; i < stored_field_count; ++i) {
-      if (stored_fields[i].jvm == jvm && stored_fields[i].object == object &&
-          stored_fields[i].field == field) {
-         *bits = stored_fields[i].bits;
-         return true;
-      }
-   }
-   return false;
+  if (!jvm || !object || !field || !bits)
+    return false;
+  for (size_t i = 0; i < stored_field_count; ++i) {
+    if (stored_fields[i].jvm == jvm && stored_fields[i].object == object &&
+        stored_fields[i].field == field) {
+      *bits = stored_fields[i].bits;
+      return true;
+    }
+  }
+  return false;
 }
 
 static void
 jvm_set_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t bits)
 {
-   if (!jvm || !object || !field)
+  if (!jvm || !object || !field)
+    return;
+  for (size_t i = 0; i < stored_field_count; ++i) {
+    if (stored_fields[i].jvm == jvm && stored_fields[i].object == object &&
+        stored_fields[i].field == field) {
+      stored_fields[i].bits = bits;
       return;
-   for (size_t i = 0; i < stored_field_count; ++i) {
-      if (stored_fields[i].jvm == jvm && stored_fields[i].object == object &&
-          stored_fields[i].field == field) {
-         stored_fields[i].bits = bits;
-         return;
-      }
-   }
-   if (stored_field_count < ARRAY_SIZE(stored_fields)) {
-      stored_fields[stored_field_count++] = (struct jvm_stored_field){
-         .jvm = jvm, .object = object, .field = field, .bits = bits
-      };
-   }
+    }
+  }
+  if (stored_field_count < ARRAY_SIZE(stored_fields)) {
+    stored_fields[stored_field_count++] = (struct jvm_stored_field) {
+      .jvm = jvm, .object = object, .field = field, .bits = bits
+    };
+  }
 }
 
 /* Name the field before the assert fires.  A NULL object here means some
@@ -2232,27 +2290,27 @@ jvm_set_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t bit
 static void
 jvm_report_field_access(JNIEnv *env, jobject object, jfieldID field, const char *op)
 {
-   static int trace = -1;
-   if (trace < 0)
-      trace = getenv("LUNARIA_TRACE_JNIFIELD") != NULL;
-   if (env && object && field && !trace)
-      return;
-   const char *klass = "?", *name = "?";
-   if (env && field) {
-      struct jvm *jvm = jnienv_get_jvm(env);
-      struct jvm_object *m = jvm_get_object_of_type(jvm, field, JVM_OBJECT_METHOD);
-      if (m && m->method.name.data) {
-         name = m->method.name.data;
-         struct jvm_object *k = jvm_get_object_of_type(jvm, m->method.klass, JVM_OBJECT_CLASS);
-         if (k && k->klass.name.data) klass = k->klass.name.data;
-      }
-   }
-   if (env && object && field) {
-      fprintf(stderr, "[jvm] %s %s.%s on %p\n", op, klass, name, (void *)object);
-      return;
-   }
-   fprintf(stderr, "[jvm] %s %s.%s: %s%s%s is NULL\n", op, klass, name,
-           env ? "" : "env ", object ? "" : "object ", field ? "" : "field ");
+  static int trace = -1;
+  if (trace < 0)
+    trace = getenv("LUNARIA_TRACE_JNIFIELD") != NULL;
+  if (env && object && field && !trace)
+    return;
+  const char *klass = "?", *name = "?";
+  if (env && field) {
+    struct jvm *jvm = jnienv_get_jvm(env);
+    struct jvm_object *m = jvm_get_object_of_type(jvm, field, JVM_OBJECT_METHOD);
+    if (m && m->method.name.data) {
+      name = m->method.name.data;
+      struct jvm_object *k = jvm_get_object_of_type(jvm, m->method.klass, JVM_OBJECT_CLASS);
+      if (k && k->klass.name.data) klass = k->klass.name.data;
+    }
+  }
+  if (env && object && field) {
+    fprintf(stderr, "[jvm] %s %s.%s on %p\n", op, klass, name, (void *)object);
+    return;
+  }
+  fprintf(stderr, "[jvm] %s %s.%s: %s%s%s is NULL\n", op, klass, name,
+          env ? "" : "env ", object ? "" : "object ", field ? "" : "field ");
 }
 
 // N == Property method type convention (Long, Float, StaticLong, StaticFloat, etc...)
@@ -2353,104 +2411,105 @@ gen_jnienv_property(Double, jdouble, 0, 0)
 static void
 jvm_trace_field_result(JNIEnv *env, jobject holder, jfieldID field, jobject value)
 {
-   static int on = -1;
-   if (on < 0) on = getenv("LUNARIA_TRACE_JNIFIELD") != NULL;
-   if (!on) return;
-   struct jvm *jvm = jnienv_get_jvm(env);
-   const char *cls = "-";
-   if (value) {
-      struct jvm_object *vo = jvm_get_object(jvm, value);
-      struct jvm_object *ko = vo && vo->this_klass ? jvm_get_object(jvm, vo->this_klass) : NULL;
-      if (ko && ko->type == JVM_OBJECT_CLASS && ko->klass.name.data) cls = ko->klass.name.data;
-      if (vo && vo->type == JVM_OBJECT_CLASS && vo->klass.name.data)
-         fprintf(stderr, "[jvm]   -> %p (a Class object for %s)\n", (void *)value, vo->klass.name.data);
-      else
-         fprintf(stderr, "[jvm]   -> %p (instance of %s)\n", (void *)value, cls);
-   } else
-      fprintf(stderr, "[jvm]   -> null\n");
-   (void)holder; (void)field;
+  static int on = -1;
+  if (on < 0) on = getenv("LUNARIA_TRACE_JNIFIELD") != NULL;
+  if (!on) return;
+  struct jvm *jvm = jnienv_get_jvm(env);
+  const char *cls = "-";
+  if (value) {
+    struct jvm_object *vo = jvm_get_object(jvm, value);
+    struct jvm_object *ko = vo && vo->this_klass ? jvm_get_object(jvm, vo->this_klass) : NULL;
+    if (ko && ko->type == JVM_OBJECT_CLASS && ko->klass.name.data) cls = ko->klass.name.data;
+    if (vo && vo->type == JVM_OBJECT_CLASS && vo->klass.name.data)
+      fprintf(stderr, "[jvm]   -> %p (a Class object for %s)\n", (void *)value, vo->klass.name.data);
+    else
+      fprintf(stderr, "[jvm]   -> %p (instance of %s)\n", (void *)value, cls);
+  } else
+    fprintf(stderr, "[jvm]   -> null\n");
+  (void)holder;
+  (void)field;
 }
 
 static jobject
 JNIEnv_GetObjectField_traced(JNIEnv *p0, jclass p1, jfieldID p2)
 {
-   jobject v = JNIEnv_GetObjectField(p0, p1, p2);
-   jvm_trace_field_result(p0, p1, p2, v);
-   return v;
+  jobject v = JNIEnv_GetObjectField(p0, p1, p2);
+  jvm_trace_field_result(p0, p1, p2, v);
+  return v;
 }
 
 static jobject
 JNIEnv_GetStaticObjectField_traced(JNIEnv *p0, jclass p1, jfieldID p2)
 {
-   jobject v = JNIEnv_GetStaticObjectField(p0, p1, p2);
-   jvm_trace_field_result(p0, p1, p2, v);
-   return v;
+  jobject v = JNIEnv_GetStaticObjectField(p0, p1, p2);
+  jvm_trace_field_result(p0, p1, p2, v);
+  return v;
 }
 
 static jmethodID
 jvm_make_method(struct jvm *jvm, jclass klass, const char *name, const char *sig)
 {
-   assert(jvm && name && sig);
-   /* Limp mode: a NULL class flows in when GetObjectClass was called on a NULL
-    * object (unimplemented stub).  Return a NULL method id rather than abort;
-    * the ARM JNI bridge treats that as "method unavailable" and yields the
-    * default value. */
-   if (!klass) {
-      verbose("jvm_make_method: NULL class for %s%s — returning NULL method", name, sig);
-      return NULL;
-   }
-   verbose("%s::%s::%s", jvm_get_object_of_type(jvm, klass, JVM_OBJECT_CLASS)->klass.name.data, name, sig);
-   struct jvm_object o = { .method.klass = klass, .type = JVM_OBJECT_METHOD };
-   jvm_string_set_cstr(&o.method.name, name, true);
-   jvm_string_set_cstr(&o.method.signature, sig, true);
-   return jvm_add_object_if_not_there(jvm, &o);
+  assert(jvm && name && sig);
+  /* Limp mode: a NULL class flows in when GetObjectClass was called on a NULL
+   * object (unimplemented stub).  Return a NULL method id rather than abort;
+   * the ARM JNI bridge treats that as "method unavailable" and yields the
+   * default value. */
+  if (!klass) {
+    verbose("jvm_make_method: NULL class for %s%s — returning NULL method", name, sig);
+    return NULL;
+  }
+  verbose("%s::%s::%s", jvm_get_object_of_type(jvm, klass, JVM_OBJECT_CLASS)->klass.name.data, name, sig);
+  struct jvm_object o = { .method.klass = klass, .type = JVM_OBJECT_METHOD };
+  jvm_string_set_cstr(&o.method.name, name, true);
+  jvm_string_set_cstr(&o.method.signature, sig, true);
+  return jvm_add_object_if_not_there(jvm, &o);
 }
 
 static jmethodID
 JNIEnv_GetMethodID(JNIEnv* p0, jclass klass, const char* name, const char* sig)
 {
-   return jvm_make_method(jnienv_get_jvm(p0), klass, name, sig);
+  return jvm_make_method(jnienv_get_jvm(p0), klass, name, sig);
 }
 
 static jmethodID
 JNIEnv_GetStaticMethodID(JNIEnv* p0, jclass klass, const char* name, const char* sig)
 {
-   return jvm_make_method(jnienv_get_jvm(p0), klass, name, sig);
+  return jvm_make_method(jnienv_get_jvm(p0), klass, name, sig);
 }
 
 static jfieldID
 jvm_make_fieldid(struct jvm *jvm, const jclass klass, const char *name, const char *sig)
 {
-   return (jfieldID)jvm_make_method(jvm, klass, name, sig);
+  return (jfieldID)jvm_make_method(jvm, klass, name, sig);
 }
 
 static jfieldID
 JNIEnv_GetFieldID(JNIEnv* p0, jclass klass, const char* name, const char* sig)
 {
-   return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
+  return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
 }
 
 static jfieldID
 JNIEnv_GetStaticFieldID(JNIEnv* p0, jclass klass, const char* name, const char* sig)
 {
-   return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
+  return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
 }
 
 jstring jvm_new_string_wtf8(struct jvm *jvm, const char *text, size_t bytes)
 {
-   struct jvm_object o = { .type = JVM_OBJECT_STRING };
-   if (!jvm_string_set_cstr_with_length(&o.string, text, bytes, true)) {
-      jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "Java string");
-      return NULL;
-   }
-   return jvm_add_object_if_not_there(jvm, &o);
+  struct jvm_object o = { .type = JVM_OBJECT_STRING };
+  if (!jvm_string_set_cstr_with_length(&o.string, text, bytes, true)) {
+    jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "Java string");
+    return NULL;
+  }
+  return jvm_add_object_if_not_there(jvm, &o);
 }
 
 const char *jvm_string_wtf8(struct jvm *jvm, jstring string, size_t *bytes)
 {
-   const struct jvm_string *s = &jvm_get_object_of_type(jvm, string, JVM_OBJECT_STRING)->string;
-   if (bytes) *bytes = s->size;
-   return s->data ? s->data : "";
+  const struct jvm_string *s = &jvm_get_object_of_type(jvm, string, JVM_OBJECT_STRING)->string;
+  if (bytes) *bytes = s->size;
+  return s->data ? s->data : "";
 }
 
 /* Publish a String constructor's payload on the original JNI identity.
@@ -2458,153 +2517,169 @@ const char *jvm_string_wtf8(struct jvm *jvm, jstring string, size_t *bytes)
  * the interpreter alone must not leave native callers with an empty string. */
 bool jvm_init_string_wtf8(struct jvm *jvm, jobject object, const char *text, size_t bytes)
 {
-   struct jvm_string value = {0};
-   if (!jvm_string_set_cstr_with_length(&value, text, bytes, true)) {
-      jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "String constructor");
-      return false;
-   }
-   jvm_meta_lock();
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   if (!o || (o->type != JVM_OBJECT_OPAQUE && o->type != JVM_OBJECT_STRING)) {
-      jvm_meta_unlock();
-      jvm_string_release(&value);
-      return false;
-   }
-   uintptr_t index = (uintptr_t)(o - jvm->objects);
-   jvm_index_remove(jvm, index);
-   if (o->type == JVM_OBJECT_STRING) jvm_string_release(&o->string);
-   o->string = value;
-   o->type = JVM_OBJECT_STRING;
-   jvm_index_add(jvm, index);
-   jvm_meta_unlock();
-   return true;
+  struct jvm_string value = {0};
+  if (!jvm_string_set_cstr_with_length(&value, text, bytes, true)) {
+    jvm_throw_new(jvm, "java/lang/OutOfMemoryError", "String constructor");
+    return false;
+  }
+  jvm_meta_lock();
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  if (!o || (o->type != JVM_OBJECT_OPAQUE && o->type != JVM_OBJECT_STRING)) {
+    jvm_meta_unlock();
+    jvm_string_release(&value);
+    return false;
+  }
+  uintptr_t index = (uintptr_t)(o - jvm->objects);
+  jvm_index_remove(jvm, index);
+  if (o->type == JVM_OBJECT_STRING) jvm_string_release(&o->string);
+  o->string = value;
+  o->type = JVM_OBJECT_STRING;
+  jvm_index_add(jvm, index);
+  jvm_meta_unlock();
+  return true;
 }
 
 static jstring
 JNIEnv_NewString(JNIEnv* p0, const jchar* p1, jsize p2)
 {
-   assert(p0);
-   if (p2 < 0 || (!p1 && p2)) return NULL;
-   char *text = malloc((size_t)p2 * 3 + 1);
-   if (!text) { jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewString"); return NULL; }
-   size_t bytes = jcs_utf16_to_wtf8(p1, (size_t)p2, text);
-   text[bytes] = 0;
-   struct jvm_object o = { .type = JVM_OBJECT_STRING };
-   o.string = (struct jvm_string){ .data = text, .size = bytes, .heap = true };
-   return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
+  assert(p0);
+  if (p2 < 0 || (!p1 && p2)) return NULL;
+  char *text = malloc((size_t)p2 * 3 + 1);
+  if (!text) {
+    jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewString");
+    return NULL;
+  }
+  size_t bytes = jcs_utf16_to_wtf8(p1, (size_t)p2, text);
+  text[bytes] = 0;
+  struct jvm_object o = { .type = JVM_OBJECT_STRING };
+  o.string = (struct jvm_string) {
+    .data = text, .size = bytes, .heap = true
+  };
+  return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
 }
 
 static jsize
 JNIEnv_GetStringLength(JNIEnv* p0, jstring p1)
 {
-   assert(p0 && p1);
-   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
-   return (jsize)jcs_wtf8_to_utf16(s->data, s->size, NULL);
+  assert(p0 && p1);
+  const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
+  return (jsize)jcs_wtf8_to_utf16(s->data, s->size, NULL);
 }
 
 static const jchar*
 JNIEnv_GetStringChars(JNIEnv* p0, jstring p1, jboolean* p2)
 {
-   assert(p0 && p1);
-   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
-   size_t count = jcs_wtf8_to_utf16(s->data, s->size, NULL);
-   jchar *chars = malloc((count + 1) * sizeof *chars);
-   if (!chars) { jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "GetStringChars"); return NULL; }
-   jcs_wtf8_to_utf16(s->data, s->size, chars);
-   chars[count] = 0;
-   if (p2) *p2 = JNI_TRUE;
-   return chars;
+  assert(p0 && p1);
+  const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
+  size_t count = jcs_wtf8_to_utf16(s->data, s->size, NULL);
+  jchar *chars = malloc((count + 1) * sizeof *chars);
+  if (!chars) {
+    jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "GetStringChars");
+    return NULL;
+  }
+  jcs_wtf8_to_utf16(s->data, s->size, chars);
+  chars[count] = 0;
+  if (p2) *p2 = JNI_TRUE;
+  return chars;
 }
 
 static void
 JNIEnv_ReleaseStringChars(JNIEnv* p0, jstring p1, const jchar* p2)
 {
-   assert(p0 && p1);
-   free((void *)p2);
+  assert(p0 && p1);
+  free((void *)p2);
 }
 
 static jstring
 JNIEnv_NewStringUTF(JNIEnv* p0, const char* p1)
 {
-   assert(p0);
-   verbose("%s", p1);
-   if (!p1) return NULL;
-   size_t bytes = strlen(p1);
-   bool ascii = true;
-   for (size_t i = 0; i < bytes; ++i) if ((unsigned char)p1[i] >= 0x80) { ascii = false; break; }
-   if (ascii) {
-      struct jvm_object o = { .type = JVM_OBJECT_STRING };
-      if (!jvm_string_set_cstr_with_length(&o.string, p1, bytes, true)) {
-         jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewStringUTF");
-         return NULL;
-      }
-      return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
-   }
-   jchar *chars = malloc((bytes + 1) * sizeof *chars);
-   if (!chars) { jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewStringUTF"); return NULL; }
-   size_t count = jcs_wtf8_to_utf16(p1, bytes, chars);
-   jstring result = JNIEnv_NewString(p0, chars, (jsize)count);
-   free(chars);
-   return result;
+  assert(p0);
+  verbose("%s", p1);
+  if (!p1) return NULL;
+  size_t bytes = strlen(p1);
+  bool ascii = true;
+  for (size_t i = 0; i < bytes; ++i) if ((unsigned char)p1[i] >= 0x80) {
+      ascii = false;
+      break;
+    }
+  if (ascii) {
+    struct jvm_object o = { .type = JVM_OBJECT_STRING };
+    if (!jvm_string_set_cstr_with_length(&o.string, p1, bytes, true)) {
+      jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewStringUTF");
+      return NULL;
+    }
+    return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
+  }
+  jchar *chars = malloc((bytes + 1) * sizeof *chars);
+  if (!chars) {
+    jvm_throw_new(jnienv_get_jvm(p0), "java/lang/OutOfMemoryError", "NewStringUTF");
+    return NULL;
+  }
+  size_t count = jcs_wtf8_to_utf16(p1, bytes, chars);
+  jstring result = JNIEnv_NewString(p0, chars, (jsize)count);
+  free(chars);
+  return result;
 }
 
 /* JNI modified UTF-8 encodes each UTF-16 code unit independently, and uses
  * C0 80 for NUL. Internal strings remain WTF-8 for the Java interpreter. */
 static size_t jvm_mutf8(const jchar *chars, size_t count, char *out)
 {
-   size_t n = 0;
-   for (size_t i = 0; i < count; ++i) {
-      unsigned c = chars[i];
-      unsigned width = c && c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
-      if (out) {
-         if (width == 1) out[n] = (char)c;
-         else if (width == 2) {
-            out[n] = (char)(0xc0 | (c >> 6));
-            out[n + 1] = (char)(0x80 | (c & 63));
-         } else {
-            out[n] = (char)(0xe0 | (c >> 12));
-            out[n + 1] = (char)(0x80 | ((c >> 6) & 63));
-            out[n + 2] = (char)(0x80 | (c & 63));
-         }
+  size_t n = 0;
+  for (size_t i = 0; i < count; ++i) {
+    unsigned c = chars[i];
+    unsigned width = c && c < 0x80 ? 1 : c < 0x800 ? 2 : 3;
+    if (out) {
+      if (width == 1) out[n] = (char)c;
+      else if (width == 2) {
+        out[n] = (char)(0xc0 | (c >> 6));
+        out[n + 1] = (char)(0x80 | (c & 63));
+      } else {
+        out[n] = (char)(0xe0 | (c >> 12));
+        out[n + 1] = (char)(0x80 | ((c >> 6) & 63));
+        out[n + 2] = (char)(0x80 | (c & 63));
       }
-      n += width;
-   }
-   return n;
+    }
+    n += width;
+  }
+  return n;
 }
 
 static jsize
 JNIEnv_GetStringUTFLength(JNIEnv* p0, jstring p1)
 {
-   assert(p0 && p1);
-   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
-   size_t bytes = s->size;
-   for (size_t i = 0; i < s->size; ++i) {
-      unsigned c = (unsigned char)s->data[i];
-      if (!c) ++bytes; /* NUL becomes C0 80. */
-      else if (c >= 0xf0 && c <= 0xf4) bytes += 2; /* Four bytes become six. */
-   }
-   return (jsize)bytes;
+  assert(p0 && p1);
+  const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_STRING)->string;
+  size_t bytes = s->size;
+  for (size_t i = 0; i < s->size; ++i) {
+    unsigned c = (unsigned char)s->data[i];
+    if (!c) ++bytes; /* NUL becomes C0 80. */
+    else if (c >= 0xf0 && c <= 0xf4) bytes += 2; /* Four bytes become six. */
+  }
+  return (jsize)bytes;
 }
 
 static jobject
 jvm_new_array(struct jvm *jvm, const size_t size, const size_t element_sz, const char *klass)
 {
-   assert(jvm && klass);
-   struct jvm_object o = { .array = { .size = size, .element_sz = element_sz,
-      .reference_elements = klass[0] == '[' && (klass[1] == 'L' || klass[1] == '[') },
-      .type = JVM_OBJECT_ARRAY };
-   o.this_klass = jvm_make_class(jvm, klass);
-   o.array.data = calloc(size, element_sz);
-   assert(o.array.data);
-   /* Arrays are mutable objects: equal contents do not imply identity. */
-   return jvm_add_object(jvm, &o);
+  assert(jvm && klass);
+  struct jvm_object o = { .array = { .size = size, .element_sz = element_sz,
+                                       .reference_elements = klass[0] == '[' && (klass[1] == 'L' || klass[1] == '[')
+                                     },
+                            .type = JVM_OBJECT_ARRAY
+  };
+  o.this_klass = jvm_make_class(jvm, klass);
+  o.array.data = calloc(size, element_sz);
+  assert(o.array.data);
+  /* Arrays are mutable objects: equal contents do not imply identity. */
+  return jvm_add_object(jvm, &o);
 }
 
 static jsize
 JNIEnv_GetArrayLength(JNIEnv* p0, jarray p1)
 {
-   assert(p0 && p1);
-   return jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_ARRAY)->array.size;
+  assert(p0 && p1);
+  return jvm_get_object_of_type(jnienv_get_jvm(p0), p1, JVM_OBJECT_ARRAY)->array.size;
 }
 
 static void
@@ -2613,615 +2688,631 @@ JNIEnv_SetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2, jobject p3);
 static jobjectArray
 JNIEnv_NewObjectArray(JNIEnv* p0, jsize p1, jclass p2, jobject p3)
 {
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   /* Element class decides the array's runtime class.  Hard-coding
-    * Object[] made every NewObjectArray look like [Ljava.lang.Object; —
-    * IsInstanceOf against String[] failed, and the dex bridge then
-    * wrapped the handle as a non-array so array-length threw NPE. */
-   const char *elem = p2 ? jvm_get_class_name(jvm, p2) : NULL;
-   char desc[512];
-   if (elem && elem[0] == '[') {
-      snprintf(desc, sizeof desc, "[%s", elem);
-   } else {
-      char slash[480];
-      size_t i = 0;
-      const char *e = elem && *elem ? elem : "java/lang/Object";
-      for (; e[i] && i + 1 < sizeof slash; ++i)
-         slash[i] = (e[i] == '.') ? '/' : e[i];
-      slash[i] = '\0';
-      snprintf(desc, sizeof desc, "[L%s;", slash);
-   }
-   jobjectArray arr = (jobjectArray)jvm_new_array(jvm, (size_t)(p1 < 0 ? 0 : p1),
-                                                   sizeof(jobject), desc);
-   if (arr && p3 && p1 > 0) {
-      for (jsize i = 0; i < p1; ++i)
-         JNIEnv_SetObjectArrayElement(p0, arr, i, p3);
-   }
-   return arr;
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  /* Element class decides the array's runtime class.  Hard-coding
+   * Object[] made every NewObjectArray look like [Ljava.lang.Object; —
+   * IsInstanceOf against String[] failed, and the dex bridge then
+   * wrapped the handle as a non-array so array-length threw NPE. */
+  const char *elem = p2 ? jvm_get_class_name(jvm, p2) : NULL;
+  char desc[512];
+  if (elem && elem[0] == '[') {
+    snprintf(desc, sizeof desc, "[%s", elem);
+  } else {
+    char slash[480];
+    size_t i = 0;
+    const char *e = elem && *elem ? elem : "java/lang/Object";
+    for (; e[i] && i + 1 < sizeof slash; ++i)
+      slash[i] = (e[i] == '.') ? '/' : e[i];
+    slash[i] = '\0';
+    snprintf(desc, sizeof desc, "[L%s;", slash);
+  }
+  jobjectArray arr = (jobjectArray)jvm_new_array(jvm, (size_t)(p1 < 0 ? 0 : p1),
+                     sizeof(jobject), desc);
+  if (arr && p3 && p1 > 0) {
+    for (jsize i = 0; i < p1; ++i)
+      JNIEnv_SetObjectArrayElement(p0, arr, i, p3);
+  }
+  return arr;
 }
 
 static jbooleanArray
 JNIEnv_NewBooleanArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jboolean), "[Z");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jboolean), "[Z");
 }
 
 static jbyteArray
 JNIEnv_NewByteArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jbyte), "[B");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jbyte), "[B");
 }
 
 static jcharArray
 JNIEnv_NewCharArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jchar), "[C");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jchar), "[C");
 }
 
 static jshortArray
 JNIEnv_NewShortArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jshort), "[S");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jshort), "[S");
 }
 
 static jintArray
 JNIEnv_NewIntArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jint), "[I");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jint), "[I");
 }
 
 static jlongArray
 JNIEnv_NewLongArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jlong), "[J");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jlong), "[J");
 }
 
 static jfloatArray
 JNIEnv_NewFloatArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jfloat), "[F");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jfloat), "[F");
 }
 
 static jdoubleArray
 JNIEnv_NewDoubleArray(JNIEnv* p0, jsize p1)
 {
-   return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jdouble), "[D");
+  return jvm_new_array(jnienv_get_jvm(p0), p1, sizeof(jdouble), "[D");
 }
 
 static void*
 jvm_get_array_elements(struct jvm *jvm, jobject array, jboolean *is_copy)
 {
-   assert(jvm && array);
+  assert(jvm && array);
 
-   if (is_copy)
-      *is_copy = JNI_FALSE;
+  if (is_copy)
+    *is_copy = JNI_FALSE;
 
-   return jvm_get_object_of_type(jvm, array, JVM_OBJECT_ARRAY)->array.data;
+  return jvm_get_object_of_type(jvm, array, JVM_OBJECT_ARRAY)->array.data;
 }
 
 static jobject
 JNIEnv_GetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2)
 {
-   assert(p0 && p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_meta_lock();
-   const struct jvm_object *obj = jvm_get_object_of_type(jvm, p1, JVM_OBJECT_ARRAY);
-   jobject result = NULL;
-   if (obj && p2 >= 0 && (size_t)p2 < obj->array.size)
-      result = jvm_ref_object(jvm, ((jobject*)obj->array.data)[p2]);
-   else jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
-   jvm_meta_unlock();
-   if (result) jvm_trace_bridge_ref(jvm,result,2);
-   return jvm_record_local(jvm,result);
+  assert(p0 && p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jvm_meta_lock();
+  const struct jvm_object *obj = jvm_get_object_of_type(jvm, p1, JVM_OBJECT_ARRAY);
+  jobject result = NULL;
+  if (obj && p2 >= 0 && (size_t)p2 < obj->array.size)
+    result = jvm_ref_object(jvm, ((jobject*)obj->array.data)[p2]);
+  else jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
+  jvm_meta_unlock();
+  if (result) jvm_trace_bridge_ref(jvm,result,2);
+  return jvm_record_local(jvm,result);
 }
 
 static void
 JNIEnv_SetObjectArrayElement(JNIEnv* p0, jobjectArray p1, jsize p2, jobject p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_meta_lock();
-   const struct jvm_object *obj = jvm_get_object_of_type(jvm, p1, JVM_OBJECT_ARRAY);
-   if (!obj || p2 < 0 || (size_t)p2 >= obj->array.size) {
-      jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
-      jvm_meta_unlock();
-      return;
-   }
-   jobject *elements = obj->array.data;
-   jobject old = elements[p2];
-   elements[p2] = p3 ? jvm_ref_object(jvm, p3) : NULL;
-   if (elements[p2]) ++jvm_get_object(jvm, elements[p2])->array_refs;
-   if (old) {
-      struct jvm_object *child = jvm_get_object(jvm, old);
-      if (child && child->array_refs > 0) --child->array_refs;
-      jvm_deref_object(jvm, old);
-   }
-   jvm_meta_unlock();
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jvm_meta_lock();
+  const struct jvm_object *obj = jvm_get_object_of_type(jvm, p1, JVM_OBJECT_ARRAY);
+  if (!obj || p2 < 0 || (size_t)p2 >= obj->array.size) {
+    jvm_throw_new(jvm, "java/lang/ArrayIndexOutOfBoundsException", "array index");
+    jvm_meta_unlock();
+    return;
+  }
+  jobject *elements = obj->array.data;
+  jobject old = elements[p2];
+  elements[p2] = p3 ? jvm_ref_object(jvm, p3) : NULL;
+  if (elements[p2]) ++jvm_get_object(jvm, elements[p2])->array_refs;
+  if (old) {
+    struct jvm_object *child = jvm_get_object(jvm, old);
+    if (child && child->array_refs > 0) --child->array_refs;
+    jvm_deref_object(jvm, old);
+  }
+  jvm_meta_unlock();
 }
 
 static jboolean*
 JNIEnv_GetBooleanArrayElements(JNIEnv* p0, jbooleanArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jbyte*
 JNIEnv_GetByteArrayElements(JNIEnv* p0, jbyteArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jchar*
 JNIEnv_GetCharArrayElements(JNIEnv* p0, jcharArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jshort*
 JNIEnv_GetShortArrayElements(JNIEnv* p0, jshortArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jint*
 JNIEnv_GetIntArrayElements(JNIEnv* p0, jintArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jlong*
 JNIEnv_GetLongArrayElements(JNIEnv* p0, jlongArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jfloat*
 JNIEnv_GetFloatArrayElements(JNIEnv* p0, jfloatArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static jdouble*
 JNIEnv_GetDoubleArrayElements(JNIEnv* p0, jdoubleArray p1, jboolean* p2)
 {
-   return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
+  return jvm_get_array_elements(jnienv_get_jvm(p0), p1, p2);
 }
 
 static void
 JNIEnv_ReleaseBooleanArrayElements(JNIEnv* p0, jbooleanArray p1, jboolean* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseByteArrayElements(JNIEnv* p0, jbyteArray p1, jbyte* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseCharArrayElements(JNIEnv* p0, jcharArray p1, jchar* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseShortArrayElements(JNIEnv* p0, jshortArray p1, jshort* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseIntArrayElements(JNIEnv* p0, jintArray p1, jint* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseLongArrayElements(JNIEnv* p0, jlongArray p1, jlong* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseFloatArrayElements(JNIEnv* p0, jfloatArray p1, jfloat* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 JNIEnv_ReleaseDoubleArrayElements(JNIEnv* p0, jdoubleArray p1, jdouble* p2, jint p3)
 {
-   assert(p0 && p1);
+  assert(p0 && p1);
 }
 
 static void
 jvm_get_array_region(struct jvm *jvm, jobject obj, const size_t offset, const size_t size, void *buf)
 {
-   assert(jvm && obj);
-   const struct jvm_array *array = &jvm_get_object_of_type(jvm, obj, JVM_OBJECT_ARRAY)->array;
-   assert(offset + size <= array->size);
-   memcpy(buf, (char*)array->data + offset * array->element_sz, size * array->element_sz);
+  assert(jvm && obj);
+  const struct jvm_array *array = &jvm_get_object_of_type(jvm, obj, JVM_OBJECT_ARRAY)->array;
+  assert(offset + size <= array->size);
+  memcpy(buf, (char*)array->data + offset * array->element_sz, size * array->element_sz);
 }
 
 static void
 JNIEnv_GetBooleanArrayRegion(JNIEnv* p0, jbooleanArray p1, jsize p2, jsize p3, jboolean* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetByteArrayRegion(JNIEnv *p0, jbyteArray p1, jsize p2, jsize p3, jbyte* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetCharArrayRegion(JNIEnv* p0, jcharArray p1, jsize p2, jsize p3, jchar* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetShortArrayRegion(JNIEnv* p0, jshortArray p1, jsize p2, jsize p3, jshort* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetIntArrayRegion(JNIEnv* p0, jintArray p1, jsize p2, jsize p3, jint* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetLongArrayRegion(JNIEnv* p0, jlongArray p1, jsize p2, jsize p3, jlong* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetFloatArrayRegion(JNIEnv* p0, jfloatArray p1, jsize p2, jsize p3, jfloat* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_GetDoubleArrayRegion(JNIEnv* p0, jdoubleArray p1, jsize p2, jsize p3, jdouble* p4)
 {
-   jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_get_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 jvm_set_array_region(struct jvm *jvm, jobject obj, const size_t offset, const size_t size, const void *buf)
 {
-   assert(jvm && obj);
-   struct jvm_array *array = &jvm_get_object_of_type(jvm, obj, JVM_OBJECT_ARRAY)->array;
-   assert(offset + size <= array->size);
-   memcpy((char*)array->data + offset * array->element_sz, buf, size * array->element_sz);
+  assert(jvm && obj);
+  struct jvm_array *array = &jvm_get_object_of_type(jvm, obj, JVM_OBJECT_ARRAY)->array;
+  assert(offset + size <= array->size);
+  memcpy((char*)array->data + offset * array->element_sz, buf, size * array->element_sz);
 }
 
 static void
 JNIEnv_SetBooleanArrayRegion(JNIEnv* p0, jbooleanArray p1, jsize p2, jsize p3, const jboolean* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetByteArrayRegion(JNIEnv* p0, jbyteArray p1, jsize p2, jsize p3, const jbyte* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetCharArrayRegion(JNIEnv* p0, jcharArray p1, jsize p2, jsize p3, const jchar* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetShortArrayRegion(JNIEnv* p0, jshortArray p1, jsize p2, jsize p3, const jshort* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetIntArrayRegion(JNIEnv* p0, jintArray p1, jsize p2, jsize p3, const jint* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetLongArrayRegion(JNIEnv* p0, jlongArray p1, jsize p2, jsize p3, const jlong* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetFloatArrayRegion(JNIEnv* p0, jfloatArray p1, jsize p2, jsize p3, const jfloat* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 JNIEnv_SetDoubleArrayRegion(JNIEnv* p0, jdoubleArray p1, jsize p2, jsize p3, const jdouble* p4)
 {
-   jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
+  jvm_set_array_region(jnienv_get_jvm(p0), p1, p2, p3, p4);
 }
 
 static void
 jvm_register_native_method(struct jvm *jvm, const jclass klass, const JNINativeMethod *method)
 {
-   assert(jvm && klass && method);
-   size_t i;
-   for (i = 0; i < ARRAY_SIZE(jvm->methods) && jvm->methods[i].function; ++i);
-   assert(i < ARRAY_SIZE(jvm->methods) && "native method limit reached!");
-   jvm->methods[i].method.klass = klass;
-   jvm_string_set_cstr(&jvm->methods[i].method.name, method->name, true);
-   jvm_string_set_cstr(&jvm->methods[i].method.signature, method->signature, true);
-   jvm->methods[i].function = method->fnPtr;
-   verbose("%s::%s::%s", jvm_get_object_of_type(jvm, klass, JVM_OBJECT_CLASS)->klass.name.data, method->name, method->signature);
+  assert(jvm && klass && method);
+  size_t i;
+  for (i = 0; i < ARRAY_SIZE(jvm->methods) && jvm->methods[i].function; ++i);
+  assert(i < ARRAY_SIZE(jvm->methods) && "native method limit reached!");
+  jvm->methods[i].method.klass = klass;
+  jvm_string_set_cstr(&jvm->methods[i].method.name, method->name, true);
+  jvm_string_set_cstr(&jvm->methods[i].method.signature, method->signature, true);
+  jvm->methods[i].function = method->fnPtr;
+  verbose("%s::%s::%s", jvm_get_object_of_type(jvm, klass, JVM_OBJECT_CLASS)->klass.name.data, method->name, method->signature);
 }
 
 static jint
 JNIEnv_RegisterNatives(JNIEnv* p0, jclass p1, const JNINativeMethod* p2, jint p3)
 {
-   assert(p0 && p1);
-   const JNINativeMethod *method = p2;
-   for (jint i = 0; i < p3; ++i, ++method)
-      jvm_register_native_method(jnienv_get_jvm(p0), p1, method);
-   return 0;
+  assert(p0 && p1);
+  const JNINativeMethod *method = p2;
+  for (jint i = 0; i < p3; ++i, ++method)
+    jvm_register_native_method(jnienv_get_jvm(p0), p1, method);
+  return 0;
 }
 
 static jint
 JNIEnv_UnregisterNatives(JNIEnv* p0, jclass p1)
 {
-   assert(p0 && p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   for (size_t i = 0; i < ARRAY_SIZE(jvm->methods) && jvm->methods[i].function; ++i) {
-      if (jvm->methods[i].method.klass != p1)
-         continue;
-      jvm->methods[i] = (struct jvm_native_method){0};
-   }
-   return 0;
+  assert(p0 && p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  for (size_t i = 0; i < ARRAY_SIZE(jvm->methods) && jvm->methods[i].function; ++i) {
+    if (jvm->methods[i].method.klass != p1)
+      continue;
+    jvm->methods[i] = (struct jvm_native_method) {
+      0
+    };
+  }
+  return 0;
 }
 
 static jint
 JNIEnv_MonitorEnter(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   struct jvm_object *o = jvm_get_object(jvm, p1);
-   if (!o) return JNI_ERR;
-   const uint64_t me = jni_monitor_token();
+  assert(p0 && p1);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  struct jvm_object *o = jvm_get_object(jvm, p1);
+  if (!o) return JNI_ERR;
+  const uint64_t me = jni_monitor_token();
 
-   pthread_mutex_lock(&g_jni_monitor_mutex);
-   while (o->monitor_owner && o->monitor_owner != me) {
-      struct dvm *dvm = dvm_current();
-      unsigned gil_depth = dvm ? dvm_gil_unlock_all(dvm) : 0;
-      unsigned arm_depth = arm_lock_unlock_all();
-      pthread_cond_wait(&g_jni_monitor_cond, &g_jni_monitor_mutex);
+  pthread_mutex_lock(&g_jni_monitor_mutex);
+  while (o->monitor_owner && o->monitor_owner != me) {
+    struct dvm *dvm = dvm_current();
+    unsigned gil_depth = dvm ? dvm_gil_unlock_all(dvm) : 0;
+    unsigned arm_depth = arm_lock_unlock_all();
+    pthread_cond_wait(&g_jni_monitor_cond, &g_jni_monitor_mutex);
+    pthread_mutex_unlock(&g_jni_monitor_mutex);
+    if (dvm) dvm_gil_relock(dvm, gil_depth);
+    arm_lock_relock(arm_depth);
+    pthread_mutex_lock(&g_jni_monitor_mutex);
+    o = jvm_get_object(jvm, p1);
+    if (!o) {
       pthread_mutex_unlock(&g_jni_monitor_mutex);
-      if (dvm) dvm_gil_relock(dvm, gil_depth);
-      arm_lock_relock(arm_depth);
-      pthread_mutex_lock(&g_jni_monitor_mutex);
-      o = jvm_get_object(jvm, p1);
-      if (!o) { pthread_mutex_unlock(&g_jni_monitor_mutex); return JNI_ERR; }
-   }
-   o->monitor_owner = me;
-   ++o->monitor_depth;
-   pthread_mutex_unlock(&g_jni_monitor_mutex);
-   return JNI_OK;
+      return JNI_ERR;
+    }
+  }
+  o->monitor_owner = me;
+  ++o->monitor_depth;
+  pthread_mutex_unlock(&g_jni_monitor_mutex);
+  return JNI_OK;
 }
 
 static jint
 JNIEnv_MonitorExit(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
-   struct jvm_object *o = jvm_get_object(jnienv_get_jvm(p0), p1);
-   const uint64_t me = jni_monitor_token();
-   pthread_mutex_lock(&g_jni_monitor_mutex);
-   if (!o || o->monitor_owner != me || !o->monitor_depth) {
-      pthread_mutex_unlock(&g_jni_monitor_mutex);
-      jvm_throw_new(jnienv_get_jvm(p0),
-                    "java/lang/IllegalMonitorStateException",
-                    "JNI MonitorExit without ownership");
-      return JNI_ERR;
-   }
-   if (!--o->monitor_depth) {
-      o->monitor_owner = 0;
-      /* Waiters on different object monitors share this condition.  A single
-       * signal may select a waiter whose own monitor is still held. */
-      pthread_cond_broadcast(&g_jni_monitor_cond);
-   }
-   pthread_mutex_unlock(&g_jni_monitor_mutex);
-   return JNI_OK;
+  assert(p0 && p1);
+  struct jvm_object *o = jvm_get_object(jnienv_get_jvm(p0), p1);
+  const uint64_t me = jni_monitor_token();
+  pthread_mutex_lock(&g_jni_monitor_mutex);
+  if (!o || o->monitor_owner != me || !o->monitor_depth) {
+    pthread_mutex_unlock(&g_jni_monitor_mutex);
+    jvm_throw_new(jnienv_get_jvm(p0),
+                  "java/lang/IllegalMonitorStateException",
+                  "JNI MonitorExit without ownership");
+    return JNI_ERR;
+  }
+  if (!--o->monitor_depth) {
+    o->monitor_owner = 0;
+    /* Waiters on different object monitors share this condition.  A single
+     * signal may select a waiter whose own monitor is still held. */
+    pthread_cond_broadcast(&g_jni_monitor_cond);
+  }
+  pthread_mutex_unlock(&g_jni_monitor_mutex);
+  return JNI_OK;
 }
 
 static jint
 JNIEnv_GetJavaVM(JNIEnv* env, JavaVM** vm)
 {
-   assert(env && vm);
-   struct jvm *jvm = jnienv_get_jvm(env);
-   *vm = (JavaVM*)&jvm->vm;
-   return 0;
+  assert(env && vm);
+  struct jvm *jvm = jnienv_get_jvm(env);
+  *vm = (JavaVM*)&jvm->vm;
+  return 0;
 }
 
 static void
 JNIEnv_GetStringRegion(JNIEnv* p0, jstring p1, jsize p2, jsize p3, jchar* p4)
 {
-   assert(p0 && p1);
-   jsize length = JNIEnv_GetStringLength(p0, p1);
-   if (p2 < 0 || p3 < 0 || p2 > length || p3 > length - p2) {
-      jvm_throw_new(jnienv_get_jvm(p0), "java/lang/StringIndexOutOfBoundsException", "GetStringRegion");
-      return;
-   }
-   if (!p3) return;
-   const jchar *chars = JNIEnv_GetStringChars(p0, p1, NULL);
-   if (!chars) return;
-   memcpy(p4, chars + p2, (size_t)p3 * sizeof *chars);
-   JNIEnv_ReleaseStringChars(p0, p1, chars);
+  assert(p0 && p1);
+  jsize length = JNIEnv_GetStringLength(p0, p1);
+  if (p2 < 0 || p3 < 0 || p2 > length || p3 > length - p2) {
+    jvm_throw_new(jnienv_get_jvm(p0), "java/lang/StringIndexOutOfBoundsException", "GetStringRegion");
+    return;
+  }
+  if (!p3) return;
+  const jchar *chars = JNIEnv_GetStringChars(p0, p1, NULL);
+  if (!chars) return;
+  memcpy(p4, chars + p2, (size_t)p3 * sizeof *chars);
+  JNIEnv_ReleaseStringChars(p0, p1, chars);
 }
 
 static void
 JNIEnv_GetStringUTFRegion(JNIEnv* p0, jstring p1, jsize p2, jsize p3, char* p4)
 {
-   assert(p0 && p1);
-   jsize length = JNIEnv_GetStringLength(p0, p1);
-   if (p2 < 0 || p3 < 0 || p2 > length || p3 > length - p2) {
-      jvm_throw_new(jnienv_get_jvm(p0), "java/lang/StringIndexOutOfBoundsException", "GetStringUTFRegion");
-      return;
-   }
-   if (!p3) return;
-   const jchar *chars = JNIEnv_GetStringChars(p0, p1, NULL);
-   if (!chars) return;
-   jvm_mutf8(chars + p2, (size_t)p3, p4);
-   JNIEnv_ReleaseStringChars(p0, p1, chars);
+  assert(p0 && p1);
+  jsize length = JNIEnv_GetStringLength(p0, p1);
+  if (p2 < 0 || p3 < 0 || p2 > length || p3 > length - p2) {
+    jvm_throw_new(jnienv_get_jvm(p0), "java/lang/StringIndexOutOfBoundsException", "GetStringUTFRegion");
+    return;
+  }
+  if (!p3) return;
+  const jchar *chars = JNIEnv_GetStringChars(p0, p1, NULL);
+  if (!chars) return;
+  jvm_mutf8(chars + p2, (size_t)p3, p4);
+  JNIEnv_ReleaseStringChars(p0, p1, chars);
 }
 
 static void*
 JNIEnv_GetPrimitiveArrayCritical(JNIEnv *env, jarray array, jboolean *isCopy)
 {
-   assert(env && array);
-   return jvm_get_array_elements(jnienv_get_jvm(env), array, isCopy);
+  assert(env && array);
+  return jvm_get_array_elements(jnienv_get_jvm(env), array, isCopy);
 }
 
 static void
 JNIEnv_ReleasePrimitiveArrayCritical(JNIEnv *env, jarray array, void *carray, jint mode)
 {
-   assert(env && array);
+  assert(env && array);
 }
 
 static const jchar*
 JNIEnv_GetStringCritical(JNIEnv* p0, jstring p1, jboolean* p2)
 {
-   return JNIEnv_GetStringChars(p0, p1, p2);
+  return JNIEnv_GetStringChars(p0, p1, p2);
 }
 
 static void
 JNIEnv_ReleaseStringCritical(JNIEnv* p0, jstring p1, const jchar* p2)
 {
-   JNIEnv_ReleaseStringChars(p0, p1, p2);
+  JNIEnv_ReleaseStringChars(p0, p1, p2);
 }
 
 static jweak
 JNIEnv_NewWeakGlobalRef(JNIEnv* p0, jobject p1)
 {
-   assert(p0);
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_meta_lock();
-   p1 = jvm_resolve_reference(jvm,p1);
-   if (!p1) { jvm_meta_unlock(); return NULL; }
-   size_t i = jvm->next_weak;
-   while (i < jvm->weak_capacity && jvm->weak_refs[i].used) ++i;
-   if (i == jvm->weak_capacity) {
-      size_t old = jvm->weak_capacity;
-      size_t cap = old ? old * 2 : 64;
-      struct jvm_weak_ref *refs = cap > old &&
-         cap <= UINT32_MAX - ARRAY_SIZE(jvm->objects) &&
-         cap <= SIZE_MAX / sizeof *refs
-         ? realloc(jvm->weak_refs,cap * sizeof *refs) : NULL;
-      if (!refs) {
-         jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI weak references");
-         jvm_meta_unlock(); return NULL;
-      }
-      memset(refs + old,0,(cap - old) * sizeof *refs);
-      jvm->weak_refs = refs; jvm->weak_capacity = cap;
-   }
-   jvm->weak_refs[i] = (struct jvm_weak_ref){
-      p1,jvm->object_generation[(uintptr_t)p1 - 1],true
-   };
-   jvm->next_weak = i + 1;
-   jweak result = (jweak)(uintptr_t)(ARRAY_SIZE(jvm->objects) + i + 1);
-   jvm_meta_unlock(); return result;
+  assert(p0);
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jvm_meta_lock();
+  p1 = jvm_resolve_reference(jvm,p1);
+  if (!p1) {
+    jvm_meta_unlock();
+    return NULL;
+  }
+  size_t i = jvm->next_weak;
+  while (i < jvm->weak_capacity && jvm->weak_refs[i].used) ++i;
+  if (i == jvm->weak_capacity) {
+    size_t old = jvm->weak_capacity;
+    size_t cap = old ? old * 2 : 64;
+    struct jvm_weak_ref *refs = cap > old &&
+                                cap <= UINT32_MAX - ARRAY_SIZE(jvm->objects) &&
+                                cap <= SIZE_MAX / sizeof *refs
+                                ? realloc(jvm->weak_refs,cap * sizeof *refs) : NULL;
+    if (!refs) {
+      jvm_throw_new(jvm,"java/lang/OutOfMemoryError","JNI weak references");
+      jvm_meta_unlock();
+      return NULL;
+    }
+    memset(refs + old,0,(cap - old) * sizeof *refs);
+    jvm->weak_refs = refs;
+    jvm->weak_capacity = cap;
+  }
+  jvm->weak_refs[i] = (struct jvm_weak_ref) {
+    p1,jvm->object_generation[(uintptr_t)p1 - 1],true
+  };
+  jvm->next_weak = i + 1;
+  jweak result = (jweak)(uintptr_t)(ARRAY_SIZE(jvm->objects) + i + 1);
+  jvm_meta_unlock();
+  return result;
 }
 
 static void
 JNIEnv_DeleteWeakGlobalRef(JNIEnv* p0, jweak p1)
 {
-   assert(p0);
-   if (!p1) return;
-   struct jvm *jvm = jnienv_get_jvm(p0);
-   jvm_meta_lock();
-   size_t i = (uintptr_t)p1 - ARRAY_SIZE(jvm->objects) - 1;
-   if (i < jvm->weak_capacity) {
-      jvm->weak_refs[i] = (struct jvm_weak_ref){0};
-      if (i < jvm->next_weak) jvm->next_weak = i;
-   }
-   jvm_meta_unlock();
+  assert(p0);
+  if (!p1) return;
+  struct jvm *jvm = jnienv_get_jvm(p0);
+  jvm_meta_lock();
+  size_t i = (uintptr_t)p1 - ARRAY_SIZE(jvm->objects) - 1;
+  if (i < jvm->weak_capacity) {
+    jvm->weak_refs[i] = (struct jvm_weak_ref) {
+      0
+    };
+    if (i < jvm->next_weak) jvm->next_weak = i;
+  }
+  jvm_meta_unlock();
 }
 
 static jboolean
 JNIEnv_ExceptionCheck(JNIEnv* p0)
 {
-   assert(p0);
-   struct jvm_exception_state *e = jvm_exception_state(jnienv_get_jvm(p0));
-   if (e->pending_exception)
-      jvm_trace_pending("ExceptionCheck(pending)", e->pending_exception_class,
-                        e->pending_exception_msg);
-   return e->pending_exception ? JNI_TRUE : JNI_FALSE;
+  assert(p0);
+  struct jvm_exception_state *e = jvm_exception_state(jnienv_get_jvm(p0));
+  if (e->pending_exception)
+    jvm_trace_pending("ExceptionCheck(pending)", e->pending_exception_class,
+                      e->pending_exception_msg);
+  return e->pending_exception ? JNI_TRUE : JNI_FALSE;
 }
 
 static jobject
 JNIEnv_NewDirectByteBuffer(JNIEnv* p0, void* p1, jlong p2)
 {
-   assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+  assert(p0 && p1);
+  JVM_UNIMPLEMENTED();
+  return NULL;
 }
 
 static void*
 JNIEnv_GetDirectBufferAddress(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return NULL;
+  assert(p0 && p1);
+  JVM_UNIMPLEMENTED();
+  return NULL;
 }
 
 static jlong
 JNIEnv_GetDirectBufferCapacity(JNIEnv* p0, jobject p1)
 {
-   assert(p0 && p1);
-   JVM_UNIMPLEMENTED();
-   return 0;
+  assert(p0 && p1);
+  JVM_UNIMPLEMENTED();
+  return 0;
 }
 
 static const char*
 JNIEnv_GetStringUTFChars(JNIEnv *env, jstring string, jboolean *isCopy)
 {
-   assert(env);
-   if (!string) return NULL;
-   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string;
-   bool same = true;
-   for (size_t i = 0; i < s->size; ++i) {
-      unsigned c = (unsigned char)s->data[i];
-      if (!c || c >= 0xf0) { same = false; break; }
-   }
-   if (same) {
-      if (isCopy) *isCopy = JNI_FALSE;
-      return s->data ? s->data : "";
-   }
-   const jchar *chars = JNIEnv_GetStringChars(env, string, NULL);
-   if (!chars) return NULL;
-   size_t count = (size_t)JNIEnv_GetStringLength(env, string);
-   size_t bytes = jvm_mutf8(chars, count, NULL);
-   char *utf = malloc(bytes + 1);
-   if (utf) {
-      jvm_mutf8(chars, count, utf);
-      utf[bytes] = 0;
-      if (isCopy) *isCopy = JNI_TRUE;
-   } else jvm_throw_new(jnienv_get_jvm(env), "java/lang/OutOfMemoryError", "GetStringUTFChars");
-   JNIEnv_ReleaseStringChars(env, string, chars);
-   return utf;
+  assert(env);
+  if (!string) return NULL;
+  const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string;
+  bool same = true;
+  for (size_t i = 0; i < s->size; ++i) {
+    unsigned c = (unsigned char)s->data[i];
+    if (!c || c >= 0xf0) {
+      same = false;
+      break;
+    }
+  }
+  if (same) {
+    if (isCopy) *isCopy = JNI_FALSE;
+    return s->data ? s->data : "";
+  }
+  const jchar *chars = JNIEnv_GetStringChars(env, string, NULL);
+  if (!chars) return NULL;
+  size_t count = (size_t)JNIEnv_GetStringLength(env, string);
+  size_t bytes = jvm_mutf8(chars, count, NULL);
+  char *utf = malloc(bytes + 1);
+  if (utf) {
+    jvm_mutf8(chars, count, utf);
+    utf[bytes] = 0;
+    if (isCopy) *isCopy = JNI_TRUE;
+  } else jvm_throw_new(jnienv_get_jvm(env), "java/lang/OutOfMemoryError", "GetStringUTFChars");
+  JNIEnv_ReleaseStringChars(env, string, chars);
+  return utf;
 }
 
 static void
 JNIEnv_ReleaseStringUTFChars(JNIEnv *env, jstring string, const char *utf)
 {
-   assert(env && string);
-   const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string;
-   if (utf != s->data && s->size) free((void *)utf);
+  assert(env && string);
+  const struct jvm_string *s = &jvm_get_object_of_type(jnienv_get_jvm(env), string, JVM_OBJECT_STRING)->string;
+  if (utf != s->data && s->size) free((void *)utf);
 }
 
 #define WRAP(x) wrapper_create(#x, x)
@@ -3229,293 +3320,293 @@ JNIEnv_ReleaseStringUTFChars(JNIEnv *env, jstring string, const char *utf)
 static void
 env_init(JNIEnv *env, struct JNINativeInterface *native)
 {
-   assert(env && native);
-   native->GetStringUTFChars = WRAP(JNIEnv_GetStringUTFChars);
-   native->ReleaseStringUTFChars = WRAP(JNIEnv_ReleaseStringUTFChars);
-   native->GetVersion = WRAP(JNIEnv_GetVersion);
-   native->DefineClass = WRAP(JNIEnv_DefineClass);
-   native->FindClass = WRAP(JNIEnv_FindClass);
-   native->FromReflectedMethod = WRAP(JNIEnv_FromReflectedMethod);
-   native->FromReflectedField = WRAP(JNIEnv_FromReflectedField);
-   native->ToReflectedMethod = WRAP(JNIEnv_ToReflectedMethod);
-   native->GetSuperclass = WRAP(JNIEnv_GetSuperclass);
-   native->IsAssignableFrom = WRAP(JNIEnv_IsAssignableFrom);
-   native->ToReflectedField = WRAP(JNIEnv_ToReflectedField);
-   native->Throw = WRAP(JNIEnv_Throw);
-   native->ThrowNew = WRAP(JNIEnv_ThrowNew);
-   native->ExceptionOccurred = WRAP(JNIEnv_ExceptionOccurred);
-   native->ExceptionDescribe = WRAP(JNIEnv_ExceptionDescribe);
-   native->ExceptionClear = WRAP(JNIEnv_ExceptionClear);
-   native->FatalError = WRAP(JNIEnv_FatalError);
-   native->PushLocalFrame = WRAP(JNIEnv_PushLocalFrame);
-   native->PopLocalFrame = WRAP(JNIEnv_PopLocalFrame);
-   native->NewGlobalRef = WRAP(JNIEnv_NewGlobalRef);
-   native->DeleteGlobalRef = WRAP(JNIEnv_DeleteGlobalRef);
-   native->DeleteLocalRef = WRAP(JNIEnv_DeleteLocalRef);
-   native->IsSameObject = WRAP(JNIEnv_IsSameObject);
-   native->NewLocalRef = WRAP(JNIEnv_NewLocalRef);
-   native->EnsureLocalCapacity = WRAP(JNIEnv_EnsureLocalCapacity);
-   native->AllocObject = WRAP(JNIEnv_AllocObject);
-   native->NewObject = WRAP(JNIEnv_NewObject);
-   native->NewObjectV = WRAP(JNIEnv_NewObjectV);
-   native->NewObjectA = WRAP(JNIEnv_NewObjectA);
-   native->GetObjectClass = WRAP(JNIEnv_GetObjectClass);
-   native->IsInstanceOf = WRAP(JNIEnv_IsInstanceOf);
-   native->GetMethodID = WRAP(JNIEnv_GetMethodID);
-   native->CallObjectMethod = WRAP(JNIEnv_CallObjectMethod);
-   native->CallObjectMethodV = WRAP(JNIEnv_CallObjectMethodV);
-   native->CallObjectMethodA = WRAP(JNIEnv_CallObjectMethodA);
-   native->CallBooleanMethod = WRAP(JNIEnv_CallBooleanMethod);
-   native->CallBooleanMethodV = WRAP(JNIEnv_CallBooleanMethodV);
-   native->CallBooleanMethodA = WRAP(JNIEnv_CallBooleanMethodA);
-   native->CallByteMethod = WRAP(JNIEnv_CallByteMethod);
-   native->CallByteMethodV = WRAP(JNIEnv_CallByteMethodV);
-   native->CallByteMethodA = WRAP(JNIEnv_CallByteMethodA);
-   native->CallCharMethod = WRAP(JNIEnv_CallCharMethod);
-   native->CallCharMethodV = WRAP(JNIEnv_CallCharMethodV);
-   native->CallCharMethodA = WRAP(JNIEnv_CallCharMethodA);
-   native->CallShortMethod = WRAP(JNIEnv_CallShortMethod);
-   native->CallShortMethodV = WRAP(JNIEnv_CallShortMethodV);
-   native->CallShortMethodA = WRAP(JNIEnv_CallShortMethodA);
-   native->CallIntMethod = WRAP(JNIEnv_CallIntMethod);
-   native->CallIntMethodV = WRAP(JNIEnv_CallIntMethodV);
-   native->CallIntMethodA = WRAP(JNIEnv_CallIntMethodA);
-   native->CallLongMethod = WRAP(JNIEnv_CallLongMethod);
-   native->CallLongMethodV = WRAP(JNIEnv_CallLongMethodV);
-   native->CallLongMethodA = WRAP(JNIEnv_CallLongMethodA);
-   native->CallFloatMethod = WRAP(JNIEnv_CallFloatMethod);
-   native->CallFloatMethodV = WRAP(JNIEnv_CallFloatMethodV);
-   native->CallFloatMethodA = WRAP(JNIEnv_CallFloatMethodA);
-   native->CallDoubleMethod = WRAP(JNIEnv_CallDoubleMethod);
-   native->CallDoubleMethodV = WRAP(JNIEnv_CallDoubleMethodV);
-   native->CallDoubleMethodA = WRAP(JNIEnv_CallDoubleMethodA);
-   native->CallVoidMethod = WRAP(JNIEnv_CallVoidMethod);
-   native->CallVoidMethodV = WRAP(JNIEnv_CallVoidMethodV);
-   native->CallVoidMethodA = WRAP(JNIEnv_CallVoidMethodA);
-   native->CallNonvirtualObjectMethod = WRAP(JNIEnv_CallNonvirtualObjectMethod);
-   native->CallNonvirtualObjectMethodV = WRAP(JNIEnv_CallNonvirtualObjectMethodV);
-   native->CallNonvirtualObjectMethodA = WRAP(JNIEnv_CallNonvirtualObjectMethodA);
-   native->CallNonvirtualBooleanMethod = WRAP(JNIEnv_CallNonvirtualBooleanMethod);
-   native->CallNonvirtualBooleanMethodV = WRAP(JNIEnv_CallNonvirtualBooleanMethodV);
-   native->CallNonvirtualBooleanMethodA = WRAP(JNIEnv_CallNonvirtualBooleanMethodA);
-   native->CallNonvirtualByteMethod = WRAP(JNIEnv_CallNonvirtualByteMethod);
-   native->CallNonvirtualByteMethodV = WRAP(JNIEnv_CallNonvirtualByteMethodV);
-   native->CallNonvirtualByteMethodA = WRAP(JNIEnv_CallNonvirtualByteMethodA);
-   native->CallNonvirtualCharMethod = WRAP(JNIEnv_CallNonvirtualCharMethod);
-   native->CallNonvirtualCharMethodV = WRAP(JNIEnv_CallNonvirtualCharMethodV);
-   native->CallNonvirtualCharMethodA = WRAP(JNIEnv_CallNonvirtualCharMethodA);
-   native->CallNonvirtualShortMethod = WRAP(JNIEnv_CallNonvirtualShortMethod);
-   native->CallNonvirtualShortMethodV = WRAP(JNIEnv_CallNonvirtualShortMethodV);
-   native->CallNonvirtualShortMethodA = WRAP(JNIEnv_CallNonvirtualShortMethodA);
-   native->CallNonvirtualIntMethod = WRAP(JNIEnv_CallNonvirtualIntMethod);
-   native->CallNonvirtualIntMethodV = WRAP(JNIEnv_CallNonvirtualIntMethodV);
-   native->CallNonvirtualIntMethodA = WRAP(JNIEnv_CallNonvirtualIntMethodA);
-   native->CallNonvirtualLongMethod = WRAP(JNIEnv_CallNonvirtualLongMethod);
-   native->CallNonvirtualLongMethodV = WRAP(JNIEnv_CallNonvirtualLongMethodV);
-   native->CallNonvirtualLongMethodA = WRAP(JNIEnv_CallNonvirtualLongMethodA);
-   native->CallNonvirtualFloatMethod = WRAP(JNIEnv_CallNonvirtualFloatMethod);
-   native->CallNonvirtualFloatMethodV = WRAP(JNIEnv_CallNonvirtualFloatMethodV);
-   native->CallNonvirtualFloatMethodA = WRAP(JNIEnv_CallNonvirtualFloatMethodA);
-   native->CallNonvirtualDoubleMethod = WRAP(JNIEnv_CallNonvirtualDoubleMethod);
-   native->CallNonvirtualDoubleMethodV = WRAP(JNIEnv_CallNonvirtualDoubleMethodV);
-   native->CallNonvirtualDoubleMethodA = WRAP(JNIEnv_CallNonvirtualDoubleMethodA);
-   native->CallNonvirtualVoidMethod = WRAP(JNIEnv_CallNonvirtualVoidMethod);
-   native->CallNonvirtualVoidMethodV = WRAP(JNIEnv_CallNonvirtualVoidMethodV);
-   native->CallNonvirtualVoidMethodA = WRAP(JNIEnv_CallNonvirtualVoidMethodA);
-   native->GetFieldID = WRAP(JNIEnv_GetFieldID);
-   native->GetObjectField = WRAP(JNIEnv_GetObjectField_traced);
-   native->GetBooleanField = WRAP(JNIEnv_GetBooleanField);
-   native->GetByteField = WRAP(JNIEnv_GetByteField);
-   native->GetCharField = WRAP(JNIEnv_GetCharField);
-   native->GetShortField = WRAP(JNIEnv_GetShortField);
-   native->GetIntField = WRAP(JNIEnv_GetIntField);
-   native->GetLongField = WRAP(JNIEnv_GetLongField);
-   native->GetFloatField = WRAP(JNIEnv_GetFloatField);
-   native->GetDoubleField = WRAP(JNIEnv_GetDoubleField);
-   native->SetObjectField = WRAP(JNIEnv_SetObjectField);
-   native->SetBooleanField = WRAP(JNIEnv_SetBooleanField);
-   native->SetByteField = WRAP(JNIEnv_SetByteField);
-   native->SetCharField = WRAP(JNIEnv_SetCharField);
-   native->SetShortField = WRAP(JNIEnv_SetShortField);
-   native->SetIntField = WRAP(JNIEnv_SetIntField);
-   native->SetLongField = WRAP(JNIEnv_SetLongField);
-   native->SetFloatField = WRAP(JNIEnv_SetFloatField);
-   native->SetDoubleField = WRAP(JNIEnv_SetDoubleField);
-   native->GetStaticMethodID = WRAP(JNIEnv_GetStaticMethodID);
-   native->CallStaticObjectMethod = WRAP(JNIEnv_CallStaticObjectMethod);
-   native->CallStaticObjectMethodV = WRAP(JNIEnv_CallStaticObjectMethodV);
-   native->CallStaticObjectMethodA = WRAP(JNIEnv_CallStaticObjectMethodA);
-   native->CallStaticBooleanMethod = WRAP(JNIEnv_CallStaticBooleanMethod);
-   native->CallStaticBooleanMethodV = WRAP(JNIEnv_CallStaticBooleanMethodV);
-   native->CallStaticBooleanMethodA = WRAP(JNIEnv_CallStaticBooleanMethodA);
-   native->CallStaticByteMethod = WRAP(JNIEnv_CallStaticByteMethod);
-   native->CallStaticByteMethodV = WRAP(JNIEnv_CallStaticByteMethodV);
-   native->CallStaticByteMethodA = WRAP(JNIEnv_CallStaticByteMethodA);
-   native->CallStaticCharMethod = WRAP(JNIEnv_CallStaticCharMethod);
-   native->CallStaticCharMethodV = WRAP(JNIEnv_CallStaticCharMethodV);
-   native->CallStaticCharMethodA = WRAP(JNIEnv_CallStaticCharMethodA);
-   native->CallStaticShortMethod = WRAP(JNIEnv_CallStaticShortMethod);
-   native->CallStaticShortMethodV = WRAP(JNIEnv_CallStaticShortMethodV);
-   native->CallStaticShortMethodA = WRAP(JNIEnv_CallStaticShortMethodA);
-   native->CallStaticIntMethod = WRAP(JNIEnv_CallStaticIntMethod);
-   native->CallStaticIntMethodV = WRAP(JNIEnv_CallStaticIntMethodV);
-   native->CallStaticIntMethodA = WRAP(JNIEnv_CallStaticIntMethodA);
-   native->CallStaticLongMethod = WRAP(JNIEnv_CallStaticLongMethod);
-   native->CallStaticLongMethodV = WRAP(JNIEnv_CallStaticLongMethodV);
-   native->CallStaticLongMethodA = WRAP(JNIEnv_CallStaticLongMethodA);
-   native->CallStaticFloatMethod = WRAP(JNIEnv_CallStaticFloatMethod);
-   native->CallStaticFloatMethodV = WRAP(JNIEnv_CallStaticFloatMethodV);
-   native->CallStaticFloatMethodA = WRAP(JNIEnv_CallStaticFloatMethodA);
-   native->CallStaticDoubleMethod = WRAP(JNIEnv_CallStaticDoubleMethod);
-   native->CallStaticDoubleMethodV = WRAP(JNIEnv_CallStaticDoubleMethodV);
-   native->CallStaticDoubleMethodA = WRAP(JNIEnv_CallStaticDoubleMethodA);
-   native->CallStaticVoidMethod = WRAP(JNIEnv_CallStaticVoidMethod);
-   native->CallStaticVoidMethodV = WRAP(JNIEnv_CallStaticVoidMethodV);
-   native->CallStaticVoidMethodA = WRAP(JNIEnv_CallStaticVoidMethodA);
-   native->GetStaticFieldID = WRAP(JNIEnv_GetStaticFieldID);
-   native->GetStaticObjectField = WRAP(JNIEnv_GetStaticObjectField_traced);
-   native->GetStaticBooleanField = WRAP(JNIEnv_GetStaticBooleanField);
-   native->GetStaticByteField = WRAP(JNIEnv_GetStaticByteField);
-   native->GetStaticCharField = WRAP(JNIEnv_GetStaticCharField);
-   native->GetStaticShortField = WRAP(JNIEnv_GetStaticShortField);
-   native->GetStaticIntField = WRAP(JNIEnv_GetStaticIntField);
-   native->GetStaticLongField = WRAP(JNIEnv_GetStaticLongField);
-   native->GetStaticFloatField = WRAP(JNIEnv_GetStaticFloatField);
-   native->GetStaticDoubleField = WRAP(JNIEnv_GetStaticDoubleField);
-   native->SetStaticObjectField = WRAP(JNIEnv_SetStaticObjectField);
-   native->SetStaticBooleanField = WRAP(JNIEnv_SetStaticBooleanField);
-   native->SetStaticByteField = WRAP(JNIEnv_SetStaticByteField);
-   native->SetStaticCharField = WRAP(JNIEnv_SetStaticCharField);
-   native->SetStaticShortField = WRAP(JNIEnv_SetStaticShortField);
-   native->SetStaticIntField = WRAP(JNIEnv_SetStaticIntField);
-   native->SetStaticLongField = WRAP(JNIEnv_SetStaticLongField);
-   native->SetStaticFloatField = WRAP(JNIEnv_SetStaticFloatField);
-   native->SetStaticDoubleField = WRAP(JNIEnv_SetStaticDoubleField);
-   native->NewString = WRAP(JNIEnv_NewString);
-   native->GetStringLength = WRAP(JNIEnv_GetStringLength);
-   native->GetStringChars = WRAP(JNIEnv_GetStringChars);
-   native->ReleaseStringChars = WRAP(JNIEnv_ReleaseStringChars);
-   native->NewStringUTF = WRAP(JNIEnv_NewStringUTF);
-   native->GetStringUTFLength = WRAP(JNIEnv_GetStringUTFLength);
-   native->GetArrayLength = WRAP(JNIEnv_GetArrayLength);
-   native->NewObjectArray = WRAP(JNIEnv_NewObjectArray);
-   native->GetObjectArrayElement = WRAP(JNIEnv_GetObjectArrayElement);
-   native->SetObjectArrayElement = WRAP(JNIEnv_SetObjectArrayElement);
-   native->NewBooleanArray = WRAP(JNIEnv_NewBooleanArray);
-   native->NewByteArray = WRAP(JNIEnv_NewByteArray);
-   native->NewCharArray = WRAP(JNIEnv_NewCharArray);
-   native->NewShortArray = WRAP(JNIEnv_NewShortArray);
-   native->NewIntArray = WRAP(JNIEnv_NewIntArray);
-   native->NewLongArray = WRAP(JNIEnv_NewLongArray);
-   native->NewFloatArray = WRAP(JNIEnv_NewFloatArray);
-   native->NewDoubleArray = WRAP(JNIEnv_NewDoubleArray);
-   native->GetBooleanArrayElements = WRAP(JNIEnv_GetBooleanArrayElements);
-   native->GetByteArrayElements = WRAP(JNIEnv_GetByteArrayElements);
-   native->GetCharArrayElements = WRAP(JNIEnv_GetCharArrayElements);
-   native->GetShortArrayElements = WRAP(JNIEnv_GetShortArrayElements);
-   native->GetIntArrayElements = WRAP(JNIEnv_GetIntArrayElements);
-   native->GetLongArrayElements = WRAP(JNIEnv_GetLongArrayElements);
-   native->GetFloatArrayElements = WRAP(JNIEnv_GetFloatArrayElements);
-   native->GetDoubleArrayElements = WRAP(JNIEnv_GetDoubleArrayElements);
-   native->ReleaseBooleanArrayElements = WRAP(JNIEnv_ReleaseBooleanArrayElements);
-   native->ReleaseByteArrayElements = WRAP(JNIEnv_ReleaseByteArrayElements);
-   native->ReleaseCharArrayElements = WRAP(JNIEnv_ReleaseCharArrayElements);
-   native->ReleaseShortArrayElements = WRAP(JNIEnv_ReleaseShortArrayElements);
-   native->ReleaseIntArrayElements = WRAP(JNIEnv_ReleaseIntArrayElements);
-   native->ReleaseLongArrayElements = WRAP(JNIEnv_ReleaseLongArrayElements);
-   native->ReleaseFloatArrayElements = WRAP(JNIEnv_ReleaseFloatArrayElements);
-   native->ReleaseDoubleArrayElements = WRAP(JNIEnv_ReleaseDoubleArrayElements);
-   native->GetBooleanArrayRegion = WRAP(JNIEnv_GetBooleanArrayRegion);
-   native->GetByteArrayRegion = WRAP(JNIEnv_GetByteArrayRegion);
-   native->GetCharArrayRegion = WRAP(JNIEnv_GetCharArrayRegion);
-   native->GetShortArrayRegion = WRAP(JNIEnv_GetShortArrayRegion);
-   native->GetIntArrayRegion = WRAP(JNIEnv_GetIntArrayRegion);
-   native->GetLongArrayRegion = WRAP(JNIEnv_GetLongArrayRegion);
-   native->GetFloatArrayRegion = WRAP(JNIEnv_GetFloatArrayRegion);
-   native->GetDoubleArrayRegion = WRAP(JNIEnv_GetDoubleArrayRegion);
-   native->SetBooleanArrayRegion = WRAP(JNIEnv_SetBooleanArrayRegion);
-   native->SetByteArrayRegion = WRAP(JNIEnv_SetByteArrayRegion);
-   native->SetCharArrayRegion = WRAP(JNIEnv_SetCharArrayRegion);
-   native->SetShortArrayRegion = WRAP(JNIEnv_SetShortArrayRegion);
-   native->SetIntArrayRegion = WRAP(JNIEnv_SetIntArrayRegion);
-   native->SetLongArrayRegion = WRAP(JNIEnv_SetLongArrayRegion);
-   native->SetFloatArrayRegion = WRAP(JNIEnv_SetFloatArrayRegion);
-   native->SetDoubleArrayRegion = WRAP(JNIEnv_SetDoubleArrayRegion);
-   native->RegisterNatives = WRAP(JNIEnv_RegisterNatives);
-   native->UnregisterNatives = WRAP(JNIEnv_UnregisterNatives);
-   native->MonitorEnter = WRAP(JNIEnv_MonitorEnter);
-   native->MonitorExit = WRAP(JNIEnv_MonitorExit);
-   native->GetJavaVM = WRAP(JNIEnv_GetJavaVM);
-   native->GetStringRegion = WRAP(JNIEnv_GetStringRegion);
-   native->GetStringUTFRegion = WRAP(JNIEnv_GetStringUTFRegion);
-   native->GetPrimitiveArrayCritical = WRAP(JNIEnv_GetPrimitiveArrayCritical);
-   native->ReleasePrimitiveArrayCritical = WRAP(JNIEnv_ReleasePrimitiveArrayCritical);
-   native->GetStringCritical = WRAP(JNIEnv_GetStringCritical);
-   native->ReleaseStringCritical = WRAP(JNIEnv_ReleaseStringCritical);
-   native->NewWeakGlobalRef = WRAP(JNIEnv_NewWeakGlobalRef);
-   native->DeleteWeakGlobalRef = WRAP(JNIEnv_DeleteWeakGlobalRef);
-   native->ExceptionCheck = WRAP(JNIEnv_ExceptionCheck);
-   native->NewDirectByteBuffer = WRAP(JNIEnv_NewDirectByteBuffer);
-   native->GetDirectBufferAddress = WRAP(JNIEnv_GetDirectBufferAddress);
-   native->GetDirectBufferCapacity = WRAP(JNIEnv_GetDirectBufferCapacity);
-   *env = native;
+  assert(env && native);
+  native->GetStringUTFChars = WRAP(JNIEnv_GetStringUTFChars);
+  native->ReleaseStringUTFChars = WRAP(JNIEnv_ReleaseStringUTFChars);
+  native->GetVersion = WRAP(JNIEnv_GetVersion);
+  native->DefineClass = WRAP(JNIEnv_DefineClass);
+  native->FindClass = WRAP(JNIEnv_FindClass);
+  native->FromReflectedMethod = WRAP(JNIEnv_FromReflectedMethod);
+  native->FromReflectedField = WRAP(JNIEnv_FromReflectedField);
+  native->ToReflectedMethod = WRAP(JNIEnv_ToReflectedMethod);
+  native->GetSuperclass = WRAP(JNIEnv_GetSuperclass);
+  native->IsAssignableFrom = WRAP(JNIEnv_IsAssignableFrom);
+  native->ToReflectedField = WRAP(JNIEnv_ToReflectedField);
+  native->Throw = WRAP(JNIEnv_Throw);
+  native->ThrowNew = WRAP(JNIEnv_ThrowNew);
+  native->ExceptionOccurred = WRAP(JNIEnv_ExceptionOccurred);
+  native->ExceptionDescribe = WRAP(JNIEnv_ExceptionDescribe);
+  native->ExceptionClear = WRAP(JNIEnv_ExceptionClear);
+  native->FatalError = WRAP(JNIEnv_FatalError);
+  native->PushLocalFrame = WRAP(JNIEnv_PushLocalFrame);
+  native->PopLocalFrame = WRAP(JNIEnv_PopLocalFrame);
+  native->NewGlobalRef = WRAP(JNIEnv_NewGlobalRef);
+  native->DeleteGlobalRef = WRAP(JNIEnv_DeleteGlobalRef);
+  native->DeleteLocalRef = WRAP(JNIEnv_DeleteLocalRef);
+  native->IsSameObject = WRAP(JNIEnv_IsSameObject);
+  native->NewLocalRef = WRAP(JNIEnv_NewLocalRef);
+  native->EnsureLocalCapacity = WRAP(JNIEnv_EnsureLocalCapacity);
+  native->AllocObject = WRAP(JNIEnv_AllocObject);
+  native->NewObject = WRAP(JNIEnv_NewObject);
+  native->NewObjectV = WRAP(JNIEnv_NewObjectV);
+  native->NewObjectA = WRAP(JNIEnv_NewObjectA);
+  native->GetObjectClass = WRAP(JNIEnv_GetObjectClass);
+  native->IsInstanceOf = WRAP(JNIEnv_IsInstanceOf);
+  native->GetMethodID = WRAP(JNIEnv_GetMethodID);
+  native->CallObjectMethod = WRAP(JNIEnv_CallObjectMethod);
+  native->CallObjectMethodV = WRAP(JNIEnv_CallObjectMethodV);
+  native->CallObjectMethodA = WRAP(JNIEnv_CallObjectMethodA);
+  native->CallBooleanMethod = WRAP(JNIEnv_CallBooleanMethod);
+  native->CallBooleanMethodV = WRAP(JNIEnv_CallBooleanMethodV);
+  native->CallBooleanMethodA = WRAP(JNIEnv_CallBooleanMethodA);
+  native->CallByteMethod = WRAP(JNIEnv_CallByteMethod);
+  native->CallByteMethodV = WRAP(JNIEnv_CallByteMethodV);
+  native->CallByteMethodA = WRAP(JNIEnv_CallByteMethodA);
+  native->CallCharMethod = WRAP(JNIEnv_CallCharMethod);
+  native->CallCharMethodV = WRAP(JNIEnv_CallCharMethodV);
+  native->CallCharMethodA = WRAP(JNIEnv_CallCharMethodA);
+  native->CallShortMethod = WRAP(JNIEnv_CallShortMethod);
+  native->CallShortMethodV = WRAP(JNIEnv_CallShortMethodV);
+  native->CallShortMethodA = WRAP(JNIEnv_CallShortMethodA);
+  native->CallIntMethod = WRAP(JNIEnv_CallIntMethod);
+  native->CallIntMethodV = WRAP(JNIEnv_CallIntMethodV);
+  native->CallIntMethodA = WRAP(JNIEnv_CallIntMethodA);
+  native->CallLongMethod = WRAP(JNIEnv_CallLongMethod);
+  native->CallLongMethodV = WRAP(JNIEnv_CallLongMethodV);
+  native->CallLongMethodA = WRAP(JNIEnv_CallLongMethodA);
+  native->CallFloatMethod = WRAP(JNIEnv_CallFloatMethod);
+  native->CallFloatMethodV = WRAP(JNIEnv_CallFloatMethodV);
+  native->CallFloatMethodA = WRAP(JNIEnv_CallFloatMethodA);
+  native->CallDoubleMethod = WRAP(JNIEnv_CallDoubleMethod);
+  native->CallDoubleMethodV = WRAP(JNIEnv_CallDoubleMethodV);
+  native->CallDoubleMethodA = WRAP(JNIEnv_CallDoubleMethodA);
+  native->CallVoidMethod = WRAP(JNIEnv_CallVoidMethod);
+  native->CallVoidMethodV = WRAP(JNIEnv_CallVoidMethodV);
+  native->CallVoidMethodA = WRAP(JNIEnv_CallVoidMethodA);
+  native->CallNonvirtualObjectMethod = WRAP(JNIEnv_CallNonvirtualObjectMethod);
+  native->CallNonvirtualObjectMethodV = WRAP(JNIEnv_CallNonvirtualObjectMethodV);
+  native->CallNonvirtualObjectMethodA = WRAP(JNIEnv_CallNonvirtualObjectMethodA);
+  native->CallNonvirtualBooleanMethod = WRAP(JNIEnv_CallNonvirtualBooleanMethod);
+  native->CallNonvirtualBooleanMethodV = WRAP(JNIEnv_CallNonvirtualBooleanMethodV);
+  native->CallNonvirtualBooleanMethodA = WRAP(JNIEnv_CallNonvirtualBooleanMethodA);
+  native->CallNonvirtualByteMethod = WRAP(JNIEnv_CallNonvirtualByteMethod);
+  native->CallNonvirtualByteMethodV = WRAP(JNIEnv_CallNonvirtualByteMethodV);
+  native->CallNonvirtualByteMethodA = WRAP(JNIEnv_CallNonvirtualByteMethodA);
+  native->CallNonvirtualCharMethod = WRAP(JNIEnv_CallNonvirtualCharMethod);
+  native->CallNonvirtualCharMethodV = WRAP(JNIEnv_CallNonvirtualCharMethodV);
+  native->CallNonvirtualCharMethodA = WRAP(JNIEnv_CallNonvirtualCharMethodA);
+  native->CallNonvirtualShortMethod = WRAP(JNIEnv_CallNonvirtualShortMethod);
+  native->CallNonvirtualShortMethodV = WRAP(JNIEnv_CallNonvirtualShortMethodV);
+  native->CallNonvirtualShortMethodA = WRAP(JNIEnv_CallNonvirtualShortMethodA);
+  native->CallNonvirtualIntMethod = WRAP(JNIEnv_CallNonvirtualIntMethod);
+  native->CallNonvirtualIntMethodV = WRAP(JNIEnv_CallNonvirtualIntMethodV);
+  native->CallNonvirtualIntMethodA = WRAP(JNIEnv_CallNonvirtualIntMethodA);
+  native->CallNonvirtualLongMethod = WRAP(JNIEnv_CallNonvirtualLongMethod);
+  native->CallNonvirtualLongMethodV = WRAP(JNIEnv_CallNonvirtualLongMethodV);
+  native->CallNonvirtualLongMethodA = WRAP(JNIEnv_CallNonvirtualLongMethodA);
+  native->CallNonvirtualFloatMethod = WRAP(JNIEnv_CallNonvirtualFloatMethod);
+  native->CallNonvirtualFloatMethodV = WRAP(JNIEnv_CallNonvirtualFloatMethodV);
+  native->CallNonvirtualFloatMethodA = WRAP(JNIEnv_CallNonvirtualFloatMethodA);
+  native->CallNonvirtualDoubleMethod = WRAP(JNIEnv_CallNonvirtualDoubleMethod);
+  native->CallNonvirtualDoubleMethodV = WRAP(JNIEnv_CallNonvirtualDoubleMethodV);
+  native->CallNonvirtualDoubleMethodA = WRAP(JNIEnv_CallNonvirtualDoubleMethodA);
+  native->CallNonvirtualVoidMethod = WRAP(JNIEnv_CallNonvirtualVoidMethod);
+  native->CallNonvirtualVoidMethodV = WRAP(JNIEnv_CallNonvirtualVoidMethodV);
+  native->CallNonvirtualVoidMethodA = WRAP(JNIEnv_CallNonvirtualVoidMethodA);
+  native->GetFieldID = WRAP(JNIEnv_GetFieldID);
+  native->GetObjectField = WRAP(JNIEnv_GetObjectField_traced);
+  native->GetBooleanField = WRAP(JNIEnv_GetBooleanField);
+  native->GetByteField = WRAP(JNIEnv_GetByteField);
+  native->GetCharField = WRAP(JNIEnv_GetCharField);
+  native->GetShortField = WRAP(JNIEnv_GetShortField);
+  native->GetIntField = WRAP(JNIEnv_GetIntField);
+  native->GetLongField = WRAP(JNIEnv_GetLongField);
+  native->GetFloatField = WRAP(JNIEnv_GetFloatField);
+  native->GetDoubleField = WRAP(JNIEnv_GetDoubleField);
+  native->SetObjectField = WRAP(JNIEnv_SetObjectField);
+  native->SetBooleanField = WRAP(JNIEnv_SetBooleanField);
+  native->SetByteField = WRAP(JNIEnv_SetByteField);
+  native->SetCharField = WRAP(JNIEnv_SetCharField);
+  native->SetShortField = WRAP(JNIEnv_SetShortField);
+  native->SetIntField = WRAP(JNIEnv_SetIntField);
+  native->SetLongField = WRAP(JNIEnv_SetLongField);
+  native->SetFloatField = WRAP(JNIEnv_SetFloatField);
+  native->SetDoubleField = WRAP(JNIEnv_SetDoubleField);
+  native->GetStaticMethodID = WRAP(JNIEnv_GetStaticMethodID);
+  native->CallStaticObjectMethod = WRAP(JNIEnv_CallStaticObjectMethod);
+  native->CallStaticObjectMethodV = WRAP(JNIEnv_CallStaticObjectMethodV);
+  native->CallStaticObjectMethodA = WRAP(JNIEnv_CallStaticObjectMethodA);
+  native->CallStaticBooleanMethod = WRAP(JNIEnv_CallStaticBooleanMethod);
+  native->CallStaticBooleanMethodV = WRAP(JNIEnv_CallStaticBooleanMethodV);
+  native->CallStaticBooleanMethodA = WRAP(JNIEnv_CallStaticBooleanMethodA);
+  native->CallStaticByteMethod = WRAP(JNIEnv_CallStaticByteMethod);
+  native->CallStaticByteMethodV = WRAP(JNIEnv_CallStaticByteMethodV);
+  native->CallStaticByteMethodA = WRAP(JNIEnv_CallStaticByteMethodA);
+  native->CallStaticCharMethod = WRAP(JNIEnv_CallStaticCharMethod);
+  native->CallStaticCharMethodV = WRAP(JNIEnv_CallStaticCharMethodV);
+  native->CallStaticCharMethodA = WRAP(JNIEnv_CallStaticCharMethodA);
+  native->CallStaticShortMethod = WRAP(JNIEnv_CallStaticShortMethod);
+  native->CallStaticShortMethodV = WRAP(JNIEnv_CallStaticShortMethodV);
+  native->CallStaticShortMethodA = WRAP(JNIEnv_CallStaticShortMethodA);
+  native->CallStaticIntMethod = WRAP(JNIEnv_CallStaticIntMethod);
+  native->CallStaticIntMethodV = WRAP(JNIEnv_CallStaticIntMethodV);
+  native->CallStaticIntMethodA = WRAP(JNIEnv_CallStaticIntMethodA);
+  native->CallStaticLongMethod = WRAP(JNIEnv_CallStaticLongMethod);
+  native->CallStaticLongMethodV = WRAP(JNIEnv_CallStaticLongMethodV);
+  native->CallStaticLongMethodA = WRAP(JNIEnv_CallStaticLongMethodA);
+  native->CallStaticFloatMethod = WRAP(JNIEnv_CallStaticFloatMethod);
+  native->CallStaticFloatMethodV = WRAP(JNIEnv_CallStaticFloatMethodV);
+  native->CallStaticFloatMethodA = WRAP(JNIEnv_CallStaticFloatMethodA);
+  native->CallStaticDoubleMethod = WRAP(JNIEnv_CallStaticDoubleMethod);
+  native->CallStaticDoubleMethodV = WRAP(JNIEnv_CallStaticDoubleMethodV);
+  native->CallStaticDoubleMethodA = WRAP(JNIEnv_CallStaticDoubleMethodA);
+  native->CallStaticVoidMethod = WRAP(JNIEnv_CallStaticVoidMethod);
+  native->CallStaticVoidMethodV = WRAP(JNIEnv_CallStaticVoidMethodV);
+  native->CallStaticVoidMethodA = WRAP(JNIEnv_CallStaticVoidMethodA);
+  native->GetStaticFieldID = WRAP(JNIEnv_GetStaticFieldID);
+  native->GetStaticObjectField = WRAP(JNIEnv_GetStaticObjectField_traced);
+  native->GetStaticBooleanField = WRAP(JNIEnv_GetStaticBooleanField);
+  native->GetStaticByteField = WRAP(JNIEnv_GetStaticByteField);
+  native->GetStaticCharField = WRAP(JNIEnv_GetStaticCharField);
+  native->GetStaticShortField = WRAP(JNIEnv_GetStaticShortField);
+  native->GetStaticIntField = WRAP(JNIEnv_GetStaticIntField);
+  native->GetStaticLongField = WRAP(JNIEnv_GetStaticLongField);
+  native->GetStaticFloatField = WRAP(JNIEnv_GetStaticFloatField);
+  native->GetStaticDoubleField = WRAP(JNIEnv_GetStaticDoubleField);
+  native->SetStaticObjectField = WRAP(JNIEnv_SetStaticObjectField);
+  native->SetStaticBooleanField = WRAP(JNIEnv_SetStaticBooleanField);
+  native->SetStaticByteField = WRAP(JNIEnv_SetStaticByteField);
+  native->SetStaticCharField = WRAP(JNIEnv_SetStaticCharField);
+  native->SetStaticShortField = WRAP(JNIEnv_SetStaticShortField);
+  native->SetStaticIntField = WRAP(JNIEnv_SetStaticIntField);
+  native->SetStaticLongField = WRAP(JNIEnv_SetStaticLongField);
+  native->SetStaticFloatField = WRAP(JNIEnv_SetStaticFloatField);
+  native->SetStaticDoubleField = WRAP(JNIEnv_SetStaticDoubleField);
+  native->NewString = WRAP(JNIEnv_NewString);
+  native->GetStringLength = WRAP(JNIEnv_GetStringLength);
+  native->GetStringChars = WRAP(JNIEnv_GetStringChars);
+  native->ReleaseStringChars = WRAP(JNIEnv_ReleaseStringChars);
+  native->NewStringUTF = WRAP(JNIEnv_NewStringUTF);
+  native->GetStringUTFLength = WRAP(JNIEnv_GetStringUTFLength);
+  native->GetArrayLength = WRAP(JNIEnv_GetArrayLength);
+  native->NewObjectArray = WRAP(JNIEnv_NewObjectArray);
+  native->GetObjectArrayElement = WRAP(JNIEnv_GetObjectArrayElement);
+  native->SetObjectArrayElement = WRAP(JNIEnv_SetObjectArrayElement);
+  native->NewBooleanArray = WRAP(JNIEnv_NewBooleanArray);
+  native->NewByteArray = WRAP(JNIEnv_NewByteArray);
+  native->NewCharArray = WRAP(JNIEnv_NewCharArray);
+  native->NewShortArray = WRAP(JNIEnv_NewShortArray);
+  native->NewIntArray = WRAP(JNIEnv_NewIntArray);
+  native->NewLongArray = WRAP(JNIEnv_NewLongArray);
+  native->NewFloatArray = WRAP(JNIEnv_NewFloatArray);
+  native->NewDoubleArray = WRAP(JNIEnv_NewDoubleArray);
+  native->GetBooleanArrayElements = WRAP(JNIEnv_GetBooleanArrayElements);
+  native->GetByteArrayElements = WRAP(JNIEnv_GetByteArrayElements);
+  native->GetCharArrayElements = WRAP(JNIEnv_GetCharArrayElements);
+  native->GetShortArrayElements = WRAP(JNIEnv_GetShortArrayElements);
+  native->GetIntArrayElements = WRAP(JNIEnv_GetIntArrayElements);
+  native->GetLongArrayElements = WRAP(JNIEnv_GetLongArrayElements);
+  native->GetFloatArrayElements = WRAP(JNIEnv_GetFloatArrayElements);
+  native->GetDoubleArrayElements = WRAP(JNIEnv_GetDoubleArrayElements);
+  native->ReleaseBooleanArrayElements = WRAP(JNIEnv_ReleaseBooleanArrayElements);
+  native->ReleaseByteArrayElements = WRAP(JNIEnv_ReleaseByteArrayElements);
+  native->ReleaseCharArrayElements = WRAP(JNIEnv_ReleaseCharArrayElements);
+  native->ReleaseShortArrayElements = WRAP(JNIEnv_ReleaseShortArrayElements);
+  native->ReleaseIntArrayElements = WRAP(JNIEnv_ReleaseIntArrayElements);
+  native->ReleaseLongArrayElements = WRAP(JNIEnv_ReleaseLongArrayElements);
+  native->ReleaseFloatArrayElements = WRAP(JNIEnv_ReleaseFloatArrayElements);
+  native->ReleaseDoubleArrayElements = WRAP(JNIEnv_ReleaseDoubleArrayElements);
+  native->GetBooleanArrayRegion = WRAP(JNIEnv_GetBooleanArrayRegion);
+  native->GetByteArrayRegion = WRAP(JNIEnv_GetByteArrayRegion);
+  native->GetCharArrayRegion = WRAP(JNIEnv_GetCharArrayRegion);
+  native->GetShortArrayRegion = WRAP(JNIEnv_GetShortArrayRegion);
+  native->GetIntArrayRegion = WRAP(JNIEnv_GetIntArrayRegion);
+  native->GetLongArrayRegion = WRAP(JNIEnv_GetLongArrayRegion);
+  native->GetFloatArrayRegion = WRAP(JNIEnv_GetFloatArrayRegion);
+  native->GetDoubleArrayRegion = WRAP(JNIEnv_GetDoubleArrayRegion);
+  native->SetBooleanArrayRegion = WRAP(JNIEnv_SetBooleanArrayRegion);
+  native->SetByteArrayRegion = WRAP(JNIEnv_SetByteArrayRegion);
+  native->SetCharArrayRegion = WRAP(JNIEnv_SetCharArrayRegion);
+  native->SetShortArrayRegion = WRAP(JNIEnv_SetShortArrayRegion);
+  native->SetIntArrayRegion = WRAP(JNIEnv_SetIntArrayRegion);
+  native->SetLongArrayRegion = WRAP(JNIEnv_SetLongArrayRegion);
+  native->SetFloatArrayRegion = WRAP(JNIEnv_SetFloatArrayRegion);
+  native->SetDoubleArrayRegion = WRAP(JNIEnv_SetDoubleArrayRegion);
+  native->RegisterNatives = WRAP(JNIEnv_RegisterNatives);
+  native->UnregisterNatives = WRAP(JNIEnv_UnregisterNatives);
+  native->MonitorEnter = WRAP(JNIEnv_MonitorEnter);
+  native->MonitorExit = WRAP(JNIEnv_MonitorExit);
+  native->GetJavaVM = WRAP(JNIEnv_GetJavaVM);
+  native->GetStringRegion = WRAP(JNIEnv_GetStringRegion);
+  native->GetStringUTFRegion = WRAP(JNIEnv_GetStringUTFRegion);
+  native->GetPrimitiveArrayCritical = WRAP(JNIEnv_GetPrimitiveArrayCritical);
+  native->ReleasePrimitiveArrayCritical = WRAP(JNIEnv_ReleasePrimitiveArrayCritical);
+  native->GetStringCritical = WRAP(JNIEnv_GetStringCritical);
+  native->ReleaseStringCritical = WRAP(JNIEnv_ReleaseStringCritical);
+  native->NewWeakGlobalRef = WRAP(JNIEnv_NewWeakGlobalRef);
+  native->DeleteWeakGlobalRef = WRAP(JNIEnv_DeleteWeakGlobalRef);
+  native->ExceptionCheck = WRAP(JNIEnv_ExceptionCheck);
+  native->NewDirectByteBuffer = WRAP(JNIEnv_NewDirectByteBuffer);
+  native->GetDirectBufferAddress = WRAP(JNIEnv_GetDirectBufferAddress);
+  native->GetDirectBufferCapacity = WRAP(JNIEnv_GetDirectBufferCapacity);
+  *env = native;
 }
 
 static jint
 JavaVM_DestroyJavaVM(JavaVM *vm)
 {
-   assert(vm);
-   return JNI_OK;
+  assert(vm);
+  return JNI_OK;
 }
 
 static jint
 JavaVM_AttachCurrentThread(JavaVM *vm, JNIEnv **env, void *args)
 {
-   assert(vm && env);
-   *env = &javavm_get_jvm(vm)->env;
-   return JNI_OK;
+  assert(vm && env);
+  *env = &javavm_get_jvm(vm)->env;
+  return JNI_OK;
 }
 
 static jint
 JavaVM_DetachCurrentThread(JavaVM *vm)
 {
-   assert(vm);
-   memset(jvm_exception_state(javavm_get_jvm(vm)), 0, sizeof(struct jvm_exception_state));
-   return JNI_OK;
+  assert(vm);
+  memset(jvm_exception_state(javavm_get_jvm(vm)), 0, sizeof(struct jvm_exception_state));
+  return JNI_OK;
 }
 
 static jint
 JavaVM_GetEnv(JavaVM *vm, void **env, jint version)
 {
-   assert(vm && env);
-   *env = &javavm_get_jvm(vm)->env;
-   return JNI_OK;
+  assert(vm && env);
+  *env = &javavm_get_jvm(vm)->env;
+  return JNI_OK;
 }
 
 static jint
 JavaVM_AttachCurrentThreadAsDaemon(JavaVM *vm, JNIEnv **env, void *args)
 {
-   assert(vm && env);
-   *env = &javavm_get_jvm(vm)->env;
-   return JNI_OK;
+  assert(vm && env);
+  *env = &javavm_get_jvm(vm)->env;
+  return JNI_OK;
 }
 
 static void
 vm_init(JavaVM *vm, struct JNIInvokeInterface *invoke)
 {
-   assert(vm && invoke);
-   invoke->DestroyJavaVM = WRAP(JavaVM_DestroyJavaVM);
-   invoke->AttachCurrentThread = WRAP(JavaVM_AttachCurrentThread);
-   invoke->DetachCurrentThread = WRAP(JavaVM_DetachCurrentThread);
-   invoke->GetEnv = WRAP(JavaVM_GetEnv);
-   invoke->AttachCurrentThreadAsDaemon = WRAP(JavaVM_AttachCurrentThreadAsDaemon);
-   *vm = invoke;
+  assert(vm && invoke);
+  invoke->DestroyJavaVM = WRAP(JavaVM_DestroyJavaVM);
+  invoke->AttachCurrentThread = WRAP(JavaVM_AttachCurrentThread);
+  invoke->DetachCurrentThread = WRAP(JavaVM_DetachCurrentThread);
+  invoke->GetEnv = WRAP(JavaVM_GetEnv);
+  invoke->AttachCurrentThreadAsDaemon = WRAP(JavaVM_AttachCurrentThreadAsDaemon);
+  *vm = invoke;
 }
 
 const char*
 jvm_get_class_name(struct jvm *jvm, jobject object)
 {
-   return jvm_get_object_of_type(jvm, object, JVM_OBJECT_CLASS)->klass.name.data;
+  return jvm_get_object_of_type(jvm, object, JVM_OBJECT_CLASS)->klass.name.data;
 }
 
 /* Like jvm_get_class_name, but NULL when `object` is not itself a Class —
@@ -3523,121 +3614,128 @@ jvm_get_class_name(struct jvm *jvm, jobject object)
 const char *
 jvm_described_class_name(struct jvm *jvm, jobject object)
 {
-   if (!jvm || !object) return NULL;
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   if (!o || o->type != JVM_OBJECT_CLASS) return NULL;
-   return o->klass.name.data;
+  if (!jvm || !object) return NULL;
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  if (!o || o->type != JVM_OBJECT_CLASS) return NULL;
+  return o->klass.name.data;
 }
 
 bool
 jvm_field_info(struct jvm *jvm, jfieldID field, const char **klass,
                const char **name, const char **type)
 {
-   if (!jvm || !field) return false;
-   struct jvm_object *fo = jvm_get_object(jvm, (jobject)field);
-   if (!fo || fo->type != JVM_OBJECT_METHOD) return false;
-   struct jvm_object *ko =
-      jvm_get_object_of_type(jvm, fo->method.klass, JVM_OBJECT_CLASS);
-   if (!ko || !ko->klass.name.data) return false;
-   if (klass) *klass = ko->klass.name.data;
-   if (name) *name = fo->method.name.data;
-   if (type) *type = fo->method.signature.data;
-   return name && *name && type && *type;
+  if (!jvm || !field) return false;
+  struct jvm_object *fo = jvm_get_object(jvm, (jobject)field);
+  if (!fo || fo->type != JVM_OBJECT_METHOD) return false;
+  struct jvm_object *ko =
+    jvm_get_object_of_type(jvm, fo->method.klass, JVM_OBJECT_CLASS);
+  if (!ko || !ko->klass.name.data) return false;
+  if (klass) *klass = ko->klass.name.data;
+  if (name) *name = fo->method.name.data;
+  if (type) *type = fo->method.signature.data;
+  return name && *name && type && *type;
 }
 
 bool
 jvm_method_has_stub(JNIEnv *env, jmethodID method)
 {
-   if (!env || !method)
-      return false;
-   struct jvm *jvm = jnienv_get_jvm(env);
-   struct jvm_object *mo = jvm_get_object(jvm, method);
-   if (!mo || mo->type != JVM_OBJECT_METHOD)
-      return false;
-   return jvm_wrap_method(jvm, method) != NULL;
+  if (!env || !method)
+    return false;
+  struct jvm *jvm = jnienv_get_jvm(env);
+  struct jvm_object *mo = jvm_get_object(jvm, method);
+  if (!mo || mo->type != JVM_OBJECT_METHOD)
+    return false;
+  return jvm_wrap_method(jvm, method) != NULL;
 }
 
 void*
 jvm_get_native_method(struct jvm *jvm, const char *klass, const char *method)
 {
-   assert(jvm && klass && method);
-   for (size_t i = 0; i < ARRAY_SIZE(jvm->methods) && jvm->methods[i].function; ++i) {
-      if (!strcmp(jvm_get_object_of_type(jvm, jvm->methods[i].method.klass, JVM_OBJECT_CLASS)->klass.name.data, klass) &&
-          !strcmp(jvm->methods[i].method.name.data, method))
-         return wrapper_create(method, jvm->methods[i].function);
-   }
-   return NULL;
+  assert(jvm && klass && method);
+  for (size_t i = 0; i < ARRAY_SIZE(jvm->methods) && jvm->methods[i].function; ++i) {
+    if (!strcmp(jvm_get_object_of_type(jvm, jvm->methods[i].method.klass, JVM_OBJECT_CLASS)->klass.name.data, klass) &&
+        !strcmp(jvm->methods[i].method.name.data, method))
+      return wrapper_create(method, jvm->methods[i].function);
+  }
+  return NULL;
 }
 
 jobject
 jvm_new_motion_event(struct jvm *jvm, const lunaria_touch_event *ev)
 {
-   assert(jvm && ev);
-   struct jvm_object o = {
-      .this_klass = jvm_make_class(jvm, "android/view/MotionEvent"),
-      .type = JVM_OBJECT_MOTION,
-      .motion = *ev,
-   };
-   return jvm_add_object(jvm, &o);
+  assert(jvm && ev);
+  struct jvm_object o = {
+    .this_klass = jvm_make_class(jvm, "android/view/MotionEvent"),
+    .type = JVM_OBJECT_MOTION,
+    .motion = *ev,
+  };
+  return jvm_add_object(jvm, &o);
 }
 
 bool
 jvm_motion_event_read(struct jvm *jvm, jobject object, lunaria_touch_event *out)
 {
-   struct jvm_object *o = jvm_get_object(jvm, object);
-   if (!o || o->type != JVM_OBJECT_MOTION || !out)
-      return false;
-   *out = o->motion;
-   return true;
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  if (!o || o->type != JVM_OBJECT_MOTION || !out)
+    return false;
+  *out = o->motion;
+  return true;
 }
 
 void
 jvm_release(struct jvm *jvm)
 {
-   if (!jvm)
-      return;
+  if (!jvm)
+    return;
 
-   dvm_prefs_finish(dvm_jni_vm());
-   while (jvm->cached_refs) {
-      struct jvm_cached_ref *r = jvm->cached_refs;
-      jvm->cached_refs = r->next;
-      *r->slot = NULL;
-      free(r);
-   }
-   while (jvm->local_states) {
-      struct jvm_local_state *s=jvm->local_states; jvm->local_states=s->next;
-      while (s->top) {
-         struct jvm_local_frame *f=s->top; s->top=f->prev;
-         free(f->items); free(f);
-      }
-      free(s);
-   }
+  dvm_prefs_finish(dvm_jni_vm());
+  while (jvm->cached_refs) {
+    struct jvm_cached_ref *r = jvm->cached_refs;
+    jvm->cached_refs = r->next;
+    *r->slot = NULL;
+    free(r);
+  }
+  while (jvm->local_states) {
+    struct jvm_local_state *s=jvm->local_states;
+    jvm->local_states=s->next;
+    while (s->top) {
+      struct jvm_local_frame *f=s->top;
+      s->top=f->prev;
+      free(f->items);
+      free(f);
+    }
+    free(s);
+  }
 
 
-   for (size_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i)
-      jvm_object_release(&jvm->objects[i]);
-   free(jvm->weak_refs);
+  for (size_t i = 0; i < ARRAY_SIZE(jvm->objects); ++i)
+    jvm_object_release(&jvm->objects[i]);
+  free(jvm->weak_refs);
 
-   for (size_t i = 0; i < ARRAY_SIZE(jvm->methods); ++i) {
-      jvm_string_release(&jvm->methods[i].method.name);
-      jvm_string_release(&jvm->methods[i].method.signature);
-   }
+  for (size_t i = 0; i < ARRAY_SIZE(jvm->methods); ++i) {
+    jvm_string_release(&jvm->methods[i].method.name);
+    jvm_string_release(&jvm->methods[i].method.signature);
+  }
 
-   *jvm = (struct jvm){0};
+  *jvm = (struct jvm) {
+    0
+  };
 }
 
 void
 jvm_init(struct jvm *jvm)
 {
-   assert(jvm);
-   for (size_t i = 0; i < ARRAY_SIZE(g_guest_jni_exceptions); ++i)
-      if (g_guest_jni_exceptions[i].owner == jvm)
-         memset(&g_guest_jni_exceptions[i], 0, sizeof g_guest_jni_exceptions[i]);
-   if (g_jni_exception.owner == jvm) memset(&g_jni_exception, 0, sizeof g_jni_exception);
-   *jvm = (struct jvm){0};
-   vm_init(&jvm->vm, &jvm->invoke);
-   env_init(&jvm->env, &jvm->native);
-   jvm_make_class(jvm, "java/lang/Class");
+  assert(jvm);
+  for (size_t i = 0; i < ARRAY_SIZE(g_guest_jni_exceptions); ++i)
+    if (g_guest_jni_exceptions[i].owner == jvm)
+      memset(&g_guest_jni_exceptions[i], 0, sizeof g_guest_jni_exceptions[i]);
+  if (g_jni_exception.owner == jvm) memset(&g_jni_exception, 0, sizeof g_jni_exception);
+  *jvm = (struct jvm) {
+    0
+  };
+  vm_init(&jvm->vm, &jvm->invoke);
+  env_init(&jvm->env, &jvm->native);
+  jvm_make_class(jvm, "java/lang/Class");
 }
 
 /* ---- Process Application startup ---- */
@@ -3645,52 +3743,112 @@ jvm_init(struct jvm *jvm)
  * Constructors and attachBaseContext precede providers; Application.onCreate
  * follows them. Failure leaves the original Java exception pending. */
 static int application_start_transaction(struct jvm *jvm,const char *manifest_class,
-      bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
-      jobject *base_out,jobject *application_out)
+    bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
+    jobject *base_out,jobject *application_out)
 {
-   *base_out=NULL;*application_out=NULL;
-   char name[512];
-   const char *source=manifest_class && *manifest_class ? manifest_class : "android/app/Application";
-   size_t n=strlen(source);if(n>=sizeof name){fprintf(stderr,"[application] %s: start failed at step 1\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   for(size_t i=0;i<=n;++i)name[i]=source[i]=='.' ? '/' : source[i];
-   bool custom=strcmp(name,"android/app/Application")!=0;
-   if(custom && !in_dex(name)){fprintf(stderr,"[application] %s: start failed at step 2\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jclass context=jvm->native.FindClass(&jvm->env,"android/app/ContextImpl");
-   if(!context || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 3\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jobject base=jvm->native.AllocObject(&jvm->env,context);
-   if(!base || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 4\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   if (!dvm_jni_bind_application(&jvm->env,base,NULL)) {fprintf(stderr,"[application] %s: start failed at step 5\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jclass cls=jvm->native.FindClass(&jvm->env,name);
-   if(!cls || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 6\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jmethodID ctor=jvm->native.GetMethodID(&jvm->env,cls,"<init>","()V");
-   if(!ctor || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 7\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jobject application=jvm->native.NewObjectA(&jvm->env,cls,ctor,NULL);
-   if(!application || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 8\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jmethodID attach=jvm->native.GetMethodID(&jvm->env,cls,"attachBaseContext",
-                                           "(Landroid/content/Context;)V");
-   if(!attach || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 9\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jvalue arg={.l=base};
-   jvm->native.CallVoidMethodA(&jvm->env,application,attach,&arg);
-   if(jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 10\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   if (!dvm_jni_bind_application(&jvm->env,base,application)) {fprintf(stderr,"[application] %s: start failed at step 11\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 12\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jmethodID create=jvm->native.GetMethodID(&jvm->env,cls,"onCreate","()V");
-   if(!create || jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 13\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   jvm->native.CallVoidMethodA(&jvm->env,application,create,NULL);
-   if(jvm->native.ExceptionCheck(&jvm->env)){fprintf(stderr,"[application] %s: start failed at step 14\n",name);jvm->native.ExceptionDescribe(&jvm->env);return -1;}
-   *base_out=base;*application_out=application;return 0;
+  *base_out=NULL;
+  *application_out=NULL;
+  char name[512];
+  const char *source=manifest_class && *manifest_class ? manifest_class : "android/app/Application";
+  size_t n=strlen(source);
+  if(n>=sizeof name) {
+    fprintf(stderr,"[application] %s: start failed at step 1\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  for(size_t i=0; i<=n; ++i)name[i]=source[i]=='.' ? '/' : source[i];
+  bool custom=strcmp(name,"android/app/Application")!=0;
+  if(custom && !in_dex(name)) {
+    fprintf(stderr,"[application] %s: start failed at step 2\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jclass context=jvm->native.FindClass(&jvm->env,"android/app/ContextImpl");
+  if(!context || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 3\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jobject base=jvm->native.AllocObject(&jvm->env,context);
+  if(!base || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 4\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  if (!dvm_jni_bind_application(&jvm->env,base,NULL)) {
+    fprintf(stderr,"[application] %s: start failed at step 5\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jclass cls=jvm->native.FindClass(&jvm->env,name);
+  if(!cls || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 6\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jmethodID ctor=jvm->native.GetMethodID(&jvm->env,cls,"<init>","()V");
+  if(!ctor || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 7\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jobject application=jvm->native.NewObjectA(&jvm->env,cls,ctor,NULL);
+  if(!application || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 8\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jmethodID attach=jvm->native.GetMethodID(&jvm->env,cls,"attachBaseContext",
+                   "(Landroid/content/Context;)V");
+  if(!attach || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 9\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jvalue arg= {.l=base};
+  jvm->native.CallVoidMethodA(&jvm->env,application,attach,&arg);
+  if(jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 10\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  if (!dvm_jni_bind_application(&jvm->env,base,application)) {
+    fprintf(stderr,"[application] %s: start failed at step 11\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 12\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jmethodID create=jvm->native.GetMethodID(&jvm->env,cls,"onCreate","()V");
+  if(!create || jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 13\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  jvm->native.CallVoidMethodA(&jvm->env,application,create,NULL);
+  if(jvm->native.ExceptionCheck(&jvm->env)) {
+    fprintf(stderr,"[application] %s: start failed at step 14\n",name);
+    jvm->native.ExceptionDescribe(&jvm->env);
+    return -1;
+  }
+  *base_out=base;
+  *application_out=application;
+  return 0;
 }
 
 /* ActivityThread handles BIND_APPLICATION as one main-Looper message:
  * attach, providers, and Application.onCreate finish before the next message.
  * A JNI boundary between these steps is not a Looper dispatch boundary. */
 int luna_application_start(struct jvm *jvm,const char *manifest_class,
-      bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
-      jobject *base_out,jobject *application_out)
+                           bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
+                           jobject *base_out,jobject *application_out)
 {
-   dvm_jni_main_transaction(&jvm->env,true);
-   int result=application_start_transaction(jvm,manifest_class,in_dex,providers,
-                                           base_out,application_out);
-   dvm_jni_main_transaction(&jvm->env,false);
-   return result;
+  dvm_jni_main_transaction(&jvm->env,true);
+  int result=application_start_transaction(jvm,manifest_class,in_dex,providers,
+             base_out,application_out);
+  dvm_jni_main_transaction(&jvm->env,false);
+  return result;
 }

@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * Single build driver for small Android runtime stubs (liblog, libEGL, …).
  * Compile with exactly one -DLUNARIA_STUB_<NAME> to select the module.
  */
@@ -23,6 +25,17 @@
 # include "inc/android.c"
 #elif defined(LUNARIA_STUB_OPENSLES)
 # include "inc/opensles.c"
+#elif defined(LUNARIA_STUB_ART_IMAGE)
+/* A zygote child maps libart.so, libartbase.so, libdexfile.so and
+ * libnativeloader.so before app code runs. Process-protection SDKs inspect
+ * their /proc/self/maps entries and ELF headers. These identities provide
+ * readable ELF images; Java execution is handled by Lunaria's DVM.
+ * Built once per library with ART_IMAGE_SYMBOL naming its exported marker. */
+__attribute__((visibility("default")))
+int ART_IMAGE_SYMBOL(void)
+{
+  return 0;
+}
 #elif defined(LUNARIA_STUB_SVC_RUNTIME)
 /* System library identities for hosts using the emulator's guest ABI.
  * pthread objects, libc calls, FILE objects, errno and libc data symbols are
@@ -36,7 +49,7 @@ int lunaria_libc_runtime_is_svc_backed(void)
 int lunaria_pthread_runtime_is_svc_backed(void)
 # endif
 {
-   return 1;
+  return 1;
 }
 #else
 # error "Define one of the LUNARIA_STUB_* runtime modules"

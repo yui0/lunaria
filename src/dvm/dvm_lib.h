@@ -5,6 +5,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
 #ifndef LUNARIA_DVM_LIB_H
 #define LUNARIA_DVM_LIB_H
 
@@ -15,13 +16,6 @@
 #include "../luna-ui/nanosvg.h"
 
 /* ---- java.nio.charset ---- */
-/*
- * Copyright © 2026 Yuichiro Nakada / Project Lunaria
- *
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- */
 
 /*
  * java.nio.charset for the VM: turning bytes in a named charset into the
@@ -46,18 +40,18 @@
 
 
 enum jcs_kind {
-   JCS_UTF8,
-   JCS_LATIN1,
-   JCS_ASCII,
-   JCS_UTF16,      /* BOM-detecting on decode, BOM + big-endian on encode */
-   JCS_UTF16BE,
-   JCS_UTF16LE,
-   JCS_NATIVE,
+  JCS_UTF8,
+  JCS_LATIN1,
+  JCS_ASCII,
+  JCS_UTF16,      /* BOM-detecting on decode, BOM + big-endian on encode */
+  JCS_UTF16BE,
+  JCS_UTF16LE,
+  JCS_NATIVE,
 };
 
 struct jcs {
-   enum jcs_kind kind;
-   char name[64];   /* Java's canonical name, what Charset.name() returns */
+  enum jcs_kind kind;
+  char name[64];   /* Java's canonical name, what Charset.name() returns */
 };
 
 /* Charset.isSupported's name syntax: letters, digits and "-+:_.", starting
@@ -103,13 +97,6 @@ int jcs_decoder_next(struct jcs_decoder *d, int (*next_byte)(void *ctx),
                      void *ctx);
 
 /* ---- java.util.regex engine ---- */
-/*
- * Copyright © 2026 Yuichiro Nakada / Project Lunaria
- *
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- */
 
 /* A java.util.regex engine.
  *
@@ -133,15 +120,15 @@ int jcs_decoder_next(struct jcs_decoder *d, int (*next_byte)(void *ctx),
 /* Pattern flag bits, spelled exactly as java.util.regex.Pattern does, so a
  * guest's Pattern.compile(s, flags) passes its int through untouched. */
 enum {
-   RX_UNIX_LINES               = 0x01,
-   RX_CASE_INSENSITIVE         = 0x02,
-   RX_COMMENTS                 = 0x04,
-   RX_MULTILINE                = 0x08,
-   RX_LITERAL                  = 0x10,
-   RX_DOTALL                   = 0x20,
-   RX_UNICODE_CASE             = 0x40,
-   RX_CANON_EQ                 = 0x80,
-   RX_UNICODE_CHARACTER_CLASS  = 0x100,
+  RX_UNIX_LINES               = 0x01,
+  RX_CASE_INSENSITIVE         = 0x02,
+  RX_COMMENTS                 = 0x04,
+  RX_MULTILINE                = 0x08,
+  RX_LITERAL                  = 0x10,
+  RX_DOTALL                   = 0x20,
+  RX_UNICODE_CASE             = 0x40,
+  RX_CANON_EQ                 = 0x80,
+  RX_UNICODE_CHARACTER_CLASS  = 0x100,
 };
 
 struct rx;
@@ -184,11 +171,11 @@ void rx_cached_release(const struct rx *re);
 /* MPL-2.0. Calendar state and arithmetic, shared by Android class adapters.
  * No VM objects, locale library, or host-specific date representation. */
 enum {
- LC_ERA,LC_YEAR,LC_MONTH,LC_WEEK_OF_YEAR,LC_WEEK_OF_MONTH,LC_DATE,
- LC_DAY_OF_YEAR,LC_DAY_OF_WEEK,LC_DAY_OF_WEEK_IN_MONTH,LC_AM_PM,LC_HOUR,
- LC_HOUR_OF_DAY,LC_MINUTE,LC_SECOND,LC_MILLISECOND,LC_ZONE_OFFSET,
- LC_DST_OFFSET,LC_YEAR_WOY,LC_DOW_LOCAL,LC_EXTENDED_YEAR,LC_JULIAN_DAY,
- LC_MILLISECONDS_IN_DAY,LC_IS_LEAP_MONTH,LC_COUNT
+  LC_ERA,LC_YEAR,LC_MONTH,LC_WEEK_OF_YEAR,LC_WEEK_OF_MONTH,LC_DATE,
+  LC_DAY_OF_YEAR,LC_DAY_OF_WEEK,LC_DAY_OF_WEEK_IN_MONTH,LC_AM_PM,LC_HOUR,
+  LC_HOUR_OF_DAY,LC_MINUTE,LC_SECOND,LC_MILLISECOND,LC_ZONE_OFFSET,
+  LC_DST_OFFSET,LC_YEAR_WOY,LC_DOW_LOCAL,LC_EXTENDED_YEAR,LC_JULIAN_DAY,
+  LC_MILLISECONDS_IN_DAY,LC_IS_LEAP_MONTH,LC_COUNT
 };
 enum {LC_OK, LC_FIELD_ERROR, LC_RANGE_ERROR, LC_ZONE_ERROR, LC_UNSUPPORTED};
 #define LC_DAY INT64_C(86400000)
@@ -196,17 +183,17 @@ enum {LC_OK, LC_FIELD_ERROR, LC_RANGE_ERROR, LC_ZONE_ERROR, LC_UNSUPPORTED};
 #define LC_MIN_MS INT64_C(-184303902528000000)
 #define LC_MAX_MS ((INT64_C(0x7f000000)-LC_EPOCH_JD)*LC_DAY)
 struct lc_zone {
- void *context;
- bool (*offset)(void *,int64_t,int32_t *,int32_t *);
- bool (*resolve)(void *,int64_t,int,int,bool,int64_t *);
+  void *context;
+  bool (*offset)(void *,int64_t,int32_t *,int32_t *);
+  bool (*resolve)(void *,int64_t,int,int,bool,int64_t *);
 };
 struct lc_calendar {
- int32_t fields[LC_COUNT];
- uint32_t stamps[LC_COUNT],next_stamp;
- int64_t millis,cutover;
- unsigned first_day,min_days;
- int repeated,skipped;
- bool icu,buddhist,lenient,time_valid,fields_valid,virtual_fields;
+  int32_t fields[LC_COUNT];
+  uint32_t stamps[LC_COUNT],next_stamp;
+  int64_t millis,cutover;
+  unsigned first_day,min_days;
+  int repeated,skipped;
+  bool icu,buddhist,lenient,time_valid,fields_valid,virtual_fields;
 };
 void lc_init(struct lc_calendar *,bool icu,bool buddhist,unsigned first,unsigned minimal);
 int lc_set_millis(struct lc_calendar *,int64_t);
@@ -225,74 +212,168 @@ void lc_day_civil(int64_t,bool gregorian,int64_t *,unsigned *,unsigned *);
 /* ---- Porter-Duff / separable blend modes ---- */
 /* MPL-2.0. Android/Skia blend modes on straight ARGB pixels. */
 static inline float luna_blend_lum(const float c[3])
-{return .3f*c[0]+.59f*c[1]+.11f*c[2];}
+{
+  return .3f*c[0]+.59f*c[1]+.11f*c[2];
+}
 static inline float luna_blend_sat(const float c[3])
-{return fmaxf(c[0],fmaxf(c[1],c[2]))-fminf(c[0],fminf(c[1],c[2]));}
+{
+  return fmaxf(c[0],fmaxf(c[1],c[2]))-fminf(c[0],fminf(c[1],c[2]));
+}
 static inline void luna_blend_set_lum(float c[3],float lum)
 {
- float delta=lum-luna_blend_lum(c);for(int i=0;i<3;++i)c[i]+=delta;
- float n=fminf(c[0],fminf(c[1],c[2])),x=fmaxf(c[0],fmaxf(c[1],c[2]));
- if(n<0)for(int i=0;i<3;++i)c[i]=lum+(c[i]-lum)*lum/(lum-n);
- if(x>1)for(int i=0;i<3;++i)c[i]=lum+(c[i]-lum)*(1-lum)/(x-lum);
+  float delta=lum-luna_blend_lum(c);
+  for(int i=0; i<3; ++i)c[i]+=delta;
+  float n=fminf(c[0],fminf(c[1],c[2])),x=fmaxf(c[0],fmaxf(c[1],c[2]));
+  if(n<0)for(int i=0; i<3; ++i)c[i]=lum+(c[i]-lum)*lum/(lum-n);
+  if(x>1)for(int i=0; i<3; ++i)c[i]=lum+(c[i]-lum)*(1-lum)/(x-lum);
 }
 static inline void luna_blend_set_sat(float c[3],float sat)
 {
- int order[3]={0,1,2};
- for(int i=0;i<2;++i)for(int j=i+1;j<3;++j)if(c[order[i]]>c[order[j]]){int v=order[i];order[i]=order[j];order[j]=v;}
- int lo=order[0],mid=order[1],hi=order[2];
- if(c[hi]>c[lo]){c[mid]=(c[mid]-c[lo])*sat/(c[hi]-c[lo]);c[hi]=sat;}else{c[mid]=c[hi]=0;}
- c[lo]=0;
+  int order[3]= {0,1,2};
+  for(int i=0; i<2; ++i)for(int j=i+1; j<3; ++j)if(c[order[i]]>c[order[j]]) {
+        int v=order[i];
+        order[i]=order[j];
+        order[j]=v;
+      }
+  int lo=order[0],mid=order[1],hi=order[2];
+  if(c[hi]>c[lo]) {
+    c[mid]=(c[mid]-c[lo])*sat/(c[hi]-c[lo]);
+    c[hi]=sat;
+  }
+  else {
+    c[mid]=c[hi]=0;
+  }
+  c[lo]=0;
 }
 static inline uint32_t luna_blend_argb(uint32_t source,uint32_t destination,int mode)
 {
- if(mode==5){unsigned alpha=((source>>24)*(destination>>24)+127)/255;return alpha ? (source&0xffffffu)|(alpha<<24) : 0;}
- float sa=(source>>24)/255.f,da=(destination>>24)/255.f,s[3],d[3],p[3]={0},a=0,fs=0,fd=0;
- for(int i=0;i<3;++i){s[i]=((source>>(16-8*i))&255)/255.f;d[i]=((destination>>(16-8*i))&255)/255.f;}
- switch(mode){
- case 0:break;case 1:fs=1;break;case 2:fd=1;break;
- case 3:fs=1;fd=1-sa;break;case 4:fs=1-da;fd=1;break;
- case 5:fs=da;break;case 6:fd=sa;break;case 7:fs=1-da;break;case 8:fd=1-sa;break;
- case 9:fs=da;fd=1-sa;break;case 10:fs=1-da;fd=sa;break;case 11:fs=1-da;fd=1-sa;break;
- }
- if(mode<=11){a=sa*fs+da*fd;for(int i=0;i<3;++i)p[i]=s[i]*sa*fs+d[i]*da*fd;}
- else if(mode==12){a=fminf(1,sa+da);for(int i=0;i<3;++i)p[i]=fminf(1,s[i]*sa+d[i]*da);}
- else if(mode==13){a=sa*da;for(int i=0;i<3;++i)p[i]=s[i]*d[i]*a;}
- else {
-  float b[3];a=sa+da-sa*da;
-  if(mode>=25){
-   for(int i=0;i<3;++i)b[i]=(mode==25 || mode==27) ? s[i] : d[i];
-   if(mode==25)luna_blend_set_sat(b,luna_blend_sat(d));
-   if(mode==26)luna_blend_set_sat(b,luna_blend_sat(s));
-   luna_blend_set_lum(b,mode==28 ? luna_blend_lum(s) : luna_blend_lum(d));
-  } else for(int i=0;i<3;++i){float x=s[i],y=d[i];
-   switch(mode){
-   case 14:b[i]=x+y-x*y;break;
-   case 15:b[i]=y<=.5f ? 2*x*y : 1-2*(1-x)*(1-y);break;
-   case 16:b[i]=fminf(x,y);break;case 17:b[i]=fmaxf(x,y);break;
-   case 18:b[i]=y==0 ? 0 : x==1 ? 1 : fminf(1,y/(1-x));break;
-   case 19:b[i]=y==1 ? 1 : x==0 ? 0 : 1-fminf(1,(1-y)/x);break;
-   case 20:b[i]=x<=.5f ? 2*x*y : 1-2*(1-x)*(1-y);break;
-   case 21:{float z=y<=.25f ? ((16*y-12)*y+4)*y : sqrtf(y);b[i]=x<=.5f ? y-(1-2*x)*y*(1-y) : y+(2*x-1)*(z-y);break;}
-   case 22:b[i]=fabsf(y-x);break;case 23:b[i]=x+y-2*x*y;break;
-   default:b[i]=x*y;break;
-   }
+  if(mode==5) {
+    unsigned alpha=((source>>24)*(destination>>24)+127)/255;
+    return alpha ? (source&0xffffffu)|(alpha<<24) : 0;
   }
-  for(int i=0;i<3;++i)p[i]=s[i]*sa*(1-da)+d[i]*da*(1-sa)+b[i]*sa*da;
- }
- if(!(a>0))return 0;
- uint32_t result=(uint32_t)lroundf(fminf(1,a)*255)<<24;
- if(!(result>>24))return 0;
- for(int i=0;i<3;++i)result|=(uint32_t)lroundf(fmaxf(0,fminf(1,p[i]/a))*255)<<(16-8*i);
- return result;
+  float sa=(source>>24)/255.f,da=(destination>>24)/255.f,s[3],d[3],p[3]= {0},a=0,fs=0,fd=0;
+  for(int i=0; i<3; ++i) {
+    s[i]=((source>>(16-8*i))&255)/255.f;
+    d[i]=((destination>>(16-8*i))&255)/255.f;
+  }
+  switch(mode) {
+  case 0:
+    break;
+  case 1:
+    fs=1;
+    break;
+  case 2:
+    fd=1;
+    break;
+  case 3:
+    fs=1;
+    fd=1-sa;
+    break;
+  case 4:
+    fs=1-da;
+    fd=1;
+    break;
+  case 5:
+    fs=da;
+    break;
+  case 6:
+    fd=sa;
+    break;
+  case 7:
+    fs=1-da;
+    break;
+  case 8:
+    fd=1-sa;
+    break;
+  case 9:
+    fs=da;
+    fd=1-sa;
+    break;
+  case 10:
+    fs=1-da;
+    fd=sa;
+    break;
+  case 11:
+    fs=1-da;
+    fd=1-sa;
+    break;
+  }
+  if(mode<=11) {
+    a=sa*fs+da*fd;
+    for(int i=0; i<3; ++i)p[i]=s[i]*sa*fs+d[i]*da*fd;
+  }
+  else if(mode==12) {
+    a=fminf(1,sa+da);
+    for(int i=0; i<3; ++i)p[i]=fminf(1,s[i]*sa+d[i]*da);
+  }
+  else if(mode==13) {
+    a=sa*da;
+    for(int i=0; i<3; ++i)p[i]=s[i]*d[i]*a;
+  }
+  else {
+    float b[3];
+    a=sa+da-sa*da;
+    if(mode>=25) {
+      for(int i=0; i<3; ++i)b[i]=(mode==25 || mode==27) ? s[i] : d[i];
+      if(mode==25)luna_blend_set_sat(b,luna_blend_sat(d));
+      if(mode==26)luna_blend_set_sat(b,luna_blend_sat(s));
+      luna_blend_set_lum(b,mode==28 ? luna_blend_lum(s) : luna_blend_lum(d));
+    } else for(int i=0; i<3; ++i) {
+        float x=s[i],y=d[i];
+        switch(mode) {
+        case 14:
+          b[i]=x+y-x*y;
+          break;
+        case 15:
+          b[i]=y<=.5f ? 2*x*y : 1-2*(1-x)*(1-y);
+          break;
+        case 16:
+          b[i]=fminf(x,y);
+          break;
+        case 17:
+          b[i]=fmaxf(x,y);
+          break;
+        case 18:
+          b[i]=y==0 ? 0 : x==1 ? 1 : fminf(1,y/(1-x));
+          break;
+        case 19:
+          b[i]=y==1 ? 1 : x==0 ? 0 : 1-fminf(1,(1-y)/x);
+          break;
+        case 20:
+          b[i]=x<=.5f ? 2*x*y : 1-2*(1-x)*(1-y);
+          break;
+        case 21: {
+          float z=y<=.25f ? ((16*y-12)*y+4)*y : sqrtf(y);
+          b[i]=x<=.5f ? y-(1-2*x)*y*(1-y) : y+(2*x-1)*(z-y);
+          break;
+        }
+        case 22:
+          b[i]=fabsf(y-x);
+          break;
+        case 23:
+          b[i]=x+y-2*x*y;
+          break;
+        default:
+          b[i]=x*y;
+          break;
+        }
+      }
+    for(int i=0; i<3; ++i)p[i]=s[i]*sa*(1-da)+d[i]*da*(1-sa)+b[i]*sa*da;
+  }
+  if(!(a>0))return 0;
+  uint32_t result=(uint32_t)lroundf(fminf(1,a)*255)<<24;
+  if(!(result>>24))return 0;
+  for(int i=0; i<3; ++i)result|=(uint32_t)lroundf(fmaxf(0,fminf(1,p[i]/a))*255)<<(16-8*i);
+  return result;
 }
 
 /* ---- Path geometry ---- */
 /* Shared C geometry for Android Path and VectorDrawable. */
 typedef struct luna_path {
-   NSVGpath *first, *last, *spare;
-   size_t capacity;
-   int fill;
-   bool after_close;
+  NSVGpath *first, *last, *spare;
+  size_t capacity;
+  int fill;
+  bool after_close;
 } luna_path;
 void luna_path_free(void *path);
 void luna_path_clear(luna_path *path,bool reset_fill);
@@ -323,6 +404,6 @@ int luna_path_measure_segment(const luna_path_measure *measure,float start,float
 float *luna_path_approximate(const luna_path *path,float error,size_t *count);
 /* RGBA mask, with top-left origin; free() by caller. Matrix is row-major. */
 unsigned char *luna_path_mask(const luna_path *path,int w,int h,const float matrix[9],
-                             int style,float stroke,int cap,int join,float miter,bool aa);
+                              int style,float stroke,int cap,int join,float miter,bool aa);
 
 #endif /* LUNARIA_DVM_LIB_H */

@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * The host operating system, as this emulator uses it.
  *
  * Platform services and shared host helpers used by the emulator. The
@@ -60,15 +62,18 @@ int luna_fnmatch(const char *pattern, const char *string, int flags);
 #include <ws2tcpip.h>
 #include <afunix.h>
 #include <mswsock.h>
-struct iovec { void *iov_base; size_t iov_len; };
+struct iovec {
+  void *iov_base;
+  size_t iov_len;
+};
 struct msghdr {
-   void *msg_name;
-   socklen_t msg_namelen;
-   struct iovec *msg_iov;
-   size_t msg_iovlen;
-   void *msg_control;
-   size_t msg_controllen;
-   int msg_flags;
+  void *msg_name;
+  socklen_t msg_namelen;
+  struct iovec *msg_iov;
+  size_t msg_iovlen;
+  void *msg_control;
+  size_t msg_controllen;
+  int msg_flags;
 };
 typedef WSACMSGHDR luna_cmsghdr;
 #define LUNA_CMSG_ALIGN(n) (((n) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
@@ -78,14 +83,14 @@ typedef WSACMSGHDR luna_cmsghdr;
 #define LUNA_CMSG_FIRSTHDR(m) ((m)->msg_controllen >= sizeof(luna_cmsghdr) ? (luna_cmsghdr *)(m)->msg_control : NULL)
 static inline luna_cmsghdr *luna_cmsg_next(const struct msghdr *message, const luna_cmsghdr *current)
 {
-   uintptr_t start = (uintptr_t)message->msg_control, at = (uintptr_t)current;
-   if (message->msg_controllen > UINTPTR_MAX - start) return NULL;
-   uintptr_t end = start + message->msg_controllen;
-   if (at < start || at > end || end - at < sizeof *current ||
-       current->cmsg_len < sizeof *current || current->cmsg_len > end - at) return NULL;
-   size_t step = LUNA_CMSG_ALIGN(current->cmsg_len);
-   if (step < current->cmsg_len || step > end - at || end - at - step < sizeof *current) return NULL;
-   return (luna_cmsghdr *)(at + step);
+  uintptr_t start = (uintptr_t)message->msg_control, at = (uintptr_t)current;
+  if (message->msg_controllen > UINTPTR_MAX - start) return NULL;
+  uintptr_t end = start + message->msg_controllen;
+  if (at < start || at > end || end - at < sizeof *current ||
+      current->cmsg_len < sizeof *current || current->cmsg_len > end - at) return NULL;
+  size_t step = LUNA_CMSG_ALIGN(current->cmsg_len);
+  if (step < current->cmsg_len || step > end - at || end - at - step < sizeof *current) return NULL;
+  return (luna_cmsghdr *)(at + step);
 }
 #define LUNA_CMSG_NXTHDR(m,c) luna_cmsg_next((m),(c))
 #ifndef IOV_MAX
@@ -114,46 +119,48 @@ typedef struct cmsghdr luna_cmsghdr;
  * string, optional output, and unchanged errno. strtoul's word width follows
  * the guest ABI instead of the host's native parser. */
 static inline int luna_socket_inet_aton_word(const char *text, struct in_addr *address,
-                                           unsigned word_bits)
+    unsigned word_bits)
 {
-   uint64_t parts[4] = {0};
-   unsigned count = 0, final_bits;
-   uint32_t value = 0;
-   int result = 0, saved_errno = errno;
-   if (!text) return 0;
-   while (count < 4) {
-      char *end;
-      errno = 0;
-      uint64_t part = strtoull(text, &end, 0);
-      if (errno || end == text || (*end != '.' && *end != '\0')) goto done;
-      if (word_bits == 32) {
-         const char *number = text;
-         while (*number == ' ' || (*number >= '\t' && *number <= '\r')) ++number;
-         uint64_t magnitude = *number == '-' ? (uint64_t)0 - part : part;
-         if (magnitude > UINT32_MAX) goto done;
-         part = (uint32_t)part;
-      }
-      parts[count++] = part;
-      if (!*end) break;
-      text = end + 1;
-      if (count == 4) goto done;
-   }
-   for (unsigned i = 0; i + 1 < count; ++i) {
-      if (parts[i] > 255) goto done;
-      value = (value << 8) | (uint32_t)parts[i];
-   }
-   final_bits = (5 - count) * 8;
-   if (parts[count - 1] > (UINT32_MAX >> (32 - final_bits))) goto done;
-   if (count > 1) value <<= final_bits;
-   value |= (uint32_t)parts[count - 1];
-   if (address) address->s_addr = htonl(value);
-   result = 1;
+  uint64_t parts[4] = {0};
+  unsigned count = 0, final_bits;
+  uint32_t value = 0;
+  int result = 0, saved_errno = errno;
+  if (!text) return 0;
+  while (count < 4) {
+    char *end;
+    errno = 0;
+    uint64_t part = strtoull(text, &end, 0);
+    if (errno || end == text || (*end != '.' && *end != '\0')) goto done;
+    if (word_bits == 32) {
+      const char *number = text;
+      while (*number == ' ' || (*number >= '\t' && *number <= '\r')) ++number;
+      uint64_t magnitude = *number == '-' ? (uint64_t)0 - part : part;
+      if (magnitude > UINT32_MAX) goto done;
+      part = (uint32_t)part;
+    }
+    parts[count++] = part;
+    if (!*end) break;
+    text = end + 1;
+    if (count == 4) goto done;
+  }
+  for (unsigned i = 0; i + 1 < count; ++i) {
+    if (parts[i] > 255) goto done;
+    value = (value << 8) | (uint32_t)parts[i];
+  }
+  final_bits = (5 - count) * 8;
+  if (parts[count - 1] > (UINT32_MAX >> (32 - final_bits))) goto done;
+  if (count > 1) value <<= final_bits;
+  value |= (uint32_t)parts[count - 1];
+  if (address) address->s_addr = htonl(value);
+  result = 1;
 done:
-   errno = saved_errno;
-   return result;
+  errno = saved_errno;
+  return result;
 }
 static inline int luna_socket_inet_aton(const char *text, struct in_addr *address)
-{ return luna_socket_inet_aton_word(text, address, 64); }
+{
+  return luna_socket_inet_aton_word(text, address, 64);
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -214,108 +221,173 @@ int luna_fd_dup_to(int fd, int target, int close_on_exec);
 #define SHUT_RDWR SD_BOTH
 #endif
 #else
-static inline int luna_socket_startup(void) { return 0; }
-static inline intptr_t luna_socket_native(int fd) { return fd; }
+static inline int luna_socket_startup(void) {
+  return 0;
+}
+static inline intptr_t luna_socket_native(int fd) {
+  return fd;
+}
 static inline int luna_socket_pair(int family, int type, int protocol, int pair[2])
-{ return socketpair(family,type,protocol,pair); }
+{
+  return socketpair(family,type,protocol,pair);
+}
 static inline int luna_socket_open(int family, int type, int protocol) {
 #ifdef __linux__
-   return socket(family, type | SOCK_CLOEXEC, protocol);
+  return socket(family, type | SOCK_CLOEXEC, protocol);
 #else
-   int fd = socket(family, type, protocol);
-   if (fd >= 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
-      int error = errno; close(fd); errno = error; return -1;
-   }
-   return fd;
+  int fd = socket(family, type, protocol);
+  if (fd >= 0 && fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+    int error = errno;
+    close(fd);
+    errno = error;
+    return -1;
+  }
+  return fd;
 #endif
 }
 static inline int luna_socket_accept(int fd, struct sockaddr *address, socklen_t *length) {
 #ifdef __linux__
-   return accept4(fd, address, length, SOCK_CLOEXEC);
+  return accept4(fd, address, length, SOCK_CLOEXEC);
 #else
-   int client = accept(fd, address, length);
-   if (client >= 0 && fcntl(client, F_SETFD, FD_CLOEXEC) < 0) {
-      int error = errno; close(client); errno = error; return -1;
-   }
-   return client;
+  int client = accept(fd, address, length);
+  if (client >= 0 && fcntl(client, F_SETFD, FD_CLOEXEC) < 0) {
+    int error = errno;
+    close(client);
+    errno = error;
+    return -1;
+  }
+  return client;
 #endif
 }
-static inline int luna_socket_bind(int fd, const struct sockaddr *a, socklen_t n) { return bind(fd,a,n); }
-static inline int luna_socket_connect(int fd, const struct sockaddr *a, socklen_t n) { return connect(fd,a,n); }
-static inline int luna_socket_listen(int fd, int backlog) { return listen(fd,backlog); }
-static inline int luna_socket_shutdown(int fd, int how) { return shutdown(fd,how); }
-static inline int luna_socket_name(int fd, struct sockaddr *a, socklen_t *n) { return getsockname(fd,a,n); }
-static inline int luna_socket_peer(int fd, struct sockaddr *a, socklen_t *n) { return getpeername(fd,a,n); }
-static inline int luna_socket_set_option(int fd, int level, int option, const void *v, socklen_t n) { return setsockopt(fd,level,option,v,n); }
-static inline int luna_socket_get_option(int fd, int level, int option, void *v, socklen_t *n) { return getsockopt(fd,level,option,v,n); }
+static inline int luna_socket_bind(int fd, const struct sockaddr *a, socklen_t n) {
+  return bind(fd,a,n);
+}
+static inline int luna_socket_connect(int fd, const struct sockaddr *a, socklen_t n) {
+  return connect(fd,a,n);
+}
+static inline int luna_socket_listen(int fd, int backlog) {
+  return listen(fd,backlog);
+}
+static inline int luna_socket_shutdown(int fd, int how) {
+  return shutdown(fd,how);
+}
+static inline int luna_socket_name(int fd, struct sockaddr *a, socklen_t *n) {
+  return getsockname(fd,a,n);
+}
+static inline int luna_socket_peer(int fd, struct sockaddr *a, socklen_t *n) {
+  return getpeername(fd,a,n);
+}
+static inline int luna_socket_set_option(int fd, int level, int option, const void *v, socklen_t n) {
+  return setsockopt(fd,level,option,v,n);
+}
+static inline int luna_socket_get_option(int fd, int level, int option, void *v, socklen_t *n) {
+  return getsockopt(fd,level,option,v,n);
+}
 static inline int luna_socket_get_nonblock(int fd) {
-   int flags = fcntl(fd, F_GETFL, 0); return flags < 0 ? -1 : !!(flags & O_NONBLOCK);
+  int flags = fcntl(fd, F_GETFL, 0);
+  return flags < 0 ? -1 : !!(flags & O_NONBLOCK);
 }
 static inline int luna_socket_nonblock(int fd, int enabled) {
-   int flags = fcntl(fd, F_GETFL, 0);
-   return flags < 0 ? -1 : fcntl(fd, F_SETFL, enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
+  int flags = fcntl(fd, F_GETFL, 0);
+  return flags < 0 ? -1 : fcntl(fd, F_SETFL, enabled ? flags | O_NONBLOCK : flags & ~O_NONBLOCK);
 }
 #ifdef __APPLE__
 int luna_socket_poll(struct pollfd *fds, size_t n, int ms);
 #else
-static inline int luna_socket_poll(struct pollfd *fds, size_t n, int ms) { return poll(fds,n,ms); }
+static inline int luna_socket_poll(struct pollfd *fds, size_t n, int ms) {
+  return poll(fds,n,ms);
+}
 #endif
-static inline int luna_socket_dns(const char *node, const char *service, const struct addrinfo *h, struct addrinfo **out) { return getaddrinfo(node,service,h,out); }
-static inline int luna_socket_available(int fd, int *bytes) { return ioctl(fd,FIONREAD,bytes); }
-static inline ptrdiff_t luna_socket_recv(int fd, void *p, size_t n, int flags) { return recv(fd,p,n,flags); }
-static inline ptrdiff_t luna_socket_send(int fd, const void *p, size_t n, int flags) { return send(fd,p,n,flags); }
-static inline ptrdiff_t luna_socket_recvfrom(int fd, void *p, size_t n, int flags, struct sockaddr *a, socklen_t *length) { return recvfrom(fd,p,n,flags,a,length); }
-static inline ptrdiff_t luna_socket_sendto(int fd, const void *p, size_t n, int flags, const struct sockaddr *a, socklen_t length) { return sendto(fd,p,n,flags,a,length); }
-static inline ptrdiff_t luna_socket_sendmsg(int fd, const struct msghdr *m, int flags) { return sendmsg(fd,m,flags); }
-static inline ptrdiff_t luna_socket_recvmsg(int fd, struct msghdr *m, int flags) { return recvmsg(fd,m,flags); }
-static inline ptrdiff_t luna_fd_writev(int fd, const struct iovec *vectors, int count) { return writev(fd,vectors,count); }
+static inline int luna_socket_dns(const char *node, const char *service, const struct addrinfo *h, struct addrinfo **out) {
+  return getaddrinfo(node,service,h,out);
+}
+static inline int luna_socket_available(int fd, int *bytes) {
+  return ioctl(fd,FIONREAD,bytes);
+}
+static inline ptrdiff_t luna_socket_recv(int fd, void *p, size_t n, int flags) {
+  return recv(fd,p,n,flags);
+}
+static inline ptrdiff_t luna_socket_send(int fd, const void *p, size_t n, int flags) {
+  return send(fd,p,n,flags);
+}
+static inline ptrdiff_t luna_socket_recvfrom(int fd, void *p, size_t n, int flags, struct sockaddr *a, socklen_t *length) {
+  return recvfrom(fd,p,n,flags,a,length);
+}
+static inline ptrdiff_t luna_socket_sendto(int fd, const void *p, size_t n, int flags, const struct sockaddr *a, socklen_t length) {
+  return sendto(fd,p,n,flags,a,length);
+}
+static inline ptrdiff_t luna_socket_sendmsg(int fd, const struct msghdr *m, int flags) {
+  return sendmsg(fd,m,flags);
+}
+static inline ptrdiff_t luna_socket_recvmsg(int fd, struct msghdr *m, int flags) {
+  return recvmsg(fd,m,flags);
+}
+static inline ptrdiff_t luna_fd_writev(int fd, const struct iovec *vectors, int count) {
+  return writev(fd,vectors,count);
+}
 #ifdef __APPLE__
 /* eventfd/timerfd are emulated (lunaria_mac.c): their read() is the 8-byte
  * counter and close() releases the emulation slot. */
 ptrdiff_t luna_fd_read(int fd, void *p, size_t n);
 int luna_fd_close(int fd);
 #else
-static inline ptrdiff_t luna_fd_read(int fd, void *p, size_t n) { return read(fd,p,n); }
+static inline ptrdiff_t luna_fd_read(int fd, void *p, size_t n) {
+  return read(fd,p,n);
+}
 #endif
-static inline ptrdiff_t luna_fd_write(int fd, const void *p, size_t n) { return write(fd,p,n); }
+static inline ptrdiff_t luna_fd_write(int fd, const void *p, size_t n) {
+  return write(fd,p,n);
+}
 #ifndef __APPLE__
-static inline int luna_fd_close(int fd) { return close(fd); }
+static inline int luna_fd_close(int fd) {
+  return close(fd);
+}
 #endif
-static inline int luna_fd_get_nonblock(int fd) { return luna_socket_get_nonblock(fd); }
-static inline int luna_fd_nonblock(int fd, int enabled) { return luna_socket_nonblock(fd, enabled); }
+static inline int luna_fd_get_nonblock(int fd) {
+  return luna_socket_get_nonblock(fd);
+}
+static inline int luna_fd_nonblock(int fd, int enabled) {
+  return luna_socket_nonblock(fd, enabled);
+}
 static inline int luna_fd_get_cloexec(int fd)
 {
-   int flags = fcntl(fd, F_GETFD);
-   return flags < 0 ? -1 : !!(flags & FD_CLOEXEC);
+  int flags = fcntl(fd, F_GETFD);
+  return flags < 0 ? -1 : !!(flags & FD_CLOEXEC);
 }
 static inline int luna_fd_dup(int fd, int minimum, int close_on_exec)
 {
 #ifdef F_DUPFD_CLOEXEC
-   return fcntl(fd, close_on_exec ? F_DUPFD_CLOEXEC : F_DUPFD, minimum);
+  return fcntl(fd, close_on_exec ? F_DUPFD_CLOEXEC : F_DUPFD, minimum);
 #else
-   int result = fcntl(fd, F_DUPFD, minimum);
-   if (result >= 0 && close_on_exec && fcntl(result, F_SETFD, FD_CLOEXEC) < 0) {
-      int error = errno; close(result); errno = error; return -1;
-   }
-   return result;
+  int result = fcntl(fd, F_DUPFD, minimum);
+  if (result >= 0 && close_on_exec && fcntl(result, F_SETFD, FD_CLOEXEC) < 0) {
+    int error = errno;
+    close(result);
+    errno = error;
+    return -1;
+  }
+  return result;
 #endif
 }
 static inline int luna_fd_dup_to(int fd, int target, int close_on_exec)
 {
-   if (fd == target) return fcntl(fd, F_GETFD) < 0 ? -1 : fd;
+  if (fd == target) return fcntl(fd, F_GETFD) < 0 ? -1 : fd;
 #ifdef __linux__
-   return dup3(fd, target, close_on_exec ? O_CLOEXEC : 0);
+  return dup3(fd, target, close_on_exec ? O_CLOEXEC : 0);
 #else
-   int result = dup2(fd, target);
-   if (result >= 0 && close_on_exec && fcntl(result, F_SETFD, FD_CLOEXEC) < 0) {
-      int error = errno; close(result); errno = error; return -1;
-   }
-   return result;
+  int result = dup2(fd, target);
+  if (result >= 0 && close_on_exec && fcntl(result, F_SETFD, FD_CLOEXEC) < 0) {
+    int error = errno;
+    close(result);
+    errno = error;
+    return -1;
+  }
+  return result;
 #endif
 }
 static inline int luna_fd_cloexec(int fd, int enabled) {
-   int flags = fcntl(fd, F_GETFD);
-   return flags < 0 ? -1 : fcntl(fd, F_SETFD, enabled ? flags | FD_CLOEXEC : flags & ~FD_CLOEXEC);
+  int flags = fcntl(fd, F_GETFD);
+  return flags < 0 ? -1 : fcntl(fd, F_SETFD, enabled ? flags | FD_CLOEXEC : flags & ~FD_CLOEXEC);
 }
 #endif
 #ifdef __cplusplus
@@ -327,36 +399,66 @@ static inline int luna_fd_cloexec(int fd, int enabled) {
 static inline int luna_errno_to_android(int error)
 {
 #ifdef _WIN32
-   /* Winsock errors have already been translated into CRT/POSIX names.
-    * MinGW's numeric values still differ from Android/Linux. */
+  /* Winsock errors have already been translated into CRT/POSIX names.
+   * MinGW's numeric values still differ from Android/Linux. */
 #define LUNA_ERRNO(name, number) if (error == name) return number
-   LUNA_ERRNO(EAGAIN, 11); LUNA_ERRNO(EWOULDBLOCK, 11);
-   LUNA_ERRNO(EDEADLK, 35); LUNA_ERRNO(ENAMETOOLONG, 36);
-   LUNA_ERRNO(ENOLCK, 37); LUNA_ERRNO(ENOSYS, 38); LUNA_ERRNO(ENOTEMPTY, 39);
-   LUNA_ERRNO(ELOOP, 40);
-   LUNA_ERRNO(ENOMSG, 42); LUNA_ERRNO(EIDRM, 43);
-   LUNA_ERRNO(ENOSTR, 60); LUNA_ERRNO(ENODATA, 61); LUNA_ERRNO(ETIME, 62);
-   LUNA_ERRNO(ENOSR, 63); LUNA_ERRNO(ENOLINK, 67); LUNA_ERRNO(EPROTO, 71);
-   LUNA_ERRNO(EBADMSG, 74); LUNA_ERRNO(EOVERFLOW, 75); LUNA_ERRNO(EILSEQ, 84);
-   LUNA_ERRNO(ENOTSOCK, 88); LUNA_ERRNO(EDESTADDRREQ, 89); LUNA_ERRNO(EMSGSIZE, 90);
-   LUNA_ERRNO(EPROTOTYPE, 91); LUNA_ERRNO(ENOPROTOOPT, 92); LUNA_ERRNO(EPROTONOSUPPORT, 93);
-   LUNA_ERRNO(ENOTSUP, 95); LUNA_ERRNO(EOPNOTSUPP, 95); LUNA_ERRNO(EAFNOSUPPORT, 97);
-   LUNA_ERRNO(EADDRINUSE, 98); LUNA_ERRNO(EADDRNOTAVAIL, 99); LUNA_ERRNO(ENETDOWN, 100);
-   LUNA_ERRNO(ENETUNREACH, 101); LUNA_ERRNO(ENETRESET, 102); LUNA_ERRNO(ECONNABORTED, 103);
-   LUNA_ERRNO(ECONNRESET, 104); LUNA_ERRNO(ENOBUFS, 105); LUNA_ERRNO(EISCONN, 106);
-   LUNA_ERRNO(ENOTCONN, 107); LUNA_ERRNO(ETIMEDOUT, 110); LUNA_ERRNO(ECONNREFUSED, 111);
-   LUNA_ERRNO(EHOSTUNREACH, 113); LUNA_ERRNO(EALREADY, 114); LUNA_ERRNO(EINPROGRESS, 115);
-   LUNA_ERRNO(ECANCELED, 125); LUNA_ERRNO(EOWNERDEAD, 130); LUNA_ERRNO(ENOTRECOVERABLE, 131);
-   LUNA_ERRNO(ETXTBSY, 26);
+  LUNA_ERRNO(EAGAIN, 11);
+  LUNA_ERRNO(EWOULDBLOCK, 11);
+  LUNA_ERRNO(EDEADLK, 35);
+  LUNA_ERRNO(ENAMETOOLONG, 36);
+  LUNA_ERRNO(ENOLCK, 37);
+  LUNA_ERRNO(ENOSYS, 38);
+  LUNA_ERRNO(ENOTEMPTY, 39);
+  LUNA_ERRNO(ELOOP, 40);
+  LUNA_ERRNO(ENOMSG, 42);
+  LUNA_ERRNO(EIDRM, 43);
+  LUNA_ERRNO(ENOSTR, 60);
+  LUNA_ERRNO(ENODATA, 61);
+  LUNA_ERRNO(ETIME, 62);
+  LUNA_ERRNO(ENOSR, 63);
+  LUNA_ERRNO(ENOLINK, 67);
+  LUNA_ERRNO(EPROTO, 71);
+  LUNA_ERRNO(EBADMSG, 74);
+  LUNA_ERRNO(EOVERFLOW, 75);
+  LUNA_ERRNO(EILSEQ, 84);
+  LUNA_ERRNO(ENOTSOCK, 88);
+  LUNA_ERRNO(EDESTADDRREQ, 89);
+  LUNA_ERRNO(EMSGSIZE, 90);
+  LUNA_ERRNO(EPROTOTYPE, 91);
+  LUNA_ERRNO(ENOPROTOOPT, 92);
+  LUNA_ERRNO(EPROTONOSUPPORT, 93);
+  LUNA_ERRNO(ENOTSUP, 95);
+  LUNA_ERRNO(EOPNOTSUPP, 95);
+  LUNA_ERRNO(EAFNOSUPPORT, 97);
+  LUNA_ERRNO(EADDRINUSE, 98);
+  LUNA_ERRNO(EADDRNOTAVAIL, 99);
+  LUNA_ERRNO(ENETDOWN, 100);
+  LUNA_ERRNO(ENETUNREACH, 101);
+  LUNA_ERRNO(ENETRESET, 102);
+  LUNA_ERRNO(ECONNABORTED, 103);
+  LUNA_ERRNO(ECONNRESET, 104);
+  LUNA_ERRNO(ENOBUFS, 105);
+  LUNA_ERRNO(EISCONN, 106);
+  LUNA_ERRNO(ENOTCONN, 107);
+  LUNA_ERRNO(ETIMEDOUT, 110);
+  LUNA_ERRNO(ECONNREFUSED, 111);
+  LUNA_ERRNO(EHOSTUNREACH, 113);
+  LUNA_ERRNO(EALREADY, 114);
+  LUNA_ERRNO(EINPROGRESS, 115);
+  LUNA_ERRNO(ECANCELED, 125);
+  LUNA_ERRNO(EOWNERDEAD, 130);
+  LUNA_ERRNO(ENOTRECOVERABLE, 131);
+  LUNA_ERRNO(ETXTBSY, 26);
 #undef LUNA_ERRNO
 #endif
-   return error;
+  return error;
 }
 
 /* Android/POSIX *at ABI; wrappers translate these on the host. */
 enum { LUNA_AT_FDCWD = -100, LUNA_AT_NOFOLLOW = 0x100,
        LUNA_AT_REMOVEDIR = 0x200, LUNA_AT_EACCESS = 0x200,
-       LUNA_AT_NO_AUTOMOUNT = 0x800, LUNA_AT_EMPTY_PATH = 0x1000 };
+       LUNA_AT_NO_AUTOMOUNT = 0x800, LUNA_AT_EMPTY_PATH = 0x1000
+     };
 /* ---- File interfaces ---- */
 #include <errno.h>
 #include <stdint.h>
@@ -369,43 +471,44 @@ enum { LUNA_AT_FDCWD = -100, LUNA_AT_NOFOLLOW = 0x100,
 /* Android timestamp sentinels, independent of the host's UTIME_* values. */
 enum { LUNA_TIME_NOW = 0x3fffffff, LUNA_TIME_OMIT = 0x3ffffffe };
 typedef struct luna_file_time {
-   int64_t seconds;
-   int64_t nanoseconds;
+  int64_t seconds;
+  int64_t nanoseconds;
 } luna_file_time;
 /* Host metadata with wide sizes and timestamps; no platform stat layout is
  * exposed to the Android ABI writer. Blocks always count 512-byte units. */
 typedef struct luna_file_info {
-   uint64_t device, inode, rdevice, blocks;
-   int64_t size;
-   uint32_t mode, links, uid, gid, block_size;
-   luna_file_time accessed, modified, changed;
+  uint64_t device, inode, rdevice, blocks;
+  int64_t size;
+  uint32_t mode, links, uid, gid, block_size;
+  luna_file_time accessed, modified, changed;
 } luna_file_info;
 typedef struct luna_file_memstream {
-   FILE *stream;
-   char *data;
-   size_t length;
+  FILE *stream;
+  char *data;
+  size_t length;
 } luna_file_memstream;
 /* Android flock flags. These are independent of host locking APIs. */
 enum { LUNA_LOCK_SHARED=1, LUNA_LOCK_EXCLUSIVE=2,
-       LUNA_LOCK_NONBLOCK=4, LUNA_LOCK_UNLOCK=8 };
+       LUNA_LOCK_NONBLOCK=4, LUNA_LOCK_UNLOCK=8
+     };
 /* Process record locks use a neutral layout and Android lock type values.
  * They are different from the open-description locks used by flock/Java. */
 enum { LUNA_RECORD_READ=0, LUNA_RECORD_WRITE=1, LUNA_RECORD_UNLOCK=2 };
 enum { LUNA_RECORD_QUERY=0, LUNA_RECORD_SET=1, LUNA_RECORD_WAIT=2 };
 typedef struct luna_file_record_lock {
-   int type, whence;
-   int64_t start, length;
-   int32_t pid;
+  int type, whence;
+  int64_t start, length;
+  int32_t pid;
 } luna_file_record_lock;
 /* pathconf names are the Android ABI, not the host's _PC_* numbers. */
 enum {
-   LUNA_PC_FILESIZEBITS=0, LUNA_PC_LINK_MAX=1, LUNA_PC_MAX_CANON=2,
-   LUNA_PC_MAX_INPUT=3, LUNA_PC_NAME_MAX=4, LUNA_PC_PATH_MAX=5,
-   LUNA_PC_PIPE_BUF=6, LUNA_PC_2_SYMLINKS=7, LUNA_PC_ALLOC_SIZE_MIN=8,
-   LUNA_PC_REC_INCR_XFER_SIZE=9, LUNA_PC_REC_MAX_XFER_SIZE=10,
-   LUNA_PC_REC_MIN_XFER_SIZE=11, LUNA_PC_REC_XFER_ALIGN=12,
-   LUNA_PC_SYMLINK_MAX=13, LUNA_PC_CHOWN_RESTRICTED=14, LUNA_PC_NO_TRUNC=15,
-   LUNA_PC_VDISABLE=16, LUNA_PC_ASYNC_IO=17, LUNA_PC_PRIO_IO=18, LUNA_PC_SYNC_IO=19
+  LUNA_PC_FILESIZEBITS=0, LUNA_PC_LINK_MAX=1, LUNA_PC_MAX_CANON=2,
+  LUNA_PC_MAX_INPUT=3, LUNA_PC_NAME_MAX=4, LUNA_PC_PATH_MAX=5,
+  LUNA_PC_PIPE_BUF=6, LUNA_PC_2_SYMLINKS=7, LUNA_PC_ALLOC_SIZE_MIN=8,
+  LUNA_PC_REC_INCR_XFER_SIZE=9, LUNA_PC_REC_MAX_XFER_SIZE=10,
+  LUNA_PC_REC_MIN_XFER_SIZE=11, LUNA_PC_REC_XFER_ALIGN=12,
+  LUNA_PC_SYMLINK_MAX=13, LUNA_PC_CHOWN_RESTRICTED=14, LUNA_PC_NO_TRUNC=15,
+  LUNA_PC_VDISABLE=16, LUNA_PC_ASYNC_IO=17, LUNA_PC_PRIO_IO=18, LUNA_PC_SYNC_IO=19
 };
 #ifdef _WIN32
 #define LUNA_FILE_CLOEXEC _O_NOINHERIT
@@ -446,7 +549,7 @@ int luna_file_sync(int fd, int data_only);
 ptrdiff_t luna_file_pread(int fd, void *buffer, size_t length, int64_t offset);
 ptrdiff_t luna_file_pwrite(int fd, const void *buffer, size_t length, int64_t offset);
 int luna_file_lock(int fd, int64_t start, int64_t length,
-                                 int shared, int nonblocking, int unlock);
+                   int shared, int nonblocking, int unlock);
 int luna_file_flock(int fd, int operation);
 int luna_file_record_control(int fd, int command, luna_file_record_lock *lock);
 int luna_file_fclose(FILE *stream);
@@ -479,249 +582,377 @@ int luna_file_memstream_finish(luna_file_memstream *writer, char **data, size_t 
 #endif
 static inline void luna_file_native_info(const struct stat *native, luna_file_info *info)
 {
-   memset(info, 0, sizeof *info);
-   info->device = native->st_dev; info->inode = native->st_ino;
-   info->rdevice = native->st_rdev; info->size = native->st_size;
-   info->blocks = native->st_blocks; info->block_size = native->st_blksize;
-   info->mode = native->st_mode; info->links = native->st_nlink;
-   info->uid = native->st_uid; info->gid = native->st_gid;
+  memset(info, 0, sizeof *info);
+  info->device = native->st_dev;
+  info->inode = native->st_ino;
+  info->rdevice = native->st_rdev;
+  info->size = native->st_size;
+  info->blocks = native->st_blocks;
+  info->block_size = native->st_blksize;
+  info->mode = native->st_mode;
+  info->links = native->st_nlink;
+  info->uid = native->st_uid;
+  info->gid = native->st_gid;
 #ifdef __APPLE__
-   info->accessed.seconds = native->st_atimespec.tv_sec;
-   info->accessed.nanoseconds = native->st_atimespec.tv_nsec;
-   info->modified.seconds = native->st_mtimespec.tv_sec;
-   info->modified.nanoseconds = native->st_mtimespec.tv_nsec;
-   info->changed.seconds = native->st_ctimespec.tv_sec;
-   info->changed.nanoseconds = native->st_ctimespec.tv_nsec;
+  info->accessed.seconds = native->st_atimespec.tv_sec;
+  info->accessed.nanoseconds = native->st_atimespec.tv_nsec;
+  info->modified.seconds = native->st_mtimespec.tv_sec;
+  info->modified.nanoseconds = native->st_mtimespec.tv_nsec;
+  info->changed.seconds = native->st_ctimespec.tv_sec;
+  info->changed.nanoseconds = native->st_ctimespec.tv_nsec;
 #else
-   info->accessed.seconds = native->st_atim.tv_sec;
-   info->accessed.nanoseconds = native->st_atim.tv_nsec;
-   info->modified.seconds = native->st_mtim.tv_sec;
-   info->modified.nanoseconds = native->st_mtim.tv_nsec;
-   info->changed.seconds = native->st_ctim.tv_sec;
-   info->changed.nanoseconds = native->st_ctim.tv_nsec;
+  info->accessed.seconds = native->st_atim.tv_sec;
+  info->accessed.nanoseconds = native->st_atim.tv_nsec;
+  info->modified.seconds = native->st_mtim.tv_sec;
+  info->modified.nanoseconds = native->st_mtim.tv_nsec;
+  info->changed.seconds = native->st_ctim.tv_sec;
+  info->changed.nanoseconds = native->st_ctim.tv_nsec;
 #endif
 }
 static inline int luna_file_fd_info(int fd, luna_file_info *info)
 {
-   if (!info) { errno = EFAULT; return -1; }
-   struct stat native;
-   if (fstat(fd, &native)) return -1;
-   luna_file_native_info(&native, info); return 0;
+  if (!info) {
+    errno = EFAULT;
+    return -1;
+  }
+  struct stat native;
+  if (fstat(fd, &native)) return -1;
+  luna_file_native_info(&native, info);
+  return 0;
 }
 static inline int luna_file_infoat(int dirfd, const char *path, luna_file_info *info, int flags)
 {
-   if (flags & ~(LUNA_AT_NOFOLLOW | LUNA_AT_NO_AUTOMOUNT | LUNA_AT_EMPTY_PATH)) { errno = EINVAL; return -1; }
-   if (!path || !info) { errno = EFAULT; return -1; }
-   if (!*path && (flags & LUNA_AT_EMPTY_PATH) && dirfd != LUNA_AT_FDCWD)
-      return luna_file_fd_info(dirfd, info);
-   struct stat native;
-   const char *query = !*path && (flags & LUNA_AT_EMPTY_PATH) ? "." : path;
-   int native_flags = flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0;
+  if (flags & ~(LUNA_AT_NOFOLLOW | LUNA_AT_NO_AUTOMOUNT | LUNA_AT_EMPTY_PATH)) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (!path || !info) {
+    errno = EFAULT;
+    return -1;
+  }
+  if (!*path && (flags & LUNA_AT_EMPTY_PATH) && dirfd != LUNA_AT_FDCWD)
+    return luna_file_fd_info(dirfd, info);
+  struct stat native;
+  const char *query = !*path && (flags & LUNA_AT_EMPTY_PATH) ? "." : path;
+  int native_flags = flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0;
 #ifdef AT_NO_AUTOMOUNT
-   if (flags & LUNA_AT_NO_AUTOMOUNT) native_flags |= AT_NO_AUTOMOUNT;
+  if (flags & LUNA_AT_NO_AUTOMOUNT) native_flags |= AT_NO_AUTOMOUNT;
 #endif
-   if (fstatat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, query, &native, native_flags)) return -1;
-   luna_file_native_info(&native, info); return 0;
+  if (fstatat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, query, &native, native_flags)) return -1;
+  luna_file_native_info(&native, info);
+  return 0;
 }
 static inline ptrdiff_t luna_file_readlink(const char *path, char *buffer, size_t capacity)
-{ return readlink(path, buffer, capacity); }
+{
+  return readlink(path, buffer, capacity);
+}
 static inline int luna_file_open(const char *path, int flags, unsigned mode)
-{ return open(path, flags, (mode_t)mode); }
+{
+  return open(path, flags, (mode_t)mode);
+}
 static inline int luna_file_openat(int dirfd, const char *path, int flags, unsigned mode)
-{ return openat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path, flags, (mode_t)mode); }
+{
+  return openat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path, flags, (mode_t)mode);
+}
 static inline int luna_file_unlinkat(int dirfd, const char *path, int flags)
 {
-   if (flags & ~LUNA_AT_REMOVEDIR) { errno = EINVAL; return -1; }
-   return unlinkat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path,
-                   flags & LUNA_AT_REMOVEDIR ? AT_REMOVEDIR : 0);
+  if (flags & ~LUNA_AT_REMOVEDIR) {
+    errno = EINVAL;
+    return -1;
+  }
+  return unlinkat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path,
+                  flags & LUNA_AT_REMOVEDIR ? AT_REMOVEDIR : 0);
 }
 static inline int luna_file_accessat(int dirfd, const char *path, int mode, int flags)
 {
-   if (flags & ~(LUNA_AT_NOFOLLOW | LUNA_AT_EACCESS)) { errno = EINVAL; return -1; }
-   int native = (flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0) |
-                (flags & LUNA_AT_EACCESS ? AT_EACCESS : 0);
-   return faccessat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path, mode, native);
+  if (flags & ~(LUNA_AT_NOFOLLOW | LUNA_AT_EACCESS)) {
+    errno = EINVAL;
+    return -1;
+  }
+  int native = (flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0) |
+               (flags & LUNA_AT_EACCESS ? AT_EACCESS : 0);
+  return faccessat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path, mode, native);
 }
 static inline int luna_file_rename(const char *from, const char *to)
-{ return rename(from, to); }
+{
+  return rename(from, to);
+}
 static inline int luna_file_unlink(const char *path)
-{ return unlink(path); }
+{
+  return unlink(path);
+}
 static inline int luna_file_temp_directory(char *result, size_t capacity)
 {
-   const char *directory = getenv("TMPDIR");
-   if (!directory || !*directory) directory = "/tmp";
-   size_t length = strlen(directory) + 1;
-   if (length > capacity) { errno = ENAMETOOLONG; return -1; }
-   memcpy(result, directory, length); return 0;
+  const char *directory = getenv("TMPDIR");
+  if (!directory || !*directory) directory = "/tmp";
+  size_t length = strlen(directory) + 1;
+  if (length > capacity) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(result, directory, length);
+  return 0;
 }
-static inline FILE *luna_file_tmpfile(void) { return tmpfile(); }
+static inline FILE *luna_file_tmpfile(void) {
+  return tmpfile();
+}
 static inline FILE *luna_file_memory_reader(const void *buffer, size_t length)
-{ return fmemopen((void *)buffer, length, "r"); }
-static inline char *luna_file_mkdtemp(char *pattern) { return mkdtemp(pattern); }
+{
+  return fmemopen((void *)buffer, length, "r");
+}
+static inline char *luna_file_mkdtemp(char *pattern) {
+  return mkdtemp(pattern);
+}
 static inline int luna_file_mkstemps(char *pattern, int suffix_length)
-{ return mkstemps(pattern, suffix_length); }
+{
+  return mkstemps(pattern, suffix_length);
+}
 static inline char *luna_file_realpath(const char *path, char *result, size_t capacity)
 {
-   char *resolved = realpath(path, NULL);
-   if (!resolved) return NULL;
-   size_t length = strlen(resolved) + 1;
-   if (length > capacity) { free(resolved); errno = ENAMETOOLONG; return NULL; }
-   memcpy(result, resolved, length); free(resolved); return result;
+  char *resolved = realpath(path, NULL);
+  if (!resolved) return NULL;
+  size_t length = strlen(resolved) + 1;
+  if (length > capacity) {
+    free(resolved);
+    errno = ENAMETOOLONG;
+    return NULL;
+  }
+  memcpy(result, resolved, length);
+  free(resolved);
+  return result;
 }
 static inline int luna_file_native_times(const luna_file_time times[2], struct timespec native[2])
 {
-   for (int i = 0; i < 2; ++i) {
-      int64_t ns = times[i].nanoseconds;
-      if (ns == LUNA_TIME_NOW || ns == LUNA_TIME_OMIT) {
-         native[i].tv_sec = 0;
-         native[i].tv_nsec = ns == LUNA_TIME_NOW ? UTIME_NOW : UTIME_OMIT;
-      } else {
-         if (ns < 0 || ns >= 1000000000) { errno = EINVAL; return -1; }
-         native[i].tv_sec = (time_t)times[i].seconds;
-         if ((int64_t)native[i].tv_sec != times[i].seconds) { errno = EOVERFLOW; return -1; }
-         native[i].tv_nsec = ns;
+  for (int i = 0; i < 2; ++i) {
+    int64_t ns = times[i].nanoseconds;
+    if (ns == LUNA_TIME_NOW || ns == LUNA_TIME_OMIT) {
+      native[i].tv_sec = 0;
+      native[i].tv_nsec = ns == LUNA_TIME_NOW ? UTIME_NOW : UTIME_OMIT;
+    } else {
+      if (ns < 0 || ns >= 1000000000) {
+        errno = EINVAL;
+        return -1;
       }
-   }
-   return 0;
+      native[i].tv_sec = (time_t)times[i].seconds;
+      if ((int64_t)native[i].tv_sec != times[i].seconds) {
+        errno = EOVERFLOW;
+        return -1;
+      }
+      native[i].tv_nsec = ns;
+    }
+  }
+  return 0;
 }
 static inline int luna_file_timesat(int dirfd, const char *path, const luna_file_time times[2], int flags)
 {
-   if (flags & ~LUNA_AT_NOFOLLOW) { errno = EINVAL; return -1; }
-   struct timespec native[2];
-   if (times && luna_file_native_times(times, native)) return -1;
-   return utimensat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path,
-                    times ? native : NULL, flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0);
+  if (flags & ~LUNA_AT_NOFOLLOW) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct timespec native[2];
+  if (times && luna_file_native_times(times, native)) return -1;
+  return utimensat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path,
+                   times ? native : NULL, flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0);
 }
 static inline int luna_file_fd_times(int fd, const luna_file_time times[2])
 {
-   struct timespec native[2];
-   if (times && luna_file_native_times(times, native)) return -1;
-   return futimens(fd, times ? native : NULL);
+  struct timespec native[2];
+  if (times && luna_file_native_times(times, native)) return -1;
+  return futimens(fd, times ? native : NULL);
 }
 static inline int luna_file_set_modified(const char *path, int64_t ms)
 {
-   if (ms < 0) { errno = EINVAL; return -1; }
-   struct timespec times[2] = { { 0, UTIME_OMIT },
-      { (time_t)(ms / 1000), (long)((ms % 1000) * 1000000) } };
-   return utimensat(AT_FDCWD, path, times, 0);
+  if (ms < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct timespec times[2] = { { 0, UTIME_OMIT },
+    { (time_t)(ms / 1000), (long)((ms % 1000) * 1000000) }
+  };
+  return utimensat(AT_FDCWD, path, times, 0);
 }
 static inline int luna_file_chmodat(int dirfd, const char *path, unsigned mode, int flags)
 {
-   if (flags & ~LUNA_AT_NOFOLLOW) { errno = EINVAL; return -1; }
-   return fchmodat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path, (mode_t)mode,
-                   flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0);
+  if (flags & ~LUNA_AT_NOFOLLOW) {
+    errno = EINVAL;
+    return -1;
+  }
+  return fchmodat(dirfd == LUNA_AT_FDCWD ? AT_FDCWD : dirfd, path, (mode_t)mode,
+                  flags & LUNA_AT_NOFOLLOW ? AT_SYMLINK_NOFOLLOW : 0);
 }
 static inline int luna_file_fd_chmod(int fd, unsigned mode)
-{ return fchmod(fd, (mode_t)mode); }
+{
+  return fchmod(fd, (mode_t)mode);
+}
 static inline int luna_file_link(const char *from, const char *to)
-{ return link(from, to); }
+{
+  return link(from, to);
+}
 static inline int luna_file_symlink(const char *target, const char *path)
-{ return symlink(target, path); }
+{
+  return symlink(target, path);
+}
 static inline long luna_file_pathconf(const char *path, int name)
 {
-   if (!path) { errno = EINVAL; return -1; }
-   if (name < 0 || name > LUNA_PC_SYNC_IO) { errno = EINVAL; return -1; }
-   int native = -1;
-   switch (name) {
+  if (!path) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (name < 0 || name > LUNA_PC_SYNC_IO) {
+    errno = EINVAL;
+    return -1;
+  }
+  int native = -1;
+  switch (name) {
 #ifdef _PC_FILESIZEBITS
-   case LUNA_PC_FILESIZEBITS: native = _PC_FILESIZEBITS; break;
+  case LUNA_PC_FILESIZEBITS:
+    native = _PC_FILESIZEBITS;
+    break;
 #endif
 #ifdef _PC_LINK_MAX
-   case LUNA_PC_LINK_MAX: native = _PC_LINK_MAX; break;
+  case LUNA_PC_LINK_MAX:
+    native = _PC_LINK_MAX;
+    break;
 #endif
 #ifdef _PC_MAX_CANON
-   case LUNA_PC_MAX_CANON: native = _PC_MAX_CANON; break;
+  case LUNA_PC_MAX_CANON:
+    native = _PC_MAX_CANON;
+    break;
 #endif
 #ifdef _PC_MAX_INPUT
-   case LUNA_PC_MAX_INPUT: native = _PC_MAX_INPUT; break;
+  case LUNA_PC_MAX_INPUT:
+    native = _PC_MAX_INPUT;
+    break;
 #endif
 #ifdef _PC_NAME_MAX
-   case LUNA_PC_NAME_MAX: native = _PC_NAME_MAX; break;
+  case LUNA_PC_NAME_MAX:
+    native = _PC_NAME_MAX;
+    break;
 #endif
 #ifdef _PC_PATH_MAX
-   case LUNA_PC_PATH_MAX: native = _PC_PATH_MAX; break;
+  case LUNA_PC_PATH_MAX:
+    native = _PC_PATH_MAX;
+    break;
 #endif
 #ifdef _PC_PIPE_BUF
-   case LUNA_PC_PIPE_BUF: native = _PC_PIPE_BUF; break;
+  case LUNA_PC_PIPE_BUF:
+    native = _PC_PIPE_BUF;
+    break;
 #endif
 #ifdef _PC_2_SYMLINKS
-   case LUNA_PC_2_SYMLINKS: native = _PC_2_SYMLINKS; break;
+  case LUNA_PC_2_SYMLINKS:
+    native = _PC_2_SYMLINKS;
+    break;
 #endif
 #ifdef _PC_ALLOC_SIZE_MIN
-   case LUNA_PC_ALLOC_SIZE_MIN: native = _PC_ALLOC_SIZE_MIN; break;
+  case LUNA_PC_ALLOC_SIZE_MIN:
+    native = _PC_ALLOC_SIZE_MIN;
+    break;
 #endif
 #ifdef _PC_REC_INCR_XFER_SIZE
-   case LUNA_PC_REC_INCR_XFER_SIZE: native = _PC_REC_INCR_XFER_SIZE; break;
+  case LUNA_PC_REC_INCR_XFER_SIZE:
+    native = _PC_REC_INCR_XFER_SIZE;
+    break;
 #endif
 #ifdef _PC_REC_MAX_XFER_SIZE
-   case LUNA_PC_REC_MAX_XFER_SIZE: native = _PC_REC_MAX_XFER_SIZE; break;
+  case LUNA_PC_REC_MAX_XFER_SIZE:
+    native = _PC_REC_MAX_XFER_SIZE;
+    break;
 #endif
 #ifdef _PC_REC_MIN_XFER_SIZE
-   case LUNA_PC_REC_MIN_XFER_SIZE: native = _PC_REC_MIN_XFER_SIZE; break;
+  case LUNA_PC_REC_MIN_XFER_SIZE:
+    native = _PC_REC_MIN_XFER_SIZE;
+    break;
 #endif
 #ifdef _PC_REC_XFER_ALIGN
-   case LUNA_PC_REC_XFER_ALIGN: native = _PC_REC_XFER_ALIGN; break;
+  case LUNA_PC_REC_XFER_ALIGN:
+    native = _PC_REC_XFER_ALIGN;
+    break;
 #endif
 #ifdef _PC_SYMLINK_MAX
-   case LUNA_PC_SYMLINK_MAX: native = _PC_SYMLINK_MAX; break;
+  case LUNA_PC_SYMLINK_MAX:
+    native = _PC_SYMLINK_MAX;
+    break;
 #endif
 #ifdef _PC_CHOWN_RESTRICTED
-   case LUNA_PC_CHOWN_RESTRICTED: native = _PC_CHOWN_RESTRICTED; break;
+  case LUNA_PC_CHOWN_RESTRICTED:
+    native = _PC_CHOWN_RESTRICTED;
+    break;
 #endif
 #ifdef _PC_NO_TRUNC
-   case LUNA_PC_NO_TRUNC: native = _PC_NO_TRUNC; break;
+  case LUNA_PC_NO_TRUNC:
+    native = _PC_NO_TRUNC;
+    break;
 #endif
 #ifdef _PC_VDISABLE
-   case LUNA_PC_VDISABLE: native = _PC_VDISABLE; break;
+  case LUNA_PC_VDISABLE:
+    native = _PC_VDISABLE;
+    break;
 #endif
 #ifdef _PC_ASYNC_IO
-   case LUNA_PC_ASYNC_IO: native = _PC_ASYNC_IO; break;
+  case LUNA_PC_ASYNC_IO:
+    native = _PC_ASYNC_IO;
+    break;
 #endif
 #ifdef _PC_PRIO_IO
-   case LUNA_PC_PRIO_IO: native = _PC_PRIO_IO; break;
+  case LUNA_PC_PRIO_IO:
+    native = _PC_PRIO_IO;
+    break;
 #endif
 #ifdef _PC_SYNC_IO
-   case LUNA_PC_SYNC_IO: native = _PC_SYNC_IO; break;
+  case LUNA_PC_SYNC_IO:
+    native = _PC_SYNC_IO;
+    break;
 #endif
-   default: break;
-   }
-   if (native >= 0) return pathconf(path, native);
-   luna_file_info info;
-   if (luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0)) return -1;
-   errno = 0; return -1; /* An indeterminate limit, not an invalid query. */
+  default:
+    break;
+  }
+  if (native >= 0) return pathconf(path, native);
+  luna_file_info info;
+  if (luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0)) return -1;
+  errno = 0;
+  return -1; /* An indeterminate limit, not an invalid query. */
 }
 static inline int luna_file_mkdir(const char *path, unsigned mode)
-{ return mkdir(path, (mode_t)mode); }
+{
+  return mkdir(path, (mode_t)mode);
+}
 static inline int luna_file_sync(int fd, int data_only)
 {
 #ifdef __APPLE__
-   (void)data_only; return fsync(fd);
+  (void)data_only;
+  return fsync(fd);
 #else
-   return data_only ? fdatasync(fd) : fsync(fd);
+  return data_only ? fdatasync(fd) : fsync(fd);
 #endif
 }
 static inline ptrdiff_t luna_file_pread(int fd, void *buffer, size_t length, int64_t offset)
-{ return pread(fd, buffer, length, (off_t)offset); }
+{
+  return pread(fd, buffer, length, (off_t)offset);
+}
 static inline ptrdiff_t luna_file_pwrite(int fd, const void *buffer, size_t length, int64_t offset)
-{ return pwrite(fd, buffer, length, (off_t)offset); }
+{
+  return pwrite(fd, buffer, length, (off_t)offset);
+}
 static inline int luna_file_lock(int fd, int64_t start, int64_t length,
                                  int shared, int nonblocking, int unlock)
 {
-   if (start < 0 || length < 0 || length > INT64_MAX - start) {
-      errno = EINVAL; return -1;
-   }
-   if (!length) return 0;
-   struct flock region = { 0 };
-   region.l_type = unlock ? F_UNLCK : shared ? F_RDLCK : F_WRLCK;
-   region.l_whence = SEEK_SET;
-   region.l_start = (off_t)start;
-   region.l_len = (off_t)length;
+  if (start < 0 || length < 0 || length > INT64_MAX - start) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (!length) return 0;
+  struct flock region = { 0 };
+  region.l_type = unlock ? F_UNLCK : shared ? F_RDLCK : F_WRLCK;
+  region.l_whence = SEEK_SET;
+  region.l_start = (off_t)start;
+  region.l_len = (off_t)length;
 #ifdef F_OFD_SETLK
-   int command = nonblocking || unlock ? F_OFD_SETLK : F_OFD_SETLKW;
+  int command = nonblocking || unlock ? F_OFD_SETLK : F_OFD_SETLKW;
 #else
-   int command = nonblocking || unlock ? F_SETLK : F_SETLKW;
+  int command = nonblocking || unlock ? F_SETLK : F_SETLKW;
 #endif
-   return fcntl(fd, command, &region);
+  return fcntl(fd, command, &region);
 }
 #ifdef __APPLE__
 #ifdef __cplusplus
@@ -731,123 +962,174 @@ int luna_file_flock(int fd, int operation);
 #else
 static inline int luna_file_flock(int fd, int operation)
 {
-   int kind = operation & ~LUNA_LOCK_NONBLOCK;
-   if (kind != LUNA_LOCK_SHARED && kind != LUNA_LOCK_EXCLUSIVE &&
-       kind != LUNA_LOCK_UNLOCK) { errno = EINVAL; return -1; }
-   int native = kind == LUNA_LOCK_SHARED ? LOCK_SH :
-                kind == LUNA_LOCK_EXCLUSIVE ? LOCK_EX : LOCK_UN;
-   return flock(fd, native | (operation & LUNA_LOCK_NONBLOCK ? LOCK_NB : 0));
+  int kind = operation & ~LUNA_LOCK_NONBLOCK;
+  if (kind != LUNA_LOCK_SHARED && kind != LUNA_LOCK_EXCLUSIVE &&
+      kind != LUNA_LOCK_UNLOCK) {
+    errno = EINVAL;
+    return -1;
+  }
+  int native = kind == LUNA_LOCK_SHARED ? LOCK_SH :
+               kind == LUNA_LOCK_EXCLUSIVE ? LOCK_EX : LOCK_UN;
+  return flock(fd, native | (operation & LUNA_LOCK_NONBLOCK ? LOCK_NB : 0));
 }
 #endif
-static inline int luna_file_fclose(FILE *stream) { return fclose(stream); }
-static inline FILE *luna_file_fopen(const char *path, const char *mode) { return fopen(path, mode); }
-static inline int luna_fd_get_status(int fd) { return fcntl(fd, F_GETFL); }
-static inline int luna_fd_set_status(int fd, int flags) { return fcntl(fd, F_SETFL, flags); }
+static inline int luna_file_fclose(FILE *stream) {
+  return fclose(stream);
+}
+static inline FILE *luna_file_fopen(const char *path, const char *mode) {
+  return fopen(path, mode);
+}
+static inline int luna_fd_get_status(int fd) {
+  return fcntl(fd, F_GETFL);
+}
+static inline int luna_fd_set_status(int fd, int flags) {
+  return fcntl(fd, F_SETFL, flags);
+}
 static inline int luna_fd_control(int fd, int command, int argument)
 {
-   int native;
-   switch (command) {
-   case 3: return luna_fd_get_status(fd);
-   case 4: return luna_fd_set_status(fd, argument);
-   case 8: native = F_SETOWN; break;
-   case 9: return fcntl(fd, F_GETOWN);
+  int native;
+  switch (command) {
+  case 3:
+    return luna_fd_get_status(fd);
+  case 4:
+    return luna_fd_set_status(fd, argument);
+  case 8:
+    native = F_SETOWN;
+    break;
+  case 9:
+    return fcntl(fd, F_GETOWN);
 #ifdef F_SETSIG
-   case 10: native = F_SETSIG; break;
+  case 10:
+    native = F_SETSIG;
+    break;
 #endif
 #ifdef F_GETSIG
-   case 11: return fcntl(fd, F_GETSIG);
+  case 11:
+    return fcntl(fd, F_GETSIG);
 #endif
 #ifdef F_SETLEASE
-   case 1024: native = F_SETLEASE; break;
+  case 1024:
+    native = F_SETLEASE;
+    break;
 #endif
 #ifdef F_GETLEASE
-   case 1025: return fcntl(fd, F_GETLEASE);
+  case 1025:
+    return fcntl(fd, F_GETLEASE);
 #endif
 #ifdef F_NOTIFY
-   case 1026: native = F_NOTIFY; break;
+  case 1026:
+    native = F_NOTIFY;
+    break;
 #endif
 #ifdef F_SETPIPE_SZ
-   case 1031: native = F_SETPIPE_SZ; break;
+  case 1031:
+    native = F_SETPIPE_SZ;
+    break;
 #endif
 #ifdef F_GETPIPE_SZ
-   case 1032: return fcntl(fd, F_GETPIPE_SZ);
+  case 1032:
+    return fcntl(fd, F_GETPIPE_SZ);
 #endif
 #ifdef F_ADD_SEALS
-   case 1033: native = F_ADD_SEALS; break;
+  case 1033:
+    native = F_ADD_SEALS;
+    break;
 #endif
 #ifdef F_GET_SEALS
-   case 1034: return fcntl(fd, F_GET_SEALS);
+  case 1034:
+    return fcntl(fd, F_GET_SEALS);
 #endif
-   default: errno = EINVAL; return -1;
-   }
-   return fcntl(fd, native, argument);
+  default:
+    errno = EINVAL;
+    return -1;
+  }
+  return fcntl(fd, native, argument);
 }
 static inline int luna_file_record_control(int fd, int command, luna_file_record_lock *lock)
 {
-   if (!lock) { errno = EFAULT; return -1; }
-   if (command < LUNA_RECORD_QUERY || command > LUNA_RECORD_WAIT ||
-       lock->type < LUNA_RECORD_READ || lock->type > LUNA_RECORD_UNLOCK ||
-       (lock->whence != SEEK_SET && lock->whence != SEEK_CUR && lock->whence != SEEK_END)) {
-      errno = EINVAL; return -1;
-   }
-   struct flock native = { 0 };
-   native.l_type = lock->type == LUNA_RECORD_READ ? F_RDLCK :
-                   lock->type == LUNA_RECORD_WRITE ? F_WRLCK : F_UNLCK;
-   native.l_whence = (short)lock->whence;
-   native.l_start = (off_t)lock->start;
-   native.l_len = (off_t)lock->length;
-   if ((int64_t)native.l_start != lock->start || (int64_t)native.l_len != lock->length) {
-      errno = EOVERFLOW; return -1;
-   }
-   int op = command == LUNA_RECORD_QUERY ? F_GETLK :
-            command == LUNA_RECORD_SET ? F_SETLK : F_SETLKW;
-   int result = fcntl(fd, op, &native);
-   if (!result && command == LUNA_RECORD_QUERY) {
-      lock->type = native.l_type == F_RDLCK ? LUNA_RECORD_READ :
-                   native.l_type == F_WRLCK ? LUNA_RECORD_WRITE : LUNA_RECORD_UNLOCK;
-      lock->whence = native.l_whence;
-      lock->start = native.l_start; lock->length = native.l_len;
-      lock->pid = (int32_t)native.l_pid;
-   }
-   return result;
+  if (!lock) {
+    errno = EFAULT;
+    return -1;
+  }
+  if (command < LUNA_RECORD_QUERY || command > LUNA_RECORD_WAIT ||
+      lock->type < LUNA_RECORD_READ || lock->type > LUNA_RECORD_UNLOCK ||
+      (lock->whence != SEEK_SET && lock->whence != SEEK_CUR && lock->whence != SEEK_END)) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct flock native = { 0 };
+  native.l_type = lock->type == LUNA_RECORD_READ ? F_RDLCK :
+                  lock->type == LUNA_RECORD_WRITE ? F_WRLCK : F_UNLCK;
+  native.l_whence = (short)lock->whence;
+  native.l_start = (off_t)lock->start;
+  native.l_len = (off_t)lock->length;
+  if ((int64_t)native.l_start != lock->start || (int64_t)native.l_len != lock->length) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  int op = command == LUNA_RECORD_QUERY ? F_GETLK :
+           command == LUNA_RECORD_SET ? F_SETLK : F_SETLKW;
+  int result = fcntl(fd, op, &native);
+  if (!result && command == LUNA_RECORD_QUERY) {
+    lock->type = native.l_type == F_RDLCK ? LUNA_RECORD_READ :
+                 native.l_type == F_WRLCK ? LUNA_RECORD_WRITE : LUNA_RECORD_UNLOCK;
+    lock->whence = native.l_whence;
+    lock->start = native.l_start;
+    lock->length = native.l_len;
+    lock->pid = (int32_t)native.l_pid;
+  }
+  return result;
 }
 #endif
 static inline int luna_file_mkstemp(char *pattern)
-{ return luna_file_mkstemps(pattern, 0); }
+{
+  return luna_file_mkstemps(pattern, 0);
+}
 #ifndef _WIN32
 static inline FILE *luna_file_memstream_begin(luna_file_memstream *writer)
 {
-   memset(writer, 0, sizeof *writer);
-   writer->stream = open_memstream(&writer->data, &writer->length);
+  memset(writer, 0, sizeof *writer);
+  writer->stream = open_memstream(&writer->data, &writer->length);
 
-   return writer->stream;
+  return writer->stream;
 }
 /* Finish the stream and transfer the allocated, NUL-terminated bytes. */
 static inline int luna_file_memstream_finish(luna_file_memstream *writer,
-                                             char **data, size_t *length)
+    char **data, size_t *length)
 {
-   if (!writer->stream) { errno = EINVAL; return -1; }
-   int error = 0;
-   if (ferror(writer->stream)) error = EIO;
+  if (!writer->stream) {
+    errno = EINVAL;
+    return -1;
+  }
+  int error = 0;
+  if (ferror(writer->stream)) error = EIO;
 
-   if (fclose(writer->stream) && !error) error = errno ? errno : EIO;
-   writer->stream = NULL;
-   if (error) { free(writer->data); writer->data = NULL; errno = error; return -1; }
-   *data = writer->data; *length = writer->length; writer->data = NULL;
-   return 0;
+  if (fclose(writer->stream) && !error) error = errno ? errno : EIO;
+  writer->stream = NULL;
+  if (error) {
+    free(writer->data);
+    writer->data = NULL;
+    errno = error;
+    return -1;
+  }
+  *data = writer->data;
+  *length = writer->length;
+  writer->data = NULL;
+  return 0;
 }
 #endif
 
 /* ---- Directory streams ---- */
 enum { LUNA_DT_UNKNOWN = 0, LUNA_DT_FIFO = 1, LUNA_DT_CHR = 2,
        LUNA_DT_DIR = 4, LUNA_DT_BLK = 6, LUNA_DT_REG = 8,
-       LUNA_DT_LNK = 10, LUNA_DT_SOCK = 12 };
+       LUNA_DT_LNK = 10, LUNA_DT_SOCK = 12
+     };
 #ifdef _WIN32
 typedef struct luna_directory luna_directory;
 typedef struct luna_directory_entry {
-   uint64_t d_ino;
-   unsigned char d_type;
-   char d_name[1024];
+  uint64_t d_ino;
+  unsigned char d_type;
+  char d_name[1024];
 } luna_directory_entry;
 #ifdef __cplusplus
 extern "C" {
@@ -865,11 +1147,21 @@ void luna_directory_rewind(luna_directory *directory);
 #include <dirent.h>
 typedef DIR luna_directory;
 typedef struct dirent luna_directory_entry;
-static inline luna_directory *luna_directory_open(const char *path) { return opendir(path); }
-static inline luna_directory *luna_directory_open_fd(int fd) { return fdopendir(fd); }
-static inline luna_directory_entry *luna_directory_read(luna_directory *directory) { return readdir(directory); }
-static inline int luna_directory_close(luna_directory *directory) { return closedir(directory); }
-static inline void luna_directory_rewind(luna_directory *directory) { rewinddir(directory); }
+static inline luna_directory *luna_directory_open(const char *path) {
+  return opendir(path);
+}
+static inline luna_directory *luna_directory_open_fd(int fd) {
+  return fdopendir(fd);
+}
+static inline luna_directory_entry *luna_directory_read(luna_directory *directory) {
+  return readdir(directory);
+}
+static inline int luna_directory_close(luna_directory *directory) {
+  return closedir(directory);
+}
+static inline void luna_directory_rewind(luna_directory *directory) {
+  rewinddir(directory);
+}
 #endif
 
 /* ---- Android socket ABI ---- */
@@ -877,154 +1169,168 @@ static inline void luna_directory_rewind(luna_directory *directory) { rewinddir(
 #include <string.h>
 
 enum { LUNA_ANDROID_MSG_CTRUNC = 8, LUNA_ANDROID_MSG_DONTWAIT = 0x40,
-       LUNA_ANDROID_MSG_ERRQUEUE = 0x2000, LUNA_ANDROID_MSG_NOSIGNAL = 0x4000 };
+       LUNA_ANDROID_MSG_ERRQUEUE = 0x2000, LUNA_ANDROID_MSG_NOSIGNAL = 0x4000
+     };
 /* Scheduler-owned guest sockets are nonblocking on the host. DONTWAIT is
  * handled by the guest scheduler rather than a Windows message flag. */
 static inline int luna_message_flags_from_android(int flags, int *native)
 {
 #ifdef _WIN32
-   if (flags & LUNA_ANDROID_MSG_ERRQUEUE) { errno = EAGAIN; return -1; }
-   if (flags & ~0x4147) { errno = EOPNOTSUPP; return -1; }
-   *native = 0;
-   if (flags & 1) *native |= MSG_OOB;
-   if (flags & 2) *native |= MSG_PEEK;
-   if (flags & 4) *native |= MSG_DONTROUTE;
-   if (flags & 0x100) *native |= MSG_WAITALL;
+  if (flags & LUNA_ANDROID_MSG_ERRQUEUE) {
+    errno = EAGAIN;
+    return -1;
+  }
+  if (flags & ~0x4147) {
+    errno = EOPNOTSUPP;
+    return -1;
+  }
+  *native = 0;
+  if (flags & 1) *native |= MSG_OOB;
+  if (flags & 2) *native |= MSG_PEEK;
+  if (flags & 4) *native |= MSG_DONTROUTE;
+  if (flags & 0x100) *native |= MSG_WAITALL;
 #else
-   *native = flags;
+  *native = flags;
 #endif
-   return 0;
+  return 0;
 }
 static inline int luna_message_flags_to_android(int native)
 {
 #ifdef _WIN32
-   int flags = 0;
-   if (native & MSG_OOB) flags |= 1;
-   if (native & MSG_CTRUNC) flags |= 8;
-   if (native & MSG_TRUNC) flags |= 32;
-   return flags;
+  int flags = 0;
+  if (native & MSG_OOB) flags |= 1;
+  if (native & MSG_CTRUNC) flags |= 8;
+  if (native & MSG_TRUNC) flags |= 32;
+  return flags;
 #else
-   return native;
+  return native;
 #endif
 }
 static inline ptrdiff_t luna_android_socket_send(int fd, const void *buffer, size_t length, int flags)
 {
-   int native; if (luna_message_flags_from_android(flags, &native)) return -1;
-   return luna_socket_send(fd, buffer, length, native);
+  int native;
+  if (luna_message_flags_from_android(flags, &native)) return -1;
+  return luna_socket_send(fd, buffer, length, native);
 }
 static inline ptrdiff_t luna_android_socket_recv(int fd, void *buffer, size_t length, int flags)
 {
-   int native; if (luna_message_flags_from_android(flags, &native)) return -1;
-   return luna_socket_recv(fd, buffer, length, native);
+  int native;
+  if (luna_message_flags_from_android(flags, &native)) return -1;
+  return luna_socket_recv(fd, buffer, length, native);
 }
 static inline ptrdiff_t luna_android_socket_sendto(int fd, const void *buffer, size_t length,
-                                                  int flags, const struct sockaddr *address, socklen_t size)
+    int flags, const struct sockaddr *address, socklen_t size)
 {
-   int native; if (luna_message_flags_from_android(flags, &native)) return -1;
-   return luna_socket_sendto(fd, buffer, length, native, address, size);
+  int native;
+  if (luna_message_flags_from_android(flags, &native)) return -1;
+  return luna_socket_sendto(fd, buffer, length, native, address, size);
 }
 static inline ptrdiff_t luna_android_socket_recvfrom(int fd, void *buffer, size_t length,
-                                                    int flags, struct sockaddr *address, socklen_t *size)
+    int flags, struct sockaddr *address, socklen_t *size)
 {
-   int native; if (luna_message_flags_from_android(flags, &native)) return -1;
-   return luna_socket_recvfrom(fd, buffer, length, native, address, size);
+  int native;
+  if (luna_message_flags_from_android(flags, &native)) return -1;
+  return luna_socket_recvfrom(fd, buffer, length, native, address, size);
 }
 static inline ptrdiff_t luna_android_socket_sendmsg(int fd, const struct msghdr *message, int flags)
 {
-   int native; if (luna_message_flags_from_android(flags, &native)) return -1;
-   return luna_socket_sendmsg(fd, message, native);
+  int native;
+  if (luna_message_flags_from_android(flags, &native)) return -1;
+  return luna_socket_sendmsg(fd, message, native);
 }
 static inline ptrdiff_t luna_android_socket_recvmsg(int fd, struct msghdr *message, int flags)
 {
-   int native; if (luna_message_flags_from_android(flags, &native)) return -1;
-   ptrdiff_t count = luna_socket_recvmsg(fd, message, native);
-   if (count >= 0) message->msg_flags = luna_message_flags_to_android(message->msg_flags);
-   return count;
+  int native;
+  if (luna_message_flags_from_android(flags, &native)) return -1;
+  ptrdiff_t count = luna_socket_recvmsg(fd, message, native);
+  if (count >= 0) message->msg_flags = luna_message_flags_to_android(message->msg_flags);
+  return count;
 }
 
 /* Android pollfd is always { int32 fd; int16 events; int16 revents; }.
  * Winsock uses a pointer-sized SOCKET and different event bits. */
 static inline short luna_poll_events_from_android(uint16_t events)
 {
-   short result = 0;
-   if (events & 0x0001) result |= POLLIN;
-   if (events & 0x0002) result |= POLLPRI;
-   if (events & 0x0004) result |= POLLOUT;
+  short result = 0;
+  if (events & 0x0001) result |= POLLIN;
+  if (events & 0x0002) result |= POLLPRI;
+  if (events & 0x0004) result |= POLLOUT;
 #ifdef POLLRDNORM
-   if (events & 0x0040) result |= POLLRDNORM;
+  if (events & 0x0040) result |= POLLRDNORM;
 #endif
 #ifdef POLLRDBAND
-   if (events & 0x0080) result |= POLLRDBAND;
+  if (events & 0x0080) result |= POLLRDBAND;
 #endif
 #ifdef POLLWRNORM
-   if (events & 0x0100) result |= POLLWRNORM;
+  if (events & 0x0100) result |= POLLWRNORM;
 #endif
 #ifdef POLLWRBAND
-   if (events & 0x0200) result |= POLLWRBAND;
+  if (events & 0x0200) result |= POLLWRBAND;
 #endif
 #ifdef POLLRDHUP
-   if (events & 0x2000) result |= POLLRDHUP;
+  if (events & 0x2000) result |= POLLRDHUP;
 #endif
-   return result;
+  return result;
 }
 static inline uint16_t luna_poll_events_to_android(short events, uint16_t requested)
 {
-   uint16_t result = 0;
-   if (events & POLLIN) result |= 0x0001;
-   if (events & POLLPRI) result |= 0x0002;
-   if (events & POLLOUT) result |= 0x0004;
-   if (events & POLLERR) result |= 0x0008;
-   if (events & POLLHUP) result |= 0x0010;
-   if (events & POLLNVAL) result |= 0x0020;
+  uint16_t result = 0;
+  if (events & POLLIN) result |= 0x0001;
+  if (events & POLLPRI) result |= 0x0002;
+  if (events & POLLOUT) result |= 0x0004;
+  if (events & POLLERR) result |= 0x0008;
+  if (events & POLLHUP) result |= 0x0010;
+  if (events & POLLNVAL) result |= 0x0020;
 #ifdef POLLRDNORM
-   if (events & POLLRDNORM) result |= 0x0040;
+  if (events & POLLRDNORM) result |= 0x0040;
 #endif
 #ifdef POLLRDBAND
-   if (events & POLLRDBAND) result |= 0x0080;
+  if (events & POLLRDBAND) result |= 0x0080;
 #endif
 #ifdef POLLWRNORM
-   if (events & POLLWRNORM) result |= 0x0100;
+  if (events & POLLWRNORM) result |= 0x0100;
 #endif
 #ifdef POLLWRBAND
-   if (events & POLLWRBAND) result |= 0x0200;
+  if (events & POLLWRBAND) result |= 0x0200;
 #endif
 #ifdef POLLRDHUP
-   if (events & POLLRDHUP) result |= 0x2000;
+  if (events & POLLRDHUP) result |= 0x2000;
 #endif
-   return result & (uint16_t)(requested | 0x0038);
+  return result & (uint16_t)(requested | 0x0038);
 }
 /* fd is a signed Lunaria/CRT descriptor, not a native Winsock SOCKET.
  * Windows' pollfd stores it in SOCKET width until luna_socket_poll unwraps
  * it. Sign extension preserves negative descriptors, which poll ignores. */
 static inline struct pollfd luna_pollfd_make(int fd, short events)
 {
-   struct pollfd result;
-   result.fd = (intptr_t)fd;
-   result.events = events;
-   result.revents = 0;
-   return result;
+  struct pollfd result;
+  result.fd = (intptr_t)fd;
+  result.events = events;
+  result.revents = 0;
+  return result;
 }
 
 static inline void luna_poll_load_android(struct pollfd *host, const void *guest, size_t count,
-                                          uint16_t *requests)
+    uint16_t *requests)
 {
-   const unsigned char *bytes = (const unsigned char *)guest;
-   for (size_t i = 0; i < count; ++i) {
-      int32_t fd; uint16_t events;
-      memcpy(&fd, bytes + i * 8, sizeof fd);
-      memcpy(&events, bytes + i * 8 + 4, sizeof events);
-      requests[i] = events;
-      host[i] = luna_pollfd_make(fd, luna_poll_events_from_android(events));
-   }
+  const unsigned char *bytes = (const unsigned char *)guest;
+  for (size_t i = 0; i < count; ++i) {
+    int32_t fd;
+    uint16_t events;
+    memcpy(&fd, bytes + i * 8, sizeof fd);
+    memcpy(&events, bytes + i * 8 + 4, sizeof events);
+    requests[i] = events;
+    host[i] = luna_pollfd_make(fd, luna_poll_events_from_android(events));
+  }
 }
 static inline void luna_poll_store_android(void *guest, const struct pollfd *host, size_t count,
-                                           const uint16_t *requests)
+    const uint16_t *requests)
 {
-   unsigned char *bytes = (unsigned char *)guest;
-   for (size_t i = 0; i < count; ++i) {
-      uint16_t result = luna_poll_events_to_android(host[i].revents, requests[i]);
-      memcpy(bytes + i * 8 + 6, &result, sizeof result);
-   }
+  unsigned char *bytes = (unsigned char *)guest;
+  for (size_t i = 0; i < count; ++i) {
+    uint16_t result = luna_poll_events_to_android(host[i].revents, requests[i]);
+    memcpy(bytes + i * 8 + 6, &result, sizeof result);
+  }
 }
 
 /* Host local time without a shared static result buffer. */
@@ -1032,9 +1338,9 @@ static inline void luna_poll_store_android(void *guest, const struct pollfd *hos
 static inline struct tm *luna_localtime(const time_t *value, struct tm *result)
 {
 #ifdef _WIN32
-   return localtime_s(result, value) ? NULL : result;
+  return localtime_s(result, value) ? NULL : result;
 #else
-   return localtime_r(value, result);
+  return localtime_r(value, result);
 #endif
 }
 
@@ -1046,134 +1352,150 @@ static inline struct tm *luna_localtime(const time_t *value, struct tm *result)
 /* Split in place, preserving empty fields like BSD strsep. */
 static inline char *luna_strsep(char **cursor, const char *delimiters)
 {
-   char *field = *cursor;
-   if (!field) return NULL;
-   char *end = field + strcspn(field, delimiters);
-   if (*end) { *end = 0; *cursor = end + 1; }
-   else *cursor = NULL;
-   return field;
+  char *field = *cursor;
+  if (!field) return NULL;
+  char *end = field + strcspn(field, delimiters);
+  if (*end) {
+    *end = 0;
+    *cursor = end + 1;
+  }
+  else *cursor = NULL;
+  return field;
 }
 
 static inline const void *luna_memmem(const void *buffer, size_t length,
-                                    const void *pattern, size_t pattern_length)
+                                      const void *pattern, size_t pattern_length)
 {
-   const unsigned char *bytes = (const unsigned char *)buffer;
-   if (!pattern_length) return buffer;
-   if (pattern_length > length) return NULL;
-   for (size_t i = 0; i <= length - pattern_length; ++i)
-      if (!memcmp(bytes + i, pattern, pattern_length)) return bytes + i;
-   return NULL;
+  const unsigned char *bytes = (const unsigned char *)buffer;
+  if (!pattern_length) return buffer;
+  if (pattern_length > length) return NULL;
+  for (size_t i = 0; i <= length - pattern_length; ++i)
+    if (!memcmp(bytes + i, pattern, pattern_length)) return bytes + i;
+  return NULL;
 }
 
 static inline const char *luna_strcasestr(const char *text, const char *pattern)
 {
-   if (!*pattern) return text;
-   for (; *text; ++text) {
-      size_t i = 0;
-      while (pattern[i] && text[i] &&
-             tolower((unsigned char)pattern[i]) == tolower((unsigned char)text[i])) ++i;
-      if (!pattern[i]) return text;
-   }
-   return NULL;
+  if (!*pattern) return text;
+  for (; *text; ++text) {
+    size_t i = 0;
+    while (pattern[i] && text[i] &&
+           tolower((unsigned char)pattern[i]) == tolower((unsigned char)text[i])) ++i;
+    if (!pattern[i]) return text;
+  }
+  return NULL;
 }
 
 static inline char *luna_strndup(const char *text, size_t limit)
 {
-   size_t length = 0;
-   while (length < limit && text[length]) ++length;
-   if (length == (size_t)-1) return NULL;
-   char *copy = (char *)malloc(length + 1);
-   if (copy) { memcpy(copy, text, length); copy[length] = 0; }
-   return copy;
+  size_t length = 0;
+  while (length < limit && text[length]) ++length;
+  if (length == (size_t)-1) return NULL;
+  char *copy = (char *)malloc(length + 1);
+  if (copy) {
+    memcpy(copy, text, length);
+    copy[length] = 0;
+  }
+  return copy;
 }
 
 /* ---- Guest thread deadlines (255 IDs; caller serializes) ---- */
 #include <string.h>
 
-struct luna_deadline_entry { uint64_t deadline_ns; uint8_t tid; };
+struct luna_deadline_entry {
+  uint64_t deadline_ns;
+  uint8_t tid;
+};
 struct luna_deadline_heap {
-    struct luna_deadline_entry entries[256]; /* index zero is unused */
-    uint16_t positions[256];
-    uint16_t count;
+  struct luna_deadline_entry entries[256]; /* index zero is unused */
+  uint16_t positions[256];
+  uint16_t count;
 };
 
 static inline void luna_deadline_heap_clear(struct luna_deadline_heap *h)
 {
-    memset(h, 0, sizeof *h);
+  memset(h, 0, sizeof *h);
 }
 
 static inline bool luna_deadline_heap_contains(const struct luna_deadline_heap *h,
-                                               uint32_t tid)
+    uint32_t tid)
 {
-    return tid > 0 && tid < 256 && h->positions[tid] != 0;
+  return tid > 0 && tid < 256 && h->positions[tid] != 0;
 }
 
 static inline bool luna_deadline_before(struct luna_deadline_entry a,
                                         struct luna_deadline_entry b)
 {
-    return a.deadline_ns < b.deadline_ns ||
-           (a.deadline_ns == b.deadline_ns && a.tid < b.tid);
+  return a.deadline_ns < b.deadline_ns ||
+         (a.deadline_ns == b.deadline_ns && a.tid < b.tid);
 }
 
 static inline void luna_deadline_swap(struct luna_deadline_heap *h,
                                       uint16_t a, uint16_t b)
 {
-    struct luna_deadline_entry tmp = h->entries[a];
-    h->entries[a] = h->entries[b]; h->entries[b] = tmp;
-    h->positions[h->entries[a].tid] = a;
-    h->positions[h->entries[b].tid] = b;
+  struct luna_deadline_entry tmp = h->entries[a];
+  h->entries[a] = h->entries[b];
+  h->entries[b] = tmp;
+  h->positions[h->entries[a].tid] = a;
+  h->positions[h->entries[b].tid] = b;
 }
 
 static inline void luna_deadline_fix(struct luna_deadline_heap *h, uint16_t i)
 {
-    if (i > 1 && luna_deadline_before(h->entries[i], h->entries[i / 2])) {
-        do {
-            luna_deadline_swap(h, i, i / 2);
-            i /= 2;
-        } while (i > 1 && luna_deadline_before(h->entries[i], h->entries[i / 2]));
-    } else {
-        while (2u * i <= h->count) {
-            uint16_t child = (uint16_t)(2u * i);
-            if (child < h->count && luna_deadline_before(h->entries[child + 1], h->entries[child])) ++child;
-            if (!luna_deadline_before(h->entries[child], h->entries[i])) break;
-            luna_deadline_swap(h, i, child);
-            i = child;
-        }
+  if (i > 1 && luna_deadline_before(h->entries[i], h->entries[i / 2])) {
+    do {
+      luna_deadline_swap(h, i, i / 2);
+      i /= 2;
+    } while (i > 1 && luna_deadline_before(h->entries[i], h->entries[i / 2]));
+  } else {
+    while (2u * i <= h->count) {
+      uint16_t child = (uint16_t)(2u * i);
+      if (child < h->count && luna_deadline_before(h->entries[child + 1], h->entries[child])) ++child;
+      if (!luna_deadline_before(h->entries[child], h->entries[i])) break;
+      luna_deadline_swap(h, i, child);
+      i = child;
     }
+  }
 }
 
 static inline void luna_deadline_heap_remove(struct luna_deadline_heap *h,
-                                             uint32_t tid)
+    uint32_t tid)
 {
-    if (!luna_deadline_heap_contains(h, tid)) return;
-    uint16_t i = h->positions[tid];
-    h->positions[tid] = 0;
-    if (i != h->count) {
-        h->entries[i] = h->entries[h->count];
-        h->positions[h->entries[i].tid] = i;
-    }
-    --h->count;
-    if (i <= h->count) luna_deadline_fix(h, i);
+  if (!luna_deadline_heap_contains(h, tid)) return;
+  uint16_t i = h->positions[tid];
+  h->positions[tid] = 0;
+  if (i != h->count) {
+    h->entries[i] = h->entries[h->count];
+    h->positions[h->entries[i].tid] = i;
+  }
+  --h->count;
+  if (i <= h->count) luna_deadline_fix(h, i);
 }
 
 static inline void luna_deadline_heap_set(struct luna_deadline_heap *h,
-                                          uint32_t tid, uint64_t deadline_ns)
+    uint32_t tid, uint64_t deadline_ns)
 {
-    if (!tid || tid >= 256) return;
-    if (!deadline_ns) { luna_deadline_heap_remove(h, tid); return; }
-    uint16_t i = h->positions[tid];
-    if (!i) { i = ++h->count; h->positions[tid] = i; }
-    h->entries[i].tid = (uint8_t)tid;
-    h->entries[i].deadline_ns = deadline_ns;
-    luna_deadline_fix(h, i);
+  if (!tid || tid >= 256) return;
+  if (!deadline_ns) {
+    luna_deadline_heap_remove(h, tid);
+    return;
+  }
+  uint16_t i = h->positions[tid];
+  if (!i) {
+    i = ++h->count;
+    h->positions[tid] = i;
+  }
+  h->entries[i].tid = (uint8_t)tid;
+  h->entries[i].deadline_ns = deadline_ns;
+  luna_deadline_fix(h, i);
 }
 
 static inline bool luna_deadline_heap_peek(const struct luna_deadline_heap *h,
-                                           struct luna_deadline_entry *entry)
+    struct luna_deadline_entry *entry)
 {
-    if (!h->count) return false;
-    *entry = h->entries[1];
-    return true;
+  if (!h->count) return false;
+  *entry = h->entries[1];
+  return true;
 }
 
 /* ---- Guest run queue ---- */
@@ -1184,49 +1506,55 @@ static inline bool luna_deadline_heap_peek(const struct luna_deadline_heap *h,
 /* One entry per guest tid (1..255). External scheduler lock protects this
  * queue. Value copies are independent snapshots, including membership. */
 struct luna_run_queue {
-    uint8_t next[256], prev[256], present[256];
-    uint8_t head, tail;
-    size_t count;
+  uint8_t next[256], prev[256], present[256];
+  uint8_t head, tail;
+  size_t count;
 };
 static inline void luna_run_queue_clear(struct luna_run_queue *q)
-{ memset(q, 0, sizeof *q); }
+{
+  memset(q, 0, sizeof *q);
+}
 static inline void luna_run_queue_remove(struct luna_run_queue *q, uint8_t tid)
 {
-    if (!tid || !q->present[tid]) return;
-    uint8_t before = q->prev[tid], after = q->next[tid];
-    if (before) q->next[before] = after; else q->head = after;
-    if (after) q->prev[after] = before; else q->tail = before;
-    q->present[tid] = q->next[tid] = q->prev[tid] = 0;
-    --q->count;
+  if (!tid || !q->present[tid]) return;
+  uint8_t before = q->prev[tid], after = q->next[tid];
+  if (before) q->next[before] = after;
+  else q->head = after;
+  if (after) q->prev[after] = before;
+  else q->tail = before;
+  q->present[tid] = q->next[tid] = q->prev[tid] = 0;
+  --q->count;
 }
 static inline void luna_run_queue_push(struct luna_run_queue *q, uint8_t tid, int urgent)
 {
-    if (!tid) return;
-    luna_run_queue_remove(q, tid);
-    q->present[tid] = 1;
-    if (urgent) {
-        q->next[tid] = q->head;
-        if (q->head) q->prev[q->head] = tid; else q->tail = tid;
-        q->head = tid;
-    } else {
-        q->prev[tid] = q->tail;
-        if (q->tail) q->next[q->tail] = tid; else q->head = tid;
-        q->tail = tid;
-    }
-    ++q->count;
+  if (!tid) return;
+  luna_run_queue_remove(q, tid);
+  q->present[tid] = 1;
+  if (urgent) {
+    q->next[tid] = q->head;
+    if (q->head) q->prev[q->head] = tid;
+    else q->tail = tid;
+    q->head = tid;
+  } else {
+    q->prev[tid] = q->tail;
+    if (q->tail) q->next[q->tail] = tid;
+    else q->head = tid;
+    q->tail = tid;
+  }
+  ++q->count;
 }
 static inline uint8_t luna_run_queue_pop(struct luna_run_queue *q)
 {
-    uint8_t tid = q->head;
-    luna_run_queue_remove(q, tid);
-    return tid;
+  uint8_t tid = q->head;
+  luna_run_queue_remove(q, tid);
+  return tid;
 }
 static inline size_t luna_run_queue_copy(const struct luna_run_queue *q, uint8_t out[256])
 {
-    size_t n = 0;
-    uint8_t tid;
-    for (tid = q->head; tid; tid = q->next[tid]) out[n++] = tid;
-    return n;
+  size_t n = 0;
+  uint8_t tid;
+  for (tid = q->head; tid; tid = q->next[tid]) out[n++] = tid;
+  return n;
 }
 
 #ifdef __cplusplus
@@ -1305,7 +1633,7 @@ void *luna_os_map_file(void *want, size_t len, int prot, int fd,
  * where supported. Neither function returns a MAP_FAILED sentinel. */
 void *luna_os_map_anon(void *want, size_t len, int replace);
 void *luna_os_map_file_flags(void *want, size_t len, int prot, int flags,
-                            int fd, uint64_t off);
+                             int fd, uint64_t off);
 
 /* Grow or shrink an existing anonymous mapping in place where the host can,
  * and otherwise report that it cannot (returns NULL, leaving the old mapping
@@ -1381,15 +1709,15 @@ int luna_os_random(void *buffer, size_t length);
  * hardware address is left out: Android 11+ withholds it from apps. */
 #define LUNA_OS_NETIF_ADDRS 8
 struct luna_os_netif {
-   char name[40];
-   unsigned index, mtu;
-   bool up, loopback, multicast, point_to_point;
-   int naddr;
-   struct {
-      uint8_t family;          /* 4 or 6 */
-      uint8_t bytes[16];
-      uint8_t prefix;          /* prefix length in bits */
-   } addr[LUNA_OS_NETIF_ADDRS];
+  char name[40];
+  unsigned index, mtu;
+  bool up, loopback, multicast, point_to_point;
+  int naddr;
+  struct {
+    uint8_t family;          /* 4 or 6 */
+    uint8_t bytes[16];
+    uint8_t prefix;          /* prefix length in bits */
+  } addr[LUNA_OS_NETIF_ADDRS];
 };
 int luna_os_net_list(struct luna_os_netif *out, int capacity);
 void *luna_os_library_symbol(void *handle, const char *name);
@@ -1415,7 +1743,7 @@ void luna_os_backtrace_print(void *const *frames, int count);
  * Fields use signed 64-bit seconds/nanoseconds; the guest ABI is marshalled
  * by the caller. Flags and clock IDs use the Linux/Android values. */
 typedef struct luna_os_timer_spec {
-   int64_t interval_sec, interval_nsec, value_sec, value_nsec;
+  int64_t interval_sec, interval_nsec, value_sec, value_nsec;
 } luna_os_timer_spec;
 int luna_os_timer_open(int clock_id, int flags);
 int luna_os_timer_set(int fd, int flags, const luna_os_timer_spec *value,
@@ -1430,8 +1758,8 @@ int luna_os_event_drain(int fd, uint64_t *out);
  * macOS.  Event bits deliberately use Linux/Android's numeric values because
  * they are copied to and from the guest ABI unchanged. */
 typedef struct luna_os_poll_event {
-   uint32_t events;
-   uint64_t data;
+  uint32_t events;
+  uint64_t data;
 } luna_os_poll_event;
 
 int luna_os_poll_create(int cloexec);
@@ -1462,17 +1790,21 @@ int luna_os_thread_nice(uint64_t token, int niceness);
  * Android-specific niceness request. Scheduling remains a host policy. */
 static inline int luna_java_priority_nice(int priority)
 {
-   static const int values[]={19,16,13,10,0,-2,-4,-5,-6,-8};
-   return values[priority-1];
+  static const int values[]= {19,16,13,10,0,-2,-4,-5,-6,-8};
+  return values[priority-1];
 }
 static inline int luna_nice_java_priority(int niceness)
 {
-   int best=1,distance=100;
-   for(int p=1;p<=10;++p) {
-      int delta=niceness-luna_java_priority_nice(p);if(delta<0) delta=-delta;
-      if(delta<=distance) {distance=delta;best=p;}
-   }
-   return best;
+  int best=1,distance=100;
+  for(int p=1; p<=10; ++p) {
+    int delta=niceness-luna_java_priority_nice(p);
+    if(delta<0) delta=-delta;
+    if(delta<=distance) {
+      distance=delta;
+      best=p;
+    }
+  }
+  return best;
 }
 
 /* Give up the rest of this thread's slice. */
@@ -1495,114 +1827,135 @@ uint64_t luna_os_uptime_ns(void);
 /* Guest POSIX timer deadlines and coalesced notifications. The caller
  * serializes access and supplies wall, monotonic and guest CPU clocks. */
 struct luna_posix_timer {
-    uint32_t id,owner,clock_tid,target_tid,notified_tid;
-    int clock,armed_clock,notify,signo,overrun;
-    uint64_t value,callback,due,interval,pending;
-    bool armed,published,deleted;
+  uint32_t id,owner,clock_tid,target_tid,notified_tid;
+  int clock,armed_clock,notify,signo,overrun;
+  uint64_t value,callback,due,interval,pending;
+  bool armed,published,deleted;
 };
 struct luna_posix_timers {
-    struct luna_posix_timer *items;
-    size_t count,capacity;
-    uint32_t sequence;
+  struct luna_posix_timer *items;
+  size_t count,capacity;
+  uint32_t sequence;
 };
-struct luna_timer_spec { uint64_t interval,value; };
+struct luna_timer_spec {
+  uint64_t interval,value;
+};
 typedef uint64_t (*luna_timer_clock)(void *,int,uint32_t);
 static inline struct luna_posix_timer *luna_timer_find(struct luna_posix_timers *s,uint32_t owner,uint32_t id)
 {
-    if(!id)return NULL;
-    for(size_t i=0;i<s->count;++i)if(s->items[i].id==id && !s->items[i].deleted && s->items[i].owner==owner)return s->items+i;
-    return NULL;
+  if(!id)return NULL;
+  for(size_t i=0; i<s->count; ++i)if(s->items[i].id==id && !s->items[i].deleted && s->items[i].owner==owner)return s->items+i;
+  return NULL;
 }
 static inline int luna_timer_create(struct luna_posix_timers *s,uint32_t owner,int clock,int notify,int signo,
-                      uint64_t value,uint64_t callback,uint32_t tid,uint32_t *id)
+                                    uint64_t value,uint64_t callback,uint32_t tid,uint32_t *id)
 {
-    if(clock!=0 && clock!=1 && clock!=2 && clock!=3 && clock!=7)return EINVAL;
-    if(notify!=0 && notify!=1 && notify!=2 && notify!=4)return EINVAL;
-    if(((notify==0 || notify==4) && (signo<1 || signo>64)) || (notify==2 && !callback))return EINVAL;
-    if(s->sequence==UINT32_MAX)return EAGAIN;
-    size_t i=0;while(i<s->count && s->items[i].id)++i;
-    if(i==s->capacity) {
-        size_t cap=s->capacity ? s->capacity*2 : 8;
-        if(cap<s->capacity || cap>SIZE_MAX/sizeof *s->items)return EAGAIN;
-        void *grown=realloc(s->items,cap*sizeof *s->items);
-        if(!grown)return EAGAIN;
-        s->items=(struct luna_posix_timer *)grown;s->capacity=cap;
-    }
-    if(i==s->count)++s->count;
-    struct luna_posix_timer *t=s->items+i;memset(t,0,sizeof *t);
-    t->id=++s->sequence;t->owner=owner;t->clock=clock;t->armed_clock=clock;t->notify=notify;t->signo=signo;
-    t->value=value;t->callback=callback;t->clock_tid=tid;t->target_tid=tid;
-    *id=t->id;return 0;
+  if(clock!=0 && clock!=1 && clock!=2 && clock!=3 && clock!=7)return EINVAL;
+  if(notify!=0 && notify!=1 && notify!=2 && notify!=4)return EINVAL;
+  if(((notify==0 || notify==4) && (signo<1 || signo>64)) || (notify==2 && !callback))return EINVAL;
+  if(s->sequence==UINT32_MAX)return EAGAIN;
+  size_t i=0;
+  while(i<s->count && s->items[i].id)++i;
+  if(i==s->capacity) {
+    size_t cap=s->capacity ? s->capacity*2 : 8;
+    if(cap<s->capacity || cap>SIZE_MAX/sizeof *s->items)return EAGAIN;
+    void *grown=realloc(s->items,cap*sizeof *s->items);
+    if(!grown)return EAGAIN;
+    s->items=(struct luna_posix_timer *)grown;
+    s->capacity=cap;
+  }
+  if(i==s->count)++s->count;
+  struct luna_posix_timer *t=s->items+i;
+  memset(t,0,sizeof *t);
+  t->id=++s->sequence;
+  t->owner=owner;
+  t->clock=clock;
+  t->armed_clock=clock;
+  t->notify=notify;
+  t->signo=signo;
+  t->value=value;
+  t->callback=callback;
+  t->clock_tid=tid;
+  t->target_tid=tid;
+  *id=t->id;
+  return 0;
 }
 static inline int luna_timer_delete(struct luna_posix_timers *s,uint32_t owner,uint32_t id)
 {
-    struct luna_posix_timer *t=luna_timer_find(s,owner,id);
-    if(!t)return EINVAL;
-    if(t->published && t->pending && (t->notify==0 || t->notify==4)) {
-        t->deleted=true;t->armed=false;
-    } else memset(t,0,sizeof *t);
-    return 0;
+  struct luna_posix_timer *t=luna_timer_find(s,owner,id);
+  if(!t)return EINVAL;
+  if(t->published && t->pending && (t->notify==0 || t->notify==4)) {
+    t->deleted=true;
+    t->armed=false;
+  } else memset(t,0,sizeof *t);
+  return 0;
 }
 static inline int luna_timer_get(struct luna_posix_timers *s,uint32_t owner,uint32_t id,struct luna_timer_spec *spec,luna_timer_clock clock,void *context)
 {
-    struct luna_posix_timer *t=luna_timer_find(s,owner,id);
-    if(!t)return EINVAL;
-    uint64_t now=clock(context,t->armed_clock,t->clock_tid);
-    spec->interval=t->interval;
-    spec->value=t->armed && t->due>now ? t->due-now : 0;
-    return 0;
+  struct luna_posix_timer *t=luna_timer_find(s,owner,id);
+  if(!t)return EINVAL;
+  uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+  spec->interval=t->interval;
+  spec->value=t->armed && t->due>now ? t->due-now : 0;
+  return 0;
 }
 static inline int luna_timer_set(struct luna_posix_timers *s,uint32_t owner,uint32_t id,int flags,
-                   const struct luna_timer_spec *spec,struct luna_timer_spec *old,luna_timer_clock clock,void *context)
+                                 const struct luna_timer_spec *spec,struct luna_timer_spec *old,luna_timer_clock clock,void *context)
 {
-    struct luna_posix_timer *t=luna_timer_find(s,owner,id);
-    if(!t || (flags & ~1))return EINVAL;
-    if(old)(void)luna_timer_get(s,owner,id,old,clock,context);
-    /* Relative realtime timers are elapsed-time timers: wall-clock steps must
-     * not move them. An absolute rearm switches back to the original clock. */
-    t->armed_clock=t->clock==0 && !(flags&1) ? 1 : t->clock;
-    uint64_t now=clock(context,t->armed_clock,t->clock_tid);
-    const uint64_t limit=INT64_MAX; /* Linux ktime_t saturation */
-    t->interval=spec->interval>limit ? limit : spec->interval;t->armed=spec->value!=0;
-    t->due=(flags & 1) ? (spec->value>limit ? limit : spec->value) :
-        now>=limit || spec->value>limit-now ? limit : now+spec->value;
-    return 0;
+  struct luna_posix_timer *t=luna_timer_find(s,owner,id);
+  if(!t || (flags & ~1))return EINVAL;
+  if(old)(void)luna_timer_get(s,owner,id,old,clock,context);
+  /* Relative realtime timers are elapsed-time timers: wall-clock steps must
+   * not move them. An absolute rearm switches back to the original clock. */
+  t->armed_clock=t->clock==0 && !(flags&1) ? 1 : t->clock;
+  uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+  const uint64_t limit=INT64_MAX; /* Linux ktime_t saturation */
+  t->interval=spec->interval>limit ? limit : spec->interval;
+  t->armed=spec->value!=0;
+  t->due=(flags & 1) ? (spec->value>limit ? limit : spec->value) :
+         now>=limit || spec->value>limit-now ? limit : now+spec->value;
+  return 0;
 }
 static inline void luna_timer_poll(struct luna_posix_timers *s,luna_timer_clock clock,void *context)
 {
-    for(size_t i=0;i<s->count;++i) {
-        struct luna_posix_timer *t=s->items+i;
-        if(!t->id || !t->armed)continue;
-        uint64_t now=clock(context,t->armed_clock,t->clock_tid);
-        if(now<t->due)continue;
-        uint64_t extra=t->interval ? (now-t->due)/t->interval : 0;
-        uint64_t n=extra==UINT64_MAX ? UINT64_MAX : extra+1;
-        if(!t->interval)t->armed=false;
-        else if(n>((uint64_t)INT64_MAX-t->due)/t->interval)t->due=INT64_MAX;
-        else t->due+=n*t->interval;
-        if(t->notify!=1)t->pending=n>UINT64_MAX-t->pending ? UINT64_MAX : t->pending+n;
-    }
+  for(size_t i=0; i<s->count; ++i) {
+    struct luna_posix_timer *t=s->items+i;
+    if(!t->id || !t->armed)continue;
+    uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+    if(now<t->due)continue;
+    uint64_t extra=t->interval ? (now-t->due)/t->interval : 0;
+    uint64_t n=extra==UINT64_MAX ? UINT64_MAX : extra+1;
+    if(!t->interval)t->armed=false;
+    else if(n>((uint64_t)INT64_MAX-t->due)/t->interval)t->due=INT64_MAX;
+    else t->due+=n*t->interval;
+    if(t->notify!=1)t->pending=n>UINT64_MAX-t->pending ? UINT64_MAX : t->pending+n;
+  }
 }
 static inline uint64_t luna_timer_next(struct luna_posix_timers *s,luna_timer_clock clock,void *context)
 {
-    uint64_t next=UINT64_MAX;
-    for(size_t i=0;i<s->count;++i) {
-        const struct luna_posix_timer *t=s->items+i;
-        if(!t->id || !t->armed)continue;
-        uint64_t now=clock(context,t->armed_clock,t->clock_tid);
-        uint64_t left=t->due>now ? t->due-now : 0;
-        if(left<next)next=left;
-    }
-    return next;
+  uint64_t next=UINT64_MAX;
+  for(size_t i=0; i<s->count; ++i) {
+    const struct luna_posix_timer *t=s->items+i;
+    if(!t->id || !t->armed)continue;
+    uint64_t now=clock(context,t->armed_clock,t->clock_tid);
+    uint64_t left=t->due>now ? t->due-now : 0;
+    if(left<next)next=left;
+  }
+  return next;
 }
 static inline bool luna_timer_take(struct luna_posix_timer *t)
 {
-    if(!t || !t->pending)return false;
-    t->overrun=t->pending-1>(uint64_t)INT_MAX ? INT_MAX : (int)(t->pending-1);
-    t->pending=0;t->published=false;return true;
+  if(!t || !t->pending)return false;
+  t->overrun=t->pending-1>(uint64_t)INT_MAX ? INT_MAX : (int)(t->pending-1);
+  t->pending=0;
+  t->published=false;
+  return true;
 }
 static inline void luna_timer_destroy(struct luna_posix_timers *s)
-{free(s->items);memset(s,0,sizeof *s);}
+{
+  free(s->items);
+  memset(s,0,sizeof *s);
+}
 
 /* ---- what the machine has ----------------------------------------------
  *
@@ -1618,8 +1971,8 @@ int luna_os_disk_info(const char *path, uint64_t *total_bytes,
 /* Host filesystem counters, copied into the guest's own ABI by the core.
  * A host without inode quotas reports zero for the inode counters. */
 typedef struct luna_os_fs_info {
-   uint64_t f_bsize, f_frsize, f_blocks, f_bfree, f_bavail;
-   uint64_t f_files, f_ffree, f_favail, f_fsid, f_flag, f_namemax;
+  uint64_t f_bsize, f_frsize, f_blocks, f_bfree, f_bavail;
+  uint64_t f_files, f_ffree, f_favail, f_fsid, f_flag, f_namemax;
 } luna_os_fs_info;
 int luna_os_statfs(const char *path, luna_os_fs_info *info);
 int luna_os_fstatfs(int fd, luna_os_fs_info *info);
@@ -1711,9 +2064,9 @@ int luna_calendar_timezone(const char *zone, int64_t ms, int32_t *west,
 #include <stdbool.h>
 
 struct luna_guest_mapping {
-    uint64_t lo, hi;
-    uint32_t prot;
-    bool owned, file_backed;
+  uint64_t lo, hi;
+  uint32_t prot;
+  bool owned, file_backed;
 };
 typedef int (*luna_vm_host_operation)(void *, size_t, int);
 typedef int (*luna_vm_host_release)(void *, size_t);
@@ -1721,27 +2074,27 @@ typedef int (*luna_vm_host_release)(void *, size_t);
 /* Linux siginfo fault codes: 0 succeeds, 1 means an unmapped address,
  * 2 means a mapped address without the requested permissions. */
 static inline int luna_vm_access_fault(const struct luna_guest_mapping *maps,
-    size_t count, uint64_t lo, size_t length, uint32_t required, uint64_t *fault)
+                                       size_t count, uint64_t lo, size_t length, uint32_t required, uint64_t *fault)
 {
-    uint64_t end = lo + length;
-    size_t left = 0, right = count;
+  uint64_t end = lo + length;
+  size_t left = 0, right = count;
+  *fault = lo;
+  if (!length || end < lo) return 1;
+  while (left < right) {
+    size_t middle = left + (right - left) / 2;
+    if (maps[middle].hi <= lo) left = middle + 1;
+    else right = middle;
+  }
+  while (lo < end) {
+    const struct luna_guest_mapping *m;
     *fault = lo;
-    if (!length || end < lo) return 1;
-    while (left < right) {
-        size_t middle = left + (right - left) / 2;
-        if (maps[middle].hi <= lo) left = middle + 1;
-        else right = middle;
-    }
-    while (lo < end) {
-        const struct luna_guest_mapping *m;
-        *fault = lo;
-        if (left == count || maps[left].lo > lo) return 1;
-        m = maps + left;
-        if ((m->prot & required) != required) return 2;
-        lo = m->hi < end ? m->hi : end;
-        ++left;
-    }
-    return 0;
+    if (left == count || maps[left].lo > lo) return 1;
+    m = maps + left;
+    if ((m->prot & required) != required) return 2;
+    lo = m->hi < end ? m->hi : end;
+    ++left;
+  }
+  return 0;
 }
 
 /* Anonymous MAP_FIXED may reuse backing only when every byte belongs to
@@ -1749,72 +2102,75 @@ static inline int luna_vm_access_fault(const struct luna_guest_mapping *maps,
 static inline bool luna_vm_anonymous_span(const struct luna_guest_mapping *maps,
     size_t count, uint64_t lo, uint64_t hi)
 {
-    size_t i;
-    if (hi <= lo) return false;
-    for (i = 0; i < count && lo < hi; ++i) {
-        const struct luna_guest_mapping *m = maps + i;
-        if (m->hi <= lo) continue;
-        if (m->lo > lo || m->file_backed) return false;
-        lo = m->hi < hi ? m->hi : hi;
-    }
-    return lo == hi;
+  size_t i;
+  if (hi <= lo) return false;
+  for (i = 0; i < count && lo < hi; ++i) {
+    const struct luna_guest_mapping *m = maps + i;
+    if (m->hi <= lo) continue;
+    if (m->lo > lo || m->file_backed) return false;
+    lo = m->hi < hi ? m->hi : hi;
+  }
+  return lo == hi;
 }
 
 static inline uint32_t luna_vm_edge_prot(const struct luna_guest_mapping *maps,
     size_t count, uint64_t page, uint64_t page_size,
     uint64_t lo, uint64_t hi, uint32_t prot)
 {
-    size_t i;
-    for (i = 0; i < count; ++i) {
-        const struct luna_guest_mapping *m = maps + i;
-        if (m->hi <= page) continue;
-        if (m->lo >= page + page_size) break;
-        if ((m->lo < lo && m->hi > page) ||
-            (m->hi > hi && m->lo < page + page_size)) prot |= m->prot;
-    }
-    return prot;
+  size_t i;
+  for (i = 0; i < count; ++i) {
+    const struct luna_guest_mapping *m = maps + i;
+    if (m->hi <= page) continue;
+    if (m->lo >= page + page_size) break;
+    if ((m->lo < lo && m->hi > page) ||
+        (m->hi > hi && m->lo < page + page_size)) prot |= m->prot;
+  }
+  return prot;
 }
 
 static inline int luna_vm_protect_span(const struct luna_guest_mapping *maps,
-    size_t count, uint64_t begin, uint64_t end, uint32_t prot,
-    uint64_t page_size, luna_vm_host_operation protect)
+                                       size_t count, uint64_t begin, uint64_t end, uint32_t prot,
+                                       uint64_t page_size, luna_vm_host_operation protect)
 {
-    /* Guest instructions are data to the translator, so EXEC needs host READ,
-     * rather than native executable memory. Anonymous backing remains RW for
-     * the memory manager's MAP_FIXED commit/zeroing below guest permissions. */
-    int host_prot = (prot & 5u) ? 1 : 0;
-    size_t i;
-    if (prot & 2u) host_prot |= 2;
-    if (page_size > 4096u) {
-        for (i = 0; i < count; ++i) {
-            const struct luna_guest_mapping *m = maps + i;
-            if (m->hi <= begin) continue;
-            if (m->lo >= end) break;
-            if (!m->file_backed) { host_prot |= 3; break; }
-        }
+  /* Guest instructions are data to the translator, so EXEC needs host READ,
+   * rather than native executable memory. Anonymous backing remains RW for
+   * the memory manager's MAP_FIXED commit/zeroing below guest permissions. */
+  int host_prot = (prot & 5u) ? 1 : 0;
+  size_t i;
+  if (prot & 2u) host_prot |= 2;
+  if (page_size > 4096u) {
+    for (i = 0; i < count; ++i) {
+      const struct luna_guest_mapping *m = maps + i;
+      if (m->hi <= begin) continue;
+      if (m->lo >= end) break;
+      if (!m->file_backed) {
+        host_prot |= 3;
+        break;
+      }
     }
-    return protect((void *)(uintptr_t)begin, (size_t)(end - begin), host_prot);
+  }
+  return protect((void *)(uintptr_t)begin, (size_t)(end - begin), host_prot);
 }
 
 /* Enforce the union of guest subpage rights on each host page. At most three
  * native calls cover the two edge granules and the complete interior span. */
 static inline int luna_vm_protect_host(const struct luna_guest_mapping *maps,
-    size_t count, uint64_t lo, uint64_t hi, uint32_t prot,
-    uint64_t page_size, luna_vm_host_operation protect)
+                                       size_t count, uint64_t lo, uint64_t hi, uint32_t prot,
+                                       uint64_t page_size, luna_vm_host_operation protect)
 {
-    uint64_t first = lo & ~(page_size - 1);
-    uint64_t end = (hi + page_size - 1) & ~(page_size - 1);
-    uint32_t edge = luna_vm_edge_prot(maps, count, first, page_size, lo, hi, prot);
-    if (end - first == page_size)
-        return luna_vm_protect_span(maps, count, first, end, edge, page_size, protect);
-    if (luna_vm_protect_span(maps, count, first, first + page_size,
-                             edge, page_size, protect)) return -1;
-    if (end - first > 2 * page_size &&
-        luna_vm_protect_span(maps, count, first + page_size, end - page_size,
-                             prot, page_size, protect)) return -1;
-    edge = luna_vm_edge_prot(maps, count, end - page_size, page_size, lo, hi, prot);
-    return luna_vm_protect_span(maps, count, end - page_size, end,
-                                edge, page_size, protect);
+  uint64_t first = lo & ~(page_size - 1);
+  uint64_t end = (hi + page_size - 1) & ~(page_size - 1);
+  uint32_t edge = luna_vm_edge_prot(maps, count, first, page_size, lo, hi, prot);
+  if (end - first == page_size)
+    return luna_vm_protect_span(maps, count, first, end, edge, page_size, protect);
+  if (luna_vm_protect_span(maps, count, first, first + page_size,
+                           edge, page_size, protect)) return -1;
+  if (end - first > 2 * page_size &&
+      luna_vm_protect_span(maps, count, first + page_size, end - page_size,
+                           prot, page_size, protect)) return -1;
+  edge = luna_vm_edge_prot(maps, count, end - page_size, page_size, lo, hi, prot);
+  return luna_vm_protect_span(maps, count, end - page_size, end,
+                              edge, page_size, protect);
 }
 
 /* The caller has already removed the guest ranges. A physical page survives
@@ -1823,132 +2179,145 @@ static inline void luna_vm_release_empty(const struct luna_guest_mapping *maps,
     size_t count, uint64_t begin, uint64_t end, uint64_t page_size,
     luna_vm_host_release release)
 {
-    while (begin < end) {
-        size_t left = 0, right = count;
-        while (left < right) {
-            size_t middle = left + (right - left) / 2;
-            if (maps[middle].hi <= begin) left = middle + 1;
-            else right = middle;
-        }
-        if (left == count || maps[left].lo >= end) {
-            release((void *)(uintptr_t)begin, (size_t)(end - begin));
-            return;
-        }
-        {
-            uint64_t stop = maps[left].lo & ~(page_size - 1);
-            if (stop > begin)
-                release((void *)(uintptr_t)begin, (size_t)(stop - begin));
-            begin = (maps[left].hi + page_size - 1) & ~(page_size - 1);
-        }
+  while (begin < end) {
+    size_t left = 0, right = count;
+    while (left < right) {
+      size_t middle = left + (right - left) / 2;
+      if (maps[middle].hi <= begin) left = middle + 1;
+      else right = middle;
     }
+    if (left == count || maps[left].lo >= end) {
+      release((void *)(uintptr_t)begin, (size_t)(end - begin));
+      return;
+    }
+    {
+      uint64_t stop = maps[left].lo & ~(page_size - 1);
+      if (stop > begin)
+        release((void *)(uintptr_t)begin, (size_t)(stop - begin));
+      begin = (maps[left].hi + page_size - 1) & ~(page_size - 1);
+    }
+  }
 }
 
 /* The page range mprotect()/munmap() act on: `address` must be page aligned,
  * the length rounds up to whole pages and must not run past `limit`.
  * Returns 0 or an errno; an empty range is [lo,lo). */
 static inline int luna_vm_page_range(uint64_t address, uint64_t length,
-    uint64_t limit, uint64_t *lo, uint64_t *hi)
+                                     uint64_t limit, uint64_t *lo, uint64_t *hi)
 {
-    if (address & 4095u) return 22; /* EINVAL */
-    if (length > UINT64_MAX - 4095u) return 12; /* ENOMEM */
-    length = (length + 4095u) & ~(uint64_t)4095u;
-    if (length > limit || address > limit - length) return 12;
-    *lo = address;
-    *hi = address + length;
-    return 0;
+  if (address & 4095u) return 22; /* EINVAL */
+  if (length > UINT64_MAX - 4095u) return 12; /* ENOMEM */
+  length = (length + 4095u) & ~(uint64_t)4095u;
+  if (length > limit || address > limit - length) return 12;
+  *lo = address;
+  *hi = address + length;
+  return 0;
 }
 
 /* A32 guest mapping table: the one record of what guest mmap() handed out,
  * read by mprotect() (to change it) and by /proc/self/maps (to show it).
  * Sorted, disjoint, [lo,hi) page aligned. */
 struct luna_vma_table {
-    struct luna_guest_mapping *v;
-    size_t n, cap;
+  struct luna_guest_mapping *v;
+  size_t n, cap;
 };
 
 /* Replace v[at, at+del) with add[0, count). */
 static inline int luna_vma_splice(struct luna_vma_table *t, size_t at,
-    size_t del, const struct luna_guest_mapping *add, size_t count)
+                                  size_t del, const struct luna_guest_mapping *add, size_t count)
 {
-    size_t need = t->n - del + count;
-    if (need > t->cap) {
-        size_t cap = t->cap ? t->cap * 2 : 64;
-        struct luna_guest_mapping *grown;
-        while (cap < need) cap *= 2;
-        grown = (struct luna_guest_mapping *)realloc(t->v, cap * sizeof *grown);
-        if (!grown) return -1;
-        t->v = grown;
-        t->cap = cap;
-    }
-    memmove(t->v + at + count, t->v + at + del, (t->n - at - del) * sizeof *t->v);
-    if (count) memcpy(t->v + at, add, count * sizeof *add);
-    t->n = need;
-    return 0;
+  size_t need = t->n - del + count;
+  if (need > t->cap) {
+    size_t cap = t->cap ? t->cap * 2 : 64;
+    struct luna_guest_mapping *grown;
+    while (cap < need) cap *= 2;
+    grown = (struct luna_guest_mapping *)realloc(t->v, cap * sizeof *grown);
+    if (!grown) return -1;
+    t->v = grown;
+    t->cap = cap;
+  }
+  memmove(t->v + at + count, t->v + at + del, (t->n - at - del) * sizeof *t->v);
+  if (count) memcpy(t->v + at, add, count * sizeof *add);
+  t->n = need;
+  return 0;
 }
 
 /* Map [lo,hi) with `prot` (set) or unmap it (!set), cutting what it overlaps. */
 static inline int luna_vma_map(struct luna_vma_table *t, uint64_t lo,
-    uint64_t hi, bool set, uint32_t prot, bool file_backed)
+                               uint64_t hi, bool set, uint32_t prot, bool file_backed)
 {
-    struct luna_guest_mapping piece[3];
-    size_t first = 0, last, k = 0;
-    if (hi <= lo) return 0;
-    while (first < t->n && t->v[first].hi <= lo) ++first;
-    last = first;
-    while (last < t->n && t->v[last].lo < hi) ++last;
-    if (first < last && t->v[first].lo < lo) {
-        piece[k] = t->v[first];
-        piece[k++].hi = lo;
-    }
-    if (set) {
-        piece[k].lo = lo; piece[k].hi = hi; piece[k].prot = prot;
-        piece[k].owned = true; piece[k++].file_backed = file_backed;
-    }
-    if (first < last && t->v[last - 1].hi > hi) {
-        piece[k] = t->v[last - 1];
-        piece[k++].lo = hi;
-    }
-    return luna_vma_splice(t, first, last - first, piece, k);
+  struct luna_guest_mapping piece[3];
+  size_t first = 0, last, k = 0;
+  if (hi <= lo) return 0;
+  while (first < t->n && t->v[first].hi <= lo) ++first;
+  last = first;
+  while (last < t->n && t->v[last].lo < hi) ++last;
+  if (first < last && t->v[first].lo < lo) {
+    piece[k] = t->v[first];
+    piece[k++].hi = lo;
+  }
+  if (set) {
+    piece[k].lo = lo;
+    piece[k].hi = hi;
+    piece[k].prot = prot;
+    piece[k].owned = true;
+    piece[k++].file_backed = file_backed;
+  }
+  if (first < last && t->v[last - 1].hi > hi) {
+    piece[k] = t->v[last - 1];
+    piece[k++].lo = hi;
+  }
+  return luna_vma_splice(t, first, last - first, piece, k);
 }
 
 /* True when every byte of [lo,hi) is in the table. */
 static inline bool luna_vma_covered(const struct luna_vma_table *t,
-    uint64_t lo, uint64_t hi)
+                                    uint64_t lo, uint64_t hi)
 {
-    size_t i = 0;
-    while (i < t->n && t->v[i].hi <= lo) ++i;
-    while (lo < hi) {
-        if (i == t->n || t->v[i].lo > lo) return false;
-        lo = t->v[i++].hi;
-    }
-    return true;
+  size_t i = 0;
+  while (i < t->n && t->v[i].hi <= lo) ++i;
+  while (lo < hi) {
+    if (i == t->n || t->v[i].lo > lo) return false;
+    lo = t->v[i++].hi;
+  }
+  return true;
 }
 
 /* Change the protection of the tabled part of [lo,hi). */
 static inline int luna_vma_protect(struct luna_vma_table *t, uint64_t lo,
-    uint64_t hi, uint32_t prot)
+                                   uint64_t hi, uint32_t prot)
 {
-    size_t i = t->n;
-    while (i-- > 0) {
-        struct luna_guest_mapping m = t->v[i], piece[3];
-        size_t k = 0;
-        uint64_t clo, chi;
-        if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
-        clo = m.lo > lo ? m.lo : lo;
-        chi = m.hi < hi ? m.hi : hi;
-        if (m.lo < clo) { piece[k] = m; piece[k++].hi = clo; }
-        piece[k] = m; piece[k].lo = clo; piece[k].hi = chi;
-        piece[k++].prot = prot;
-        if (chi < m.hi) { piece[k] = m; piece[k++].lo = chi; }
-        if (luna_vma_splice(t, i, 1, piece, k)) return -1;
+  size_t i = t->n;
+  while (i-- > 0) {
+    struct luna_guest_mapping m = t->v[i], piece[3];
+    size_t k = 0;
+    uint64_t clo, chi;
+    if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
+    clo = m.lo > lo ? m.lo : lo;
+    chi = m.hi < hi ? m.hi : hi;
+    if (m.lo < clo) {
+      piece[k] = m;
+      piece[k++].hi = clo;
     }
-    return 0;
+    piece[k] = m;
+    piece[k].lo = clo;
+    piece[k].hi = chi;
+    piece[k++].prot = prot;
+    if (chi < m.hi) {
+      piece[k] = m;
+      piece[k++].lo = chi;
+    }
+    if (luna_vma_splice(t, i, 1, piece, k)) return -1;
+  }
+  return 0;
 }
 
 /* Namespace reverse mapping must canonicalize the host staging root without
  * entering the guest symlink resolver (which calls the reverse mapper). */
 static inline char *luna_host_realpath(const char *path, char *result, size_t capacity)
-{ return luna_file_realpath(path, result, capacity); }
+{
+  return luna_file_realpath(path, result, capacity);
+}
 
 /* Host-backed guest files share the same link representation across C and
  * native guests. Backend implementations and scratch cleanup use raw APIs. */
@@ -1989,9 +2358,9 @@ struct luna_process_pool;
 /* Device process inventory, published by the framework rather than inferred
  * from installed packages. The registry is private to the emulated image. */
 struct luna_process_info {
-   uint32_t pid, uid;
-   int32_t importance;
-   char name[512], package[256];
+  uint32_t pid, uid;
+  int32_t importance;
+  char name[512], package[256];
 };
 int luna_process_state_open(const char *directory);
 int luna_process_state_publish(const struct luna_process_info *);
@@ -2015,14 +2384,14 @@ void luna_process_channel_close(struct luna_process_channel *);
  * and control fd 3 inherited. One VM is reused per Android process name.
  * Guest PID ranges are disjoint, each reserving 4096 thread IDs. */
 struct luna_process_pool *luna_process_pool_open(const char *executable,const char *mode,
-                                                uint32_t parent_pid,uint32_t first_pid);
+    uint32_t parent_pid,uint32_t first_pid);
 /* A pool whose children are another installed package's component host:
  * each is exec'd as `executable --service-host host_apk` (the launcher prepares
  * the package, then runs it with control fd 3).  The process name is the
  * package name and the process runs as `guest_uid` (LUNARIA_GUEST_UID).
  * `first_pid` must not overlap another pool's range. */
 struct luna_process_pool *luna_process_pool_open_host(const char *executable,const char *host_apk,
-                                                     uint32_t guest_uid,uint32_t parent_pid,uint32_t first_pid);
+    uint32_t guest_uid,uint32_t parent_pid,uint32_t first_pid);
 int luna_process_pool_set_profile(struct luna_process_pool *,const char *profile);
 /* Whether a host named `name` is alive in the pool (sending to it would not start one). */
 int luna_process_pool_running(struct luna_process_pool *,const char *name);
@@ -2033,7 +2402,7 @@ int luna_process_pool_send_to_host_fds(struct luna_process_pool *,uint32_t,const
 int luna_process_pool_publish(struct luna_process_pool *,uint32_t exclude_host,const void *,size_t);
 int luna_process_pool_publish_fds(struct luna_process_pool *,uint32_t,const void *,size_t,const int *,size_t);
 int luna_process_pool_send(struct luna_process_pool *,const char *process,
-                            const void *,size_t,uint32_t *guest_pid);
+                           const void *,size_t,uint32_t *guest_pid);
 int luna_process_pool_send_fds(struct luna_process_pool *,const char *,const void *,size_t,uint32_t *,const int *,size_t);
 /* A reply callback may enqueue another message, including to another VM.
  * -EPIPE reports a closed channel; the corresponding death notice becomes
@@ -2043,7 +2412,7 @@ int luna_process_pool_tick(struct luna_process_pool *,luna_process_reply_fn,void
  * Returns 1 for a notice, 0 when empty, or negative errno. status is a
  * waitpid-encoded status, or -ECHILD when another reaper collected it. */
 int luna_process_pool_next_exit(struct luna_process_pool *,char *name,size_t capacity,
-                                 uint32_t *guest_pid,int *status);
+                                uint32_t *guest_pid,int *status);
 /* Closes IPC, then reaps only this pool's own children. A bounded grace
  * period precedes termination of a child that does not close voluntarily. */
 void luna_process_pool_close(struct luna_process_pool *);

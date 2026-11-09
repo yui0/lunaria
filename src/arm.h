@@ -5,6 +5,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
 #ifndef ARM_H
 #define ARM_H
 
@@ -17,40 +18,42 @@
  * replacement privately, then publish complete words, never an empty table.
  * Compiler atomics keep this representation usable from both C and C++. */
 #define GUEST_RX_WORDS (UINT32_C(1) << 14)
-struct guest_rx_table { uint64_t words[GUEST_RX_WORDS]; };
+struct guest_rx_table {
+  uint64_t words[GUEST_RX_WORDS];
+};
 
 static inline void guest_rx_add(struct guest_rx_table *table,
                                 uint32_t lo, uint32_t hi)
 {
-    if (hi <= lo) return;
-    uint32_t first = lo >> 12, last = (hi - 1) >> 12;
-    for (uint32_t page = first; page <= last; ++page)
-        table->words[page >> 6] |= UINT64_C(1) << (page & 63);
+  if (hi <= lo) return;
+  uint32_t first = lo >> 12, last = (hi - 1) >> 12;
+  for (uint32_t page = first; page <= last; ++page)
+    table->words[page >> 6] |= UINT64_C(1) << (page & 63);
 }
 
 static inline void guest_rx_publish(struct guest_rx_table *shared,
                                     const struct guest_rx_table *next)
 {
-    for (uint32_t i = 0; i < GUEST_RX_WORDS; ++i)
-        __atomic_store_n(&shared->words[i], next->words[i], __ATOMIC_RELEASE);
+  for (uint32_t i = 0; i < GUEST_RX_WORDS; ++i)
+    __atomic_store_n(&shared->words[i], next->words[i], __ATOMIC_RELEASE);
 }
 
 static inline int guest_rx_hits(const struct guest_rx_table *shared,
                                 uint32_t va, uint32_t length)
 {
-    if (!length) return 0;
-    uint64_t end = (uint64_t)va + length;
-    if (end > (UINT64_C(1) << 32)) end = UINT64_C(1) << 32;
-    uint32_t first = va >> 12, last = (uint32_t)((end - 1) >> 12);
-    uint32_t word = first >> 6, final_word = last >> 6;
-    for (; word <= final_word; ++word) {
-        uint64_t mask = UINT64_MAX;
-        if (word == (first >> 6)) mask &= UINT64_MAX << (first & 63);
-        if (word == final_word) mask &= UINT64_MAX >> (63 - (last & 63));
-        if (__atomic_load_n(&shared->words[word], __ATOMIC_ACQUIRE) & mask)
-            return 1;
-    }
-    return 0;
+  if (!length) return 0;
+  uint64_t end = (uint64_t)va + length;
+  if (end > (UINT64_C(1) << 32)) end = UINT64_C(1) << 32;
+  uint32_t first = va >> 12, last = (uint32_t)((end - 1) >> 12);
+  uint32_t word = first >> 6, final_word = last >> 6;
+  for (; word <= final_word; ++word) {
+    uint64_t mask = UINT64_MAX;
+    if (word == (first >> 6)) mask &= UINT64_MAX << (first & 63);
+    if (word == final_word) mask &= UINT64_MAX >> (63 - (last & 63));
+    if (__atomic_load_n(&shared->words[word], __ATOMIC_ACQUIRE) & mask)
+      return 1;
+  }
+  return 0;
 }
 
 #ifdef __cplusplus
@@ -197,10 +200,14 @@ inline std::atomic<unsigned> g_env_slot_gen[LUNARIA_ENV_CACHE_SLOTS];
  * common C; this is only the C++ convenience for holding it across a block. */
 namespace {
 struct ArmLockGuard {
-    ArmLockGuard()  { arm_lock_acquire(); }
-    ~ArmLockGuard() { arm_lock_release(); }
-    ArmLockGuard(const ArmLockGuard &) = delete;
-    ArmLockGuard &operator=(const ArmLockGuard &) = delete;
+  ArmLockGuard()  {
+    arm_lock_acquire();
+  }
+  ~ArmLockGuard() {
+    arm_lock_release();
+  }
+  ArmLockGuard(const ArmLockGuard &) = delete;
+  ArmLockGuard &operator=(const ArmLockGuard &) = delete;
 };
 
 /* Same, but only when the caller says the lock is needed.  The scheduler holds
@@ -208,11 +215,15 @@ struct ArmLockGuard {
  * parallel; with a single engine nothing else is executing and taking it would
  * change the order the emulator has always run in. */
 struct ArmLockGuardIf {
-    const bool on;
-    explicit ArmLockGuardIf(bool want) : on(want) { if (on) arm_lock_acquire(); }
-    ~ArmLockGuardIf() { if (on) arm_lock_release(); }
-    ArmLockGuardIf(const ArmLockGuardIf &) = delete;
-    ArmLockGuardIf &operator=(const ArmLockGuardIf &) = delete;
+  const bool on;
+  explicit ArmLockGuardIf(bool want) : on(want) {
+    if (on) arm_lock_acquire();
+  }
+  ~ArmLockGuardIf() {
+    if (on) arm_lock_release();
+  }
+  ArmLockGuardIf(const ArmLockGuardIf &) = delete;
+  ArmLockGuardIf &operator=(const ArmLockGuardIf &) = delete;
 };
 
 /* The inverse, for the one thing an SVC handler must never do while holding
@@ -224,52 +235,52 @@ struct ArmLockGuardIf {
  * not a slow path, and it has to be spelled out at each such call rather than
  * left to the caller to remember. */
 struct ArmLockDropped {
-    const unsigned depth;
-    ArmLockDropped() : depth(arm_lock_unlock_all()) {}
-    ~ArmLockDropped() {
-        const int error = errno;
-        arm_lock_relock(depth);
-        errno = error;
-    }
-    ArmLockDropped(const ArmLockDropped &) = delete;
-    ArmLockDropped &operator=(const ArmLockDropped &) = delete;
+  const unsigned depth;
+  ArmLockDropped() : depth(arm_lock_unlock_all()) {}
+  ~ArmLockDropped() {
+    const int error = errno;
+    arm_lock_relock(depth);
+    errno = error;
+  }
+  ArmLockDropped(const ArmLockDropped &) = delete;
+  ArmLockDropped &operator=(const ArmLockDropped &) = delete;
 };
 }  // namespace
 
 inline const char *lunaria_env(const char *lit) {
-    const unsigned gen = g_env_generation.load(std::memory_order_relaxed);
-    /* The key is an address, and the addresses of distinct literals differ in
-     * their low bits far more than in their high ones. */
-    unsigned h = (unsigned)(((uintptr_t)lit >> 4) * 2654435761u);
-    for (unsigned probe = 0; probe < LUNARIA_ENV_CACHE_SLOTS; ++probe) {
-        const unsigned i = (h + probe) & (LUNARIA_ENV_CACHE_SLOTS - 1u);
-        const void *k = g_env_key[i].load(std::memory_order_acquire);
-        if (k && k != (const void *)lit) continue;   /* another literal's slot */
-        if (!k) {
-            /* Claim the slot before filling it: filling first would let the
-             * thread that lost the race overwrite the winner's value. */
-            const void *expected = nullptr;
-            if (!g_env_key[i].compare_exchange_strong(
-                    expected, (const void *)lit,
-                    std::memory_order_release, std::memory_order_acquire) &&
-                expected != (const void *)lit)
-                continue;                           /* somebody else took it */
-        }
-        /* The slot is ours (or already was).  A generation that does not match
-         * means "not filled yet" and "filled before an invalidate" alike, and
-         * both are answered the same way. */
-        if (g_env_slot_gen[i].load(std::memory_order_acquire) == gen)
-            return g_env_val[i].load(std::memory_order_relaxed);
-        const char *v = getenv(lit);
-        g_env_val[i].store(v, std::memory_order_relaxed);
-        g_env_slot_gen[i].store(gen, std::memory_order_release);
-        return v;
+  const unsigned gen = g_env_generation.load(std::memory_order_relaxed);
+  /* The key is an address, and the addresses of distinct literals differ in
+   * their low bits far more than in their high ones. */
+  unsigned h = (unsigned)(((uintptr_t)lit >> 4) * 2654435761u);
+  for (unsigned probe = 0; probe < LUNARIA_ENV_CACHE_SLOTS; ++probe) {
+    const unsigned i = (h + probe) & (LUNARIA_ENV_CACHE_SLOTS - 1u);
+    const void *k = g_env_key[i].load(std::memory_order_acquire);
+    if (k && k != (const void *)lit) continue;   /* another literal's slot */
+    if (!k) {
+      /* Claim the slot before filling it: filling first would let the
+       * thread that lost the race overwrite the winner's value. */
+      const void *expected = nullptr;
+      if (!g_env_key[i].compare_exchange_strong(
+            expected, (const void *)lit,
+            std::memory_order_release, std::memory_order_acquire) &&
+          expected != (const void *)lit)
+        continue;                           /* somebody else took it */
     }
-    return getenv(lit);                             /* table full: still right */
+    /* The slot is ours (or already was).  A generation that does not match
+     * means "not filled yet" and "filled before an invalidate" alike, and
+     * both are answered the same way. */
+    if (g_env_slot_gen[i].load(std::memory_order_acquire) == gen)
+      return g_env_val[i].load(std::memory_order_relaxed);
+    const char *v = getenv(lit);
+    g_env_val[i].store(v, std::memory_order_relaxed);
+    g_env_slot_gen[i].store(gen, std::memory_order_release);
+    return v;
+  }
+  return getenv(lit);                             /* table full: still right */
 }
 // Call after any setenv() we perform ourselves.
 inline void lunaria_env_invalidate(void) {
-    g_env_generation.fetch_add(1u, std::memory_order_relaxed);
+  g_env_generation.fetch_add(1u, std::memory_order_relaxed);
 }
 
 // Virtual address layout (32-bit guest VA; A64 relocates tramp/stack).
@@ -313,17 +324,17 @@ inline bool g_a64_identity_arena = false;
 inline bool g_a64_arena_identity = false;
 
 inline bool a64_is_guest_va(GuestVA va) {
-    return va >= A64_GUEST_BASE && va < A64_GUEST_BASE + A64_GUEST_SIZE;
+  return va >= A64_GUEST_BASE && va < A64_GUEST_BASE + A64_GUEST_SIZE;
 }
 inline GuestVA a64_guest_va(BackingOffset backing) {
-    return A64_GUEST_BASE + (GuestVA)backing;
+  return A64_GUEST_BASE + (GuestVA)backing;
 }
 /* Dynarmic's callbacks may report an image-window access as its 32-bit
  * backing offset even though the architectural A64 pointer uses the identity
  * arena VA.  Both spellings name the same guest page; VMA lookups must use
  * the architectural spelling stored in g_a64_maps. */
 inline GuestVA a64_mapping_va(GuestVA va) {
-    return va < A64_GUEST_SIZE ? a64_guest_va((BackingOffset)va) : va;
+  return va < A64_GUEST_SIZE ? a64_guest_va((BackingOffset)va) : va;
 }
 // A64: real 64-bit guest address space; outside image window, guest VA == host VA.
 using A64Mapping = luna_guest_mapping;
@@ -339,10 +350,12 @@ inline std::shared_mutex g_a64_maps_mu;
 /* Bumped on every change so a thread that cached a range which has since been
  * unmapped stops answering "mapped" for it. */
 inline std::atomic<uint64_t> g_a64_maps_gen{1};
-inline void a64_maps_bump() { g_a64_maps_gen.fetch_add(1, std::memory_order_release); }
+inline void a64_maps_bump() {
+  g_a64_maps_gen.fetch_add(1, std::memory_order_release);
+}
 inline size_t a64_host_page_size() {
-    static const size_t size = luna_os_page_size();
-    return size;
+  static const size_t size = luna_os_page_size();
+  return size;
 }
 /* Bumped only when address space is taken *away*.  A cached answer "[lo,hi)
  * is mapped" stays true across an insert or a protection change (neither
@@ -356,36 +369,41 @@ inline std::atomic<uint64_t> g_a64_unmap_gen{1};
  * write the pair non-atomically and a third can see a torn lo/hi that spans
  * an unmapped hole).  Several entries, because a copy has a source and a
  * destination and a single entry ping-pongs between them. */
-struct A64RangeCache { GuestVA lo = 1, hi = 0; uint64_t gen = 0; };
+struct A64RangeCache {
+  GuestVA lo = 1, hi = 0;
+  uint64_t gen = 0;
+};
 inline thread_local A64RangeCache t_a64_cache[8];
 
 // Caller holds g_a64_maps_mu (either way).
 inline const A64Mapping *a64_find_locked(GuestVA va) {
-    auto it = std::upper_bound(g_a64_maps.begin(), g_a64_maps.end(), va,
-                               [](GuestVA v, const A64Mapping &m) { return v < m.lo; });
-    if (it == g_a64_maps.begin()) return nullptr;
-    --it;
-    return (va >= it->lo && va < it->hi) ? &*it : nullptr;
+  auto it = std::upper_bound(g_a64_maps.begin(), g_a64_maps.end(), va,
+  [](GuestVA v, const A64Mapping &m) {
+    return v < m.lo;
+  });
+  if (it == g_a64_maps.begin()) return nullptr;
+  --it;
+  return (va >= it->lo && va < it->hi) ? &*it : nullptr;
 }
 
 inline bool a64_mapped(GuestVA va) {
-    va = a64_mapping_va(va);
-    const uint64_t gen = g_a64_unmap_gen.load(std::memory_order_acquire);
-    A64RangeCache &c = t_a64_cache[(va >> 21) & 7u];
-    if (gen == c.gen && va >= c.lo && va < c.hi)
-        return true;
-    for (const A64RangeCache &o : t_a64_cache)
-        if (gen == o.gen && va >= o.lo && va < o.hi) {
-            c = o;
-            return true;
-        }
-    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    const A64Mapping *m = a64_find_locked(va);
-    if (!m) return false;
-    c.lo  = m->lo;
-    c.hi  = m->hi;
-    c.gen = gen;
+  va = a64_mapping_va(va);
+  const uint64_t gen = g_a64_unmap_gen.load(std::memory_order_acquire);
+  A64RangeCache &c = t_a64_cache[(va >> 21) & 7u];
+  if (gen == c.gen && va >= c.lo && va < c.hi)
     return true;
+  for (const A64RangeCache &o : t_a64_cache)
+    if (gen == o.gen && va >= o.lo && va < o.hi) {
+      c = o;
+      return true;
+    }
+  std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  const A64Mapping *m = a64_find_locked(va);
+  if (!m) return false;
+  c.lo  = m->lo;
+  c.hi  = m->hi;
+  c.gen = gen;
+  return true;
 }
 
 /* Instruction fetch permission is distinct from address validity.  The old
@@ -394,18 +412,18 @@ inline bool a64_mapped(GuestVA va) {
  * bytes to the decoder turns zero-filled data into an endless undefined-
  * instruction fallback instead. */
 inline bool a64_executable(GuestVA va) {
-    va = a64_mapping_va(va);
-    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    const A64Mapping *m = a64_find_locked(va);
-    return m && (m->prot & 4u /* PROT_EXEC */) != 0;
+  va = a64_mapping_va(va);
+  std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  const A64Mapping *m = a64_find_locked(va);
+  return m && (m->prot & 4u /* PROT_EXEC */) != 0;
 }
 
 // Bytes mapped contiguously from `va`, or 0 when `va` itself is unmapped.
 inline size_t a64_mapped_span(GuestVA va) {
-    va = a64_mapping_va(va);
-    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    const A64Mapping *m = a64_find_locked(va);
-    return m ? (size_t)(m->hi - va) : 0u;
+  va = a64_mapping_va(va);
+  std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  const A64Mapping *m = a64_find_locked(va);
+  return m ? (size_t)(m->hi - va) : 0u;
 }
 
 /* True when every byte in [va, va+len) has the requested guest permission.
@@ -413,26 +431,28 @@ inline size_t a64_mapped_span(GuestVA va) {
  * substitute for the guest's mmap table.  Walk adjacent entries as Linux
  * does for an access spanning a page/mapping boundary. */
 inline int a64_access_fault_for_prot(GuestVA va, size_t len, uint32_t prot, GuestVA *fault) {
-    const GuestVA mapped = a64_mapping_va(va);
-    GuestVA bad = mapped;
-    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    const int code = luna_vm_access_fault(g_a64_maps.data(), g_a64_maps.size(),
-                                         mapped, len, prot, &bad);
-    *fault = va + (bad - mapped);
-    return code;
+  const GuestVA mapped = a64_mapping_va(va);
+  GuestVA bad = mapped;
+  std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  const int code = luna_vm_access_fault(g_a64_maps.data(), g_a64_maps.size(),
+                                        mapped, len, prot, &bad);
+  *fault = va + (bad - mapped);
+  return code;
 }
 
 inline int a64_access_fault(GuestVA va, size_t len, bool write, GuestVA *fault) {
-    return a64_access_fault_for_prot(va, len, write ? 3u : 1u, fault);
+  return a64_access_fault_for_prot(va, len, write ? 3u : 1u, fault);
 }
 
 inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned,
                            bool file_backed = false) {
-    std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
-                               [](const A64Mapping &m, GuestVA v) { return m.lo < v; });
-    g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned, file_backed});
-    a64_maps_bump();
+  std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
+  [](const A64Mapping &m, GuestVA v) {
+    return m.lo < v;
+  });
+  g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned, file_backed});
+  a64_maps_bump();
 }
 
 /* Declare pages in the 4 GiB image/backing window as part of the guest
@@ -450,42 +470,45 @@ inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned,
  * inserting them would violate g_a64_maps' sorted/disjoint invariant. */
 inline void a64_map_declare_backing(BackingOffset base, uint64_t len,
                                     uint32_t prot = 3u /* R|W */) {
-    if (!len) return;
-    uint64_t off_lo = (uint64_t)base & ~4095ull;
-    uint64_t off_hi = ((uint64_t)base + len + 4095ull) & ~4095ull;
-    if (off_hi <= off_lo || off_hi > A64_GUEST_SIZE) return;
-    GuestVA lo = a64_guest_va((BackingOffset)off_lo);
-    const GuestVA hi = A64_GUEST_BASE + off_hi;
+  if (!len) return;
+  uint64_t off_lo = (uint64_t)base & ~4095ull;
+  uint64_t off_hi = ((uint64_t)base + len + 4095ull) & ~4095ull;
+  if (off_hi <= off_lo || off_hi > A64_GUEST_SIZE) return;
+  GuestVA lo = a64_guest_va((BackingOffset)off_lo);
+  const GuestVA hi = A64_GUEST_BASE + off_hi;
 
-    std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    while (lo < hi) {
-        auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
-                                   [](const A64Mapping &m, GuestVA v) {
-                                       return m.lo < v;
-                                   });
-        if (it != g_a64_maps.begin()) {
-            const A64Mapping &prev = *std::prev(it);
-            if (prev.hi > lo) { lo = std::min(prev.hi, hi); continue; }
-        }
-        if (it != g_a64_maps.end() && it->lo <= lo) {
-            lo = std::min(it->hi, hi);
-            continue;
-        }
-        GuestVA gap_hi = it == g_a64_maps.end() ? hi : std::min(hi, it->lo);
-        it = g_a64_maps.insert(it, A64Mapping{lo, gap_hi, prot, false});
-        lo = gap_hi;
+  std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  while (lo < hi) {
+    auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
+    [](const A64Mapping &m, GuestVA v) {
+      return m.lo < v;
+    });
+    if (it != g_a64_maps.begin()) {
+      const A64Mapping &prev = *std::prev(it);
+      if (prev.hi > lo) {
+        lo = std::min(prev.hi, hi);
+        continue;
+      }
     }
-    for (size_t i = 1; i < g_a64_maps.size();) {
-        A64Mapping &a = g_a64_maps[i - 1];
-        const A64Mapping &b = g_a64_maps[i];
-        if (a.hi == b.lo && a.prot == b.prot && a.owned == b.owned) {
-            a.hi = b.hi;
-            g_a64_maps.erase(g_a64_maps.begin() + (long)i);
-        } else {
-            ++i;
-        }
+    if (it != g_a64_maps.end() && it->lo <= lo) {
+      lo = std::min(it->hi, hi);
+      continue;
     }
-    a64_maps_bump();
+    GuestVA gap_hi = it == g_a64_maps.end() ? hi : std::min(hi, it->lo);
+    it = g_a64_maps.insert(it, A64Mapping{lo, gap_hi, prot, false});
+    lo = gap_hi;
+  }
+  for (size_t i = 1; i < g_a64_maps.size();) {
+    A64Mapping &a = g_a64_maps[i - 1];
+    const A64Mapping &b = g_a64_maps[i];
+    if (a.hi == b.lo && a.prot == b.prot && a.owned == b.owned) {
+      a.hi = b.hi;
+      g_a64_maps.erase(g_a64_maps.begin() + (long)i);
+    } else {
+      ++i;
+    }
+  }
+  a64_maps_bump();
 }
 
 /* A mapping that replaces or removes pages of a loaded image (MAP_FIXED over
@@ -496,169 +519,194 @@ inline void a64_loaded_regions_unmap(GuestVA lo, GuestVA hi);
 
 // Drop [lo,hi) from the table, splitting/trimming entries as needed.
 inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
-    a64_loaded_regions_unmap(lo, hi);
-    std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    const GuestVA page = a64_host_page_size();
-    std::vector<std::pair<GuestVA, GuestVA>> released;
-    for (size_t i = 0; i < g_a64_maps.size();) {
-        A64Mapping &m = g_a64_maps[i];
-        if (m.hi <= lo || m.lo >= hi) { ++i; continue; }
-        GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
-        if (release && m.owned) {
-            if (page <= 4096u)
-                luna_os_release((void *)clo, (size_t)(chi - clo));
-            else {
-                const GuestVA begin = clo & ~(page - 1);
-                const GuestVA end = (chi + page - 1) & ~(page - 1);
-                if (!released.empty() && released.back().second >= begin)
-                    released.back().second = std::max(end, released.back().second);
-                else
-                    released.emplace_back(begin, end);
-            }
-        }
-        bool head = m.lo < clo, tail = m.hi > chi;
-        if (head && tail) {
-            A64Mapping right{chi, m.hi, m.prot, m.owned, m.file_backed};
-            m.hi = clo;
-            g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, right);
-            i += 2;
-        } else if (head) {
-            m.hi = clo; ++i;
-        } else if (tail) {
-            m.lo = chi; ++i;
-        } else {
-            g_a64_maps.erase(g_a64_maps.begin() + (long)i);
-        }
+  a64_loaded_regions_unmap(lo, hi);
+  std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  const GuestVA page = a64_host_page_size();
+  std::vector<std::pair<GuestVA, GuestVA>> released;
+  for (size_t i = 0; i < g_a64_maps.size();) {
+    A64Mapping &m = g_a64_maps[i];
+    if (m.hi <= lo || m.lo >= hi) {
+      ++i;
+      continue;
     }
-    /* A host page cannot be released while any guest subpage still owns it.
-     * Release contiguous empty host pages in one call, not one syscall per page. */
-    for (const auto &range : released) {
-        luna_vm_release_empty(g_a64_maps.data(), g_a64_maps.size(),
-                              range.first, range.second, page, luna_os_release);
+    GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
+    if (release && m.owned) {
+      if (page <= 4096u)
+        luna_os_release((void *)clo, (size_t)(chi - clo));
+      else {
+        const GuestVA begin = clo & ~(page - 1);
+        const GuestVA end = (chi + page - 1) & ~(page - 1);
+        if (!released.empty() && released.back().second >= begin)
+          released.back().second = std::max(end, released.back().second);
+        else
+          released.emplace_back(begin, end);
+      }
     }
-    g_a64_unmap_gen.fetch_add(1, std::memory_order_release);
-    a64_maps_bump();
+    bool head = m.lo < clo, tail = m.hi > chi;
+    if (head && tail) {
+      A64Mapping right{chi, m.hi, m.prot, m.owned, m.file_backed};
+      m.hi = clo;
+      g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, right);
+      i += 2;
+    } else if (head) {
+      m.hi = clo;
+      ++i;
+    } else if (tail) {
+      m.lo = chi;
+      ++i;
+    } else {
+      g_a64_maps.erase(g_a64_maps.begin() + (long)i);
+    }
+  }
+  /* A host page cannot be released while any guest subpage still owns it.
+   * Release contiguous empty host pages in one call, not one syscall per page. */
+  for (const auto &range : released) {
+    luna_vm_release_empty(g_a64_maps.data(), g_a64_maps.size(),
+                          range.first, range.second, page, luna_os_release);
+  }
+  g_a64_unmap_gen.fetch_add(1, std::memory_order_release);
+  a64_maps_bump();
 }
 
 // Record a guest mprotect over [lo,hi).
 inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
-    if ((lo & 4095u) || hi <= lo) { errno = EINVAL; return -1; }
-    lo = a64_mapping_va(lo);
-    hi = a64_mapping_va(hi - 1) + 1;
-    std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    for (GuestVA cursor = lo; cursor < hi;) {
-        const A64Mapping *m = a64_find_locked(cursor);
-        if (!m) { errno = ENOMEM; return -1; }
-        cursor = std::min(hi, m->hi);
+  if ((lo & 4095u) || hi <= lo) {
+    errno = EINVAL;
+    return -1;
+  }
+  lo = a64_mapping_va(lo);
+  hi = a64_mapping_va(hi - 1) + 1;
+  std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  for (GuestVA cursor = lo; cursor < hi;) {
+    const A64Mapping *m = a64_find_locked(cursor);
+    if (!m) {
+      errno = ENOMEM;
+      return -1;
     }
-    if (!a64_is_guest_va(lo)) {
-        if (luna_vm_protect_host(g_a64_maps.data(), g_a64_maps.size(), lo, hi,
-                                prot, a64_host_page_size(), luna_os_protect))
-            return -1;
+    cursor = std::min(hi, m->hi);
+  }
+  if (!a64_is_guest_va(lo)) {
+    if (luna_vm_protect_host(g_a64_maps.data(), g_a64_maps.size(), lo, hi,
+                             prot, a64_host_page_size(), luna_os_protect))
+      return -1;
+  }
+  for (size_t i = 0; i < g_a64_maps.size(); ++i) {
+    A64Mapping &m = g_a64_maps[i];
+    if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
+    GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
+    if (m.lo == clo && m.hi == chi) {
+      m.prot = prot;
+      continue;
     }
-    for (size_t i = 0; i < g_a64_maps.size(); ++i) {
-        A64Mapping &m = g_a64_maps[i];
-        if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
-        GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
-        if (m.lo == clo && m.hi == chi) { m.prot = prot; continue; }
-        A64Mapping head{m.lo, clo, m.prot, m.owned, m.file_backed};
-        A64Mapping tail{chi, m.hi, m.prot, m.owned, m.file_backed};
-        m.lo = clo; m.hi = chi; m.prot = prot;
-        if (tail.hi > tail.lo) g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, tail);
-        if (head.hi > head.lo) { g_a64_maps.insert(g_a64_maps.begin() + (long)i, head); ++i; }
+    A64Mapping head{m.lo, clo, m.prot, m.owned, m.file_backed};
+    A64Mapping tail{chi, m.hi, m.prot, m.owned, m.file_backed};
+    m.lo = clo;
+    m.hi = chi;
+    m.prot = prot;
+    if (tail.hi > tail.lo) g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, tail);
+    if (head.hi > head.lo) {
+      g_a64_maps.insert(g_a64_maps.begin() + (long)i, head);
+      ++i;
     }
-    a64_maps_bump();
-    return 0;
+  }
+  a64_maps_bump();
+  return 0;
 }
 
 // Guest VA is host VA, so a mapping must never land inside the image window.
 inline bool a64_va_usable(void *p, uint64_t len) {
-    if (!p) return false;
-    uint64_t lo = (uint64_t)p, hi = lo + len;
-    if (lo < A64_GUEST_SIZE || hi < lo) return false;
-    if (lo < A64_GUEST_BASE + A64_GUEST_SIZE && hi > A64_GUEST_BASE) return false;
-    // Must stay inside the AArch64 lower-half canonical range (52-bit VA).
-    if (hi > 0x0010000000000000ull) return false;
-    return true;
+  if (!p) return false;
+  uint64_t lo = (uint64_t)p, hi = lo + len;
+  if (lo < A64_GUEST_SIZE || hi < lo) return false;
+  if (lo < A64_GUEST_BASE + A64_GUEST_SIZE && hi > A64_GUEST_BASE) return false;
+  // Must stay inside the AArch64 lower-half canonical range (52-bit VA).
+  if (hi > 0x0010000000000000ull) return false;
+  return true;
 }
 
 // Reserve `len` bytes of 64-bit guest VA backed by real host pages.
 inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
                           bool fixed = false) {
-    len = (len + 4095ull) & ~4095ull;
-    if (!len) return 0;
-    void *want = nullptr;
-    const bool image_fixed = fixed && hint &&
-        (hint < A64_GUEST_SIZE || a64_is_guest_va(hint));
-    if (image_fixed) {
-        const GuestVA canonical = a64_mapping_va(hint);
-        if (!(hint & 4095ull) && len <= A64_GUEST_BASE + A64_GUEST_SIZE - canonical)
-            want = (void *)canonical;
-    } else if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
-               !(hint & 4095ull) && hint + len >= hint &&
-               hint + len <= 0x0010000000000000ull)
-        want = (void *)hint;
-    if (fixed && !want) { errno = EINVAL; return 0; }
-    /* Android exposes 4 KiB pages while Apple Silicon uses 16 KiB host
-     * pages.  Scudo reserves a large PROT_NONE span and commits 4 KiB-aligned
-     * subranges with MAP_FIXED; asking Darwin to mmap such a subrange fails
-     * with EINVAL when it is not host-page aligned.  Our anonymous reserve is
-     * deliberately host-RW already, so replacing a wholly mapped guest range
-     * is represented by zeroing it and changing the guest VMA metadata. */
+  len = (len + 4095ull) & ~4095ull;
+  if (!len) return 0;
+  void *want = nullptr;
+  const bool image_fixed = fixed && hint &&
+                           (hint < A64_GUEST_SIZE || a64_is_guest_va(hint));
+  if (image_fixed) {
+    const GuestVA canonical = a64_mapping_va(hint);
+    if (!(hint & 4095ull) && len <= A64_GUEST_BASE + A64_GUEST_SIZE - canonical)
+      want = (void *)canonical;
+  } else if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
+             !(hint & 4095ull) && hint + len >= hint &&
+             hint + len <= 0x0010000000000000ull)
+    want = (void *)hint;
+  if (fixed && !want) {
+    errno = EINVAL;
+    return 0;
+  }
+  /* Android exposes 4 KiB pages while Apple Silicon uses 16 KiB host
+   * pages.  Scudo reserves a large PROT_NONE span and commits 4 KiB-aligned
+   * subranges with MAP_FIXED; asking Darwin to mmap such a subrange fails
+   * with EINVAL when it is not host-page aligned.  Our anonymous reserve is
+   * deliberately host-RW already, so replacing a wholly mapped guest range
+   * is represented by zeroing it and changing the guest VMA metadata. */
 #ifdef __APPLE__
-    bool reuse_anon = false;
-    bool replaces_file_granule = false;
-    if (fixed && a64_host_page_size() > 4096u) {
-        std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-        reuse_anon = luna_vm_anonymous_span(g_a64_maps.data(), g_a64_maps.size(),
-                                           (GuestVA)want, (GuestVA)want + len);
-        const size_t page = a64_host_page_size();
-        const GuestVA first = (GuestVA)want & ~(page - 1u);
-        const GuestVA end = ((GuestVA)want + len + page - 1u) & ~(page - 1u);
-        for (const A64Mapping &m : g_a64_maps) {
-            if (m.hi <= first) continue;
-            if (m.lo >= end) break;
-            if (m.file_backed) { replaces_file_granule = true; break; }
-        }
+  bool reuse_anon = false;
+  bool replaces_file_granule = false;
+  if (fixed && a64_host_page_size() > 4096u) {
+    std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+    reuse_anon = luna_vm_anonymous_span(g_a64_maps.data(), g_a64_maps.size(),
+                                        (GuestVA)want, (GuestVA)want + len);
+    const size_t page = a64_host_page_size();
+    const GuestVA first = (GuestVA)want & ~(page - 1u);
+    const GuestVA end = ((GuestVA)want + len + page - 1u) & ~(page - 1u);
+    for (const A64Mapping &m : g_a64_maps) {
+      if (m.hi <= first) continue;
+      if (m.lo >= end) break;
+      if (m.file_backed) {
+        replaces_file_granule = true;
+        break;
+      }
     }
-    if (reuse_anon) {
-        memset(want, 0, (size_t)len);
-        a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
-        a64_map_insert((GuestVA)want, (GuestVA)want + len, prot, /*owned=*/true);
-        return image_fixed ? hint : (GuestVA)want;
-    }
-    /* A native fixed replacement must not destroy neighboring guest
-     * subpages. File-backed partial host granules need separate backing
-     * translation; until implemented, leave the old mapping intact. */
-    if (fixed && replaces_file_granule &&
-        (((GuestVA)want | len) & (a64_host_page_size() - 1u))) {
-        errno = EINVAL;
-        return 0;
-    }
+  }
+  if (reuse_anon) {
+    memset(want, 0, (size_t)len);
+    a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
+    a64_map_insert((GuestVA)want, (GuestVA)want + len, prot, /*owned=*/true);
+    return image_fixed ? hint : (GuestVA)want;
+  }
+  /* A native fixed replacement must not destroy neighboring guest
+   * subpages. File-backed partial host granules need separate backing
+   * translation; until implemented, leave the old mapping intact. */
+  if (fixed && replaces_file_granule &&
+      (((GuestVA)want | len) & (a64_host_page_size() - 1u))) {
+    errno = EINVAL;
+    return 0;
+  }
 #endif
-    void *p = luna_os_map_anon(want, (size_t)len, fixed);
-    if (fixed && p != want) {
-        if (p) luna_os_release(p, (size_t)len);
-        return 0;
+  void *p = luna_os_map_anon(want, (size_t)len, fixed);
+  if (fixed && p != want) {
+    if (p) luna_os_release(p, (size_t)len);
+    return 0;
+  }
+  if (!(image_fixed && p == want) && !a64_va_usable(p, len)) {
+    if (fixed) {
+      if (p) luna_os_release(p, (size_t)len);
+      return 0;
     }
-    if (!(image_fixed && p == want) && !a64_va_usable(p, len)) {
-        if (fixed) {
-            if (p) luna_os_release(p, (size_t)len);
-            return 0;
-        }
-        // Landed in the image window (or an unusable hint).
-        void *bad = p;
-        p = (want || p) ? luna_os_map_anon(nullptr, (size_t)len, 0) : nullptr;
-        if (bad) luna_os_release(bad, (size_t)len);
-        if (!a64_va_usable(p, len)) {
-            if (p) luna_os_release(p, (size_t)len);
-            return 0;
-        }
+    // Landed in the image window (or an unusable hint).
+    void *bad = p;
+    p = (want || p) ? luna_os_map_anon(nullptr, (size_t)len, 0) : nullptr;
+    if (bad) luna_os_release(bad, (size_t)len);
+    if (!a64_va_usable(p, len)) {
+      if (p) luna_os_release(p, (size_t)len);
+      return 0;
     }
-    if (fixed)
-        a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
-    a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true);
-    return image_fixed ? hint : (GuestVA)p;
+  }
+  if (fixed)
+    a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
+  a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true);
+  return image_fixed ? hint : (GuestVA)p;
 }
 
 /* File-backed mmap: guest VA == host VA, so this is a real host mmap of the
@@ -670,40 +718,40 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
  * transition crawled while a phone, which only installs a VMA, is instant. */
 inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
                                 int map_flags, int fd, int64_t off) {
-    len = (len + 4095ull) & ~4095ull;
-    if (!len || fd < 0) return 0;
-    int host_prot = (int)(prot & (LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC));
-    if (!(map_flags & (LUNA_MAP_SHARED | LUNA_MAP_PRIVATE)))
-        map_flags |= LUNA_MAP_PRIVATE;
-    map_flags |= LUNA_MAP_NORESERVE;
+  len = (len + 4095ull) & ~4095ull;
+  if (!len || fd < 0) return 0;
+  int host_prot = (int)(prot & (LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC));
+  if (!(map_flags & (LUNA_MAP_SHARED | LUNA_MAP_PRIVATE)))
+    map_flags |= LUNA_MAP_PRIVATE;
+  map_flags |= LUNA_MAP_NORESERVE;
 
-    bool fixed = (map_flags & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) != 0;
-    void *want = nullptr;
-    if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
-        !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
-        want = (void *)hint;
-    /* Native MAP_FIXED performs replacement after validating the request.
-     * Removing the old mapping first would also remove it on EACCES/error. */
-    void *p = luna_os_map_file_flags(want, (size_t)len, host_prot, map_flags, fd, (uint64_t)off);
-    if (!a64_va_usable(p, len) || (fixed && want && p != want)) {
-        void *bad = p;
-        if (fixed) {
-            if (bad) luna_os_release(bad, (size_t)len);
-            return 0;
-        }
-        int retry = map_flags & ~(LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE);
-        p = luna_os_map_file_flags(nullptr, (size_t)len, host_prot, retry, fd, (uint64_t)off);
-        if (bad && bad != p) luna_os_release(bad, (size_t)len);
-        if (!a64_va_usable(p, len)) {
-            if (p) luna_os_release(p, (size_t)len);
-            return 0;
-        }
+  bool fixed = (map_flags & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) != 0;
+  void *want = nullptr;
+  if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
+      !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
+    want = (void *)hint;
+  /* Native MAP_FIXED performs replacement after validating the request.
+   * Removing the old mapping first would also remove it on EACCES/error. */
+  void *p = luna_os_map_file_flags(want, (size_t)len, host_prot, map_flags, fd, (uint64_t)off);
+  if (!a64_va_usable(p, len) || (fixed && want && p != want)) {
+    void *bad = p;
+    if (fixed) {
+      if (bad) luna_os_release(bad, (size_t)len);
+      return 0;
     }
-    if (fixed && !(map_flags & LUNA_MAP_NOREPLACE))
-        a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
-    a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true,
-                   /*file_backed=*/true);
-    return (GuestVA)p;
+    int retry = map_flags & ~(LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE);
+    p = luna_os_map_file_flags(nullptr, (size_t)len, host_prot, retry, fd, (uint64_t)off);
+    if (bad && bad != p) luna_os_release(bad, (size_t)len);
+    if (!a64_va_usable(p, len)) {
+      if (p) luna_os_release(p, (size_t)len);
+      return 0;
+    }
+  }
+  if (fixed && !(map_flags & LUNA_MAP_NOREPLACE))
+    a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
+  a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true,
+                 /*file_backed=*/true);
+  return (GuestVA)p;
 }
 
 /* The SVC register file is 64 bits wide on both JITs, so an A64 pointer is
@@ -723,12 +771,14 @@ inline struct luna_vma_table g_a32_image_prot = {};
 inline uint64_t g_a32_vma_gen = 0;
 inline void a32_vma_map(uint64_t lo, uint64_t hi, bool set, uint32_t prot,
                         bool file_backed = false) {
-    luna_vma_map(&g_a32_vmas, lo, hi, set, prot, file_backed);
-    ++g_a32_vma_gen;
+  luna_vma_map(&g_a32_vmas, lo, hi, set, prot, file_backed);
+  ++g_a32_vma_gen;
 }
 
 // Successful anon mmap slabs [lo,hi).
-struct MmapSlab { uint32_t lo, hi; };
+struct MmapSlab {
+  uint32_t lo, hi;
+};
 inline std::vector<MmapSlab> g_mmap_slabs;
 // PROT_NONE anon bytes reserved.
 inline uint64_t g_mmap_prot_none_bytes = 0;
@@ -738,72 +788,72 @@ inline uint64_t g_mmap_prot_none_bytes = 0;
 inline bool g_guest_proc_arm64 = false;
 
 inline bool mmap_prot_none_budget_ok(uint32_t len) {
-    // PROT_NONE consumes guest VA, not committed RAM.
-    uint64_t mmap2_end = g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
-    uint64_t budget = (uint64_t)(MMAP_END - MMAP_BASE) +
-                      (mmap2_end - (uint64_t)g_mmap2_base);
-    if (!g_guest_proc_arm64) budget += g_heap_size;
-    if (g_mmap_prot_none_bytes + (uint64_t)len <= budget)
-        return true;
-    static int n = 0;
-    if (n++ < 8)
-        fprintf(stderr, "[mmap] MAP_FAILED PROT_NONE len=%u: reserved=%lluMB budget=%lluMB "
-                "(VA reserve cap)\n",
-                len, (unsigned long long)(g_mmap_prot_none_bytes >> 20),
-                (unsigned long long)(budget >> 20));
-    return false;
+  // PROT_NONE consumes guest VA, not committed RAM.
+  uint64_t mmap2_end = g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
+  uint64_t budget = (uint64_t)(MMAP_END - MMAP_BASE) +
+                    (mmap2_end - (uint64_t)g_mmap2_base);
+  if (!g_guest_proc_arm64) budget += g_heap_size;
+  if (g_mmap_prot_none_bytes + (uint64_t)len <= budget)
+    return true;
+  static int n = 0;
+  if (n++ < 8)
+    fprintf(stderr, "[mmap] MAP_FAILED PROT_NONE len=%u: reserved=%lluMB budget=%lluMB "
+                    "(VA reserve cap)\n",
+            len, (unsigned long long)(g_mmap_prot_none_bytes >> 20),
+            (unsigned long long)(budget >> 20));
+  return false;
 }
 
 #define HEAP_SIZE  (g_heap_size)
 #define MMAP2_BASE (g_mmap2_base)
 #define MMAP2_END  (g_mmap2_end)
 inline uint64_t mmap2_end_excl(void) {
-    return g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
+  return g_mmap2_end ? (uint64_t)g_mmap2_end : 0x100000000ull;
 }
 
 inline void guest_layout_init(void) {
-    static bool once = false;
-    if (once) return;
-    once = true;
-    uint32_t m2b = lunaria_env_u32("LUNARIA_MMAP2_BASE", 0);
-    uint32_t m2e = lunaria_env_u32("LUNARIA_MMAP2_END", 0);
+  static bool once = false;
+  if (once) return;
+  once = true;
+  uint32_t m2b = lunaria_env_u32("LUNARIA_MMAP2_BASE", 0);
+  uint32_t m2e = lunaria_env_u32("LUNARIA_MMAP2_END", 0);
 
-    /* malloc grows upward and overflow mmap grows downward in one arena.
-     * Reserve the available guest VA for both; touching pages, rather than
-     * this reservation, consumes host RAM. A separate fixed malloc quota
-     * would return ENOMEM while most of the process's VA remained unused. */
-    const uint32_t heap_window_top = m2b ? (uint32_t)m2b : 0xF0000000u;
-    const long window_mb = (long)((heap_window_top - HEAP_BASE) >> 20);
-    const long max_mb = window_mb;
-    long heap_mb = lunaria_env_long("LUNARIA_HEAP_MB", window_mb);
-    if (heap_mb < 64) heap_mb = 64;
-    if (heap_mb > max_mb) heap_mb = max_mb;
-    g_heap_size = (uint32_t)heap_mb * 1024u * 1024u;
-    uint32_t heap_end = HEAP_BASE + g_heap_size;
-    g_small_mmap_top = heap_end;
-    g_mmap2_base = m2b ? (uint32_t)m2b
-                       : ((heap_end + 0xfffffu) & ~0xfffffu);
-    g_mmap2_end  = m2e ? (uint32_t)m2e : 0u;
-    if (g_mmap2_base < heap_end + 0x1000u)
-        g_mmap2_base = (heap_end + 0xfffffu) & ~0xfffffu;
-    fprintf(stderr, "[mem] layout heap=[%08x,%08x) mmap2=[%08x,%llx) "
-            "report total=%ldMB avail=%ldMB "
-            "(LUNARIA_MEM_TOTAL_MB / LUNARIA_HEAP_MB / LUNARIA_MMAP2_*)\n",
-            HEAP_BASE, HEAP_BASE + g_heap_size, g_mmap2_base,
-            (unsigned long long)mmap2_end_excl(),
-            lunaria_mem_total_mb(), lunaria_mem_avail_mb());
+  /* malloc grows upward and overflow mmap grows downward in one arena.
+   * Reserve the available guest VA for both; touching pages, rather than
+   * this reservation, consumes host RAM. A separate fixed malloc quota
+   * would return ENOMEM while most of the process's VA remained unused. */
+  const uint32_t heap_window_top = m2b ? (uint32_t)m2b : 0xF0000000u;
+  const long window_mb = (long)((heap_window_top - HEAP_BASE) >> 20);
+  const long max_mb = window_mb;
+  long heap_mb = lunaria_env_long("LUNARIA_HEAP_MB", window_mb);
+  if (heap_mb < 64) heap_mb = 64;
+  if (heap_mb > max_mb) heap_mb = max_mb;
+  g_heap_size = (uint32_t)heap_mb * 1024u * 1024u;
+  uint32_t heap_end = HEAP_BASE + g_heap_size;
+  g_small_mmap_top = heap_end;
+  g_mmap2_base = m2b ? (uint32_t)m2b
+                 : ((heap_end + 0xfffffu) & ~0xfffffu);
+  g_mmap2_end  = m2e ? (uint32_t)m2e : 0u;
+  if (g_mmap2_base < heap_end + 0x1000u)
+    g_mmap2_base = (heap_end + 0xfffffu) & ~0xfffffu;
+  fprintf(stderr, "[mem] layout heap=[%08x,%08x) mmap2=[%08x,%llx) "
+                  "report total=%ldMB avail=%ldMB "
+                  "(LUNARIA_MEM_TOTAL_MB / LUNARIA_HEAP_MB / LUNARIA_MMAP2_*)\n",
+          HEAP_BASE, HEAP_BASE + g_heap_size, g_mmap2_base,
+          (unsigned long long)mmap2_end_excl(),
+          lunaria_mem_total_mb(), lunaria_mem_avail_mb());
 }
 
 // Image-window offset of a guest VA, for the code paths that still reason in 32-bit backing offsets (RX guards.
 inline uint32_t a64_canon_va(uint64_t va) {
-    if (a64_is_guest_va(va)) return (uint32_t)(va - A64_GUEST_BASE);
-    if (va < A64_GUEST_SIZE) return (uint32_t)va; /* bare offset from A32 paths */
-    return 0;
+  if (a64_is_guest_va(va)) return (uint32_t)(va - A64_GUEST_BASE);
+  if (va < A64_GUEST_SIZE) return (uint32_t)va; /* bare offset from A32 paths */
+  return 0;
 }
 
 // size_t / count args: A64 W-ops zero-extend.
 inline size_t a64_buf_len(uint64_t x) {
-    return (x >> 32) ? (size_t)(uint32_t)x : (size_t)x;
+  return (x >> 32) ? (size_t)(uint32_t)x : (size_t)x;
 }
 
 // Guest library regions, recorded by load_elf.
@@ -812,51 +862,51 @@ inline size_t a64_buf_len(uint64_t x) {
  * names it per line, and every segment of a library claiming offset 0 is not
  * a state the kernel can produce. */
 struct LoadedRegion {
-   uint32_t lo, hi;
-   uint32_t flags;
-   uint64_t file_off;
-   std::string path;
-   /* Captured while the loader still owns the fd.  A mapped ELF may be
-    * unlinked later; Linux keeps its inode in maps and suffixes the name with
-    * " (deleted)" rather than turning it into a named 00:00/inode-0 map. */
-   uint64_t backing_inode = 0;
-   /* Linux mappings belong to an mm/process.  The emulator has one backing
-    * arena, but procfs must never expose an exec child image in its parent. */
-   uint32_t process_pid = 1000u; /* initial Android app process */
+  uint32_t lo, hi;
+  uint32_t flags;
+  uint64_t file_off;
+  std::string path;
+  /* Captured while the loader still owns the fd.  A mapped ELF may be
+   * unlinked later; Linux keeps its inode in maps and suffixes the name with
+   * " (deleted)" rather than turning it into a named 00:00/inode-0 map. */
+  uint64_t backing_inode = 0;
+  /* Linux mappings belong to an mm/process.  The emulator has one backing
+   * arena, but procfs must never expose an exec child image in its parent. */
+  uint32_t process_pid = 1000u; /* initial Android app process */
 };
 inline std::vector<LoadedRegion> g_loaded_regions;
 // Process-wide ABI selector used by synthetic /proc files.
 
 // Program-header metadata exposed through dl_iterate_phdr.
 struct ModulePhdr {
-    GuestVA load_bias;
-    GuestVA name_va;
-    GuestVA phdr_va;
-    uint16_t phnum;
-    bool is_64;
-    uint32_t process_pid = 1000u;
+  GuestVA load_bias;
+  GuestVA name_va;
+  GuestVA phdr_va;
+  uint16_t phnum;
+  bool is_64;
+  uint32_t process_pid = 1000u;
 };
 inline std::vector<ModulePhdr> g_module_phdrs;
 
 inline void warn_unknown_reloc(const char *abi, uint32_t type,
                                const char *symbol) {
-    static std::map<std::string, unsigned> counts;
-    std::string key = std::string(abi ? abi : "?") + ":" +
-                      std::to_string(type) + ":" +
-                      (symbol && *symbol ? symbol : "<none>");
-    unsigned n = ++counts[key];
-    if (n <= 4)
-        fprintf(stderr, "[%s] unknown reloc type=%u symbol=%s occurrence=%u\n",
-                abi ? abi : "reloc", type,
-                symbol && *symbol ? symbol : "<none>", n);
+  static std::map<std::string, unsigned> counts;
+  std::string key = std::string(abi ? abi : "?") + ":" +
+                    std::to_string(type) + ":" +
+                    (symbol && *symbol ? symbol : "<none>");
+  unsigned n = ++counts[key];
+  if (n <= 4)
+    fprintf(stderr, "[%s] unknown reloc type=%u symbol=%s occurrence=%u\n",
+            abi ? abi : "reloc", type,
+            symbol && *symbol ? symbol : "<none>", n);
 }
 
 // Mono rejects corlib unless the path sits under .../Managed/mono/2.0/.
 inline void mono_rewrite_corlib_path(std::string &path) {
-    const char *needle = "/Managed/mscorlib.dll";
-    size_t pos = path.find(needle);
-    if (pos != std::string::npos && path.find("/mono/") == std::string::npos)
-        path.replace(pos, strlen(needle), "/Managed/mono/2.0/mscorlib.dll");
+  const char *needle = "/Managed/mscorlib.dll";
+  size_t pos = path.find(needle);
+  if (pos != std::string::npos && path.find("/mono/") == std::string::npos)
+    path.replace(pos, strlen(needle), "/Managed/mono/2.0/mscorlib.dll");
 }
 
 // Bump-allocate a guest mmap region of `raw_len` bytes (before page-rounding).
@@ -864,221 +914,228 @@ inline void mono_rewrite_corlib_path(std::string &path) {
 inline std::vector<MmapSlab> g_mmap_freelist;
 
 inline void mmap_free_insert(uint32_t lo, uint32_t hi) {
-    // Only whole aligned blocks go back: mmap_bump hands out MMAP_ALIGN-aligned addresses and callers rely on that.
-    lo = (uint32_t)(((uint64_t)lo + MMAP_ALIGN - 1u) & ~(uint64_t)(MMAP_ALIGN - 1u));
-    hi &= ~(MMAP_ALIGN - 1u);
-    if (hi <= lo) return;
-    auto it = std::lower_bound(g_mmap_freelist.begin(), g_mmap_freelist.end(), lo,
-                               [](const MmapSlab &s, uint32_t v) { return s.lo < v; });
-    it = g_mmap_freelist.insert(it, MmapSlab{lo, hi});
-    if (it != g_mmap_freelist.begin()) {
-        auto prev = std::prev(it);
-        if (prev->hi >= it->lo) {
-            prev->hi = std::max(prev->hi, it->hi);
-            it = std::prev(g_mmap_freelist.erase(it));
-        }
+  // Only whole aligned blocks go back: mmap_bump hands out MMAP_ALIGN-aligned addresses and callers rely on that.
+  lo = (uint32_t)(((uint64_t)lo + MMAP_ALIGN - 1u) & ~(uint64_t)(MMAP_ALIGN - 1u));
+  hi &= ~(MMAP_ALIGN - 1u);
+  if (hi <= lo) return;
+  auto it = std::lower_bound(g_mmap_freelist.begin(), g_mmap_freelist.end(), lo,
+  [](const MmapSlab &s, uint32_t v) {
+    return s.lo < v;
+  });
+  it = g_mmap_freelist.insert(it, MmapSlab{lo, hi});
+  if (it != g_mmap_freelist.begin()) {
+    auto prev = std::prev(it);
+    if (prev->hi >= it->lo) {
+      prev->hi = std::max(prev->hi, it->hi);
+      it = std::prev(g_mmap_freelist.erase(it));
     }
-    for (auto nxt = std::next(it);
-         nxt != g_mmap_freelist.end() && nxt->lo <= it->hi;
-         nxt = std::next(it)) {
-        it->hi = std::max(it->hi, nxt->hi);
-        g_mmap_freelist.erase(nxt);
-    }
+  }
+  for (auto nxt = std::next(it);
+       nxt != g_mmap_freelist.end() && nxt->lo <= it->hi;
+       nxt = std::next(it)) {
+    it->hi = std::max(it->hi, nxt->hi);
+    g_mmap_freelist.erase(nxt);
+  }
 }
 
 // First fit.
 inline uint32_t mmap_free_take(uint32_t len) {
-    for (auto it = g_mmap_freelist.begin(); it != g_mmap_freelist.end(); ++it) {
-        if ((uint64_t)it->hi - it->lo < len) continue;
-        uint32_t addr = it->lo;
-        uint64_t next = ((uint64_t)addr + len + MMAP_ALIGN - 1u) &
-                        ~(uint64_t)(MMAP_ALIGN - 1u);
-        if (next >= it->hi) g_mmap_freelist.erase(it);
-        else it->lo = (uint32_t)next;
-        if (lunaria_env("LUNARIA_TRACE_MMAP"))
-            fprintf(stderr, "[mmap] reuse %08x len=%u (%zu free ranges left)\n",
-                    addr, len, g_mmap_freelist.size());
-        return addr;
-    }
-    return ~0u;
+  for (auto it = g_mmap_freelist.begin(); it != g_mmap_freelist.end(); ++it) {
+    if ((uint64_t)it->hi - it->lo < len) continue;
+    uint32_t addr = it->lo;
+    uint64_t next = ((uint64_t)addr + len + MMAP_ALIGN - 1u) &
+                    ~(uint64_t)(MMAP_ALIGN - 1u);
+    if (next >= it->hi) g_mmap_freelist.erase(it);
+    else it->lo = (uint32_t)next;
+    if (lunaria_env("LUNARIA_TRACE_MMAP"))
+      fprintf(stderr, "[mmap] reuse %08x len=%u (%zu free ranges left)\n",
+              addr, len, g_mmap_freelist.size());
+    return addr;
+  }
+  return ~0u;
 }
 
 inline uint32_t mmap_bump(uint32_t raw_len) {
-    uint32_t len = (raw_len + 4095u) & ~4095u;
-    if (len == 0 || len > g_mmap_max_single) {
-        static int cap = 0;
-        if (cap++ < 4)
-            fprintf(stderr, "[mmap] reject len=%u > cap=%u\n", len, g_mmap_max_single);
-        return ~0u;
-    }
+  uint32_t len = (raw_len + 4095u) & ~4095u;
+  if (len == 0 || len > g_mmap_max_single) {
+    static int cap = 0;
+    if (cap++ < 4)
+      fprintf(stderr, "[mmap] reject len=%u > cap=%u\n", len, g_mmap_max_single);
+    return ~0u;
+  }
 
-    // Recycled space first — otherwise the bump pointers walk off the end of both arenas and never come back.
-    if (uint32_t reuse = mmap_free_take(len); reuse != ~0u) return reuse;
+  // Recycled space first — otherwise the bump pointers walk off the end of both arenas and never come back.
+  if (uint32_t reuse = mmap_free_take(len); reuse != ~0u) return reuse;
 
-    auto bump_in = [&](uint32_t &next, uint64_t arena_end) -> uint32_t {
-        for (int spins = 0; spins < 64; ++spins) {
-            if ((uint64_t)next + len > arena_end) return ~0u;
-            uint32_t addr = next;
-            uint64_t end64 = (uint64_t)addr + len;
-            bool hit = false;
-            for (const auto &r : g_loaded_regions) {
-                if (addr < r.hi && end64 > r.lo) {
-                    uint32_t skip = (r.hi + MMAP_ALIGN - 1u) & ~(MMAP_ALIGN - 1u);
-                    if (skip <= next) return ~0u;
-                    static int logged = 0;
-                    if (logged++ < 8)
-                        fprintf(stderr, "[mmap] skip lib overlap [%08x,%llx) ∩ [%08x,%08x) → next=%08x\n",
-                                addr, (unsigned long long)end64, r.lo, r.hi, skip);
-                    next = skip;
-                    hit = true;
-                    break;
-                }
-            }
-            if (hit) continue;
-            // Advance with uint64 math — uint32 (addr+len) wraps at 4 GiB and used to reset next to 0.
-            uint64_t n64 = (end64 + MMAP_ALIGN - 1u) & ~(uint64_t)(MMAP_ALIGN - 1u);
-            if (n64 >= arena_end || n64 > 0xffffffffull)
-                next = 0xffffffffu;
-            else
-                next = (uint32_t)n64;
-            return addr;
+  auto bump_in = [&](uint32_t &next, uint64_t arena_end) -> uint32_t {
+    for (int spins = 0; spins < 64; ++spins) {
+      if ((uint64_t)next + len > arena_end) return ~0u;
+      uint32_t addr = next;
+      uint64_t end64 = (uint64_t)addr + len;
+      bool hit = false;
+      for (const auto &r : g_loaded_regions) {
+        if (addr < r.hi && end64 > r.lo) {
+          uint32_t skip = (r.hi + MMAP_ALIGN - 1u) & ~(MMAP_ALIGN - 1u);
+          if (skip <= next) return ~0u;
+          static int logged = 0;
+          if (logged++ < 8)
+            fprintf(stderr, "[mmap] skip lib overlap [%08x,%llx) ∩ [%08x,%08x) → next=%08x\n",
+                    addr, (unsigned long long)end64, r.lo, r.hi, skip);
+          next = skip;
+          hit = true;
+          break;
         }
-        return ~0u;
-    };
+      }
+      if (hit) continue;
+      // Advance with uint64 math — uint32 (addr+len) wraps at 4 GiB and used to reset next to 0.
+      uint64_t n64 = (end64 + MMAP_ALIGN - 1u) & ~(uint64_t)(MMAP_ALIGN - 1u);
+      if (n64 >= arena_end || n64 > 0xffffffffull)
+        next = 0xffffffffu;
+      else
+        next = (uint32_t)n64;
+      return addr;
+    }
+    return ~0u;
+  };
 
-    uint32_t addr = bump_in(g_mmap_next, MMAP_END);
-    if (addr != ~0u) return addr;
+  uint32_t addr = bump_in(g_mmap_next, MMAP_END);
+  if (addr != ~0u) return addr;
 
-    if (!g_mmap2_active) {
-        g_mmap2_active = true;
-        g_mmap2_next = MMAP2_BASE;
-        fprintf(stderr, "[mmap] primary arena exhausted (next=%08x); activating "
-                "secondary [%08x,%llx)\n", g_mmap_next, MMAP2_BASE,
-                (unsigned long long)mmap2_end_excl());
-    } else if (g_mmap2_next == 0) {
-        // Exhausted / corrupted bump ptr — do not rewind to BASE.
-        static int rewind = 0;
-        if (rewind++ < 4)
-            fprintf(stderr, "[mmap] secondary bump exhausted (next=0), refusing rewind\n");
-        return ~0u;
+  if (!g_mmap2_active) {
+    g_mmap2_active = true;
+    g_mmap2_next = MMAP2_BASE;
+    fprintf(stderr, "[mmap] primary arena exhausted (next=%08x); activating "
+                    "secondary [%08x,%llx)\n", g_mmap_next, MMAP2_BASE,
+            (unsigned long long)mmap2_end_excl());
+  } else if (g_mmap2_next == 0) {
+    // Exhausted / corrupted bump ptr — do not rewind to BASE.
+    static int rewind = 0;
+    if (rewind++ < 4)
+      fprintf(stderr, "[mmap] secondary bump exhausted (next=0), refusing rewind\n");
+    return ~0u;
+  }
+  addr = bump_in(g_mmap2_next, mmap2_end_excl());
+  if (addr == ~0u && (!g_guest_proc_arm64 || len <= 0x01000000u) && g_small_mmap_top) {
+    // Overflow mappings share the unused malloc arena. The heap lock
+    // moves its limit downward without crossing live allocations.
+    uint32_t next = arm_heap_take_top(len, MMAP_ALIGN - 1u);
+    if (next) {
+      static int fb = 0;
+      if (fb++ < 16)
+        fprintf(stderr, "[mmap] shared heap arena len=%u -> %08x\n", len, next);
+      return next;
     }
-    addr = bump_in(g_mmap2_next, mmap2_end_excl());
-    if (addr == ~0u && (!g_guest_proc_arm64 || len <= 0x01000000u) && g_small_mmap_top) {
-        // Overflow mappings share the unused malloc arena. The heap lock
-        // moves its limit downward without crossing live allocations.
-        uint32_t next = arm_heap_take_top(len, MMAP_ALIGN - 1u);
-        if (next) {
-            static int fb = 0;
-            if (fb++ < 16)
-                fprintf(stderr, "[mmap] shared heap arena len=%u -> %08x\n", len, next);
-            return next;
-        }
-    }
-    if (addr == ~0u) {
-        static int oom = 0;
-        if (oom++ < 8)
-            fprintf(stderr, "[mmap] MAP_FAILED len=%u primary_next=%08x secondary_next=%08x\n",
-                    len, g_mmap_next, g_mmap2_next);
-    }
-    return addr;
+  }
+  if (addr == ~0u) {
+    static int oom = 0;
+    if (oom++ < 8)
+      fprintf(stderr, "[mmap] MAP_FAILED len=%u primary_next=%08x secondary_next=%08x\n",
+              len, g_mmap_next, g_mmap2_next);
+  }
+  return addr;
 }
 
 // Linux mmap: prefer exact `len`.
 // allow_split=false: return ~0u if exact size unavailable (overflow mmap).
 inline uint32_t mmap_bump_exact(uint32_t raw_len, uint32_t *out_len = nullptr,
                                 bool allow_split = true) {
-    uint32_t want = (raw_len + 4095u) & ~4095u;
-    if (want == 0) return ~0u;
-    if (want > g_mmap_max_single) {
-        static int cap = 0;
-        if (cap++ < 8)
-            fprintf(stderr, "[mmap] MAP_FAILED len=%u > max_single=%u\n",
-                    want, g_mmap_max_single);
-        return ~0u;
-    }
-    uint32_t addr = mmap_bump(want);
-    if (addr != ~0u) {
-        if (out_len) *out_len = want;
-        g_mmap_slabs.push_back({addr, addr + want});
-        return addr;
-    }
-    // Never short-map a large reservation.
-    if (!allow_split || want > 0x10000000u)
-        return ~0u;
-    uint32_t try_len = want;
-    for (int i = 0; i < 16 && try_len >= 0x10000u; ++i) {
-        try_len >>= 1;
-        try_len &= ~4095u;
-        if (!try_len) break;
-        addr = mmap_bump(try_len);
-        if (addr != ~0u) {
-            // Report requested size to caller bookkeeping that updates r1.
-            if (out_len) *out_len = want;
-            g_mmap_slabs.push_back({addr, addr + try_len});
-            static int split = 0;
-            if (split++ < 8)
-                fprintf(stderr, "[mmap] split request %u → %u at %08x\n",
-                        want, try_len, addr);
-            return addr;
-        }
-    }
+  uint32_t want = (raw_len + 4095u) & ~4095u;
+  if (want == 0) return ~0u;
+  if (want > g_mmap_max_single) {
+    static int cap = 0;
+    if (cap++ < 8)
+      fprintf(stderr, "[mmap] MAP_FAILED len=%u > max_single=%u\n",
+              want, g_mmap_max_single);
     return ~0u;
+  }
+  uint32_t addr = mmap_bump(want);
+  if (addr != ~0u) {
+    if (out_len) *out_len = want;
+    g_mmap_slabs.push_back({addr, addr + want});
+    return addr;
+  }
+  // Never short-map a large reservation.
+  if (!allow_split || want > 0x10000000u)
+    return ~0u;
+  uint32_t try_len = want;
+  for (int i = 0; i < 16 && try_len >= 0x10000u; ++i) {
+    try_len >>= 1;
+    try_len &= ~4095u;
+    if (!try_len) break;
+    addr = mmap_bump(try_len);
+    if (addr != ~0u) {
+      // Report requested size to caller bookkeeping that updates r1.
+      if (out_len) *out_len = want;
+      g_mmap_slabs.push_back({addr, addr + try_len});
+      static int split = 0;
+      if (split++ < 8)
+        fprintf(stderr, "[mmap] split request %u → %u at %08x\n",
+                want, try_len, addr);
+      return addr;
+    }
+  }
+  return ~0u;
 }
 
 inline struct guest_rx_table g_rx_pages = {};
 inline void guest_rx_bounds_refresh(void) {
-    struct guest_rx_table next = {};
-    for (const auto &r : g_loaded_regions) {
-        if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* need X, not W */
-        guest_rx_add(&next, r.lo, r.hi);
-    }
-    guest_rx_publish(&g_rx_pages, &next);
+  struct guest_rx_table next = {};
+  for (const auto &r : g_loaded_regions) {
+    if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* need X, not W */
+    guest_rx_add(&next, r.lo, r.hi);
+  }
+  guest_rx_publish(&g_rx_pages, &next);
 }
 
 inline void a64_loaded_regions_unmap(GuestVA lo, GuestVA hi) {
-    if (lo < A64_GUEST_BASE || lo >= A64_GUEST_BASE + A64_GUEST_SIZE || hi <= lo)
-        return;
-    const uint64_t cut_lo = lo - A64_GUEST_BASE;
-    const uint64_t cut_hi = std::min<uint64_t>(hi - A64_GUEST_BASE, A64_GUEST_SIZE);
-    bool changed = false;
-    for (size_t i = 0; i < g_loaded_regions.size();) {
-        LoadedRegion r = g_loaded_regions[i];
-        if (r.hi <= cut_lo || r.lo >= cut_hi) { ++i; continue; }
-        changed = true;
-        const bool head = r.lo < cut_lo, tail = r.hi > cut_hi;
-        if (head && tail) {
-            LoadedRegion t = r;
-            t.lo = (uint32_t)cut_hi;
-            t.file_off += t.lo - r.lo;
-            g_loaded_regions[i].hi = (uint32_t)cut_lo;
-            g_loaded_regions.insert(g_loaded_regions.begin() + (long)i + 1, t);
-            i += 2;
-        } else if (head) {
-            g_loaded_regions[i].hi = (uint32_t)cut_lo; ++i;
-        } else if (tail) {
-            g_loaded_regions[i].file_off += cut_hi - r.lo;
-            g_loaded_regions[i].lo = (uint32_t)cut_hi; ++i;
-        } else {
-            g_loaded_regions.erase(g_loaded_regions.begin() + (long)i);
-        }
+  if (lo < A64_GUEST_BASE || lo >= A64_GUEST_BASE + A64_GUEST_SIZE || hi <= lo)
+    return;
+  const uint64_t cut_lo = lo - A64_GUEST_BASE;
+  const uint64_t cut_hi = std::min<uint64_t>(hi - A64_GUEST_BASE, A64_GUEST_SIZE);
+  bool changed = false;
+  for (size_t i = 0; i < g_loaded_regions.size();) {
+    LoadedRegion r = g_loaded_regions[i];
+    if (r.hi <= cut_lo || r.lo >= cut_hi) {
+      ++i;
+      continue;
     }
-    if (changed) guest_rx_bounds_refresh();
+    changed = true;
+    const bool head = r.lo < cut_lo, tail = r.hi > cut_hi;
+    if (head && tail) {
+      LoadedRegion t = r;
+      t.lo = (uint32_t)cut_hi;
+      t.file_off += t.lo - r.lo;
+      g_loaded_regions[i].hi = (uint32_t)cut_lo;
+      g_loaded_regions.insert(g_loaded_regions.begin() + (long)i + 1, t);
+      i += 2;
+    } else if (head) {
+      g_loaded_regions[i].hi = (uint32_t)cut_lo;
+      ++i;
+    } else if (tail) {
+      g_loaded_regions[i].file_off += cut_hi - r.lo;
+      g_loaded_regions[i].lo = (uint32_t)cut_hi;
+      ++i;
+    } else {
+      g_loaded_regions.erase(g_loaded_regions.begin() + (long)i);
+    }
+  }
+  if (changed) guest_rx_bounds_refresh();
 }
 
 // True if [va, va+n) overlaps any loaded RX (PF_X and not PF_W) segment.
 inline bool guest_range_hits_rx(uint32_t va, uint32_t n) {
-    return guest_rx_hits(&g_rx_pages, va, n) != 0;
+  return guest_rx_hits(&g_rx_pages, va, n) != 0;
 }
 
 // True if [va, va+n) overlaps any recorded PT_LOAD (code or data).
 inline bool guest_range_hits_loaded(uint32_t va, uint32_t n) {
-    if (!n) return false;
-    uint64_t end = (uint64_t)va + n;
-    if (end > 0x100000000ull) end = 0x100000000ull;
-    for (const auto &r : g_loaded_regions) {
-        if (va < r.hi && end > r.lo) return true;
-    }
-    return false;
+  if (!n) return false;
+  uint64_t end = (uint64_t)va + n;
+  if (end > 0x100000000ull) end = 0x100000000ull;
+  for (const auto &r : g_loaded_regions) {
+    if (va < r.hi && end > r.lo) return true;
+  }
+  return false;
 }
 // sbrk / brk arena for Boehm GC's GC_scratch_alloc().
 constexpr uint32_t BRK_BASE = 0x04000000u;
@@ -1120,40 +1177,72 @@ inline uint32_t NOOP_RET0      = 0x41014100u;
  * never overwrite NOOP_RET0 (or environment strings overwrite ctype). */
 inline uint32_t MISC_DATA     = 0x41015000u;
 inline uint32_t SL_PAGE_BASE  = 0x41016000u;
-inline uint32_t misc_sl_iid(void)     { return MISC_DATA + 0x000u; }
-inline uint32_t misc_sl_iid_end(void) { return MISC_DATA + 0x100u; }
+inline uint32_t misc_sl_iid(void)     {
+  return MISC_DATA + 0x000u;
+}
+inline uint32_t misc_sl_iid_end(void) {
+  return MISC_DATA + 0x100u;
+}
 /* tzname is `char *tzname[2]`, and the two strings have to live somewhere the
  * guest can read: the array itself at +0x100, the abbreviations after it.
  * `timezone` (long) and `daylight` (int) are separate objects in bionic, so
  * they get separate words -- one address for both meant a write to either
  * changed the other. */
-inline uint32_t misc_tzname(void)     { return MISC_DATA + 0x100u; }
-inline uint32_t misc_tzname_str(int i){ return MISC_DATA + 0x120u + (uint32_t)i * 0x20u; }
-inline uint32_t misc_tzvars(void)     { return MISC_DATA + 0x180u; }
-inline uint32_t misc_daylight(void)   { return MISC_DATA + 0x190u; }
-inline uint32_t misc_stdio(void)      { return MISC_DATA + 0x200u; }
-inline uint32_t misc_environ(void)    { return MISC_DATA + 0x300u; }
-inline uint32_t misc_env_array(void)  { return MISC_DATA + 0x320u; }
-inline uint32_t misc_env_strings(void){ return MISC_DATA + 0x380u; }
+inline uint32_t misc_tzname(void)     {
+  return MISC_DATA + 0x100u;
+}
+inline uint32_t misc_tzname_str(int i) {
+  return MISC_DATA + 0x120u + (uint32_t)i * 0x20u;
+}
+inline uint32_t misc_tzvars(void)     {
+  return MISC_DATA + 0x180u;
+}
+inline uint32_t misc_daylight(void)   {
+  return MISC_DATA + 0x190u;
+}
+inline uint32_t misc_stdio(void)      {
+  return MISC_DATA + 0x200u;
+}
+inline uint32_t misc_environ(void)    {
+  return MISC_DATA + 0x300u;
+}
+inline uint32_t misc_env_array(void)  {
+  return MISC_DATA + 0x320u;
+}
+inline uint32_t misc_env_strings(void) {
+  return MISC_DATA + 0x380u;
+}
 /* getopt(3) process state.  Between daylight and the stack-guard cookie.
  * optarg is a pointer; the ints follow.  Defaults match bionic: optind=1,
  * opterr=1, optopt=0, optarg=NULL. */
-inline uint32_t misc_optarg(void)     { return MISC_DATA + 0x1A0u; }
-inline uint32_t misc_optind(void)     { return MISC_DATA + 0x1A8u; }
-inline uint32_t misc_opterr(void)     { return MISC_DATA + 0x1ACu; }
-inline uint32_t misc_optopt(void)     { return MISC_DATA + 0x1B0u; }
+inline uint32_t misc_optarg(void)     {
+  return MISC_DATA + 0x1A0u;
+}
+inline uint32_t misc_optind(void)     {
+  return MISC_DATA + 0x1A8u;
+}
+inline uint32_t misc_opterr(void)     {
+  return MISC_DATA + 0x1ACu;
+}
+inline uint32_t misc_optopt(void)     {
+  return MISC_DATA + 0x1B0u;
+}
 /* __stack_chk_guard is a *variable* the compiled guest reads directly (the
  * prologue copies it onto the stack, the epilogue compares).  Binding it to a
  * code trampoline handed out the address of an instruction as the guard
  * value; it happened to compare equal, but the whole point of the cookie is
  * that it is unpredictable.  Give it a word of real entropy instead. */
-inline uint32_t misc_stack_guard(void) { return MISC_DATA + 0x1C0u; }
+inline uint32_t misc_stack_guard(void) {
+  return MISC_DATA + 0x1C0u;
+}
 /* The AThermalManager AThermal_acquireManager() hands out.  The object is
  * opaque to the guest — the thermal calls only pass the pointer back — but it
  * has to be an address in guest memory, not an arbitrary token, so a caller
  * that stores it beside other pointers or compares it with one is not looking
  * at something that could never be mapped. */
-inline uint32_t misc_athermal(void)    { return MISC_DATA + 0x1E0u; }
+inline uint32_t misc_athermal(void)    {
+  return MISC_DATA + 0x1E0u;
+}
 // glGetString/eglQueryString ring (8 × 8 KiB) — see stash_gl_c_string().
 inline uint32_t GL_STR_RING_BASE = 0x41020000u;
 constexpr uint32_t GL_STR_RING_SLOTS = 8u;
@@ -1217,7 +1306,7 @@ constexpr int      CB_MAX_SLOTS  = 16;           /* concurrent stack windows */
  * for; the layout functions below set it from the room they have. */
 inline int         g_cb_slots    = 4;
 inline uint32_t cb_stack_base(int slot) {
-    return CB_STACK_BASE + (uint32_t)slot * CB_STACK_SIZE;
+  return CB_STACK_BASE + (uint32_t)slot * CB_STACK_SIZE;
 }
 
 /* Exclusive-monitor processor ids.
@@ -1242,119 +1331,119 @@ inline uint32_t cb_stack_base(int slot) {
 constexpr int      A64_ENGINE_MAX = 8;
 constexpr int      EXCL_PE_MAX    = 14;  /* host threads that run guest code */
 enum : size_t {
-    EXCL_ID_MAIN  = 0,
-    EXCL_ID_AUX   = 1,
-    EXCL_ID_PE    = 2,
-    EXCL_ID_COUNT = EXCL_ID_PE + EXCL_PE_MAX,
+  EXCL_ID_MAIN  = 0,
+  EXCL_ID_AUX   = 1,
+  EXCL_ID_PE    = 2,
+  EXCL_ID_COUNT = EXCL_ID_PE + EXCL_PE_MAX,
 };
 
 // A64: tramp/stack below MMAP_BASE so primary holds 2×512 MiB exact slabs and secondary 5× → 7 exact 512 MiB (A64 Unity.
 inline void guest_va_layout_arm64(void) {
-    // Ask ArmMemory::init() for the image window at A64_GUEST_BASE.
-    g_a64_identity_arena = true;
-    BRK_END           = 0x0A000000u;
-    TRAMP_BASE        = 0x0A000000u;
-    JNI_TBL_BASE      = 0x0A010000u;
-    JVM_TBL_BASE      = 0x0A011000u;
-    ENV_SLOT_BASE     = 0x0A012000u;
-    VM_SLOT_BASE      = 0x0A012008u;
-    JNI_TBL64_BASE    = JNI_TBL_BASE;
-    JVM_TBL64_BASE    = 0x0A012000u;
-    ENV_SLOT64_BASE   = 0x0A012100u;
-    VM_SLOT64_BASE    = 0x0A012108u;
-    STR_SCRATCH       = 0x0A013000u;
-    LIBC_DATA         = 0x0A014000u;
-    LIBC_PAGE_SIZE    = LIBC_DATA + 0x00u;
-    LIBC_PAGE_SHIFT   = LIBC_DATA + 0x04u;
-    LIBC_PAGE_MASK    = LIBC_DATA + 0x08u;
-    MJIV_CACHE        = LIBC_DATA + 0x20u;
-    MJIV_ENTRY_MARK   = LIBC_DATA + 0x24u;
-    MJIV_RUNTIME_VER  = LIBC_DATA + 0x28u;
-    MONO_EMPTY_STR    = LIBC_DATA + 0x2cu;
-    LIBC_CTYPE_TAB    = LIBC_DATA + 0x300u;
-    LIBC_TOLOWER_TAB  = LIBC_DATA + 0x400u;
-    LIBC_TOUPPER_TAB  = LIBC_DATA + 0x700u;
-    LIBC_CTYPE_PTR    = LIBC_DATA + 0x200u;
-    LIBC_TOLOWER_PTR  = LIBC_DATA + 0x208u;
-    LIBC_TOUPPER_PTR  = LIBC_DATA + 0x210u;
-    NOOP_RET0         = LIBC_DATA + 0x100u;
-    // The SL_IID/tzname/stdio page and the OpenSL ES vtable page keep their A32 addresses (0x41014000 / 0x41016000) by.
-    MISC_DATA         = 0x0A015000u;
-    SL_PAGE_BASE      = 0x0A016000u; /* 8 KiB: 64-bit vtables + instances */
-    /* DETOUR64_STUB_BASE occupies 0x0A018000.  The next two windows must not
-     * overlap each other: the GL string ring is written by host code on every
-     * glGetString, so any thread whose TLS page landed inside it had its
-     * stack-guard word (tpidr_el0+0x28) overwritten with extension-string
-     * bytes — the next __stack_chk_fail aborted the process. */
-    GL_STR_RING_BASE  = 0x0A020000u;              /* .. 0x0A030000 */
-    TLS_WINDOW_BASE   = 0x0A030000u;              /* .. STACK_BASE  */
-    TLS_WINDOW_END    = 0x0A100000u;
-    STACK_BASE        = 0x0A100000u;
-    STACK_SIZE        = 0x03000000u; /* 48 MiB */
-    /* CB_MAX_SLOTS concurrent stacks x 1 MiB = 16 MiB. */
-    CB_STACK_BASE     = 0x0D100000u; /* .. 0x0E100000 */
-    g_cb_slots        = CB_MAX_SLOTS;
-    SENTINEL_ADDR     = 0x0E200000u; /* must not alias CB nest stacks */
-    /* 0x0E300000: FAST_SYNC64_PAGE (arm_exec.cpp), 8 KiB of stubs. */
-    DIRECT_BB_BASE    = 0x0E400000u; /* .. 0x0EC00000, below MMAP_BASE */
-    /* 0x0F000000..0x0F040000: RX host-call code (arm_exec.cpp). */
-    // Guest thread stacks: [0x40000000, HEAP_BASE) — 256 MiB, i.
-    THREAD_STACK_BASE = 0x40000000u;
-    // ELF images: [0x10000000,0x50000000).
-    A64_IMAGE_BASE    = MMAP_BASE;         /* 0x10000000 */
-    A64_IMAGE_END     = THREAD_STACK_BASE; /* 0x40000000 — 768 MiB of images */
-    MMAP_END          = MMAP_BASE;   /* primary arena disabled (see above) */
-    g_mmap_next       = MMAP_BASE;
-    // Guest mmap now lives in the real 64-bit address space, so the image window only has to hold code.
-    luna_os_setenv("LUNARIA_MMAP2_BASE", "0xF0000000", 0);
-    lunaria_env_invalidate();
-    fprintf(stderr, "[mem] a64 VA: tramp=%08x stack=%08x mmap=[%08x,%08x) "
-            "heap=%08x\n",
-            TRAMP_BASE, STACK_BASE, MMAP_BASE, MMAP_END, HEAP_BASE);
+  // Ask ArmMemory::init() for the image window at A64_GUEST_BASE.
+  g_a64_identity_arena = true;
+  BRK_END           = 0x0A000000u;
+  TRAMP_BASE        = 0x0A000000u;
+  JNI_TBL_BASE      = 0x0A010000u;
+  JVM_TBL_BASE      = 0x0A011000u;
+  ENV_SLOT_BASE     = 0x0A012000u;
+  VM_SLOT_BASE      = 0x0A012008u;
+  JNI_TBL64_BASE    = JNI_TBL_BASE;
+  JVM_TBL64_BASE    = 0x0A012000u;
+  ENV_SLOT64_BASE   = 0x0A012100u;
+  VM_SLOT64_BASE    = 0x0A012108u;
+  STR_SCRATCH       = 0x0A013000u;
+  LIBC_DATA         = 0x0A014000u;
+  LIBC_PAGE_SIZE    = LIBC_DATA + 0x00u;
+  LIBC_PAGE_SHIFT   = LIBC_DATA + 0x04u;
+  LIBC_PAGE_MASK    = LIBC_DATA + 0x08u;
+  MJIV_CACHE        = LIBC_DATA + 0x20u;
+  MJIV_ENTRY_MARK   = LIBC_DATA + 0x24u;
+  MJIV_RUNTIME_VER  = LIBC_DATA + 0x28u;
+  MONO_EMPTY_STR    = LIBC_DATA + 0x2cu;
+  LIBC_CTYPE_TAB    = LIBC_DATA + 0x300u;
+  LIBC_TOLOWER_TAB  = LIBC_DATA + 0x400u;
+  LIBC_TOUPPER_TAB  = LIBC_DATA + 0x700u;
+  LIBC_CTYPE_PTR    = LIBC_DATA + 0x200u;
+  LIBC_TOLOWER_PTR  = LIBC_DATA + 0x208u;
+  LIBC_TOUPPER_PTR  = LIBC_DATA + 0x210u;
+  NOOP_RET0         = LIBC_DATA + 0x100u;
+  // The SL_IID/tzname/stdio page and the OpenSL ES vtable page keep their A32 addresses (0x41014000 / 0x41016000) by.
+  MISC_DATA         = 0x0A015000u;
+  SL_PAGE_BASE      = 0x0A016000u; /* 8 KiB: 64-bit vtables + instances */
+  /* DETOUR64_STUB_BASE occupies 0x0A018000.  The next two windows must not
+   * overlap each other: the GL string ring is written by host code on every
+   * glGetString, so any thread whose TLS page landed inside it had its
+   * stack-guard word (tpidr_el0+0x28) overwritten with extension-string
+   * bytes — the next __stack_chk_fail aborted the process. */
+  GL_STR_RING_BASE  = 0x0A020000u;              /* .. 0x0A030000 */
+  TLS_WINDOW_BASE   = 0x0A030000u;              /* .. STACK_BASE  */
+  TLS_WINDOW_END    = 0x0A100000u;
+  STACK_BASE        = 0x0A100000u;
+  STACK_SIZE        = 0x03000000u; /* 48 MiB */
+  /* CB_MAX_SLOTS concurrent stacks x 1 MiB = 16 MiB. */
+  CB_STACK_BASE     = 0x0D100000u; /* .. 0x0E100000 */
+  g_cb_slots        = CB_MAX_SLOTS;
+  SENTINEL_ADDR     = 0x0E200000u; /* must not alias CB nest stacks */
+  /* 0x0E300000: FAST_SYNC64_PAGE (arm_exec.cpp), 8 KiB of stubs. */
+  DIRECT_BB_BASE    = 0x0E400000u; /* .. 0x0EC00000, below MMAP_BASE */
+  /* 0x0F000000..0x0F040000: RX host-call code (arm_exec.cpp). */
+  // Guest thread stacks: [0x40000000, HEAP_BASE) — 256 MiB, i.
+  THREAD_STACK_BASE = 0x40000000u;
+  // ELF images: [0x10000000,0x50000000).
+  A64_IMAGE_BASE    = MMAP_BASE;         /* 0x10000000 */
+  A64_IMAGE_END     = THREAD_STACK_BASE; /* 0x40000000 — 768 MiB of images */
+  MMAP_END          = MMAP_BASE;   /* primary arena disabled (see above) */
+  g_mmap_next       = MMAP_BASE;
+  // Guest mmap now lives in the real 64-bit address space, so the image window only has to hold code.
+  luna_os_setenv("LUNARIA_MMAP2_BASE", "0xF0000000", 0);
+  lunaria_env_invalidate();
+  fprintf(stderr, "[mem] a64 VA: tramp=%08x stack=%08x mmap=[%08x,%08x) "
+                  "heap=%08x\n",
+          TRAMP_BASE, STACK_BASE, MMAP_BASE, MMAP_END, HEAP_BASE);
 }
 
 // MMU-ish: shrink a libc write to stay out of RX .
 inline uint32_t guest_clamp_write_n(uint32_t dst, uint32_t n) {
-    if (!n) return 0;
-    if ((uint64_t)dst + n > 0x100000000ull)
-        n = (uint32_t)(0x100000000ull - dst);
-    if (!n) return 0;
-    uint64_t end = (uint64_t)dst + n;
-    for (const auto &r : g_loaded_regions) {
-        if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* X and not W */
-        if (dst >= r.lo && dst < r.hi)
-            return 0; /* starts in RX */
-        if (dst < r.lo && end > r.lo) {
-            n = r.lo - dst;
-            end = (uint64_t)dst + n;
-        }
+  if (!n) return 0;
+  if ((uint64_t)dst + n > 0x100000000ull)
+    n = (uint32_t)(0x100000000ull - dst);
+  if (!n) return 0;
+  uint64_t end = (uint64_t)dst + n;
+  for (const auto &r : g_loaded_regions) {
+    if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* X and not W */
+    if (dst >= r.lo && dst < r.hi)
+      return 0; /* starts in RX */
+    if (dst < r.lo && end > r.lo) {
+      n = r.lo - dst;
+      end = (uint64_t)dst + n;
     }
-    // Tramp/JNI only — main/thread stacks are at STACK_BASE+.
-    if (dst < TRAMP_BASE && end > TRAMP_BASE) {
-        n = TRAMP_BASE - dst;
-        end = (uint64_t)dst + n;
-    }
-    if (dst >= TRAMP_BASE && dst < STACK_BASE) {
-        /* Java's allocateDirect pool is writable payload in this window,
-         * not trampoline code. FMOD initializes its native audio buffer
-         * with memset; suppressing that write violates the buffer contract. */
-        if (dst >= DIRECT_BB_BASE && dst < DIRECT_BB_BASE + DIRECT_BB_SIZE)
-            return n < DIRECT_BB_BASE + DIRECT_BB_SIZE - dst ? n :
-                       DIRECT_BB_BASE + DIRECT_BB_SIZE - dst;
-        return 0;
-    }
-    // Do NOT clamp libc writes to mmap slab size (Unity Dynamic Heap bookkeeping).
-    (void)g_mmap_slabs;
-    return n;
+  }
+  // Tramp/JNI only — main/thread stacks are at STACK_BASE+.
+  if (dst < TRAMP_BASE && end > TRAMP_BASE) {
+    n = TRAMP_BASE - dst;
+    end = (uint64_t)dst + n;
+  }
+  if (dst >= TRAMP_BASE && dst < STACK_BASE) {
+    /* Java's allocateDirect pool is writable payload in this window,
+     * not trampoline code. FMOD initializes its native audio buffer
+     * with memset; suppressing that write violates the buffer contract. */
+    if (dst >= DIRECT_BB_BASE && dst < DIRECT_BB_BASE + DIRECT_BB_SIZE)
+      return n < DIRECT_BB_BASE + DIRECT_BB_SIZE - dst ? n :
+             DIRECT_BB_BASE + DIRECT_BB_SIZE - dst;
+    return 0;
+  }
+  // Do NOT clamp libc writes to mmap slab size (Unity Dynamic Heap bookkeeping).
+  (void)g_mmap_slabs;
+  return n;
 }
 
 // A clean return lands the guest PC on the (non-executable) SENTINEL page.
 inline bool pc_in_sentinel(uint32_t pc) {
-    uint32_t p = pc & ~1u;
-    return p >= SENTINEL_ADDR && p < SENTINEL_ADDR + 0x1000u;
+  uint32_t p = pc & ~1u;
+  return p >= SENTINEL_ADDR && p < SENTINEL_ADDR + 0x1000u;
 }
 inline bool pc_in_sentinel(GuestVA pc) {
-    return pc_in_sentinel(a64_canon_va(pc));
+  return pc_in_sentinel(a64_canon_va(pc));
 }
 
 
@@ -1372,20 +1461,32 @@ inline bool g_asensor_enabled = false;
 /* Which SVC a JNINativeInterface slot dispatches to.  Identity up to 221;
  * beyond that the historical numbering is four short, so name every slot. */
 constexpr uint32_t jni_vtable_svc(uint32_t slot) {
-    switch (slot) {
-    case 222: return SVC_JNI_GET_PRIM_CRITICAL;
-    case 223: return SVC_JNI_REL_PRIM_CRITICAL;
-    case 224: return SVC_JNI_GET_STR_CRITICAL;
-    case 225: return SVC_JNI_REL_STR_CRITICAL;
-    case 226: return 222u;   /* NewWeakGlobalRef    */
-    case 227: return 223u;   /* DeleteWeakGlobalRef */
-    case 228: return 224u;   /* ExceptionCheck      */
-    case 229: return SVC_JNI_NEW_DIRECT_BB;
-    case 230: return SVC_JNI_DIRECT_BB_ADDR;
-    case 231: return SVC_JNI_DIRECT_BB_CAP;
-    case 232: return SVC_JNI_OBJECT_REF_TYPE;
-    default:  return slot;
-    }
+  switch (slot) {
+  case 222:
+    return SVC_JNI_GET_PRIM_CRITICAL;
+  case 223:
+    return SVC_JNI_REL_PRIM_CRITICAL;
+  case 224:
+    return SVC_JNI_GET_STR_CRITICAL;
+  case 225:
+    return SVC_JNI_REL_STR_CRITICAL;
+  case 226:
+    return 222u;   /* NewWeakGlobalRef    */
+  case 227:
+    return 223u;   /* DeleteWeakGlobalRef */
+  case 228:
+    return 224u;   /* ExceptionCheck      */
+  case 229:
+    return SVC_JNI_NEW_DIRECT_BB;
+  case 230:
+    return SVC_JNI_DIRECT_BB_ADDR;
+  case 231:
+    return SVC_JNI_DIRECT_BB_CAP;
+  case 232:
+    return SVC_JNI_OBJECT_REF_TYPE;
+  default:
+    return slot;
+  }
 }
 
 // OpenSL ES fake object page.

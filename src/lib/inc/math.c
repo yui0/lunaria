@@ -1,3 +1,10 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 
 /*
  * libm.c — Android libm wrapper for Lunaria
@@ -105,45 +112,66 @@ FWD2(double, hypot,      double, double)
 double
 ldexp(double x, int exp)
 {
-    static union { void *p; double (*f)(double, int); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "ldexp");
-    return u.f ? u.f(x, exp) : x;
+  static union {
+    void *p;
+    double (*f)(double, int);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "ldexp");
+  return u.f ? u.f(x, exp) : x;
 }
 
 float
 ldexpf(float x, int exp)
 {
-    static union { void *p; float (*f)(float, int); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "ldexpf");
-    return u.f ? u.f(x, exp) : x;
+  static union {
+    void *p;
+    float (*f)(float, int);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "ldexpf");
+  return u.f ? u.f(x, exp) : x;
 }
 
 double
 frexp(double x, int *exp)
 {
-    static union { void *p; double (*f)(double, int *); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "frexp");
-    return u.f ? u.f(x, exp) : x;
+  static union {
+    void *p;
+    double (*f)(double, int *);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "frexp");
+  return u.f ? u.f(x, exp) : x;
 }
 
 void
 sincosf(float x, float *s, float *c)
 {
-    static union { void *p; void (*f)(float, float *, float *); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "sincosf");
-    if (u.f) { u.f(x, s, c); return; }
-    if (s) *s = sinf(x);
-    if (c) *c = cosf(x);
+  static union {
+    void *p;
+    void (*f)(float, float *, float *);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "sincosf");
+  if (u.f) {
+    u.f(x, s, c);
+    return;
+  }
+  if (s) *s = sinf(x);
+  if (c) *c = cosf(x);
 }
 
 void
 sincos(double x, double *s, double *c)
 {
-    static union { void *p; void (*f)(double, double *, double *); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "sincos");
-    if (u.f) { u.f(x, s, c); return; }
-    if (s) *s = sin(x);
-    if (c) *c = cos(x);
+  static union {
+    void *p;
+    void (*f)(double, double *, double *);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "sincos");
+  if (u.f) {
+    u.f(x, s, c);
+    return;
+  }
+  if (s) *s = sin(x);
+  if (c) *c = cos(x);
 }
 
 /* isinf / isinff — glibc defines these as macros, but Android bionic has them
@@ -155,45 +183,51 @@ sincos(double x, double *s, double *c)
 int
 isinf(double x)
 {
-    uint64_t bits;
-    __builtin_memcpy(&bits, &x, 8);
-    return ((bits & 0x7fffffffffffffffULL) == 0x7ff0000000000000ULL) ? ((bits >> 63) ? -1 : 1) : 0;
+  uint64_t bits;
+  __builtin_memcpy(&bits, &x, 8);
+  return ((bits & 0x7fffffffffffffffULL) == 0x7ff0000000000000ULL) ? ((bits >> 63) ? -1 : 1) : 0;
 }
 
 int
 isinff(float x)
 {
-    uint32_t bits;
-    __builtin_memcpy(&bits, &x, 4);
-    return ((bits & 0x7fffffff) == 0x7f800000) ? ((bits >> 31) ? -1 : 1) : 0;
+  uint32_t bits;
+  __builtin_memcpy(&bits, &x, 4);
+  return ((bits & 0x7fffffff) == 0x7f800000) ? ((bits >> 31) ? -1 : 1) : 0;
 }
 
 int
 __isinf(double x)
 {
-    return isinf(x);
+  return isinf(x);
 }
 
 /* __fpclassifyf — used by some bionic code for float classification */
 int
 __fpclassifyf(float x)
 {
-    return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, (double)x);
+  return __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, (double)x);
 }
 
 long double
 strtold(const char *nptr, char **endptr)
 {
-    static union { void *p; long double (*f)(const char *, char **); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "strtold");
-    return u.f ? u.f(nptr, endptr) : 0.0L;
+  static union {
+    void *p;
+    long double (*f)(const char *, char **);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "strtold");
+  return u.f ? u.f(nptr, endptr) : 0.0L;
 }
 
 #include <wchar.h>
 double
 wcstod(const wchar_t *nptr, wchar_t **endptr)
 {
-    static union { void *p; double (*f)(const wchar_t *, wchar_t **); } u;
-    if (!u.p) u.p = dlsym(RTLD_NEXT, "wcstod");
-    return u.f ? u.f(nptr, endptr) : 0.0;
+  static union {
+    void *p;
+    double (*f)(const wchar_t *, wchar_t **);
+  } u;
+  if (!u.p) u.p = dlsym(RTLD_NEXT, "wcstod");
+  return u.f ? u.f(nptr, endptr) : 0.0;
 }

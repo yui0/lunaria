@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * The Dalvik interpreter proper: heap, class loading, resolution and the
  * instruction loop.  See dvm.h for why this exists.
  */
@@ -45,12 +47,12 @@ static const char dvm__env_unread_marker;
 
 static const char *dvm__env_once(_Atomic(const char *) *slot, const char *name)
 {
-   const char *v = atomic_load_explicit(slot, memory_order_relaxed);
-   if (v == DVM_ENV_UNREAD) {
-      v = getenv(name);
-      atomic_store_explicit(slot, v, memory_order_relaxed);
-   }
-   return v;
+  const char *v = atomic_load_explicit(slot, memory_order_relaxed);
+  if (v == DVM_ENV_UNREAD) {
+    v = getenv(name);
+    atomic_store_explicit(slot, v, memory_order_relaxed);
+  }
+  return v;
 }
 
 /* The same idea for call sites that name the variable with a literal and have
@@ -61,39 +63,42 @@ static const char *dvm__env_once(_Atomic(const char *) *slot, const char *name)
  * same pointers; the key is published last, so a reader never sees a value
  * that is not its own. */
 #define DVM_ENV_SLOTS 256u
-static struct { _Atomic(const char *) key; _Atomic(const char *) val; } g_env_cache[DVM_ENV_SLOTS];
+static struct {
+  _Atomic(const char *) key;
+  _Atomic(const char *) val;
+} g_env_cache[DVM_ENV_SLOTS];
 
 const char *dvm__env(const char *name)
 {
-   unsigned i = (unsigned)(((uintptr_t)name >> 3) * 2654435761u >> 8) & (DVM_ENV_SLOTS - 1u);
-   for (unsigned n = 0; n < DVM_ENV_SLOTS; ++n, i = (i + 1u) & (DVM_ENV_SLOTS - 1u)) {
-      const char *k = atomic_load_explicit(&g_env_cache[i].key, memory_order_acquire);
-      if (k == name) return atomic_load_explicit(&g_env_cache[i].val, memory_order_relaxed);
-      if (!k) {
-         const char *v = getenv(name);
-         atomic_store_explicit(&g_env_cache[i].val, v, memory_order_relaxed);
-         atomic_store_explicit(&g_env_cache[i].key, name, memory_order_release);
-         return v;
-      }
-   }
-   return getenv(name);
+  unsigned i = (unsigned)(((uintptr_t)name >> 3) * 2654435761u >> 8) & (DVM_ENV_SLOTS - 1u);
+  for (unsigned n = 0; n < DVM_ENV_SLOTS; ++n, i = (i + 1u) & (DVM_ENV_SLOTS - 1u)) {
+    const char *k = atomic_load_explicit(&g_env_cache[i].key, memory_order_acquire);
+    if (k == name) return atomic_load_explicit(&g_env_cache[i].val, memory_order_relaxed);
+    if (!k) {
+      const char *v = getenv(name);
+      atomic_store_explicit(&g_env_cache[i].val, v, memory_order_relaxed);
+      atomic_store_explicit(&g_env_cache[i].key, name, memory_order_release);
+      return v;
+    }
+  }
+  return getenv(name);
 }
 
 /* The three the hot paths ask for. */
 static const char *dvm__env_strwatch(void)
 {
-   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
-   return dvm__env_once(&slot, "LUNARIA_DVM_STRWATCH");
+  static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+  return dvm__env_once(&slot, "LUNARIA_DVM_STRWATCH");
 }
 static const char *dvm__env_outtrace(void)
 {
-   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
-   return dvm__env_once(&slot, "LUNARIA_DVM_OUTTRACE");
+  static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+  return dvm__env_once(&slot, "LUNARIA_DVM_OUTTRACE");
 }
 static const char *dvm__env_trace_class(void)
 {
-   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
-   return dvm__env_once(&slot, "LUNARIA_DVM_TRACE_CLASS");
+  static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+  return dvm__env_once(&slot, "LUNARIA_DVM_TRACE_CLASS");
 }
 
 /* ------------------------------------------------------------------------ *
@@ -102,112 +107,125 @@ static const char *dvm__env_trace_class(void)
 
 char dvm__kind_of(const char *desc)
 {
-   if (!desc || !*desc) return 'V';
-   switch (*desc) {
-      case 'Z': case 'B': case 'C': case 'S': case 'I':
-      case 'J': case 'F': case 'D': case 'V':
-         return *desc;
-      default:
-         return 'L';   /* object or array */
-   }
+  if (!desc || !*desc) return 'V';
+  switch (*desc) {
+  case 'Z':
+  case 'B':
+  case 'C':
+  case 'S':
+  case 'I':
+  case 'J':
+  case 'F':
+  case 'D':
+  case 'V':
+    return *desc;
+  default:
+    return 'L';   /* object or array */
+  }
 }
 
 int dvm__slots_of(char kind)
 {
-   return (kind == 'J' || kind == 'D') ? 2 : (kind == 'V' ? 0 : 1);
+  return (kind == 'J' || kind == 'D') ? 2 : (kind == 'V' ? 0 : 1);
 }
 
 /* Walks one type descriptor, returning the position just past it. */
 static const char *desc_skip(const char *p)
 {
-   while (*p == '[') ++p;
-   if (*p == 'L') {
-      while (*p && *p != ';') ++p;
-      if (*p == ';') ++p;
-   } else if (*p) {
-      ++p;
-   }
-   return p;
+  while (*p == '[') ++p;
+  if (*p == 'L') {
+    while (*p && *p != ';') ++p;
+    if (*p == ';') ++p;
+  } else if (*p) {
+    ++p;
+  }
+  return p;
 }
 
 int dvm_sig_arg_slots(const char *sig)
 {
-   if (!sig || *sig != '(') return -1;
-   int n = 0;
-   for (const char *p = sig + 1; *p && *p != ')'; ) {
-      const char *q = desc_skip(p);
-      if (q == p) return -1;
-      n += dvm__slots_of(dvm__kind_of(p));
-      p = q;
-   }
-   return n;
+  if (!sig || *sig != '(') return -1;
+  int n = 0;
+  for (const char *p = sig + 1; *p && *p != ')'; ) {
+    const char *q = desc_skip(p);
+    if (q == p) return -1;
+    n += dvm__slots_of(dvm__kind_of(p));
+    p = q;
+  }
+  return n;
 }
 
 int dvm_sig_arg_count(const char *sig)
 {
-   if (!sig || *sig != '(') return -1;
-   int n = 0;
-   for (const char *p = sig + 1; *p && *p != ')'; ) {
-      const char *q = desc_skip(p);
-      if (q == p) return -1;
-      ++n;
-      p = q;
-   }
-   return n;
+  if (!sig || *sig != '(') return -1;
+  int n = 0;
+  for (const char *p = sig + 1; *p && *p != ')'; ) {
+    const char *q = desc_skip(p);
+    if (q == p) return -1;
+    ++n;
+    p = q;
+  }
+  return n;
 }
 
 char dvm_sig_return_kind(const char *sig)
 {
-   const char *p = sig ? strchr(sig, ')') : NULL;
-   return p ? dvm__kind_of(p + 1) : 'V';
+  const char *p = sig ? strchr(sig, ')') : NULL;
+  return p ? dvm__kind_of(p + 1) : 'V';
 }
 
 /* Parameter descriptor `idx` of a signature, into `buf`. */
 bool dvm__sig_param(const char *sig, int idx, char *buf, size_t sz)
 {
-   if (!sig || *sig != '(') return false;
-   const char *p = sig + 1;
-   for (int i = 0; *p && *p != ')'; ++i) {
-      const char *q = desc_skip(p);
-      if (i == idx) {
-         size_t l = (size_t)(q - p);
-         if (l + 1 > sz) return false;
-         memcpy(buf, p, l);
-         buf[l] = '\0';
-         return true;
-      }
-      p = q;
-   }
-   return false;
+  if (!sig || *sig != '(') return false;
+  const char *p = sig + 1;
+  for (int i = 0; *p && *p != ')'; ++i) {
+    const char *q = desc_skip(p);
+    if (i == idx) {
+      size_t l = (size_t)(q - p);
+      if (l + 1 > sz) return false;
+      memcpy(buf, p, l);
+      buf[l] = '\0';
+      return true;
+    }
+    p = q;
+  }
+  return false;
 }
 
 /* JNI form ("com/foo/Bar") into a descriptor ("Lcom/foo/Bar;"). */
 static void name_to_desc(const char *name, char *buf, size_t sz)
 {
-   if (!sz) return;
-   if (!name) { buf[0] = '\0'; return; }
-   const size_t n = strlen(name);
-   const bool wrap = !((name[0] == 'L' && name[n - 1] == ';') || name[0] == '[' ||
-                       (n == 1 && strchr("ZBCSIJFDV", name[0])));
-   const size_t need = n + (wrap ? 2 : 0);
-   if (need >= sz) {   /* truncate the way snprintf did */
-      size_t room = sz - 1, k = 0;
-      if (wrap && room) { buf[k++] = 'L'; --room; }
-      if (room > n) room = n;
-      memcpy(buf + k, name, room);
-      buf[k + room] = '\0';
-   } else if (wrap) {
-      buf[0] = 'L';
-      memcpy(buf + 1, name, n);
-      buf[n + 1] = ';';
-      buf[n + 2] = '\0';
-   } else {
-      memcpy(buf, name, n + 1);
-   }
-   /* Java's dotted form shows up in Class.forName() and in strings the app
-    * hands us; the dex always uses slashes. */
-   for (char *q = buf; *q; ++q)
-      if (*q == '.') *q = '/';
+  if (!sz) return;
+  if (!name) {
+    buf[0] = '\0';
+    return;
+  }
+  const size_t n = strlen(name);
+  const bool wrap = !((name[0] == 'L' && name[n - 1] == ';') || name[0] == '[' ||
+                      (n == 1 && strchr("ZBCSIJFDV", name[0])));
+  const size_t need = n + (wrap ? 2 : 0);
+  if (need >= sz) {   /* truncate the way snprintf did */
+    size_t room = sz - 1, k = 0;
+    if (wrap && room) {
+      buf[k++] = 'L';
+      --room;
+    }
+    if (room > n) room = n;
+    memcpy(buf + k, name, room);
+    buf[k + room] = '\0';
+  } else if (wrap) {
+    buf[0] = 'L';
+    memcpy(buf + 1, name, n);
+    buf[n + 1] = ';';
+    buf[n + 2] = '\0';
+  } else {
+    memcpy(buf, name, n + 1);
+  }
+  /* Java's dotted form shows up in Class.forName() and in strings the app
+   * hands us; the dex always uses slashes. */
+  for (char *q = buf; *q; ++q)
+    if (*q == '.') *q = '/';
 }
 
 /* ------------------------------------------------------------------------ *
@@ -229,61 +247,61 @@ static void name_to_desc(const char *name, char *buf, size_t sz)
  * Only the block table moves, and no caller ever holds a pointer into it. */
 static struct dvm_object *heap_slot(struct dvm *vm, dvm_ref ref)
 {
-   uint32_t i = ref - 1u;
-   return &vm->heap_blocks[i / DVM_HEAP_BLOCK][i % DVM_HEAP_BLOCK];
+  uint32_t i = ref - 1u;
+  return &vm->heap_blocks[i / DVM_HEAP_BLOCK][i % DVM_HEAP_BLOCK];
 }
 
 struct dvm_object *dvm__obj(struct dvm *vm, dvm_ref ref)
 {
-   if (!ref || ref > vm->heap_size) return NULL;
-   struct dvm_object *o = heap_slot(vm, ref);
-   return o->live ? o : NULL;
+  if (!ref || ref > vm->heap_size) return NULL;
+  struct dvm_object *o = heap_slot(vm, ref);
+  return o->live ? o : NULL;
 }
 
 /* The same lookup for the interpreter's own use, where it is worth inlining. */
 static inline __attribute__((always_inline))
 struct dvm_object *obj_fast(struct dvm *vm, dvm_ref ref)
 {
-   if (__builtin_expect(!ref || ref > vm->heap_size, 0)) return NULL;
-   struct dvm_object *o = &vm->heap_blocks[(ref - 1u) / DVM_HEAP_BLOCK][(ref - 1u) % DVM_HEAP_BLOCK];
-   return o->live ? o : NULL;
+  if (__builtin_expect(!ref || ref > vm->heap_size, 0)) return NULL;
+  struct dvm_object *o = &vm->heap_blocks[(ref - 1u) / DVM_HEAP_BLOCK][(ref - 1u) % DVM_HEAP_BLOCK];
+  return o->live ? o : NULL;
 }
 
 static dvm_ref heap_alloc(struct dvm *vm)
 {
-   if (vm->free_head) {
-      dvm_ref r = vm->free_head;
-      struct dvm_object *o = heap_slot(vm, r);
-      vm->free_head = o->next_free;
-      memset(o, 0, sizeof *o);
-      o->live = true;
-      return r;
-   }
-   if (vm->heap_size == vm->heap_cap) {
-      struct dvm_object **t =
-         realloc(vm->heap_blocks, (size_t)(vm->heap_nblocks + 1) * sizeof *t);
-      if (!t) return 0;
-      vm->heap_blocks = t;
-      struct dvm_object *blk = calloc(DVM_HEAP_BLOCK, sizeof *blk);
-      if (!blk) return 0;
-      vm->heap_blocks[vm->heap_nblocks++] = blk;
-      vm->heap_cap += DVM_HEAP_BLOCK;
-   }
-   dvm_ref r = ++vm->heap_size;
-   heap_slot(vm, r)->live = true;
-   return r;
+  if (vm->free_head) {
+    dvm_ref r = vm->free_head;
+    struct dvm_object *o = heap_slot(vm, r);
+    vm->free_head = o->next_free;
+    memset(o, 0, sizeof *o);
+    o->live = true;
+    return r;
+  }
+  if (vm->heap_size == vm->heap_cap) {
+    struct dvm_object **t =
+      realloc(vm->heap_blocks, (size_t)(vm->heap_nblocks + 1) * sizeof *t);
+    if (!t) return 0;
+    vm->heap_blocks = t;
+    struct dvm_object *blk = calloc(DVM_HEAP_BLOCK, sizeof *blk);
+    if (!blk) return 0;
+    vm->heap_blocks[vm->heap_nblocks++] = blk;
+    vm->heap_cap += DVM_HEAP_BLOCK;
+  }
+  dvm_ref r = ++vm->heap_size;
+  heap_slot(vm, r)->live = true;
+  return r;
 }
 
 void dvm_pin(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (o) ++o->pins;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  if (o) ++o->pins;
 }
 
 void dvm_unpin(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (o && o->pins) --o->pins;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  if (o && o->pins) --o->pins;
 }
 
 /* No collector.  The VM runs short bursts of app glue code (an activity
@@ -295,169 +313,186 @@ void dvm_unpin(struct dvm *vm, dvm_ref ref)
  * builtin. */
 static void object_data_destroy(struct dvm_object *o)
 {
-   if (o->data_destroy) o->data_destroy(o->data_owner ? o->data_owner : o->data);
-   else free(o->data);
-   o->data = NULL;
-   o->data_destroy = NULL;
-   o->data_owner = NULL;
+  if (o->data_destroy) o->data_destroy(o->data_owner ? o->data_owner : o->data);
+  else free(o->data);
+  o->data = NULL;
+  o->data_destroy = NULL;
+  o->data_owner = NULL;
 }
 
 static void heap_free(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (!o || o->pins) return;
-   free(o->utf8);
-   free(o->string_units);
-   object_data_destroy(o);
-   free(o->slots);
-   memset(o, 0, sizeof *o);
-   o->next_free = vm->free_head;
-   vm->free_head = ref;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  if (!o || o->pins) return;
+  free(o->utf8);
+  free(o->string_units);
+  object_data_destroy(o);
+  free(o->slots);
+  memset(o, 0, sizeof *o);
+  o->next_free = vm->free_head;
+  vm->free_head = ref;
 }
 
 void dvm__discard_temporary(struct dvm *vm,dvm_ref ref)
 {
-   heap_free(vm,ref);
+  heap_free(vm,ref);
 }
 
 dvm_ref dvm_new_object(struct dvm *vm, struct dvm_class *cls)
 {
-   if (!cls) return 0;
-   dvm_ref r = heap_alloc(vm);
-   if (!r) return 0;
-   struct dvm_object *o = heap_slot(vm, r);
-   o->cls = cls;
-   o->kind = DVM_OBJ_PLAIN;
-   if (cls->islots > 0) {
-      o->slots = calloc((size_t)cls->islots, sizeof *o->slots);
-      if (!o->slots) { heap_free(vm, r); return 0; }
-   }
-   return r;
+  if (!cls) return 0;
+  dvm_ref r = heap_alloc(vm);
+  if (!r) return 0;
+  struct dvm_object *o = heap_slot(vm, r);
+  o->cls = cls;
+  o->kind = DVM_OBJ_PLAIN;
+  if (cls->islots > 0) {
+    o->slots = calloc((size_t)cls->islots, sizeof *o->slots);
+    if (!o->slots) {
+      heap_free(vm, r);
+      return 0;
+    }
+  }
+  return r;
 }
 
 dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len)
 {
-   struct dvm_class *cls = dvm__class_by_desc(vm, "Ljava/lang/String;");
-   dvm_ref r = heap_alloc(vm);
-   if (!r) return 0;
-   struct dvm_object *o = heap_slot(vm, r);
-   o->cls = cls;
-   o->kind = DVM_OBJ_STRING;
-   o->utf8 = malloc(len + 1);
-   if (!o->utf8) { heap_free(vm, r); return 0; }
-   if (len) memcpy(o->utf8, utf8, len);
-   o->utf8[len] = '\0';
-   o->utf8_len = (uint32_t)len;
-   {
-      const char *want = dvm__env_strwatch();
-      if (want && strstr(o->utf8, want))
-         fprintf(stderr, "[dvm] new-string \"%.200s\" in %s.%s\n", o->utf8,
-                 vm->cur_method && vm->cur_method->cls
-                    ? vm->cur_method->cls->name : "?",
-                 vm->cur_method ? vm->cur_method->name : "?");
-   }
-   return r;
+  struct dvm_class *cls = dvm__class_by_desc(vm, "Ljava/lang/String;");
+  dvm_ref r = heap_alloc(vm);
+  if (!r) return 0;
+  struct dvm_object *o = heap_slot(vm, r);
+  o->cls = cls;
+  o->kind = DVM_OBJ_STRING;
+  o->utf8 = malloc(len + 1);
+  if (!o->utf8) {
+    heap_free(vm, r);
+    return 0;
+  }
+  if (len) memcpy(o->utf8, utf8, len);
+  o->utf8[len] = '\0';
+  o->utf8_len = (uint32_t)len;
+  {
+    const char *want = dvm__env_strwatch();
+    if (want && strstr(o->utf8, want))
+      fprintf(stderr, "[dvm] new-string \"%.200s\" in %s.%s\n", o->utf8,
+              vm->cur_method && vm->cur_method->cls
+              ? vm->cur_method->cls->name : "?",
+              vm->cur_method ? vm->cur_method->name : "?");
+  }
+  return r;
 }
 
 dvm_ref dvm_new_string(struct dvm *vm, const char *utf8)
 {
-   return dvm_new_string_n(vm, utf8 ? utf8 : "", utf8 ? strlen(utf8) : 0);
+  return dvm_new_string_n(vm, utf8 ? utf8 : "", utf8 ? strlen(utf8) : 0);
 }
 
 dvm_ref dvm_new_array(struct dvm *vm, char elem, const char *elem_desc, uint32_t length)
 {
-   char primitive[2]={elem,0};
-   const char *component=elem_desc ? elem_desc : elem=='L' ? "Ljava/lang/Object;" : primitive;
-   size_t count=0;while(component[count]=='[')++count;
-   if (count>=255 || !*component || !strcmp(component,"V")) {
-      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid array component");return 0;
-   }
-   size_t length_desc=strlen(component);
-   char local[256], *desc=length_desc+2<=sizeof local ? local : malloc(length_desc+2);
-   if (!desc) {dvm__throw(vm,"java/lang/OutOfMemoryError","array descriptor");return 0;}
-   desc[0]='[';memcpy(desc+1,component,length_desc+1);
-   struct dvm_class *cls=dvm__class_by_desc(vm,desc);
-   if (desc!=local)free(desc);
-   size_t width=(size_t)dvm__elem_width(elem);
-   if (!width || length>SIZE_MAX/width) {
-      dvm__throw(vm,"java/lang/OutOfMemoryError","array allocation size");return 0;
-   }
+  char primitive[2]= {elem,0};
+  const char *component=elem_desc ? elem_desc : elem=='L' ? "Ljava/lang/Object;" : primitive;
+  size_t count=0;
+  while(component[count]=='[')++count;
+  if (count>=255 || !*component || !strcmp(component,"V")) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","invalid array component");
+    return 0;
+  }
+  size_t length_desc=strlen(component);
+  char local[256], *desc=length_desc+2<=sizeof local ? local : malloc(length_desc+2);
+  if (!desc) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","array descriptor");
+    return 0;
+  }
+  desc[0]='[';
+  memcpy(desc+1,component,length_desc+1);
+  struct dvm_class *cls=dvm__class_by_desc(vm,desc);
+  if (desc!=local)free(desc);
+  size_t width=(size_t)dvm__elem_width(elem);
+  if (!width || length>SIZE_MAX/width) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","array allocation size");
+    return 0;
+  }
 
-   dvm_ref r = heap_alloc(vm);
-   if (!r) return 0;
-   struct dvm_object *o = heap_slot(vm, r);
-   o->cls = cls;
-   o->kind = DVM_OBJ_ARRAY;
-   o->length = length;
-   o->elem_kind = elem;
-   size_t bytes = (size_t)length * width;
-   o->data = calloc(bytes ? bytes : 1, 1);
-   if (!o->data) { heap_free(vm, r); dvm__throw(vm,"java/lang/OutOfMemoryError","array data");return 0; }
-   return r;
+  dvm_ref r = heap_alloc(vm);
+  if (!r) return 0;
+  struct dvm_object *o = heap_slot(vm, r);
+  o->cls = cls;
+  o->kind = DVM_OBJ_ARRAY;
+  o->length = length;
+  o->elem_kind = elem;
+  size_t bytes = (size_t)length * width;
+  o->data = calloc(bytes ? bytes : 1, 1);
+  if (!o->data) {
+    heap_free(vm, r);
+    dvm__throw(vm,"java/lang/OutOfMemoryError","array data");
+    return 0;
+  }
+  return r;
 }
 
 struct dvm_class *dvm_object_class(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return o ? o->cls : NULL;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return o ? o->cls : NULL;
 }
 
 const char *dvm_string_utf8(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return (o && o->kind == DVM_OBJ_STRING) ? o->utf8 : NULL;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return (o && o->kind == DVM_OBJ_STRING) ? o->utf8 : NULL;
 }
 
 uint32_t dvm_string_utf8_length(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return (o && o->kind == DVM_OBJ_STRING) ? o->utf8_len : 0;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return (o && o->kind == DVM_OBJ_STRING) ? o->utf8_len : 0;
 }
 
 uint32_t dvm_array_length(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return (o && o->kind == DVM_OBJ_ARRAY) ? o->length : 0;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return (o && o->kind == DVM_OBJ_ARRAY) ? o->length : 0;
 }
 
 void *dvm_array_data(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return (o && o->kind == DVM_OBJ_ARRAY) ? o->data : NULL;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return (o && o->kind == DVM_OBJ_ARRAY) ? o->data : NULL;
 }
 
 dvm_ref dvm_wrap_external(struct dvm *vm, const char *class_name, uint32_t host_handle)
 {
-   char desc[512];
-   name_to_desc(class_name, desc, sizeof desc);
-   struct dvm_class *cls = dvm__class_by_desc(vm, desc);
-   dvm_ref r = heap_alloc(vm);
-   if (!r) return 0;
-   struct dvm_object *o = heap_slot(vm, r);
-   o->cls = cls;
-   o->kind = DVM_OBJ_EXTERNAL;
-   o->host_handle = host_handle;
-   if (cls && cls->islots > 0)
-      o->slots = calloc((size_t)cls->islots, sizeof *o->slots);
-   return r;
+  char desc[512];
+  name_to_desc(class_name, desc, sizeof desc);
+  struct dvm_class *cls = dvm__class_by_desc(vm, desc);
+  dvm_ref r = heap_alloc(vm);
+  if (!r) return 0;
+  struct dvm_object *o = heap_slot(vm, r);
+  o->cls = cls;
+  o->kind = DVM_OBJ_EXTERNAL;
+  o->host_handle = host_handle;
+  if (cls && cls->islots > 0)
+    o->slots = calloc((size_t)cls->islots, sizeof *o->slots);
+  return r;
 }
 
 uint32_t dvm_external_handle(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return o ? o->host_handle : 0;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return o ? o->host_handle : 0;
 }
 
 /* --- interning ---------------------------------------------------------- */
 
 struct dvm_intern {
-   /* Points at the pinned String object's immutable utf8 storage.  Keeping a
-    * second strdup here served no ownership purpose and, worse, its unchecked
-    * allocation failure published a NULL key: the next intern operation then
-    * crashed the host in strcmp(). */
-   const char *key;
-   dvm_ref ref;
-   uint32_t hash;
+  /* Points at the pinned String object's immutable utf8 storage.  Keeping a
+   * second strdup here served no ownership purpose and, worse, its unchecked
+   * allocation failure published a NULL key: the next intern operation then
+   * crashed the host in strcmp(). */
+  const char *key;
+  dvm_ref ref;
+  uint32_t hash;
 };
 
 /* ------------------------------------------------------------------------ *
@@ -466,111 +501,129 @@ struct dvm_intern {
 
 static uint32_t str_hash(const char *s)
 {
-   uint32_t h = 2166136261u;
-   for (; *s; ++s) h = (h ^ (uint8_t)*s) * 16777619u;
-   return h;
+  uint32_t h = 2166136261u;
+  for (; *s; ++s) h = (h ^ (uint8_t)*s) * 16777619u;
+  return h;
 }
 
 dvm_ref dvm__intern(struct dvm *vm, const char *utf8)
 {
-   const uint32_t hash = str_hash(utf8);
-   if (vm->interns_cap) {
-      unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
-      while (vm->interns[slot].ref) {
-         const struct dvm_intern *entry = vm->interns + slot;
-         if (entry->hash == hash && !strcmp(entry->key, utf8)) return entry->ref;
-         slot = (slot + 1u) & (unsigned)(vm->interns_cap - 1);
-      }
-   }
-
-   dvm_ref r = dvm_new_string(vm, utf8);
-   if (!r) return 0;
-   dvm_pin(vm, r);
-
-   /* Literals remain pinned for the VM's lifetime, so the pool has no deletes.
-    * A half-full open-addressed table avoids a scan of every literal on each
-    * const-string and String.intern call, without another allocation per key. */
-   if (vm->ninterns >= vm->interns_cap / 2) {
-      if (vm->interns_cap > INT32_MAX / 2) return r;
-      int cap = vm->interns_cap ? vm->interns_cap * 2 : 64;
-      struct dvm_intern *n = calloc((size_t)cap, sizeof *n);
-      if (!n) return r;
-      for (int i = 0; i < vm->interns_cap; ++i) {
-         if (!vm->interns[i].ref) continue;
-         unsigned slot = vm->interns[i].hash & (unsigned)(cap - 1);
-         while (n[slot].ref) slot = (slot + 1u) & (unsigned)(cap - 1);
-         n[slot] = vm->interns[i];
-      }
-      free(vm->interns);
-      vm->interns = n;
-      vm->interns_cap = cap;
-   }
-   /* r was pinned above, so its backing object and utf8 allocation live until
-    * dvm_destroy().  Use that storage as the table key: Java intern strings
-    * are immutable, and one allocation per value is both sufficient and the
-    * only failure-atomic representation. */
-   const char *key = dvm_string_utf8(vm, r);
-   if (!key) return r; /* defensive: never publish a NULL comparison key */
-   unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
-   while (vm->interns[slot].ref)
+  const uint32_t hash = str_hash(utf8);
+  if (vm->interns_cap) {
+    unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
+    while (vm->interns[slot].ref) {
+      const struct dvm_intern *entry = vm->interns + slot;
+      if (entry->hash == hash && !strcmp(entry->key, utf8)) return entry->ref;
       slot = (slot + 1u) & (unsigned)(vm->interns_cap - 1);
-   vm->interns[slot] = (struct dvm_intern){ .key = key, .ref = r, .hash = hash };
-   ++vm->ninterns;
-   return r;
+    }
+  }
+
+  dvm_ref r = dvm_new_string(vm, utf8);
+  if (!r) return 0;
+  dvm_pin(vm, r);
+
+  /* Literals remain pinned for the VM's lifetime, so the pool has no deletes.
+   * A half-full open-addressed table avoids a scan of every literal on each
+   * const-string and String.intern call, without another allocation per key. */
+  if (vm->ninterns >= vm->interns_cap / 2) {
+    if (vm->interns_cap > INT32_MAX / 2) return r;
+    int cap = vm->interns_cap ? vm->interns_cap * 2 : 64;
+    struct dvm_intern *n = calloc((size_t)cap, sizeof *n);
+    if (!n) return r;
+    for (int i = 0; i < vm->interns_cap; ++i) {
+      if (!vm->interns[i].ref) continue;
+      unsigned slot = vm->interns[i].hash & (unsigned)(cap - 1);
+      while (n[slot].ref) slot = (slot + 1u) & (unsigned)(cap - 1);
+      n[slot] = vm->interns[i];
+    }
+    free(vm->interns);
+    vm->interns = n;
+    vm->interns_cap = cap;
+  }
+  /* r was pinned above, so its backing object and utf8 allocation live until
+   * dvm_destroy().  Use that storage as the table key: Java intern strings
+   * are immutable, and one allocation per value is both sufficient and the
+   * only failure-atomic representation. */
+  const char *key = dvm_string_utf8(vm, r);
+  if (!key) return r; /* defensive: never publish a NULL comparison key */
+  unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
+  while (vm->interns[slot].ref)
+    slot = (slot + 1u) & (unsigned)(vm->interns_cap - 1);
+  vm->interns[slot] = (struct dvm_intern) {
+    .key = key, .ref = r, .hash = hash
+  };
+  ++vm->ninterns;
+  return r;
 }
 
 static struct dvm_class *class_lookup(struct dvm *vm, const char *desc)
 {
-   uint32_t h = str_hash(desc) % DVM_CLASS_HASH;
-   for (struct dvm_class *c = vm->class_hash[h]; c; c = c->hash_next)
-      if (!strcmp(c->desc, desc)) return c;
-   return NULL;
+  uint32_t h = str_hash(desc) % DVM_CLASS_HASH;
+  for (struct dvm_class *c = vm->class_hash[h]; c; c = c->hash_next)
+    if (!strcmp(c->desc, desc)) return c;
+  return NULL;
 }
 
 static struct dvm_class *class_register(struct dvm *vm, const char *desc)
 {
-   struct dvm_class *c = calloc(1, sizeof *c);
-   if (!c) return NULL;
-   c->desc = strdup(desc);
-   if (!c->desc) { free(c); return NULL; }
+  struct dvm_class *c = calloc(1, sizeof *c);
+  if (!c) return NULL;
+  c->desc = strdup(desc);
+  if (!c->desc) {
+    free(c);
+    return NULL;
+  }
 
-   size_t n = strlen(desc);
-   if (desc[0] == 'L' && n >= 2 && desc[n - 1] == ';') {
-      c->name = malloc(n - 1);
-      if (c->name) { memcpy(c->name, desc + 1, n - 2); c->name[n - 2] = '\0'; }
-   } else {
-      c->name = strdup(desc);
-   }
-   if (!c->name) { free(c->desc); free(c); return NULL; }
+  size_t n = strlen(desc);
+  if (desc[0] == 'L' && n >= 2 && desc[n - 1] == ';') {
+    c->name = malloc(n - 1);
+    if (c->name) {
+      memcpy(c->name, desc + 1, n - 2);
+      c->name[n - 2] = '\0';
+    }
+  } else {
+    c->name = strdup(desc);
+  }
+  if (!c->name) {
+    free(c->desc);
+    free(c);
+    return NULL;
+  }
 
-   uint32_t h = str_hash(desc) % DVM_CLASS_HASH;
-   c->hash_next = vm->class_hash[h];
-   vm->class_hash[h] = c;
+  uint32_t h = str_hash(desc) % DVM_CLASS_HASH;
+  c->hash_next = vm->class_hash[h];
+  vm->class_hash[h] = c;
 
-   if (vm->nclasses == vm->classes_cap) {
-      int cap = vm->classes_cap ? vm->classes_cap * 2 : 256;
-      struct dvm_class **nn = realloc(vm->classes, (size_t)cap * sizeof *nn);
-      if (nn) { vm->classes = nn; vm->classes_cap = cap; }
-   }
-   if (vm->nclasses < vm->classes_cap)
-      vm->classes[vm->nclasses++] = c;
-   return c;
+  if (vm->nclasses == vm->classes_cap) {
+    int cap = vm->classes_cap ? vm->classes_cap * 2 : 256;
+    struct dvm_class **nn = realloc(vm->classes, (size_t)cap * sizeof *nn);
+    if (nn) {
+      vm->classes = nn;
+      vm->classes_cap = cap;
+    }
+  }
+  if (vm->nclasses < vm->classes_cap)
+    vm->classes[vm->nclasses++] = c;
+  return c;
 }
 
 /* dvm_runtime.c builds its classes through this so the registry (hash chain,
  * teardown list) stays owned by one file. */
 struct dvm_class *dvm__register_builtin(struct dvm *vm, const char *desc)
 {
-   return class_register(vm, desc);
+  return class_register(vm, desc);
 }
 
 struct dvm_class *dvm__define_primitive(struct dvm *vm, const char *desc)
 {
-   struct dvm_class *c = class_lookup(vm, desc);
-   if (c) return c;
-   c = class_register(vm, desc);
-   if (c) { c->is_primitive = true; c->init_state = 2; }
-   return c;
+  struct dvm_class *c = class_lookup(vm, desc);
+  if (c) return c;
+  c = class_register(vm, desc);
+  if (c) {
+    c->is_primitive = true;
+    c->init_state = 2;
+  }
+  return c;
 }
 
 static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
@@ -580,113 +633,116 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
 
 static void note_missing(struct dvm *vm, const char *what)
 {
-   for (int i = 0; i < vm->nmissing; ++i)
-      if (!strcmp(vm->missing[i], what)) return;
-   if (vm->nmissing == vm->missing_cap) {
-      int cap = vm->missing_cap ? vm->missing_cap * 2 : 64;
-      char **n = realloc(vm->missing, (size_t)cap * sizeof *n);
-      if (!n) return;
-      vm->missing = n;
-      vm->missing_cap = cap;
-   }
-   vm->missing[vm->nmissing++] = strdup(what);
-   fprintf(stderr, "[dvm] WARNING: %s\n", what);
+  for (int i = 0; i < vm->nmissing; ++i)
+    if (!strcmp(vm->missing[i], what)) return;
+  if (vm->nmissing == vm->missing_cap) {
+    int cap = vm->missing_cap ? vm->missing_cap * 2 : 64;
+    char **n = realloc(vm->missing, (size_t)cap * sizeof *n);
+    if (!n) return;
+    vm->missing = n;
+    vm->missing_cap = cap;
+  }
+  vm->missing[vm->nmissing++] = strdup(what);
+  fprintf(stderr, "[dvm] WARNING: %s\n", what);
 }
 
 /* Descriptors the boot class loader defines: java/, javax/, android/ and the
  * runtime's own dalvik/ and libcore/.  androidx/ is application code. */
 static bool desc_is_boot_class(const char *desc)
 {
-   if(dvm_runtime_http_core_class(desc))return true;
-   static const char *const ns[] = {
-      "Ljava/", "Ljavax/", "Landroid/", "Ldalvik/", "Llibcore/",
-   };
-   for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
-      if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
-   return false;
+  if(dvm_runtime_http_core_class(desc))return true;
+  static const char *const ns[] = {
+    "Ljava/", "Ljavax/", "Landroid/", "Ldalvik/", "Llibcore/",
+  };
+  for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
+    if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
+  return false;
 }
 
 struct dvm_class *(dvm__class_by_desc)(struct dvm *vm, const char *desc)
 {
-   if (!desc || !*desc) return NULL;
+  if (!desc || !*desc) return NULL;
 
-   struct dvm_class *c = class_lookup(vm, desc);
-   if (c) {
-      /* A failed lookup is not a class definition. A dynamically loaded DEX
-       * may now define a formerly unresolved application type. Preserve the
-       * descriptor's identity for existing type references, but load its real
-       * fields, methods and class initializer before answering the lookup. */
-      if (c->synthesized && !desc_is_boot_class(desc) && c->unresolved_dexes < vm->ndexes) {
-         int first = c->unresolved_dexes;
-         c->unresolved_dexes = vm->ndexes;
-         for (int i = first; i < vm->ndexes; ++i) {
-            int index = dex_find_class(&vm->dexes[i]->file, desc);
-            if (index < 0) continue;
-            free(c->mcache); c->mcache = NULL; c->mcache_cap = c->mcache_len = 0;
-            c->external = c->synthesized = false;
-            c->init_state = 0;
-            if (!class_load_from_dex(vm, c, vm->dexes[i], (uint32_t)index)) {
-               c->external = true; c->init_state = 2;
-            }
-            break;
-         }
+  struct dvm_class *c = class_lookup(vm, desc);
+  if (c) {
+    /* A failed lookup is not a class definition. A dynamically loaded DEX
+     * may now define a formerly unresolved application type. Preserve the
+     * descriptor's identity for existing type references, but load its real
+     * fields, methods and class initializer before answering the lookup. */
+    if (c->synthesized && !desc_is_boot_class(desc) && c->unresolved_dexes < vm->ndexes) {
+      int first = c->unresolved_dexes;
+      c->unresolved_dexes = vm->ndexes;
+      for (int i = first; i < vm->ndexes; ++i) {
+        int index = dex_find_class(&vm->dexes[i]->file, desc);
+        if (index < 0) continue;
+        free(c->mcache);
+        c->mcache = NULL;
+        c->mcache_cap = c->mcache_len = 0;
+        c->external = c->synthesized = false;
+        c->init_state = 0;
+        if (!class_load_from_dex(vm, c, vm->dexes[i], (uint32_t)index)) {
+          c->external = true;
+          c->init_state = 2;
+        }
+        break;
       }
-      return c;
-   }
+    }
+    return c;
+  }
 
-   if (desc[0] == '[') {
-      c = class_register(vm, desc);
-      if (!c) return NULL;
-      c->is_array = true;
+  if (desc[0] == '[') {
+    c = class_register(vm, desc);
+    if (!c) return NULL;
+    c->is_array = true;
+    c->init_state = 2;
+    c->elem_kind = dvm__kind_of(desc + 1);
+    c->elem = dvm__class_by_desc(vm, desc + 1);
+    c->super = dvm__class_by_desc(vm, "Ljava/lang/Object;");
+    return c;
+  }
+  if (desc[1] == '\0' && strchr("ZBCSIJFDV", desc[0]))
+    return dvm__define_primitive(vm, desc);
+
+  /* The boot classpath wins for the namespaces the platform owns: ART's
+   * application loader asks its parent first, and java.* may not be defined
+   * by an app at all.  APKs do carry android.* classes (R8 API-modelling
+   * stubs for APIs newer than minSdk, e.g. android.os.LocaleList) that must
+   * never shadow the real class, which this device has.  A platform class
+   * the runtime does not model yet falls through to the dex definition, then
+   * to the host-backed stub below. */
+  if (desc_is_boot_class(desc)) {
+    c = dvm_runtime_define(vm, desc);
+    if (c) return c;
+  }
+  /* Enabled device shared libraries are a separate delegation step before
+   * the application's DEX, not an expansion of the boot namespace. */
+  c=dvm_runtime_shared_define(vm,desc);
+  if(c)return c;
+  /* Otherwise a dex definition wins; then a built-in; then a host stub. */
+  for (int i = 0; i < vm->ndexes; ++i) {
+    int idx = dex_find_class(&vm->dexes[i]->file, desc);
+    if (idx < 0) continue;
+    c = class_register(vm, desc);
+    if (!c) return NULL;
+    if (!class_load_from_dex(vm, c, vm->dexes[i], (uint32_t)idx)) {
+      c->external = true;
       c->init_state = 2;
-      c->elem_kind = dvm__kind_of(desc + 1);
-      c->elem = dvm__class_by_desc(vm, desc + 1);
-      c->super = dvm__class_by_desc(vm, "Ljava/lang/Object;");
-      return c;
-   }
-   if (desc[1] == '\0' && strchr("ZBCSIJFDV", desc[0]))
-      return dvm__define_primitive(vm, desc);
+    }
+    return c;
+  }
 
-   /* The boot classpath wins for the namespaces the platform owns: ART's
-    * application loader asks its parent first, and java.* may not be defined
-    * by an app at all.  APKs do carry android.* classes (R8 API-modelling
-    * stubs for APIs newer than minSdk, e.g. android.os.LocaleList) that must
-    * never shadow the real class, which this device has.  A platform class
-    * the runtime does not model yet falls through to the dex definition, then
-    * to the host-backed stub below. */
-   if (desc_is_boot_class(desc)) {
-      c = dvm_runtime_define(vm, desc);
-      if (c) return c;
-   }
-   /* Enabled device shared libraries are a separate delegation step before
-    * the application's DEX, not an expansion of the boot namespace. */
-   c=dvm_runtime_shared_define(vm,desc);
-   if(c)return c;
-   /* Otherwise a dex definition wins; then a built-in; then a host stub. */
-   for (int i = 0; i < vm->ndexes; ++i) {
-      int idx = dex_find_class(&vm->dexes[i]->file, desc);
-      if (idx < 0) continue;
-      c = class_register(vm, desc);
-      if (!c) return NULL;
-      if (!class_load_from_dex(vm, c, vm->dexes[i], (uint32_t)idx)) {
-         c->external = true;
-         c->init_state = 2;
-      }
-      return c;
-   }
+  c = dvm_runtime_define(vm, desc);
+  if (c) return c;
 
-   c = dvm_runtime_define(vm, desc);
-   if (c) return c;
-
-   c = class_register(vm, desc);
-   if (!c) return NULL;
-   c->external = true;
-   c->synthesized = true;
-   c->unresolved_dexes = vm->ndexes;
-   c->init_state = 2;
-   c->super = strcmp(desc, "Ljava/lang/Object;")
-                ? dvm__class_by_desc(vm, "Ljava/lang/Object;") : NULL;
-   return c;
+  c = class_register(vm, desc);
+  if (!c) return NULL;
+  c->external = true;
+  c->synthesized = true;
+  c->unresolved_dexes = vm->ndexes;
+  c->init_state = 2;
+  c->super = strcmp(desc, "Ljava/lang/Object;")
+             ? dvm__class_by_desc(vm, "Ljava/lang/Object;") : NULL;
+  return c;
 }
 
 /* Is this descriptor in one of the namespaces a device provides?
@@ -700,17 +756,17 @@ struct dvm_class *(dvm__class_by_desc)(struct dvm *vm, const char *desc)
  * app does.  See the NoClassDefFoundError in new-instance. */
 static bool desc_is_platform(const char *desc)
 {
-   static const char *const ns[] = {
-      "Ljava/", "Ljavax/", "Landroid/", "Landroidx/", "Ldalvik/", "Llibcore/",
-      "Lsun/", "Lcom/android/", "Lorg/apache/", "Lorg/json/", "Lorg/w3c/",
-      "Lorg/xml/", "Lorg/xmlpull/", "Ljunit/",
-   };
-   if (!desc) return true;
-   if(!strncmp(desc,"Lorg/apache/http/",17) && !dvm_runtime_http_core_class(desc) && !dvm_runtime_http_optional_enabled())return false;
-   if (desc[0] == '[') return true;             /* arrays are synthesised */
-   for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
-      if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
-   return false;
+  static const char *const ns[] = {
+    "Ljava/", "Ljavax/", "Landroid/", "Landroidx/", "Ldalvik/", "Llibcore/",
+    "Lsun/", "Lcom/android/", "Lorg/apache/", "Lorg/json/", "Lorg/w3c/",
+    "Lorg/xml/", "Lorg/xmlpull/", "Ljunit/",
+  };
+  if (!desc) return true;
+  if(!strncmp(desc,"Lorg/apache/http/",17) && !dvm_runtime_http_core_class(desc) && !dvm_runtime_http_optional_enabled())return false;
+  if (desc[0] == '[') return true;             /* arrays are synthesised */
+  for (size_t i = 0; i < sizeof ns / sizeof ns[0]; ++i)
+    if (!strncmp(desc, ns[i], strlen(ns[i]))) return true;
+  return false;
 }
 
 /* The class the dex names is nowhere: not in the APK, not in the platform,
@@ -719,37 +775,37 @@ static bool desc_is_platform(const char *desc)
  * is only interesting when it is not. */
 static bool class_absent(struct dvm *vm, struct dvm_class *c)
 {
-   if (!c || !c->synthesized || desc_is_platform(c->desc)) return false;
-   char what[512];
-   snprintf(what, sizeof what, "class not found in the APK or the platform, stubbed: %s",
-            c->name ? c->name : c->desc);
-   note_missing(vm, what);
-   return true;
+  if (!c || !c->synthesized || desc_is_platform(c->desc)) return false;
+  char what[512];
+  snprintf(what, sizeof what, "class not found in the APK or the platform, stubbed: %s",
+           c->name ? c->name : c->desc);
+  note_missing(vm, what);
+  return true;
 }
 
 struct dvm_class *(dvm_find_class)(struct dvm *vm, const char *name)
 {
-   char desc[512];
-   name_to_desc(name, desc, sizeof desc);
-   struct dvm_class *c = dvm__class_by_desc(vm, desc);
-   return (c && !c->external) ? c : NULL;
+  char desc[512];
+  name_to_desc(name, desc, sizeof desc);
+  struct dvm_class *c = dvm__class_by_desc(vm, desc);
+  return (c && !c->external) ? c : NULL;
 }
 
 struct dvm_class *dvm_find_class_or_external(struct dvm *vm, const char *name)
 {
-   char desc[512];
-   name_to_desc(name, desc, sizeof desc);
-   return dvm__class_by_desc(vm, desc);
+  char desc[512];
+  name_to_desc(name, desc, sizeof desc);
+  return dvm__class_by_desc(vm, desc);
 }
 
 bool dvm_class_is_known(struct dvm *vm, const char *name)
 {
-   char desc[512];
-   name_to_desc(name, desc, sizeof desc);
-   for (int i = 0; i < vm->ndexes; ++i)
-      if (dex_find_class(&vm->dexes[i]->file, desc) >= 0) return true;
-   struct dvm_class *c = class_lookup(vm, desc);
-   return c && !c->external;
+  char desc[512];
+  name_to_desc(name, desc, sizeof desc);
+  for (int i = 0; i < vm->ndexes; ++i)
+    if (dex_find_class(&vm->dexes[i]->file, desc) >= 0) return true;
+  struct dvm_class *c = class_lookup(vm, desc);
+  return c && !c->external;
 }
 
 /* Existence comes from the app's DEX, provided VM classes, or the platform's
@@ -759,44 +815,50 @@ bool dvm_class_is_known(struct dvm *vm, const char *name)
  * that the referenced class exists. */
 bool dvm_class_exists(struct dvm *vm, const char *name)
 {
-   if (!name || !*name) return false;
-   char desc[512];
-   name_to_desc(name, desc, sizeof desc);
-   if (desc[0] == '[') {
-      const char *component = desc;
-      while (*component == '[') ++component;
-      if (component - desc > 255) return false;
-      if (*component == 'L') return dvm_class_exists(vm, component);
-      return component[0] && !component[1] && strchr("ZBCSIJFD", component[0]);
-   }
-   size_t length = strlen(desc);
-   if (length < 3 || desc[0] != 'L' || desc[length - 1] != ';') return false;
-   if (dvm_class_is_known(vm, desc)) return true;
-   if(dvm_runtime_shared_class_exists(vm,desc))return true;
-   return dvm_platform_class_exists(desc);
+  if (!name || !*name) return false;
+  char desc[512];
+  name_to_desc(name, desc, sizeof desc);
+  if (desc[0] == '[') {
+    const char *component = desc;
+    while (*component == '[') ++component;
+    if (component - desc > 255) return false;
+    if (*component == 'L') return dvm_class_exists(vm, component);
+    return component[0] && !component[1] && strchr("ZBCSIJFD", component[0]);
+  }
+  size_t length = strlen(desc);
+  if (length < 3 || desc[0] != 'L' || desc[length - 1] != ';') return false;
+  if (dvm_class_is_known(vm, desc)) return true;
+  if(dvm_runtime_shared_class_exists(vm,desc))return true;
+  return dvm_platform_class_exists(desc);
 }
 
-const char *dvm_class_name(const struct dvm_class *c) { return c ? c->name : "?"; }
+const char *dvm_class_name(const struct dvm_class *c) {
+  return c ? c->name : "?";
+}
 const char *dvm_class_super_name(const struct dvm_class *c)
 {
-   return (c && c->super) ? c->super->name : NULL;
+  return (c && c->super) ? c->super->name : NULL;
 }
-const char *dvm_method_name(const struct dvm_method *m) { return m ? m->name : "?"; }
-const char *dvm_method_sig(const struct dvm_method *m) { return m ? m->sig : "?"; }
+const char *dvm_method_name(const struct dvm_method *m) {
+  return m ? m->name : "?";
+}
+const char *dvm_method_sig(const struct dvm_method *m) {
+  return m ? m->sig : "?";
+}
 bool dvm_method_is_static(const struct dvm_method *m)
 {
-   return m && (m->access & DEX_ACC_STATIC);
+  return m && (m->access & DEX_ACC_STATIC);
 }
 
 /* --- loading ------------------------------------------------------------ */
 
 static void method_finish(struct dvm_method *m)
 {
-   m->arg_slots = dvm_sig_arg_slots(m->sig);
-   if (m->arg_slots < 0) m->arg_slots = 0;
-   m->arg_count = dvm_sig_arg_count(m->sig);
-   if (m->arg_count < 0) m->arg_count = 0;
-   m->ret_kind = dvm_sig_return_kind(m->sig);
+  m->arg_slots = dvm_sig_arg_slots(m->sig);
+  if (m->arg_slots < 0) m->arg_slots = 0;
+  m->arg_count = dvm_sig_arg_count(m->sig);
+  if (m->arg_count < 0) m->arg_count = 0;
+  m->ret_kind = dvm_sig_return_kind(m->sig);
 }
 
 static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
@@ -806,120 +868,120 @@ static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
 static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
                                 struct dvm_dex *dd, uint32_t class_def_idx)
 {
-   struct dex_file *d = &dd->file;
-   struct dex_class_def cd;
-   if (!dex_class_def(d, class_def_idx, &cd)) return false;
+  struct dex_file *d = &dd->file;
+  struct dex_class_def cd;
+  if (!dex_class_def(d, class_def_idx, &cd)) return false;
 
-   c->dex = d;
-   c->class_def_idx = class_def_idx;
-   c->access = cd.access_flags;
-   c->is_interface = (cd.access_flags & DEX_ACC_INTERFACE) != 0;
-   c->static_values_off = cd.static_values_off;
+  c->dex = d;
+  c->class_def_idx = class_def_idx;
+  c->access = cd.access_flags;
+  c->is_interface = (cd.access_flags & DEX_ACC_INTERFACE) != 0;
+  c->static_values_off = cd.static_values_off;
 
-   if (cd.superclass_idx != DEX_NO_INDEX) {
-      const char *sd = dex_type(d, cd.superclass_idx);
-      if (sd && strcmp(sd, c->desc))
-         c->super = dvm__class_by_desc(vm, sd);
-   }
+  if (cd.superclass_idx != DEX_NO_INDEX) {
+    const char *sd = dex_type(d, cd.superclass_idx);
+    if (sd && strcmp(sd, c->desc))
+      c->super = dvm__class_by_desc(vm, sd);
+  }
 
-   int ni = dex_interfaces(d, cd.interfaces_off, NULL, 0);
-   if (ni > 0) {
-      uint16_t *ifaces = malloc((size_t)ni * sizeof *ifaces);
-      c->ifaces = calloc((size_t)ni, sizeof *c->ifaces);
-      if (!ifaces || !c->ifaces) {
-         free(ifaces);
-         free(c->ifaces);
-         c->ifaces = NULL;
-         dvm__throw(vm, "java/lang/OutOfMemoryError", "class interfaces");
-         return false;
-      }
-      (void)dex_interfaces(d, cd.interfaces_off, ifaces, ni);
-      for (int i = 0; i < ni; ++i) {
-         const char *t = dex_type(d, ifaces[i]);
-         if (t) c->ifaces[c->nifaces++] = dvm__class_by_desc(vm, t);
-      }
+  int ni = dex_interfaces(d, cd.interfaces_off, NULL, 0);
+  if (ni > 0) {
+    uint16_t *ifaces = malloc((size_t)ni * sizeof *ifaces);
+    c->ifaces = calloc((size_t)ni, sizeof *c->ifaces);
+    if (!ifaces || !c->ifaces) {
       free(ifaces);
-   }
+      free(c->ifaces);
+      c->ifaces = NULL;
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "class interfaces");
+      return false;
+    }
+    (void)dex_interfaces(d, cd.interfaces_off, ifaces, ni);
+    for (int i = 0; i < ni; ++i) {
+      const char *t = dex_type(d, ifaces[i]);
+      if (t) c->ifaces[c->nifaces++] = dvm__class_by_desc(vm, t);
+    }
+    free(ifaces);
+  }
 
-   struct dex_class_data data;
-   if (!dex_class_data(d, cd.class_data_off, &data)) {
-      /* A class_def with no class_data is legal (a marker interface).  It
-       * still has a name, a super and interfaces, so it is fully usable. */
-      c->islots = c->super ? c->super->islots : 0;
-      return true;
-   }
+  struct dex_class_data data;
+  if (!dex_class_data(d, cd.class_data_off, &data)) {
+    /* A class_def with no class_data is legal (a marker interface).  It
+     * still has a name, a super and interfaces, so it is fully usable. */
+    c->islots = c->super ? c->super->islots : 0;
+    return true;
+  }
 
-   /* Instance fields sit after the superclass's, so a subclass reference can
-    * be read through a superclass field index. */
-   int base = c->super ? c->super->islots : 0;
-   c->nifields = (int)data.instance_fields_size;
-   c->ifields = c->nifields ? calloc((size_t)c->nifields, sizeof *c->ifields) : NULL;
-   int slot = base;
-   for (int i = 0; i < c->nifields; ++i) {
-      struct dex_field_id fid;
-      if (!dex_field_id(d, data.instance_fields[i].field_idx, &fid)) continue;
-      struct dvm_field *f = &c->ifields[i];
-      f->cls = c;
-      f->name = dex_string(d, fid.name_idx);
-      f->type = dex_type(d, fid.type_idx);
-      f->access = data.instance_fields[i].access_flags;
-      f->kind = dvm__kind_of(f->type);
-      f->width = 1;   /* one union slot holds a wide value */
-      f->slot = (uint16_t)slot++;
-   }
-   c->islots = slot;
+  /* Instance fields sit after the superclass's, so a subclass reference can
+   * be read through a superclass field index. */
+  int base = c->super ? c->super->islots : 0;
+  c->nifields = (int)data.instance_fields_size;
+  c->ifields = c->nifields ? calloc((size_t)c->nifields, sizeof *c->ifields) : NULL;
+  int slot = base;
+  for (int i = 0; i < c->nifields; ++i) {
+    struct dex_field_id fid;
+    if (!dex_field_id(d, data.instance_fields[i].field_idx, &fid)) continue;
+    struct dvm_field *f = &c->ifields[i];
+    f->cls = c;
+    f->name = dex_string(d, fid.name_idx);
+    f->type = dex_type(d, fid.type_idx);
+    f->access = data.instance_fields[i].access_flags;
+    f->kind = dvm__kind_of(f->type);
+    f->width = 1;   /* one union slot holds a wide value */
+    f->slot = (uint16_t)slot++;
+  }
+  c->islots = slot;
 
-   c->nsfields = (int)data.static_fields_size;
-   c->sfields = c->nsfields ? calloc((size_t)c->nsfields, sizeof *c->sfields) : NULL;
-   for (int i = 0; i < c->nsfields; ++i) {
-      struct dex_field_id fid;
-      if (!dex_field_id(d, data.static_fields[i].field_idx, &fid)) continue;
-      struct dvm_field *f = &c->sfields[i];
-      f->cls = c;
-      f->name = dex_string(d, fid.name_idx);
-      f->type = dex_type(d, fid.type_idx);
-      f->access = data.static_fields[i].access_flags;
-      f->kind = dvm__kind_of(f->type);
-      f->width = 1;
-      f->slot = (uint16_t)i;
-   }
-   c->nsslots = c->nsfields;
-   c->sslots = c->nsslots ? calloc((size_t)c->nsslots, sizeof *c->sslots) : NULL;
+  c->nsfields = (int)data.static_fields_size;
+  c->sfields = c->nsfields ? calloc((size_t)c->nsfields, sizeof *c->sfields) : NULL;
+  for (int i = 0; i < c->nsfields; ++i) {
+    struct dex_field_id fid;
+    if (!dex_field_id(d, data.static_fields[i].field_idx, &fid)) continue;
+    struct dvm_field *f = &c->sfields[i];
+    f->cls = c;
+    f->name = dex_string(d, fid.name_idx);
+    f->type = dex_type(d, fid.type_idx);
+    f->access = data.static_fields[i].access_flags;
+    f->kind = dvm__kind_of(f->type);
+    f->width = 1;
+    f->slot = (uint16_t)i;
+  }
+  c->nsslots = c->nsfields;
+  c->sslots = c->nsslots ? calloc((size_t)c->nsslots, sizeof *c->sslots) : NULL;
 
-   int nm = (int)(data.direct_methods_size + data.virtual_methods_size);
-   c->methods = nm ? calloc((size_t)nm, sizeof *c->methods) : NULL;
-   c->nmethods = 0;
-   for (int pass = 0; pass < 2; ++pass) {
-      struct dex_encoded_method *list = pass ? data.virtual_methods : data.direct_methods;
-      uint32_t n = pass ? data.virtual_methods_size : data.direct_methods_size;
-      for (uint32_t i = 0; i < n && c->methods; ++i) {
-         struct dex_method_id mid;
-         if (!dex_method_id(d, list[i].method_idx, &mid)) continue;
-         struct dvm_method *m = &c->methods[c->nmethods];
-         m->cls = c;
-         m->name = dex_string(d, mid.name_idx);
-         m->shorty = dex_proto_shorty(d, mid.proto_idx);
-         m->access = list[i].access_flags;
-         m->dex = d;
-         m->sig = dex_proto_signature_alloc(d, mid.proto_idx);
-         if (!m->sig) continue;
-         if (list[i].code_off && dex_code(d, list[i].code_off, &m->code))
-            m->has_code = true;
-         method_finish(m);
-         /* An annotation type's element declarations are abstract interface
-          * methods in DEX, but a materialised annotation instance must answer
-          * them from its encoded element map.  Bind every zero-argument
-          * element here, so this works for arbitrary application annotations
-          * rather than a Gson-specific proxy class. */
-         if ((c->access & DEX_ACC_ANNOTATION) && m->arg_count == 0 &&
-             strcmp(m->name, "<clinit>") && strcmp(m->name, "<init>"))
-            m->builtin = annotation_element_builtin;
-         ++c->nmethods;
-      }
-   }
+  int nm = (int)(data.direct_methods_size + data.virtual_methods_size);
+  c->methods = nm ? calloc((size_t)nm, sizeof *c->methods) : NULL;
+  c->nmethods = 0;
+  for (int pass = 0; pass < 2; ++pass) {
+    struct dex_encoded_method *list = pass ? data.virtual_methods : data.direct_methods;
+    uint32_t n = pass ? data.virtual_methods_size : data.direct_methods_size;
+    for (uint32_t i = 0; i < n && c->methods; ++i) {
+      struct dex_method_id mid;
+      if (!dex_method_id(d, list[i].method_idx, &mid)) continue;
+      struct dvm_method *m = &c->methods[c->nmethods];
+      m->cls = c;
+      m->name = dex_string(d, mid.name_idx);
+      m->shorty = dex_proto_shorty(d, mid.proto_idx);
+      m->access = list[i].access_flags;
+      m->dex = d;
+      m->sig = dex_proto_signature_alloc(d, mid.proto_idx);
+      if (!m->sig) continue;
+      if (list[i].code_off && dex_code(d, list[i].code_off, &m->code))
+        m->has_code = true;
+      method_finish(m);
+      /* An annotation type's element declarations are abstract interface
+       * methods in DEX, but a materialised annotation instance must answer
+       * them from its encoded element map.  Bind every zero-argument
+       * element here, so this works for arbitrary application annotations
+       * rather than a Gson-specific proxy class. */
+      if ((c->access & DEX_ACC_ANNOTATION) && m->arg_count == 0 &&
+          strcmp(m->name, "<clinit>") && strcmp(m->name, "<init>"))
+        m->builtin = annotation_element_builtin;
+      ++c->nmethods;
+    }
+  }
 
-   dex_class_data_release(&data);
-   return true;
+  dex_class_data_release(&data);
+  return true;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -927,14 +989,14 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
  * ------------------------------------------------------------------------ */
 
 static struct dvm_method *class_own_method(struct dvm_class *c, const char *name,
-                                           const char *sig)
+    const char *sig)
 {
-   for (int i = 0; i < c->nmethods; ++i) {
-      if (!c->methods[i].name || strcmp(c->methods[i].name, name)) continue;
-      if (sig && c->methods[i].sig && strcmp(c->methods[i].sig, sig)) continue;
-      return &c->methods[i];
-   }
-   return NULL;
+  for (int i = 0; i < c->nmethods; ++i) {
+    if (!c->methods[i].name || strcmp(c->methods[i].name, name)) continue;
+    if (sig && c->methods[i].sig && strcmp(c->methods[i].sig, sig)) continue;
+    return &c->methods[i];
+  }
+  return NULL;
 }
 
 /* --- resolved-method cache ------------------------------------------------
@@ -958,44 +1020,44 @@ static struct dvm_method *class_own_method(struct dvm_class *c, const char *name
  * lock, so the table needs no synchronisation of its own. */
 static uint32_t mcache_hash(const char *name, const char *sig)
 {
-   uint32_t h = 2166136261u;
-   for (const char *p = name; *p; ++p) h = (h ^ (unsigned char)*p) * 16777619u;
-   if (sig) {
-      h = (h ^ 0xffu) * 16777619u;
-      for (const char *p = sig; *p; ++p) h = (h ^ (unsigned char)*p) * 16777619u;
-   }
-   return h | 1u;   /* zero means "empty slot" */
+  uint32_t h = 2166136261u;
+  for (const char *p = name; *p; ++p) h = (h ^ (unsigned char)*p) * 16777619u;
+  if (sig) {
+    h = (h ^ 0xffu) * 16777619u;
+    for (const char *p = sig; *p; ++p) h = (h ^ (unsigned char)*p) * 16777619u;
+  }
+  return h | 1u;   /* zero means "empty slot" */
 }
 
 static bool mcache_key_eq(const struct dvm_mcache_slot *s, uint32_t h,
                           const char *name, const char *sig)
 {
-   if (s->hash != h) return false;
-   if (strcmp(s->name, name)) return false;
-   if ((sig == NULL) != (s->sig == NULL)) return false;
-   return sig == NULL || !strcmp(s->sig, sig);
+  if (s->hash != h) return false;
+  if (strcmp(s->name, name)) return false;
+  if ((sig == NULL) != (s->sig == NULL)) return false;
+  return sig == NULL || !strcmp(s->sig, sig);
 }
 
 static struct dvm_method *mcache_get(const struct dvm_class *c, uint32_t h,
                                      const char *name, const char *sig)
 {
-   if (!c->mcache) return NULL;
-   const uint32_t mask = c->mcache_cap - 1u;
-   for (uint32_t i = h & mask, n = 0; n <= mask; i = (i + 1u) & mask, ++n) {
-      const struct dvm_mcache_slot *s = &c->mcache[i];
-      if (!s->hash) return NULL;                 /* probe ends at a free slot */
-      if (mcache_key_eq(s, h, name, sig)) return s->m;
-   }
-   return NULL;
+  if (!c->mcache) return NULL;
+  const uint32_t mask = c->mcache_cap - 1u;
+  for (uint32_t i = h & mask, n = 0; n <= mask; i = (i + 1u) & mask, ++n) {
+    const struct dvm_mcache_slot *s = &c->mcache[i];
+    if (!s->hash) return NULL;                 /* probe ends at a free slot */
+    if (mcache_key_eq(s, h, name, sig)) return s->m;
+  }
+  return NULL;
 }
 
 static void mcache_insert(struct dvm_mcache_slot *tab, uint32_t cap,
                           const struct dvm_mcache_slot *e)
 {
-   const uint32_t mask = cap - 1u;
-   uint32_t i = e->hash & mask;
-   while (tab[i].hash) i = (i + 1u) & mask;
-   tab[i] = *e;
+  const uint32_t mask = cap - 1u;
+  uint32_t i = e->hash & mask;
+  while (tab[i].hash) i = (i + 1u) & mask;
+  tab[i] = *e;
 }
 
 /* The key is stored as the strings the *found method* owns, never as the
@@ -1008,126 +1070,133 @@ static void mcache_insert(struct dvm_mcache_slot *tab, uint32_t cap,
 static void mcache_put(struct dvm_class *c, uint32_t h, const char *name,
                        const char *sig, struct dvm_method *m)
 {
-   /* Equal by content to the query — class_own_method() matched them with
-    * strcmp — so the hash computed from the query still describes the key.
-    * The one exception is a method declared with no signature at all, which
-    * matches any query: there is nothing to key that on, so it is not cached. */
-   if (!m->name || (sig && !m->sig)) return;
-   name = m->name;
-   sig  = sig ? m->sig : NULL;
-   if (c->mcache_len + 1u > c->mcache_cap - c->mcache_cap / 4u) {
-      const uint32_t cap = c->mcache_cap ? c->mcache_cap * 2u : 16u;
-      struct dvm_mcache_slot *tab = calloc(cap, sizeof *tab);
-      if (!tab) return;                          /* a cache, not a ledger */
-      for (uint32_t i = 0; i < c->mcache_cap; ++i)
-         if (c->mcache[i].hash) mcache_insert(tab, cap, &c->mcache[i]);
-      free(c->mcache);
-      c->mcache = tab;
-      c->mcache_cap = cap;
-   }
-   struct dvm_mcache_slot e = { h, name, sig, m };
-   mcache_insert(c->mcache, c->mcache_cap, &e);
-   ++c->mcache_len;
+  /* Equal by content to the query — class_own_method() matched them with
+   * strcmp — so the hash computed from the query still describes the key.
+   * The one exception is a method declared with no signature at all, which
+   * matches any query: there is nothing to key that on, so it is not cached. */
+  if (!m->name || (sig && !m->sig)) return;
+  name = m->name;
+  sig  = sig ? m->sig : NULL;
+  if (c->mcache_len + 1u > c->mcache_cap - c->mcache_cap / 4u) {
+    const uint32_t cap = c->mcache_cap ? c->mcache_cap * 2u : 16u;
+    struct dvm_mcache_slot *tab = calloc(cap, sizeof *tab);
+    if (!tab) return;                          /* a cache, not a ledger */
+    for (uint32_t i = 0; i < c->mcache_cap; ++i)
+      if (c->mcache[i].hash) mcache_insert(tab, cap, &c->mcache[i]);
+    free(c->mcache);
+    c->mcache = tab;
+    c->mcache_cap = cap;
+  }
+  struct dvm_mcache_slot e = { h, name, sig, m };
+  mcache_insert(c->mcache, c->mcache_cap, &e);
+  ++c->mcache_len;
 }
 
 struct dvm_method *dvm_find_method_by_params(struct dvm *vm, struct dvm_class *cls,
-                                             const char *name, const char *sig)
+    const char *name, const char *sig)
 {
-   struct dvm_method *m = dvm_find_method(vm, cls, name, sig);
-   if (m || !cls || !sig) return m;
-   const char *close = strchr(sig, ')');
-   if (!close) return NULL;
-   const size_t plen = (size_t)(close - sig) + 1;
-   for (struct dvm_class *c = cls; c; c = c->super)
-      for (int i = 0; i < c->nmethods; ++i) {
-         const struct dvm_method *cand = &c->methods[i];
-         if (cand->name && cand->sig && !strcmp(cand->name, name) &&
-             !strncmp(cand->sig, sig, plen))
-            return &c->methods[i];
-      }
-   return NULL;
+  struct dvm_method *m = dvm_find_method(vm, cls, name, sig);
+  if (m || !cls || !sig) return m;
+  const char *close = strchr(sig, ')');
+  if (!close) return NULL;
+  const size_t plen = (size_t)(close - sig) + 1;
+  for (struct dvm_class *c = cls; c; c = c->super)
+    for (int i = 0; i < c->nmethods; ++i) {
+      const struct dvm_method *cand = &c->methods[i];
+      if (cand->name && cand->sig && !strcmp(cand->name, name) &&
+          !strncmp(cand->sig, sig, plen))
+        return &c->methods[i];
+    }
+  return NULL;
 }
 
 struct dvm_method *(dvm_find_method)(struct dvm *vm, struct dvm_class *cls,
-                                   const char *name, const char *sig)
+                                     const char *name, const char *sig)
 {
-   if (!cls) return NULL;
-   const uint32_t h = mcache_hash(name, sig);
-   struct dvm_method *hit = mcache_get(cls, h, name, sig);
-   if (hit) return hit;
+  if (!cls) return NULL;
+  const uint32_t h = mcache_hash(name, sig);
+  struct dvm_method *hit = mcache_get(cls, h, name, sig);
+  if (hit) return hit;
 
-   struct dvm_method *m = class_own_method(cls, name, sig);
-   if (m) { mcache_put(cls, h, name, sig, m); return m; }
+  struct dvm_method *m = class_own_method(cls, name, sig);
+  if (m) {
+    mcache_put(cls, h, name, sig, m);
+    return m;
+  }
 
-   /* Constructors and class initialisers are never inherited.  Treating
-    * <init> like an ordinary virtual method made a missing constructor on a
-    * subclass resolve to Object.<init>(); reflective construction then
-    * returned an object without ever running the subclass initialisation.
-    * Apart from violating the VM method-resolution rules, that leaves any
-    * registrations performed by the real constructor silently absent. */
-   if (!strcmp(name, "<init>") || !strcmp(name, "<clinit>")) return NULL;
+  /* Constructors and class initialisers are never inherited.  Treating
+   * <init> like an ordinary virtual method made a missing constructor on a
+   * subclass resolve to Object.<init>(); reflective construction then
+   * returned an object without ever running the subclass initialisation.
+   * Apart from violating the VM method-resolution rules, that leaves any
+   * registrations performed by the real constructor silently absent. */
+  if (!strcmp(name, "<init>") || !strcmp(name, "<clinit>")) return NULL;
 
-   for (struct dvm_class *c = cls->super; c; c = c->super) {
-      m = class_own_method(c, name, sig);
-      if (m) { mcache_put(cls, h, name, sig, m); return m; }
-   }
-   /* Default methods live on the interface. */
-   struct dvm_method *declaration = NULL;
-   for (struct dvm_class *c = cls; c; c = c->super) {
-      for (int i = 0; i < c->nifaces; ++i) {
-         if (!c->ifaces[i]) continue;
-         struct dvm_method *m = dvm_find_method(vm, c->ifaces[i], name, sig);
-         if (m && (m->has_code || m->builtin)) {
-            mcache_put(cls, h, name, sig, m);
-            return m;
-         }
-         if (m && !declaration) declaration = m;
+  for (struct dvm_class *c = cls->super; c; c = c->super) {
+    m = class_own_method(c, name, sig);
+    if (m) {
+      mcache_put(cls, h, name, sig, m);
+      return m;
+    }
+  }
+  /* Default methods live on the interface. */
+  struct dvm_method *declaration = NULL;
+  for (struct dvm_class *c = cls; c; c = c->super) {
+    for (int i = 0; i < c->nifaces; ++i) {
+      if (!c->ifaces[i]) continue;
+      struct dvm_method *m = dvm_find_method(vm, c->ifaces[i], name, sig);
+      if (m && (m->has_code || m->builtin)) {
+        mcache_put(cls, h, name, sig, m);
+        return m;
       }
-   }
-   /* An inherited abstract declaration still resolves. Invocation decides
-    * whether the receiver implements it; generated proxies dispatch it to
-    * InvocationHandler. Prefer a concrete default above when one exists. */
-   if (declaration) {
-      mcache_put(cls, h, name, sig, declaration);
-      return declaration;
-   }
-   return NULL;
+      if (m && !declaration) declaration = m;
+    }
+  }
+  /* An inherited abstract declaration still resolves. Invocation decides
+   * whether the receiver implements it; generated proxies dispatch it to
+   * InvocationHandler. Prefer a concrete default above when one exists. */
+  if (declaration) {
+    mcache_put(cls, h, name, sig, declaration);
+    return declaration;
+  }
+  return NULL;
 }
 
 struct dvm_method *dvm_lookup(struct dvm *vm, const char *class_name,
                               const char *method, const char *sig)
 {
-   char desc[512];
-   name_to_desc(class_name, desc, sizeof desc);
-   struct dvm_class *c = dvm__class_by_desc(vm, desc);
-   if (!c || c->external) return NULL;
-   return dvm_find_method(vm, c, method, sig);
+  char desc[512];
+  name_to_desc(class_name, desc, sizeof desc);
+  struct dvm_class *c = dvm__class_by_desc(vm, desc);
+  if (!c || c->external) return NULL;
+  return dvm_find_method(vm, c, method, sig);
 }
 
 static struct dvm_field *class_find_field_slow(struct dvm_class *cls, const char *name,
-                                               const char *type, bool statics,
-                                               struct dvm_class **owner, int *index)
+    const char *type, bool statics,
+    struct dvm_class **owner, int *index)
 {
-   for (struct dvm_class *c = cls; c; c = c->super) {
-      struct dvm_field *list = statics ? c->sfields : c->ifields;
-      int n = statics ? c->nsfields : c->nifields;
-      for (int i = 0; i < n; ++i) {
-         if (!list[i].name || strcmp(list[i].name, name)) continue;
-         if (type && list[i].type && strcmp(list[i].type, type)) continue;
-         *owner = c; *index = i;
-         return &list[i];
+  for (struct dvm_class *c = cls; c; c = c->super) {
+    struct dvm_field *list = statics ? c->sfields : c->ifields;
+    int n = statics ? c->nsfields : c->nifields;
+    for (int i = 0; i < n; ++i) {
+      if (!list[i].name || strcmp(list[i].name, name)) continue;
+      if (type && list[i].type && strcmp(list[i].type, type)) continue;
+      *owner = c;
+      *index = i;
+      return &list[i];
+    }
+    if (statics) {
+      /* Interface constants. */
+      for (int i = 0; i < c->nifaces; ++i) {
+        if (!c->ifaces[i]) continue;
+        struct dvm_field *f = class_find_field_slow(c->ifaces[i], name, type, true,
+                              owner, index);
+        if (f) return f;
       }
-      if (statics) {
-         /* Interface constants. */
-         for (int i = 0; i < c->nifaces; ++i) {
-            if (!c->ifaces[i]) continue;
-            struct dvm_field *f = class_find_field_slow(c->ifaces[i], name, type, true,
-                                                        owner, index);
-            if (f) return f;
-         }
-      }
-   }
-   return NULL;
+    }
+  }
+  return NULL;
 }
 
 /* Cache successful lookups, validating caller-owned name/type contents on
@@ -1136,55 +1205,60 @@ static struct dvm_field *class_find_field_slow(struct dvm_class *cls, const char
  * so it is not retained. Each VM has a generation to prevent cache pointers
  * from surviving class destruction and allocator address reuse. */
 struct field_hit {
-   struct dvm_class *cls, *owner;
-   const char *name, *type;
-   int index;
-   bool statics;
-   /* A lookup that found nothing is remembered too, with its own copy of the
-    * strings (the caller's may live on a stack that is reused).  Callers probe
-    * "I" and then "Z" for the same name, so every boolean read paid for a full
-    * walk of the class chain that could only fail. */
-   bool missing;
-   char miss_name[48], miss_type[16];
+  struct dvm_class *cls, *owner;
+  const char *name, *type;
+  int index;
+  bool statics;
+  /* A lookup that found nothing is remembered too, with its own copy of the
+   * strings (the caller's may live on a stack that is reused).  Callers probe
+   * "I" and then "Z" for the same name, so every boolean read paid for a full
+   * walk of the class chain that could only fail. */
+  bool missing;
+  char miss_name[48], miss_type[16];
 };
 static _Atomic uint64_t field_cache_generation = 1;
 
 static struct dvm_field *class_find_field(struct dvm *vm, struct dvm_class *cls,
-                                          const char *name, const char *type, bool statics)
+    const char *name, const char *type, bool statics)
 {
-   static _Thread_local struct field_hit cache[2048];
-   static _Thread_local uint64_t generation;
-   if (generation != vm->field_cache_generation) {
-      memset(cache, 0, sizeof cache);
-      generation = vm->field_cache_generation;
-   }
-   const uintptr_t key = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^
-                          ((uintptr_t)type >> 2) * 40503u ^ (statics ? 1u : 0u)) * 2246822519u >> 7;
-   struct field_hit *hit = &cache[key & 2047u];
-   if (hit->missing && hit->cls == cls && hit->statics == statics &&
-       !strcmp(hit->miss_name, name) && !strcmp(hit->miss_type, type ? type : ""))
-      return NULL;
-   if (hit->cls == cls && hit->name == name && hit->statics == statics && hit->owner) {
-      struct dvm_field *list = statics ? hit->owner->sfields : hit->owner->ifields;
-      int count = statics ? hit->owner->nsfields : hit->owner->nifields;
-      if (hit->index < count) {
-         struct dvm_field *field = &list[hit->index];
-         if (field->name && !strcmp(field->name, name) &&
-             (!type || !field->type || !strcmp(field->type, type))) return field;
-      }
-   }
-   struct dvm_class *owner = NULL;
-   int index = 0;
-   struct dvm_field *field = class_find_field_slow(cls, name, type, statics, &owner, &index);
-   if (field) *hit = (struct field_hit){.cls=cls,.owner=owner,.name=name,.type=type,.index=index,.statics=statics};
-   else {
-      memset(hit, 0, sizeof *hit);
-      if (strlen(name) < sizeof hit->miss_name && (!type || strlen(type) < sizeof hit->miss_type)) {
-         hit->cls = cls; hit->statics = statics; hit->missing = true;
-         strcpy(hit->miss_name, name); strcpy(hit->miss_type, type ? type : "");
-      }
-   }
-   return field;
+  static _Thread_local struct field_hit cache[2048];
+  static _Thread_local uint64_t generation;
+  if (generation != vm->field_cache_generation) {
+    memset(cache, 0, sizeof cache);
+    generation = vm->field_cache_generation;
+  }
+  const uintptr_t key = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) ^
+                         ((uintptr_t)type >> 2) * 40503u ^ (statics ? 1u : 0u)) * 2246822519u >> 7;
+  struct field_hit *hit = &cache[key & 2047u];
+  if (hit->missing && hit->cls == cls && hit->statics == statics &&
+      !strcmp(hit->miss_name, name) && !strcmp(hit->miss_type, type ? type : ""))
+    return NULL;
+  if (hit->cls == cls && hit->name == name && hit->statics == statics && hit->owner) {
+    struct dvm_field *list = statics ? hit->owner->sfields : hit->owner->ifields;
+    int count = statics ? hit->owner->nsfields : hit->owner->nifields;
+    if (hit->index < count) {
+      struct dvm_field *field = &list[hit->index];
+      if (field->name && !strcmp(field->name, name) &&
+          (!type || !field->type || !strcmp(field->type, type))) return field;
+    }
+  }
+  struct dvm_class *owner = NULL;
+  int index = 0;
+  struct dvm_field *field = class_find_field_slow(cls, name, type, statics, &owner, &index);
+  if (field) *hit = (struct field_hit) {
+    .cls=cls,.owner=owner,.name=name,.type=type,.index=index,.statics=statics
+  };
+  else {
+    memset(hit, 0, sizeof *hit);
+    if (strlen(name) < sizeof hit->miss_name && (!type || strlen(type) < sizeof hit->miss_type)) {
+      hit->cls = cls;
+      hit->statics = statics;
+      hit->missing = true;
+      strcpy(hit->miss_name, name);
+      strcpy(hit->miss_type, type ? type : "");
+    }
+  }
+  return field;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1202,32 +1276,32 @@ static unsigned long long g_throws;
  * profile report, not a log. */
 #define DVM_THROW_TALLY 64
 static struct {
-   const char *cls;
-   const char *method;
-   const char *in;
-   unsigned long long n;
+  const char *cls;
+  const char *method;
+  const char *in;
+  unsigned long long n;
 } g_throw_tally[DVM_THROW_TALLY];
 
 static void throw_tally(struct dvm *vm, const char *class_name)
 {
-   const struct dvm_method *m =
-      atomic_load_explicit(&vm->cur_method, memory_order_relaxed);
-   const char *meth = m ? m->name : "?";
-   const char *in   = (m && m->cls) ? m->cls->name : "?";
-   for (int i = 0; i < DVM_THROW_TALLY; ++i) {
-      if (!g_throw_tally[i].cls) {
-         g_throw_tally[i].cls = class_name;
-         g_throw_tally[i].method = meth;
-         g_throw_tally[i].in = in;
-         g_throw_tally[i].n = 1;
-         return;
-      }
-      if (g_throw_tally[i].cls == class_name &&
-          g_throw_tally[i].method == meth && g_throw_tally[i].in == in) {
-         ++g_throw_tally[i].n;
-         return;
-      }
-   }
+  const struct dvm_method *m =
+    atomic_load_explicit(&vm->cur_method, memory_order_relaxed);
+  const char *meth = m ? m->name : "?";
+  const char *in   = (m && m->cls) ? m->cls->name : "?";
+  for (int i = 0; i < DVM_THROW_TALLY; ++i) {
+    if (!g_throw_tally[i].cls) {
+      g_throw_tally[i].cls = class_name;
+      g_throw_tally[i].method = meth;
+      g_throw_tally[i].in = in;
+      g_throw_tally[i].n = 1;
+      return;
+    }
+    if (g_throw_tally[i].cls == class_name &&
+        g_throw_tally[i].method == meth && g_throw_tally[i].in == in) {
+      ++g_throw_tally[i].n;
+      return;
+    }
+  }
 }
 
 /* An exception storm reports itself.
@@ -1249,155 +1323,164 @@ static bool g_throw_want_stack;
 
 static void throw_storm_watch(void)
 {
-   static unsigned long long since;
-   static double last_check, last_report;
-   static bool started;
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-   if (!started) { started = true; last_check = last_report = now; return; }
+  static unsigned long long since;
+  static double last_check, last_report;
+  static bool started;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+  if (!started) {
+    started = true;
+    last_check = last_report = now;
+    return;
+  }
 
-   if (++since < 1024u) return;
-   const double window = now - last_check;
-   const double rate = window > 0.0 ? (double)since / window : 0.0;
-   since = 0;
-   last_check = now;
-   if (rate < 200.0 || now - last_report < 10.0) return;
-   last_report = now;
+  if (++since < 1024u) return;
+  const double window = now - last_check;
+  const double rate = window > 0.0 ? (double)since / window : 0.0;
+  since = 0;
+  last_check = now;
+  if (rate < 200.0 || now - last_report < 10.0) return;
+  last_report = now;
 
-   fprintf(stderr, "[dvm] exception storm: %.0f/s — a retry loop, not "
-           "ordinary error handling.  Most frequent since the last report:\n",
-           rate);
-   /* And who is driving it.  The tally names the method that throws; the loop
-    * is whatever keeps calling it, which only the call stack shows.  Asking
-    * for the next throw's stack costs one flag test on the throw path and one
-    * print per report. */
-   g_throw_want_stack = true;
-   for (int shown = 0; shown < 3; ++shown) {
-      int best = -1;
-      for (int i = 0; i < DVM_THROW_TALLY; ++i)
-         if (g_throw_tally[i].cls && g_throw_tally[i].n &&
-             (best < 0 || g_throw_tally[i].n > g_throw_tally[best].n))
-            best = i;
-      if (best < 0) break;
-      fprintf(stderr, "[dvm]   %8llu  %s thrown in %s.%s\n",
-              g_throw_tally[best].n, g_throw_tally[best].cls,
-              g_throw_tally[best].in, g_throw_tally[best].method);
-      g_throw_tally[best].n = 0;
-   }
-   memset(g_throw_tally, 0, sizeof g_throw_tally);
+  fprintf(stderr, "[dvm] exception storm: %.0f/s — a retry loop, not "
+                  "ordinary error handling.  Most frequent since the last report:\n",
+          rate);
+  /* And who is driving it.  The tally names the method that throws; the loop
+   * is whatever keeps calling it, which only the call stack shows.  Asking
+   * for the next throw's stack costs one flag test on the throw path and one
+   * print per report. */
+  g_throw_want_stack = true;
+  for (int shown = 0; shown < 3; ++shown) {
+    int best = -1;
+    for (int i = 0; i < DVM_THROW_TALLY; ++i)
+      if (g_throw_tally[i].cls && g_throw_tally[i].n &&
+          (best < 0 || g_throw_tally[i].n > g_throw_tally[best].n))
+        best = i;
+    if (best < 0) break;
+    fprintf(stderr, "[dvm]   %8llu  %s thrown in %s.%s\n",
+            g_throw_tally[best].n, g_throw_tally[best].cls,
+            g_throw_tally[best].in, g_throw_tally[best].method);
+    g_throw_tally[best].n = 0;
+  }
+  memset(g_throw_tally, 0, sizeof g_throw_tally);
 }
 
 static const char *dvm__env_throws(void)
 {
-   static _Atomic(const char *) slot = DVM_ENV_UNREAD;
-   return dvm__env_once(&slot, "LUNARIA_DVM_THROWS");
+  static _Atomic(const char *) slot = DVM_ENV_UNREAD;
+  return dvm__env_once(&slot, "LUNARIA_DVM_THROWS");
 }
 
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
 {
-   ++g_throws;
-   if (vm) throw_tally(vm, class_name);
-   throw_storm_watch();
-   char msg[512];
-   if (fmt) {
-      va_list ap;
-      va_start(ap, fmt);
-      vsnprintf(msg, sizeof msg, fmt, ap);
-      va_end(ap);
-   } else {
-      msg[0] = '\0';
-   }
+  ++g_throws;
+  if (vm) throw_tally(vm, class_name);
+  throw_storm_watch();
+  char msg[512];
+  if (fmt) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof msg, fmt, ap);
+    va_end(ap);
+  } else {
+    msg[0] = '\0';
+  }
 
-   if (g_throw_want_stack && vm) {
-      g_throw_want_stack = false;
-      fprintf(stderr, "[dvm]   the loop, innermost first:\n");
-      for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 10;
-           --i, ++shown) {
-         const struct dvm_method *f = vm->callstack[i];
-         if (!f) continue;
-         fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
-                 f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
-      }
-   }
+  if (g_throw_want_stack && vm) {
+    g_throw_want_stack = false;
+    fprintf(stderr, "[dvm]   the loop, innermost first:\n");
+    for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 10;
+         --i, ++shown) {
+      const struct dvm_method *f = vm->callstack[i];
+      if (!f) continue;
+      fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
+              f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+    }
+  }
 
-   /* LUNARIA_DVM_THROW_STACK=<text>: print the Java call chain of every throw
-    * whose class or message contains <text> — which caller passed the null. */
-   static const char *stack_filter = (const char *)-1;
-   if (stack_filter == (const char *)-1) stack_filter = getenv("LUNARIA_DVM_THROW_STACK");
-   if (stack_filter && *stack_filter && vm &&
-       (strstr(msg, stack_filter) || strstr(class_name, stack_filter))) {
-      fprintf(stderr, "[dvm] throw %s: %s — call chain, innermost first:\n", class_name, msg);
-      const struct dvm_call_frame *f = vm->invoke_frame;
-      for (int shown = 0; f && shown < 14; f = f->previous, ++shown) {
-         const struct dvm_method *fm = f->method;
-         if (fm) fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
-                         fm->cls ? fm->cls->name : "?", fm->name, fm->sig ? fm->sig : "");
-      }
-   }
+  /* LUNARIA_DVM_THROW_STACK=<text>: print the Java call chain of every throw
+   * whose class or message contains <text> — which caller passed the null. */
+  static const char *stack_filter = (const char *)-1;
+  if (stack_filter == (const char *)-1) stack_filter = getenv("LUNARIA_DVM_THROW_STACK");
+  if (stack_filter && *stack_filter && vm &&
+      (strstr(msg, stack_filter) || strstr(class_name, stack_filter))) {
+    fprintf(stderr, "[dvm] throw %s: %s — call chain, innermost first:\n", class_name, msg);
+    const struct dvm_call_frame *f = vm->invoke_frame;
+    for (int shown = 0; f && shown < 14; f = f->previous, ++shown) {
+      const struct dvm_method *fm = f->method;
+      if (fm) fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
+                        fm->cls ? fm->cls->name : "?", fm->name, fm->sig ? fm->sig : "");
+    }
+  }
 
-   if (dvm__env_throws()) {
-      const struct dvm_method *m =
-         vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
-      fprintf(stderr, "[dvm] throw %s: %s (in %s.%s)\n", class_name, msg,
-              (m && m->cls && m->cls->name) ? m->cls->name : "?",
-              m ? m->name : "?");
-   }
+  if (dvm__env_throws()) {
+    const struct dvm_method *m =
+      vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
+    fprintf(stderr, "[dvm] throw %s: %s (in %s.%s)\n", class_name, msg,
+            (m && m->cls && m->cls->name) ? m->cls->name : "?",
+            m ? m->name : "?");
+  }
 
-   char desc[256];
-   name_to_desc(class_name, desc, sizeof desc);
-   struct dvm_class *cls = dvm__class_by_desc(vm, desc);
-   dvm_ref e = dvm_new_object(vm, cls);
-   if (e) {
-      union dvm_value v = { .l = msg[0] ? dvm_new_string(vm, msg) : 0 };
-      (void)dvm_set_field(vm, e, "detailMessage", "Ljava/lang/String;", v);
-      struct dvm_object *o = dvm__obj(vm, e);
-      if (o && !o->utf8 && msg[0]) o->utf8 = strdup(msg);   /* always readable */
-   }
-   if (e) dvm__throwable_capture(vm,e);
-   vm->exception = e;
-   vm->exc_ref = e;
-   vm->nexc_trace = 0;   /* a fresh throw starts a fresh unwind path */
-   if (vm->cur_method) {
-      vm->exc_trace[vm->nexc_trace++] = vm->cur_method;
-      vm->exc_pc = vm->cur_pc;
-   }
-   if (vm->trace)
-      fprintf(stderr, "[dvm] throw %s: %s\n", class_name, msg);
+  char desc[256];
+  name_to_desc(class_name, desc, sizeof desc);
+  struct dvm_class *cls = dvm__class_by_desc(vm, desc);
+  dvm_ref e = dvm_new_object(vm, cls);
+  if (e) {
+    union dvm_value v = { .l = msg[0] ? dvm_new_string(vm, msg) : 0 };
+    (void)dvm_set_field(vm, e, "detailMessage", "Ljava/lang/String;", v);
+    struct dvm_object *o = dvm__obj(vm, e);
+    if (o && !o->utf8 && msg[0]) o->utf8 = strdup(msg);   /* always readable */
+  }
+  if (e) dvm__throwable_capture(vm,e);
+  vm->exception = e;
+  vm->exc_ref = e;
+  vm->nexc_trace = 0;   /* a fresh throw starts a fresh unwind path */
+  if (vm->cur_method) {
+    vm->exc_trace[vm->nexc_trace++] = vm->cur_method;
+    vm->exc_pc = vm->cur_pc;
+  }
+  if (vm->trace)
+    fprintf(stderr, "[dvm] throw %s: %s\n", class_name, msg);
 }
 
-dvm_ref dvm_exception(struct dvm *vm) { return vm->exception; }
-void dvm_clear_exception(struct dvm *vm) { vm->exception = 0; vm->parked = false; }
+dvm_ref dvm_exception(struct dvm *vm) {
+  return vm->exception;
+}
+void dvm_clear_exception(struct dvm *vm) {
+  vm->exception = 0;
+  vm->parked = false;
+}
 
 void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
 {
-   /* Follow the cause chain.  Wrapping is how library code reports a failure —
-    * `catch (Throwable t) { throw new RuntimeException(t); }` — and the
-    * wrapper carries no message at all, so stopping at the outermost throwable
-    * prints "java/lang/RuntimeException" and says nothing about what went
-    * wrong.  The cause is the part worth reading. */
-   size_t at = 0;
-   for (int hop = 0; hop < 8 && exc; ++hop) {
-      struct dvm_object *o = dvm__obj(vm, exc);
-      if (!o) break;
-      const char *cn = o->cls ? o->cls->name : "java/lang/Throwable";
-      union dvm_value msg = { 0 };
-      const char *text = NULL;
-      if (dvm_get_field(vm, exc, "detailMessage", "Ljava/lang/String;", &msg) &&
-          msg.l)
-         text = dvm_string_utf8(vm, msg.l);
-      if (!text) text = o->utf8;
-      if (at >= sz) return;
-      at += (size_t)snprintf(buf + at, sz - at, "%s%s%s%s",
-                             hop ? " <- " : "", cn,
-                             text ? ": " : "", text ? text : "");
-      union dvm_value cause = { 0 };
-      if (!dvm_get_field(vm, exc, "cause", "Ljava/lang/Throwable;", &cause) ||
-          cause.l == exc)
-         return;
-      exc = cause.l;
-   }
-   if (!at && at < sz) snprintf(buf, sz, "(no exception)");
+  /* Follow the cause chain.  Wrapping is how library code reports a failure —
+   * `catch (Throwable t) { throw new RuntimeException(t); }` — and the
+   * wrapper carries no message at all, so stopping at the outermost throwable
+   * prints "java/lang/RuntimeException" and says nothing about what went
+   * wrong.  The cause is the part worth reading. */
+  size_t at = 0;
+  for (int hop = 0; hop < 8 && exc; ++hop) {
+    struct dvm_object *o = dvm__obj(vm, exc);
+    if (!o) break;
+    const char *cn = o->cls ? o->cls->name : "java/lang/Throwable";
+    union dvm_value msg = { 0 };
+    const char *text = NULL;
+    if (dvm_get_field(vm, exc, "detailMessage", "Ljava/lang/String;", &msg) &&
+        msg.l)
+      text = dvm_string_utf8(vm, msg.l);
+    if (!text) text = o->utf8;
+    if (at >= sz) return;
+    at += (size_t)snprintf(buf + at, sz - at, "%s%s%s%s",
+                           hop ? " <- " : "", cn,
+                           text ? ": " : "", text ? text : "");
+    union dvm_value cause = { 0 };
+    if (!dvm_get_field(vm, exc, "cause", "Ljava/lang/Throwable;", &cause) ||
+        cause.l == exc)
+      return;
+    exc = cause.l;
+  }
+  if (!at && at < sz) snprintf(buf, sz, "(no exception)");
 }
 
 /* An installed UncaughtExceptionHandler receives the Throwable as an ordinary
@@ -1409,37 +1492,37 @@ void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
 static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
                                    const struct dvm_method *handler)
 {
-   char why[1024];
-   dvm_describe_exception(vm, exc, why, sizeof why);
-   fprintf(stderr, "[dvm] forwarded uncaught %s to %s.%s\n", why,
-           handler && handler->cls ? handler->cls->name : "?",
-           handler ? handler->name : "?");
+  char why[1024];
+  dvm_describe_exception(vm, exc, why, sizeof why);
+  fprintf(stderr, "[dvm] forwarded uncaught %s to %s.%s\n", why,
+          handler && handler->cls ? handler->cls->name : "?",
+          handler ? handler->name : "?");
 
-   /* Throwable.fillInStackTrace()/setStackTrace() store the actual throw-side
-    * trace on the object.  Print it when present; do not synthesize the
-    * handler's current stack, which would point at Crashlytics instead of the
-    * failure. */
-   union dvm_value trace = { 0 };
-   if (!dvm_get_field(vm, exc, "stackTrace", "[Ljava/lang/StackTraceElement;",
-                      &trace) || !trace.l)
-      return;
-   struct dvm_object *array = dvm__obj(vm, trace.l);
-   if (!array || array->kind != DVM_OBJ_ARRAY || array->elem_kind != 'L' ||
-       !array->data)
-      return;
-   const dvm_ref *items = array->data;
-   uint32_t n = array->length < 32u ? array->length : 32u;
-   for (uint32_t i = 0; i < n; ++i) {
-      union dvm_value cls = { 0 }, method = { 0 };
-      if (!items[i]) continue;
-      (void)dvm_get_field(vm, items[i], "declaringClass", "Ljava/lang/String;",
-                          &cls);
-      (void)dvm_get_field(vm, items[i], "methodName", "Ljava/lang/String;",
-                          &method);
-      fprintf(stderr, "[dvm]   at %s.%s\n",
-              cls.l ? dvm_string_utf8(vm, cls.l) : "?",
-              method.l ? dvm_string_utf8(vm, method.l) : "?");
-   }
+  /* Throwable.fillInStackTrace()/setStackTrace() store the actual throw-side
+   * trace on the object.  Print it when present; do not synthesize the
+   * handler's current stack, which would point at Crashlytics instead of the
+   * failure. */
+  union dvm_value trace = { 0 };
+  if (!dvm_get_field(vm, exc, "stackTrace", "[Ljava/lang/StackTraceElement;",
+                     &trace) || !trace.l)
+    return;
+  struct dvm_object *array = dvm__obj(vm, trace.l);
+  if (!array || array->kind != DVM_OBJ_ARRAY || array->elem_kind != 'L' ||
+      !array->data)
+    return;
+  const dvm_ref *items = array->data;
+  uint32_t n = array->length < 32u ? array->length : 32u;
+  for (uint32_t i = 0; i < n; ++i) {
+    union dvm_value cls = { 0 }, method = { 0 };
+    if (!items[i]) continue;
+    (void)dvm_get_field(vm, items[i], "declaringClass", "Ljava/lang/String;",
+                        &cls);
+    (void)dvm_get_field(vm, items[i], "methodName", "Ljava/lang/String;",
+                        &method);
+    fprintf(stderr, "[dvm]   at %s.%s\n",
+            cls.l ? dvm_string_utf8(vm, cls.l) : "?",
+            method.l ? dvm_string_utf8(vm, method.l) : "?");
+  }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1451,63 +1534,63 @@ static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
  * once per class and indexes the object's slots afterwards. */
 int dvm__field_slot(struct dvm *vm, struct dvm_class *cls, const char *name, const char *type)
 {
-   struct dvm_field *f = cls ? class_find_field(vm, cls, name, type, false) : NULL;
-   return f && f->slot < cls->islots ? (int)f->slot : -1;
+  struct dvm_field *f = cls ? class_find_field(vm, cls, name, type, false) : NULL;
+  return f && f->slot < cls->islots ? (int)f->slot : -1;
 }
 
 bool (dvm__get_field_from)(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
-                         const char *name, const char *type,
-                         union dvm_value *out)
+                           const char *name, const char *type,
+                           union dvm_value *out)
 {
-   struct dvm_object *o = dvm__obj(vm, obj);
-   if (!o || !o->cls) return false;
-   struct dvm_field *f = class_find_field(vm, owner ? owner : o->cls, name, type, false);
-   if (!f || !o->slots || f->slot >= o->cls->islots) return false;
-   *out = o->slots[f->slot];
-   return true;
+  struct dvm_object *o = dvm__obj(vm, obj);
+  if (!o || !o->cls) return false;
+  struct dvm_field *f = class_find_field(vm, owner ? owner : o->cls, name, type, false);
+  if (!f || !o->slots || f->slot >= o->cls->islots) return false;
+  *out = o->slots[f->slot];
+  return true;
 }
 
 bool (dvm__set_field_from)(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
-                         const char *name, const char *type,
-                         union dvm_value val)
+                           const char *name, const char *type,
+                           union dvm_value val)
 {
-   struct dvm_object *o = dvm__obj(vm, obj);
-   if (!o || !o->cls) return false;
-   struct dvm_field *f = class_find_field(vm, owner ? owner : o->cls, name, type, false);
-   if (!f || !o->slots || f->slot >= o->cls->islots) return false;
-   o->slots[f->slot] = val;
-   return true;
+  struct dvm_object *o = dvm__obj(vm, obj);
+  if (!o || !o->cls) return false;
+  struct dvm_field *f = class_find_field(vm, owner ? owner : o->cls, name, type, false);
+  if (!f || !o->slots || f->slot >= o->cls->islots) return false;
+  o->slots[f->slot] = val;
+  return true;
 }
 
 bool (dvm_get_field)(struct dvm *vm, dvm_ref obj, const char *name,
-                   const char *type, union dvm_value *out)
+                     const char *type, union dvm_value *out)
 {
-   return dvm__get_field_from(vm, obj, NULL, name, type, out);
+  return dvm__get_field_from(vm, obj, NULL, name, type, out);
 }
 
 bool (dvm_set_field)(struct dvm *vm, dvm_ref obj, const char *name,
-                   const char *type, union dvm_value val)
+                     const char *type, union dvm_value val)
 {
-   return dvm__set_field_from(vm, obj, NULL, name, type, val);
+  return dvm__set_field_from(vm, obj, NULL, name, type, val);
 }
 
 bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
                     const char *type, union dvm_value *out)
 {
-   struct dvm_field *f = class_find_field(vm, cls, name, type, true);
-   if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
-   if (!dvm_init_class(vm, f->cls)) return false;
-   *out = f->cls->sslots[f->slot];
-   return true;
+  struct dvm_field *f = class_find_field(vm, cls, name, type, true);
+  if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
+  if (!dvm_init_class(vm, f->cls)) return false;
+  *out = f->cls->sslots[f->slot];
+  return true;
 }
 
 bool dvm_set_static(struct dvm *vm, struct dvm_class *cls, const char *name,
                     const char *type, union dvm_value val)
 {
-   struct dvm_field *f = class_find_field(vm, cls, name, type, true);
-   if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
-   f->cls->sslots[f->slot] = val;
-   return true;
+  struct dvm_field *f = class_find_field(vm, cls, name, type, true);
+  if (!f || !f->cls->sslots || f->slot >= f->cls->nsslots) return false;
+  f->cls->sslots[f->slot] = val;
+  return true;
 }
 
 /* ---- call-site caches (see dvm_internal.h) -------------------------------- */
@@ -1520,112 +1603,128 @@ bool dvm_set_static(struct dvm *vm, struct dvm_class *cls, const char *name,
 static inline int ic_find(const struct dvm_field_ic *ic, const struct dvm_class *lookup,
                           struct dvm *vm)
 {
-   for (unsigned i = 0; i < 8; ++i) {
-      const uint64_t w = atomic_load_explicit(&ic->w[i], memory_order_relaxed);
-      if (IC_MATCH(w, lookup, vm)) return (int)((w >> 44) & 0xfffu);
-   }
-   return -1;
+  for (unsigned i = 0; i < 8; ++i) {
+    const uint64_t w = atomic_load_explicit(&ic->w[i], memory_order_relaxed);
+    if (IC_MATCH(w, lookup, vm)) return (int)((w >> 44) & 0xfffu);
+  }
+  return -1;
 }
 
 static void ic_remember(struct dvm_field_ic *ic, const struct dvm_class *lookup,
                         uint32_t slot, struct dvm *vm)
 {
-   if (slot >= 0x1000u) return;
-   const unsigned at = atomic_fetch_add_explicit(&ic->next, 1, memory_order_relaxed) & 7u;
-   atomic_store_explicit(&ic->w[at], IC_PACK(lookup, slot, vm), memory_order_relaxed);
+  if (slot >= 0x1000u) return;
+  const unsigned at = atomic_fetch_add_explicit(&ic->next, 1, memory_order_relaxed) & 7u;
+  atomic_store_explicit(&ic->w[at], IC_PACK(lookup, slot, vm), memory_order_relaxed);
 }
 
 /* Only call sites whose name and type are string literals reach here, so the
  * addresses are stable and a cached lookup needs no string comparison. */
 static struct dvm_field *class_find_field_literal(struct dvm *vm, struct dvm_class *cls,
-                                                  const char *name, const char *type)
+    const char *name, const char *type)
 {
-   static _Thread_local struct { const struct dvm_class *cls; const char *name, *type;
-                                 struct dvm_field *field; } cache[1024];
-   static _Thread_local uint64_t generation;
-   if (generation != vm->field_cache_generation) {
-      memset(cache, 0, sizeof cache);
-      generation = vm->field_cache_generation;
-   }
-   const size_t at = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) * 40503u ^ ((uintptr_t)type >> 2)) & 1023u;
-   if (cache[at].cls == cls && cache[at].name == name && cache[at].type == type)
-      return cache[at].field;
-   struct dvm_field *f = class_find_field(vm, cls, name, type, false);
-   cache[at].cls = cls; cache[at].name = name; cache[at].type = type; cache[at].field = f;
-   return f;
+  static _Thread_local struct {
+    const struct dvm_class *cls;
+    const char *name, *type;
+    struct dvm_field *field;
+  } cache[1024];
+  static _Thread_local uint64_t generation;
+  if (generation != vm->field_cache_generation) {
+    memset(cache, 0, sizeof cache);
+    generation = vm->field_cache_generation;
+  }
+  const size_t at = (((uintptr_t)cls >> 4) * 2654435761u ^ ((uintptr_t)name >> 3) * 40503u ^ ((uintptr_t)type >> 2)) & 1023u;
+  if (cache[at].cls == cls && cache[at].name == name && cache[at].type == type)
+    return cache[at].field;
+  struct dvm_field *f = class_find_field(vm, cls, name, type, false);
+  cache[at].cls = cls;
+  cache[at].name = name;
+  cache[at].type = type;
+  cache[at].field = f;
+  return f;
 }
 
 bool dvm__get_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                        const char *name, const char *type, union dvm_value *out,
                        struct dvm_field_ic *ic)
 {
-   struct dvm_object *o = dvm__obj(vm, obj);
-   if (!o || !o->cls) return false;
-   struct dvm_class *lookup = owner ? owner : o->cls;
-   const int slot = ic_find(ic, lookup, vm);
-   if (slot >= 0) {
-      if (o->slots && (uint32_t)slot < o->cls->islots) { *out = o->slots[slot]; return true; }
-      return false;
-   }
-   struct dvm_field *f = class_find_field_literal(vm, lookup, name, type);
-   if (!f || !o->slots || f->slot >= o->cls->islots) return false;
-   ic_remember(ic, lookup, f->slot, vm);
-   *out = o->slots[f->slot];
-   return true;
+  struct dvm_object *o = dvm__obj(vm, obj);
+  if (!o || !o->cls) return false;
+  struct dvm_class *lookup = owner ? owner : o->cls;
+  const int slot = ic_find(ic, lookup, vm);
+  if (slot >= 0) {
+    if (o->slots && (uint32_t)slot < o->cls->islots) {
+      *out = o->slots[slot];
+      return true;
+    }
+    return false;
+  }
+  struct dvm_field *f = class_find_field_literal(vm, lookup, name, type);
+  if (!f || !o->slots || f->slot >= o->cls->islots) return false;
+  ic_remember(ic, lookup, f->slot, vm);
+  *out = o->slots[f->slot];
+  return true;
 }
 
 bool dvm__set_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                        const char *name, const char *type, union dvm_value val,
                        struct dvm_field_ic *ic)
 {
-   struct dvm_object *o = dvm__obj(vm, obj);
-   if (!o || !o->cls) return false;
-   struct dvm_class *lookup = owner ? owner : o->cls;
-   const int slot = ic_find(ic, lookup, vm);
-   if (slot >= 0) {
-      if (o->slots && (uint32_t)slot < o->cls->islots) { o->slots[slot] = val; return true; }
-      return false;
-   }
-   struct dvm_field *f = class_find_field_literal(vm, lookup, name, type);
-   if (!f || !o->slots || f->slot >= o->cls->islots) return false;
-   ic_remember(ic, lookup, f->slot, vm);
-   o->slots[f->slot] = val;
-   return true;
+  struct dvm_object *o = dvm__obj(vm, obj);
+  if (!o || !o->cls) return false;
+  struct dvm_class *lookup = owner ? owner : o->cls;
+  const int slot = ic_find(ic, lookup, vm);
+  if (slot >= 0) {
+    if (o->slots && (uint32_t)slot < o->cls->islots) {
+      o->slots[slot] = val;
+      return true;
+    }
+    return false;
+  }
+  struct dvm_field *f = class_find_field_literal(vm, lookup, name, type);
+  if (!f || !o->slots || f->slot >= o->cls->islots) return false;
+  ic_remember(ic, lookup, f->slot, vm);
+  o->slots[f->slot] = val;
+  return true;
 }
 
 struct dvm_class *dvm__find_class_ic(struct dvm *vm, const char *name,
                                      _Atomic uint64_t *ic)
 {
-   const uint64_t w = atomic_load_explicit(ic, memory_order_relaxed);
-   if (w && (w >> 56) == IC_GEN(vm))
-      return (struct dvm_class *)(uintptr_t)((w & 0xfffffffffffull) << 4);
-   struct dvm_class *c = (dvm_find_class)(vm, name);
-   if (c && ((uintptr_t)c & 0xf) == 0 && ((uintptr_t)c >> 48) == 0)
-      atomic_store_explicit(ic, IC_PACK(c, 0, vm), memory_order_relaxed);
-   return c;
+  const uint64_t w = atomic_load_explicit(ic, memory_order_relaxed);
+  if (w && (w >> 56) == IC_GEN(vm))
+    return (struct dvm_class *)(uintptr_t)((w & 0xfffffffffffull) << 4);
+  struct dvm_class *c = (dvm_find_class)(vm, name);
+  if (c && ((uintptr_t)c & 0xf) == 0 && ((uintptr_t)c >> 48) == 0)
+    atomic_store_explicit(ic, IC_PACK(c, 0, vm), memory_order_relaxed);
+  return c;
 }
 
 struct dvm_class *dvm__class_by_desc_ic(struct dvm *vm, const char *desc,
                                         _Atomic uint64_t *ic)
 {
-   const uint64_t w = atomic_load_explicit(ic, memory_order_relaxed);
-   if (w && (w >> 56) == IC_GEN(vm))
-      return (struct dvm_class *)(uintptr_t)((w & 0xfffffffffffull) << 4);
-   struct dvm_class *c = (dvm__class_by_desc)(vm, desc);
-   if (c && ((uintptr_t)c & 0xf) == 0 && ((uintptr_t)c >> 48) == 0)
-      atomic_store_explicit(ic, IC_PACK(c, 0, vm), memory_order_relaxed);
-   return c;
+  const uint64_t w = atomic_load_explicit(ic, memory_order_relaxed);
+  if (w && (w >> 56) == IC_GEN(vm))
+    return (struct dvm_class *)(uintptr_t)((w & 0xfffffffffffull) << 4);
+  struct dvm_class *c = (dvm__class_by_desc)(vm, desc);
+  if (c && ((uintptr_t)c & 0xf) == 0 && ((uintptr_t)c >> 48) == 0)
+    atomic_store_explicit(ic, IC_PACK(c, 0, vm), memory_order_relaxed);
+  return c;
 }
 
 struct dvm_method *dvm__find_method_ic(struct dvm *vm, struct dvm_class *cls,
                                        const char *name, const char *sig,
                                        struct dvm_method_ic *ic)
 {
-   if (ic->cls == cls && ic->generation == vm->field_cache_generation && cls)
-      return ic->m;
-   struct dvm_method *m = (dvm_find_method)(vm, cls, name, sig);
-   if (m && cls) { ic->generation = vm->field_cache_generation; ic->cls = cls; ic->m = m; }
-   return m;
+  if (ic->cls == cls && ic->generation == vm->field_cache_generation && cls)
+    return ic->m;
+  struct dvm_method *m = (dvm_find_method)(vm, cls, name, sig);
+  if (m && cls) {
+    ic->generation = vm->field_cache_generation;
+    ic->cls = cls;
+    ic->m = m;
+  }
+  return m;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1637,93 +1736,93 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 
 bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
 {
-   if (!cls) return true;
-   if (cls->init_state == 2) return true;
-   /* Only the initialising Java thread may recursively use partial state.
-    * Other threads wait without GIL; the owner must be able to finish. */
-   uint64_t me = 0;
-   if (cls->init_state != 3) {
-      me = dvm__current_thread_id(vm);
-      if (!me) return false;
-      while (cls->init_state == 1 && cls->init_owner != me) {
-         if (dvm_is_stopping(vm)) return false;
-         dvm_gil_wait_for_ns(vm, (uintptr_t)&cls->init_owner, UINT64_MAX);
-      }
-   }
-   /* A class whose <clinit> threw stays erroneous: every later use has to fail
-    * too, because its static fields were never assigned.  Reporting success
-    * once the first attempt is over hands out nulls that look like data. */
-   if (cls->init_state == 3) {
-      dvm__throw(vm, "java/lang/NoClassDefFoundError",
-                 "%s failed to initialise", cls->name);
-      return false;
-   }
-   if (cls->init_state) return true;
-   cls->init_state = 1;
-   cls->init_owner = me;
+  if (!cls) return true;
+  if (cls->init_state == 2) return true;
+  /* Only the initialising Java thread may recursively use partial state.
+   * Other threads wait without GIL; the owner must be able to finish. */
+  uint64_t me = 0;
+  if (cls->init_state != 3) {
+    me = dvm__current_thread_id(vm);
+    if (!me) return false;
+    while (cls->init_state == 1 && cls->init_owner != me) {
+      if (dvm_is_stopping(vm)) return false;
+      dvm_gil_wait_for_ns(vm, (uintptr_t)&cls->init_owner, UINT64_MAX);
+    }
+  }
+  /* A class whose <clinit> threw stays erroneous: every later use has to fail
+   * too, because its static fields were never assigned.  Reporting success
+   * once the first attempt is over hands out nulls that look like data. */
+  if (cls->init_state == 3) {
+    dvm__throw(vm, "java/lang/NoClassDefFoundError",
+               "%s failed to initialise", cls->name);
+    return false;
+  }
+  if (cls->init_state) return true;
+  cls->init_state = 1;
+  cls->init_owner = me;
 
-   if (cls->super && !dvm_init_class(vm, cls->super)) goto failed;
+  if (cls->super && !dvm_init_class(vm, cls->super)) goto failed;
 
-   /* Constant static fields come from the encoded array, in declaration
-    * order, before <clinit> runs. */
-   if (cls->static_values_off && cls->dex && cls->nsslots) {
-      struct dex_value *vals = calloc((size_t)cls->nsslots, sizeof *vals);
-      if (vals) {
-         int n = dex_static_values(cls->dex, cls->static_values_off, vals, cls->nsslots);
-         if (n > cls->nsslots) n = cls->nsslots;
-         for (int i = 0; i < n; ++i) {
-            union dvm_value v = { 0 };
-            switch (vals[i].type) {
-               case DEX_VALUE_STRING: {
-                  const char *s = dex_string(cls->dex, (uint32_t)vals[i].bits);
-                  v.l = s ? dvm__intern(vm, s) : 0;
-                  break;
-               }
-               case DEX_VALUE_TYPE: {
-                  const char *t = dex_type(cls->dex, (uint32_t)vals[i].bits);
-                  struct dvm_class *tc = t ? dvm__class_by_desc(vm, t) : NULL;
-                  v.l = tc ? dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/lang/Class;")) : 0;
-                  if (v.l) {
-                     struct dvm_object *co = dvm__obj(vm, v.l);
-                     co->kind = DVM_OBJ_CLASS;
-                     co->klass = tc;
-                  }
-                  break;
-               }
-               case DEX_VALUE_NULL:
-                  break;
-               default:
-                  v.ju = vals[i].bits;
-                  break;
-            }
-            cls->sslots[i] = v;
-         }
-         free(vals);
+  /* Constant static fields come from the encoded array, in declaration
+   * order, before <clinit> runs. */
+  if (cls->static_values_off && cls->dex && cls->nsslots) {
+    struct dex_value *vals = calloc((size_t)cls->nsslots, sizeof *vals);
+    if (vals) {
+      int n = dex_static_values(cls->dex, cls->static_values_off, vals, cls->nsslots);
+      if (n > cls->nsslots) n = cls->nsslots;
+      for (int i = 0; i < n; ++i) {
+        union dvm_value v = { 0 };
+        switch (vals[i].type) {
+        case DEX_VALUE_STRING: {
+          const char *s = dex_string(cls->dex, (uint32_t)vals[i].bits);
+          v.l = s ? dvm__intern(vm, s) : 0;
+          break;
+        }
+        case DEX_VALUE_TYPE: {
+          const char *t = dex_type(cls->dex, (uint32_t)vals[i].bits);
+          struct dvm_class *tc = t ? dvm__class_by_desc(vm, t) : NULL;
+          v.l = tc ? dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/lang/Class;")) : 0;
+          if (v.l) {
+            struct dvm_object *co = dvm__obj(vm, v.l);
+            co->kind = DVM_OBJ_CLASS;
+            co->klass = tc;
+          }
+          break;
+        }
+        case DEX_VALUE_NULL:
+          break;
+        default:
+          v.ju = vals[i].bits;
+          break;
+        }
+        cls->sslots[i] = v;
       }
-   }
+      free(vals);
+    }
+  }
 
-   struct dvm_method *clinit = class_own_method(cls, "<clinit>", "()V");
-   if (clinit && (clinit->has_code || clinit->builtin)) {
-      if (vm->trace) fprintf(stderr, "[dvm] <clinit> %s\n", cls->name);
-      union dvm_value ret;
-      if (!invoke(vm, clinit, 0, NULL, 0, &ret)) {
-         char why[512] = "";
-         if (vm->exception)
-            dvm_describe_exception(vm, vm->exception, why, sizeof why);
-         fprintf(stderr, "[dvm] <clinit> %s failed: %s\n", cls->name,
-                 why[0] ? why : "no exception");
-         goto failed;
-      }
-   }
-   cls->init_state = 2;
-   cls->init_owner = 0;
-   dvm_gil_notify_for((uintptr_t)&cls->init_owner);
-   return true;
+  struct dvm_method *clinit = class_own_method(cls, "<clinit>", "()V");
+  if (clinit && (clinit->has_code || clinit->builtin)) {
+    if (vm->trace) fprintf(stderr, "[dvm] <clinit> %s\n", cls->name);
+    union dvm_value ret;
+    if (!invoke(vm, clinit, 0, NULL, 0, &ret)) {
+      char why[512] = "";
+      if (vm->exception)
+        dvm_describe_exception(vm, vm->exception, why, sizeof why);
+      fprintf(stderr, "[dvm] <clinit> %s failed: %s\n", cls->name,
+              why[0] ? why : "no exception");
+      goto failed;
+    }
+  }
+  cls->init_state = 2;
+  cls->init_owner = 0;
+  dvm_gil_notify_for((uintptr_t)&cls->init_owner);
+  return true;
 failed:
-   cls->init_state = 3;
-   cls->init_owner = 0;
-   dvm_gil_notify_for((uintptr_t)&cls->init_owner);
-   return false;
+  cls->init_state = 3;
+  cls->init_owner = 0;
+  dvm_gil_notify_for((uintptr_t)&cls->init_owner);
+  return false;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1734,48 +1833,50 @@ failed:
 static int slots_to_values(const char *sig, const uint32_t *slots, int nslots,
                            union dvm_value *out, int max)
 {
-   int n = 0, s = 0;
-   if (!sig || *sig != '(') return 0;
-   for (const char *p = sig + 1; *p && *p != ')'; ) {
-      const char *q = desc_skip(p);
-      char k = dvm__kind_of(p);
-      if (n >= max) break;
-      if (k == 'J' || k == 'D') {
-         uint64_t lo = (s < nslots) ? slots[s] : 0;
-         uint64_t hi = (s + 1 < nslots) ? slots[s + 1] : 0;
-         out[n].ju = lo | (hi << 32);
-         s += 2;
-      } else {
-         out[n].u = (s < nslots) ? slots[s] : 0;
-         ++s;
-      }
-      ++n;
-      p = q;
-   }
-   return n;
+  int n = 0, s = 0;
+  if (!sig || *sig != '(') return 0;
+  for (const char *p = sig + 1; *p && *p != ')'; ) {
+    const char *q = desc_skip(p);
+    char k = dvm__kind_of(p);
+    if (n >= max) break;
+    if (k == 'J' || k == 'D') {
+      uint64_t lo = (s < nslots) ? slots[s] : 0;
+      uint64_t hi = (s + 1 < nslots) ? slots[s + 1] : 0;
+      out[n].ju = lo | (hi << 32);
+      s += 2;
+    } else {
+      out[n].u = (s < nslots) ? slots[s] : 0;
+      ++s;
+    }
+    ++n;
+    p = q;
+  }
+  return n;
 }
 
 static int values_to_slots(const char *sig, const union dvm_value *vals, int nvals,
                            uint32_t *out, int max)
 {
-   int s = 0, n = 0;
-   if (!sig || *sig != '(') return 0;
-   for (const char *p = sig + 1; *p && *p != ')'; ) {
-      const char *q = desc_skip(p);
-      char k = dvm__kind_of(p);
-      union dvm_value v = (n < nvals) ? vals[n] : (union dvm_value){ 0 };
-      if (k == 'J' || k == 'D') {
-         if (s >= max - 1) break;
-         out[s++] = (uint32_t)v.ju;
-         out[s++] = (uint32_t)(v.ju >> 32);
-      } else {
-         if (s >= max) break;
-         out[s++] = v.u;
-      }
-      ++n;
-      p = q;
-   }
-   return s;
+  int s = 0, n = 0;
+  if (!sig || *sig != '(') return 0;
+  for (const char *p = sig + 1; *p && *p != ')'; ) {
+    const char *q = desc_skip(p);
+    char k = dvm__kind_of(p);
+    union dvm_value v = (n < nvals) ? vals[n] : (union dvm_value) {
+      0
+    };
+    if (k == 'J' || k == 'D') {
+      if (s >= max - 1) break;
+      out[s++] = (uint32_t)v.ju;
+      out[s++] = (uint32_t)(v.ju >> 32);
+    } else {
+      if (s >= max) break;
+      out[s++] = v.u;
+    }
+    ++n;
+    p = q;
+  }
+  return s;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -1789,28 +1890,44 @@ static int values_to_slots(const char *sig, const union dvm_value *vals, int nva
 #define B4(u) ((uint8_t)(((u) >> 12) & 0x0f))
 
 struct frame {
-   struct dvm_method *m;
-   uint32_t *regs;
-   uint32_t nregs;
-   uint32_t pc;
-   uint64_t result;   /* the pseudo-register move-result reads */
+  struct dvm_method *m;
+  uint32_t *regs;
+  uint32_t nregs;
+  uint32_t pc;
+  uint64_t result;   /* the pseudo-register move-result reads */
 };
 
 static inline uint64_t rw(const uint32_t *r, int i)
 {
-   return (uint64_t)r[i] | ((uint64_t)r[i + 1] << 32);
+  return (uint64_t)r[i] | ((uint64_t)r[i + 1] << 32);
 }
 
 static inline void sw(uint32_t *r, int i, uint64_t v)
 {
-   r[i] = (uint32_t)v;
-   r[i + 1] = (uint32_t)(v >> 32);
+  r[i] = (uint32_t)v;
+  r[i + 1] = (uint32_t)(v >> 32);
 }
 
-static inline float bits_to_f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
-static inline uint32_t f_to_bits(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
-static inline double bits_to_d(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
-static inline uint64_t d_to_bits(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+static inline float bits_to_f(uint32_t u) {
+  float f;
+  memcpy(&f, &u, 4);
+  return f;
+}
+static inline uint32_t f_to_bits(float f) {
+  uint32_t u;
+  memcpy(&u, &f, 4);
+  return u;
+}
+static inline double bits_to_d(uint64_t u) {
+  double d;
+  memcpy(&d, &u, 8);
+  return d;
+}
+static inline uint64_t d_to_bits(double d) {
+  uint64_t u;
+  memcpy(&u, &d, 8);
+  return u;
+}
 
 static bool class_assignable(struct dvm *vm, struct dvm_class *from,
                              struct dvm_class *to);
@@ -1818,22 +1935,22 @@ static bool class_assignable(struct dvm *vm, struct dvm_class *from,
 static bool iface_assignable(struct dvm *vm, struct dvm_class *from,
                              struct dvm_class *to)
 {
-   for (struct dvm_class *c = from; c; c = c->super)
-      for (int i = 0; i < c->nifaces; ++i)
-         /* A class that lists itself teaches this walk nothing and never ends:
-          * the recursion comes straight back here and the process dies of a
-          * stack overflow rather than of a wrong answer.  Java has no such
-          * declaration, but a builtin table can be written with one. */
-         if (c->ifaces[i] && c->ifaces[i] != c && c->ifaces[i] != from &&
-             class_assignable(vm, c->ifaces[i], to))
-            return true;
-   return false;
+  for (struct dvm_class *c = from; c; c = c->super)
+    for (int i = 0; i < c->nifaces; ++i)
+      /* A class that lists itself teaches this walk nothing and never ends:
+       * the recursion comes straight back here and the process dies of a
+       * stack overflow rather than of a wrong answer.  Java has no such
+       * declaration, but a builtin table can be written with one. */
+      if (c->ifaces[i] && c->ifaces[i] != c && c->ifaces[i] != from &&
+          class_assignable(vm, c->ifaces[i], to))
+        return true;
+  return false;
 }
 
 bool dvm__class_assignable(struct dvm *vm, struct dvm_class *from,
                            struct dvm_class *to)
 {
-   return class_assignable(vm, from, to);
+  return class_assignable(vm, from, to);
 }
 
 static bool class_assignable_slow(struct dvm *vm, struct dvm_class *from,
@@ -1848,66 +1965,71 @@ static bool class_assignable_slow(struct dvm *vm, struct dvm_class *from,
 static bool class_assignable(struct dvm *vm, struct dvm_class *from,
                              struct dvm_class *to)
 {
-   if (!from || !to) return true;   /* unknown: do not block the app */
-   if (from == to) return true;
-   static _Thread_local struct { const struct dvm_class *from, *to; } cache[1024];
-   static _Thread_local uint64_t generation;
-   if (generation != vm->field_cache_generation) {
-      memset(cache, 0, sizeof cache);
-      generation = vm->field_cache_generation;
-   }
-   const size_t slot = ((((uintptr_t)from >> 4) * 2654435761u) ^ ((uintptr_t)to >> 4)) & 1023u;
-   if (cache[slot].from == from && cache[slot].to == to) return true;
-   if (!class_assignable_slow(vm, from, to)) return false;
-   cache[slot].from = from; cache[slot].to = to;
-   return true;
+  if (!from || !to) return true;   /* unknown: do not block the app */
+  if (from == to) return true;
+  static _Thread_local struct {
+    const struct dvm_class *from, *to;
+  } cache[1024];
+  static _Thread_local uint64_t generation;
+  if (generation != vm->field_cache_generation) {
+    memset(cache, 0, sizeof cache);
+    generation = vm->field_cache_generation;
+  }
+  const size_t slot = ((((uintptr_t)from >> 4) * 2654435761u) ^ ((uintptr_t)to >> 4)) & 1023u;
+  if (cache[slot].from == from && cache[slot].to == to) return true;
+  if (!class_assignable_slow(vm, from, to)) return false;
+  cache[slot].from = from;
+  cache[slot].to = to;
+  return true;
 }
 
 static bool class_assignable_slow(struct dvm *vm, struct dvm_class *from,
                                   struct dvm_class *to)
 {
-   if (!from || !to) return true;
-   if (from == to || !strcmp(from->desc, to->desc)) return true;
-   /* Primitive values have no reference widening conversion.  This check
-    * must precede Object: array covariance recurses on the component type,
-    * and treating byte as an Object made byte[] pass `instanceof Object[]`.
-    * Primitive arrays are Objects, Cloneable and Serializable, but are never
-    * arrays of references; only identical primitive component types match. */
-   if (from->is_primitive || to->is_primitive) return false;
-   if (!strcmp(to->desc, "Ljava/lang/Object;")) return true;
-   for (struct dvm_class *c = from; c; c = c->super)
-      if (c == to || !strcmp(c->desc, to->desc)) return true;
-   if (iface_assignable(vm, from, to)) return true;
-   if (from->is_array && to->is_array)
-      return class_assignable(vm, from->elem, to->elem);
-   /* Unknown hierarchy is not evidence of assignability.  Returning true for
-    * every external class makes `x instanceof InternalSentinel` succeed for
-    * arbitrary objects; lock-free queues then mistake real tasks for their
-    * private marker objects and spin forever.  Exact classes and every known
-    * superclass/interface were handled above, so the only sound answer left
-    * is false. */
-   return false;
+  if (!from || !to) return true;
+  if (from == to || !strcmp(from->desc, to->desc)) return true;
+  /* Primitive values have no reference widening conversion.  This check
+   * must precede Object: array covariance recurses on the component type,
+   * and treating byte as an Object made byte[] pass `instanceof Object[]`.
+   * Primitive arrays are Objects, Cloneable and Serializable, but are never
+   * arrays of references; only identical primitive component types match. */
+  if (from->is_primitive || to->is_primitive) return false;
+  if (!strcmp(to->desc, "Ljava/lang/Object;")) return true;
+  for (struct dvm_class *c = from; c; c = c->super)
+    if (c == to || !strcmp(c->desc, to->desc)) return true;
+  if (iface_assignable(vm, from, to)) return true;
+  if (from->is_array && to->is_array)
+    return class_assignable(vm, from->elem, to->elem);
+  /* Unknown hierarchy is not evidence of assignability.  Returning true for
+   * every external class makes `x instanceof InternalSentinel` succeed for
+   * arbitrary objects; lock-free queues then mistake real tasks for their
+   * private marker objects and spin forever.  Exact classes and every known
+   * superclass/interface were handled above, so the only sound answer left
+   * is false. */
+  return false;
 }
 
 /* Resolves the target of an invoke-virtual / -interface at the receiver's
  * actual class. */
 static struct dvm_method *virtual_target(struct dvm *vm, dvm_ref self,
-                                         struct dvm_method *decl)
+    struct dvm_method *decl)
 {
-   struct dvm_object *o = dvm__obj(vm, self);
-   if (!o || !o->cls || o->cls == decl->cls) return decl;
-   /* Inline cache on the declared method: a call site sees the same few
-    * receiver classes over and over, and the lookup below hashes the name and
-    * the signature on every call.  Method tables are fixed once a class is
-    * built, so a (receiver class, declared method) answer never goes stale. */
-   struct dvm_class *rc = o->cls;
-   if (decl->vt_cls[0] == rc) return decl->vt_m[0];
-   if (decl->vt_cls[1] == rc) return decl->vt_m[1];
-   struct dvm_method *m = dvm_find_method(vm, rc, decl->name, decl->sig);
-   if (!m) m = decl;
-   decl->vt_cls[1] = decl->vt_cls[0]; decl->vt_m[1] = decl->vt_m[0];
-   decl->vt_cls[0] = rc; decl->vt_m[0] = m;
-   return m;
+  struct dvm_object *o = dvm__obj(vm, self);
+  if (!o || !o->cls || o->cls == decl->cls) return decl;
+  /* Inline cache on the declared method: a call site sees the same few
+   * receiver classes over and over, and the lookup below hashes the name and
+   * the signature on every call.  Method tables are fixed once a class is
+   * built, so a (receiver class, declared method) answer never goes stale. */
+  struct dvm_class *rc = o->cls;
+  if (decl->vt_cls[0] == rc) return decl->vt_m[0];
+  if (decl->vt_cls[1] == rc) return decl->vt_m[1];
+  struct dvm_method *m = dvm_find_method(vm, rc, decl->name, decl->sig);
+  if (!m) m = decl;
+  decl->vt_cls[1] = decl->vt_cls[0];
+  decl->vt_m[1] = decl->vt_m[0];
+  decl->vt_cls[0] = rc;
+  decl->vt_m[0] = m;
+  return m;
 }
 
 bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
@@ -1915,63 +2037,63 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
                    dvm_ref self, const uint32_t *slots, int nslots,
                    union dvm_value *out)
 {
-   union dvm_value args[64];
-   int nargs = slots_to_values(sig, slots, nslots, args, 64);
-   memset(out, 0, sizeof *out);
+  union dvm_value args[64];
+  int nargs = slots_to_values(sig, slots, nslots, args, 64);
+  memset(out, 0, sizeof *out);
 
-   if (dvm__env_outtrace())
-      fprintf(stderr, "[out] %s.%s%s%s\n", cls->name, name, sig,
-              is_native ? " (native)" : "");
+  if (dvm__env_outtrace())
+    fprintf(stderr, "[out] %s.%s%s%s\n", cls->name, name, sig,
+            is_native ? " (native)" : "");
 
-   /* Interface / abstract methods on a Proxy instance never have bytecode;
-    * they must reach the InvocationHandler rather than the unresolved stub. */
-   if (!is_static && self &&
-       dvm_proxy_try_invoke(vm, self, cls, name, sig, args, nargs, out))
-      return !vm->exception;
+  /* Interface / abstract methods on a Proxy instance never have bytecode;
+   * they must reach the InvocationHandler rather than the unresolved stub. */
+  if (!is_static && self &&
+      dvm_proxy_try_invoke(vm, self, cls, name, sig, args, nargs, out))
+    return !vm->exception;
 
-   if (is_native && vm->hooks.call_native) {
-      /* The bridge converts VM objects before and after guest execution.
-       * Those conversions require GIL just like bytecode. The bridge drops
-       * it only around actual native execution, preserving GIL -> AEL order. */
-      bool ok = vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
-                                      is_static, self, args, nargs, out);
-      if (ok) {
-         if (vm->hooks.take_pending_exception) {
-            dvm_ref raised = vm->hooks.take_pending_exception(vm->hooks.user, vm);
-            if (raised) {
-               memset(out, 0, sizeof *out);
-               vm->exception = raised;
-               return false;
-            }
-         }
-         return true;
+  if (is_native && vm->hooks.call_native) {
+    /* The bridge converts VM objects before and after guest execution.
+     * Those conversions require GIL just like bytecode. The bridge drops
+     * it only around actual native execution, preserving GIL -> AEL order. */
+    bool ok = vm->hooks.call_native(vm->hooks.user, vm, cls->name, name, sig,
+                                    is_static, self, args, nargs, out);
+    if (ok) {
+      if (vm->hooks.take_pending_exception) {
+        dvm_ref raised = vm->hooks.take_pending_exception(vm->hooks.user, vm);
+        if (raised) {
+          memset(out, 0, sizeof *out);
+          vm->exception = raised;
+          return false;
+        }
       }
-   }
-
-   if (vm->hooks.call_external &&
-       vm->hooks.call_external(vm->hooks.user, vm, cls->name, name, sig,
-                               self, args, nargs, out))
       return true;
+    }
+  }
 
-   /* Nothing implements this and the guest is calling it *now*: the zero
-    * below is about to be used as an answer.  Report the caller with it —
-    * which app method acted on the missing result is what separates a
-    * harmless optional-plugin probe from the cause of the next failure. */
-   char what[512];
-   struct dvm_method *from = vm->cur_method;
-   /* The declared class is what the dex names; the receiver's own class is
-    * what has to gain the method, and the two differ for every interface. */
-   struct dvm_class *receiver = self ? dvm_object_class(vm, self) : NULL;
-   snprintf(what, sizeof what,
-            "method not implemented, stub returns null/0: %s.%s%s (receiver %s, called from %s.%s)",
-            cls->name, name, sig,
-            receiver && receiver->name ? receiver->name : "-",
-            from && from->cls && from->cls->name ? from->cls->name : "?",
-            from && from->name ? from->name : "?");
-   note_missing(vm, what);
-   /* Returning zero is what the stub layer did before this module existed.
-    * Throwing here would abort app code that only wanted a no-op logger. */
-   return true;
+  if (vm->hooks.call_external &&
+      vm->hooks.call_external(vm->hooks.user, vm, cls->name, name, sig,
+                              self, args, nargs, out))
+    return true;
+
+  /* Nothing implements this and the guest is calling it *now*: the zero
+   * below is about to be used as an answer.  Report the caller with it —
+   * which app method acted on the missing result is what separates a
+   * harmless optional-plugin probe from the cause of the next failure. */
+  char what[512];
+  struct dvm_method *from = vm->cur_method;
+  /* The declared class is what the dex names; the receiver's own class is
+   * what has to gain the method, and the two differ for every interface. */
+  struct dvm_class *receiver = self ? dvm_object_class(vm, self) : NULL;
+  snprintf(what, sizeof what,
+           "method not implemented, stub returns null/0: %s.%s%s (receiver %s, called from %s.%s)",
+           cls->name, name, sig,
+           receiver && receiver->name ? receiver->name : "-",
+           from && from->cls && from->cls->name ? from->cls->name : "?",
+           from && from->name ? from->name : "?");
+  note_missing(vm, what);
+  /* Returning zero is what the stub layer did before this module existed.
+   * Throwing here would abort app code that only wanted a no-op logger. */
+  return true;
 }
 
 /* --- the loop ----------------------------------------------------------- */
@@ -1981,42 +2103,42 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
 static int find_handler(struct dvm *vm, struct dvm_method *m, uint32_t pc,
                         struct dvm_class *exc_cls, uint32_t *out_pc)
 {
-   const struct dex_code *code = &m->code;
-   if (!code->tries_size || !code->tries || !m->dex) return -1;
+  const struct dex_code *code = &m->code;
+  if (!code->tries_size || !code->tries || !m->dex) return -1;
 
-   for (uint32_t i = 0; i < code->tries_size; ++i) {
-      const uint8_t *t = code->tries + (size_t)i * 8u;
-      uint32_t start, count16;
-      memcpy(&start, t, 4);
-      uint16_t cnt, hoff;
-      memcpy(&cnt, t + 4, 2);
-      memcpy(&hoff, t + 6, 2);
-      count16 = cnt;
-      if (pc < start || pc >= start + count16) continue;
+  for (uint32_t i = 0; i < code->tries_size; ++i) {
+    const uint8_t *t = code->tries + (size_t)i * 8u;
+    uint32_t start, count16;
+    memcpy(&start, t, 4);
+    uint16_t cnt, hoff;
+    memcpy(&cnt, t + 4, 2);
+    memcpy(&hoff, t + 6, 2);
+    count16 = cnt;
+    if (pc < start || pc >= start + count16) continue;
 
-      size_t p = (size_t)(code->handlers - m->dex->p) + hoff;
-      int32_t size;
-      p = dex_sleb(m->dex, p, &size);
-      int npairs = size < 0 ? -size : size;
-      for (int k = 0; k < npairs; ++k) {
-         uint32_t type_idx, addr;
-         p = dex_uleb(m->dex, p, &type_idx);
-         p = dex_uleb(m->dex, p, &addr);
-         const char *td = dex_type(m->dex, type_idx);
-         struct dvm_class *tc = td ? dvm__class_by_desc(vm, td) : NULL;
-         if (tc && class_assignable(vm, exc_cls, tc)) {
-            *out_pc = addr;
-            return 0;
-         }
+    size_t p = (size_t)(code->handlers - m->dex->p) + hoff;
+    int32_t size;
+    p = dex_sleb(m->dex, p, &size);
+    int npairs = size < 0 ? -size : size;
+    for (int k = 0; k < npairs; ++k) {
+      uint32_t type_idx, addr;
+      p = dex_uleb(m->dex, p, &type_idx);
+      p = dex_uleb(m->dex, p, &addr);
+      const char *td = dex_type(m->dex, type_idx);
+      struct dvm_class *tc = td ? dvm__class_by_desc(vm, td) : NULL;
+      if (tc && class_assignable(vm, exc_cls, tc)) {
+        *out_pc = addr;
+        return 0;
       }
-      if (size <= 0) {
-         uint32_t all;
-         p = dex_uleb(m->dex, p, &all);
-         *out_pc = all;
-         return 0;
-      }
-   }
-   return -1;
+    }
+    if (size <= 0) {
+      uint32_t all;
+      p = dex_uleb(m->dex, p, &all);
+      *out_pc = all;
+      return 0;
+    }
+  }
+  return -1;
 }
 
 /* A cooperative park is an interpreter unwind token, not a Java
@@ -2026,82 +2148,82 @@ static int find_handler(struct dvm *vm, struct dvm_method *m, uint32_t pc,
 static int find_catchall_handler(struct dvm_method *m, uint32_t pc,
                                  uint32_t *out_pc)
 {
-   const struct dex_code *code = &m->code;
-   if (!code->tries_size || !code->tries || !m->dex) return -1;
-   for (uint32_t i = 0; i < code->tries_size; ++i) {
-      const uint8_t *t = code->tries + (size_t)i * 8u;
-      uint32_t start;
-      uint16_t count, hoff;
-      memcpy(&start, t, 4);
-      memcpy(&count, t + 4, 2);
-      memcpy(&hoff, t + 6, 2);
-      if (pc < start || pc >= start + count) continue;
-      size_t p = (size_t)(code->handlers - m->dex->p) + hoff;
-      int32_t size;
-      p = dex_sleb(m->dex, p, &size);
-      int npairs = size < 0 ? -size : size;
-      for (int k = 0; k < npairs; ++k) {
-         uint32_t ignored;
-         p = dex_uleb(m->dex, p, &ignored);
-         p = dex_uleb(m->dex, p, &ignored);
-      }
-      if (size <= 0) {
-         p = dex_uleb(m->dex, p, out_pc);
-         (void)p;
-         return 0;
-      }
-   }
-   return -1;
+  const struct dex_code *code = &m->code;
+  if (!code->tries_size || !code->tries || !m->dex) return -1;
+  for (uint32_t i = 0; i < code->tries_size; ++i) {
+    const uint8_t *t = code->tries + (size_t)i * 8u;
+    uint32_t start;
+    uint16_t count, hoff;
+    memcpy(&start, t, 4);
+    memcpy(&count, t + 4, 2);
+    memcpy(&hoff, t + 6, 2);
+    if (pc < start || pc >= start + count) continue;
+    size_t p = (size_t)(code->handlers - m->dex->p) + hoff;
+    int32_t size;
+    p = dex_sleb(m->dex, p, &size);
+    int npairs = size < 0 ? -size : size;
+    for (int k = 0; k < npairs; ++k) {
+      uint32_t ignored;
+      p = dex_uleb(m->dex, p, &ignored);
+      p = dex_uleb(m->dex, p, &ignored);
+    }
+    if (size <= 0) {
+      p = dex_uleb(m->dex, p, out_pc);
+      (void)p;
+      return 0;
+    }
+  }
+  return -1;
 }
 
 /* Reads the 35c/3rc argument registers into `slots`. */
 static int gather_args(const uint16_t *insns, uint32_t nins, uint32_t pc, bool range,
                        uint32_t *regs, uint32_t nregs, uint32_t *slots)
 {
-   uint16_t u0 = insns[pc];
-   uint16_t cccc = (pc + 2 < nins) ? insns[pc + 2] : 0;
-   if (range) {
-      int n = AA(u0);
-      uint16_t first = cccc;
-      for (int i = 0; i < n; ++i)
-         slots[i] = (uint32_t)(first + i) < nregs ? regs[first + i] : 0;
-      return n;
-   }
-   int n = B4(u0);
-   uint16_t g = A4(u0);
-   uint16_t fedc = cccc;
-   uint16_t idx[5] = {
-      (uint16_t)(fedc & 0xf), (uint16_t)((fedc >> 4) & 0xf),
-      (uint16_t)((fedc >> 8) & 0xf), (uint16_t)((fedc >> 12) & 0xf), g
-   };
-   if (n > 5) n = 5;
-   for (int i = 0; i < n; ++i)
-      slots[i] = idx[i] < nregs ? regs[idx[i]] : 0;
-   return n;
+  uint16_t u0 = insns[pc];
+  uint16_t cccc = (pc + 2 < nins) ? insns[pc + 2] : 0;
+  if (range) {
+    int n = AA(u0);
+    uint16_t first = cccc;
+    for (int i = 0; i < n; ++i)
+      slots[i] = (uint32_t)(first + i) < nregs ? regs[first + i] : 0;
+    return n;
+  }
+  int n = B4(u0);
+  uint16_t g = A4(u0);
+  uint16_t fedc = cccc;
+  uint16_t idx[5] = {
+    (uint16_t)(fedc & 0xf), (uint16_t)((fedc >> 4) & 0xf),
+    (uint16_t)((fedc >> 8) & 0xf), (uint16_t)((fedc >> 12) & 0xf), g
+  };
+  if (n > 5) n = 5;
+  for (int i = 0; i < n; ++i)
+    slots[i] = idx[i] < nregs ? regs[idx[i]] : 0;
+  return n;
 }
 
 static struct dvm_class *resolve_type(struct dvm *vm, struct dvm_dex *dd, uint32_t idx)
 {
-   if (dd->type_cache && idx < dd->file.type_ids_size && dd->type_cache[idx])
-      return dd->type_cache[idx];
-   const char *t = dex_type(&dd->file, idx);
-   if (!t) return NULL;
-   struct dvm_class *c = dvm__class_by_desc(vm, t);
-   if (dd->type_cache && idx < dd->file.type_ids_size)
-      dd->type_cache[idx] = c;
-   return c;
+  if (dd->type_cache && idx < dd->file.type_ids_size && dd->type_cache[idx])
+    return dd->type_cache[idx];
+  const char *t = dex_type(&dd->file, idx);
+  if (!t) return NULL;
+  struct dvm_class *c = dvm__class_by_desc(vm, t);
+  if (dd->type_cache && idx < dd->file.type_ids_size)
+    dd->type_cache[idx] = c;
+  return c;
 }
 
 static struct dvm_dex *dex_of(struct dvm *vm, struct dex_file *f)
 {
-   for (int i = 0; i < vm->ndexes; ++i)
-      if (&vm->dexes[i]->file == f) return vm->dexes[i];
-   return NULL;
+  for (int i = 0; i < vm->ndexes; ++i)
+    if (&vm->dexes[i]->file == f) return vm->dexes[i];
+  return NULL;
 }
 
 static struct dvm_method *resolve_method_slow(struct dvm *vm, struct dvm_dex *dd,
-                                              uint32_t idx, struct dvm_class **out_cls,
-                                              const char **out_name, const char **out_sig);
+    uint32_t idx, struct dvm_class **out_cls,
+    const char **out_name, const char **out_sig);
 
 /* The constant-pool entry is almost always already resolved: answer from the
  * per-dex table without a call, and leave the descriptor work to the slow path. */
@@ -2110,76 +2232,76 @@ struct dvm_method *resolve_method(struct dvm *vm, struct dvm_dex *dd,
                                   uint32_t idx, struct dvm_class **out_cls,
                                   const char **out_name, const char **out_sig)
 {
-   if (__builtin_expect(dd->method_cache && idx < dd->file.method_ids_size, 1)) {
-      struct dvm_method *m = dd->method_cache[idx];
-      if (__builtin_expect(m != NULL, 1)) {
-         *out_cls  = m->cls;
-         *out_name = m->name;
-         *out_sig = m->sig ? m->sig : "";
-         return m;
-      }
-   }
-   return resolve_method_slow(vm, dd, idx, out_cls, out_name, out_sig);
-}
-
-static struct dvm_method *resolve_method_slow(struct dvm *vm, struct dvm_dex *dd,
-                                              uint32_t idx, struct dvm_class **out_cls,
-                                              const char **out_name, const char **out_sig)
-{
-   /* The cache is consulted first, because everything below it is the
-    * expensive half: dex_proto_signature() builds the descriptor string out of
-    * the proto's parameter type ids, and dvm__class_by_desc() hashes and
-    * compares the class descriptor.  Both used to run on every single invoke
-    * instruction and only then was the cached answer returned, so the cache
-    * saved the lookup and paid for the parsing — profiles of a Cross Worlds
-    * load screen sat in dex_proto_signature() through the interpreter.
-    *
-    * A resolved method already knows the three things the caller wanted out of
-    * the constant pool: its class, its name and its signature.  The referenced
-    * class may be a subclass of the declaring one, which is what the caller
-    * wants anyway — dispatch is on the receiver and the error messages name
-    * the method that was actually found. */
-   if (dd->method_cache && idx < dd->file.method_ids_size && dd->method_cache[idx]) {
-      struct dvm_method *m = dd->method_cache[idx];
+  if (__builtin_expect(dd->method_cache && idx < dd->file.method_ids_size, 1)) {
+    struct dvm_method *m = dd->method_cache[idx];
+    if (__builtin_expect(m != NULL, 1)) {
       *out_cls  = m->cls;
       *out_name = m->name;
       *out_sig = m->sig ? m->sig : "";
       return m;
-   }
+    }
+  }
+  return resolve_method_slow(vm, dd, idx, out_cls, out_name, out_sig);
+}
 
-   struct dex_method_id mid;
-   if (!dex_method_id(&dd->file, idx, &mid)) return NULL;
-   const char *cd = dex_type(&dd->file, mid.class_idx);
-   const char *name = dex_string(&dd->file, mid.name_idx);
-   if (!cd || !name) return NULL;
-   if (!dd->proto_cache || mid.proto_idx >= dd->file.proto_ids_size) {
-      dvm__throw(vm, "java/lang/VerifyError", "invalid method prototype");
-      return NULL;
-   }
-   if (!dd->proto_cache[mid.proto_idx])
-      dd->proto_cache[mid.proto_idx] = dex_proto_signature_alloc(&dd->file, mid.proto_idx);
-   *out_sig = dd->proto_cache[mid.proto_idx];
-   if (!*out_sig) {
-      *out_sig = "";
-      dvm__throw(vm, "java/lang/VerifyError", "cannot read method descriptor");
-      return NULL;
-   }
+static struct dvm_method *resolve_method_slow(struct dvm *vm, struct dvm_dex *dd,
+    uint32_t idx, struct dvm_class **out_cls,
+    const char **out_name, const char **out_sig)
+{
+  /* The cache is consulted first, because everything below it is the
+   * expensive half: dex_proto_signature() builds the descriptor string out of
+   * the proto's parameter type ids, and dvm__class_by_desc() hashes and
+   * compares the class descriptor.  Both used to run on every single invoke
+   * instruction and only then was the cached answer returned, so the cache
+   * saved the lookup and paid for the parsing — profiles of a Cross Worlds
+   * load screen sat in dex_proto_signature() through the interpreter.
+   *
+   * A resolved method already knows the three things the caller wanted out of
+   * the constant pool: its class, its name and its signature.  The referenced
+   * class may be a subclass of the declaring one, which is what the caller
+   * wants anyway — dispatch is on the receiver and the error messages name
+   * the method that was actually found. */
+  if (dd->method_cache && idx < dd->file.method_ids_size && dd->method_cache[idx]) {
+    struct dvm_method *m = dd->method_cache[idx];
+    *out_cls  = m->cls;
+    *out_name = m->name;
+    *out_sig = m->sig ? m->sig : "";
+    return m;
+  }
 
-   struct dvm_class *cls = dvm__class_by_desc(vm, cd);
-   *out_cls = cls;
-   *out_name = name;
-   if (!cls) return NULL;
+  struct dex_method_id mid;
+  if (!dex_method_id(&dd->file, idx, &mid)) return NULL;
+  const char *cd = dex_type(&dd->file, mid.class_idx);
+  const char *name = dex_string(&dd->file, mid.name_idx);
+  if (!cd || !name) return NULL;
+  if (!dd->proto_cache || mid.proto_idx >= dd->file.proto_ids_size) {
+    dvm__throw(vm, "java/lang/VerifyError", "invalid method prototype");
+    return NULL;
+  }
+  if (!dd->proto_cache[mid.proto_idx])
+    dd->proto_cache[mid.proto_idx] = dex_proto_signature_alloc(&dd->file, mid.proto_idx);
+  *out_sig = dd->proto_cache[mid.proto_idx];
+  if (!*out_sig) {
+    *out_sig = "";
+    dvm__throw(vm, "java/lang/VerifyError", "cannot read method descriptor");
+    return NULL;
+  }
 
-   struct dvm_method *m = dvm_find_method(vm, cls, name, *out_sig);
-   if (m && dd->method_cache && idx < dd->file.method_ids_size)
-      dd->method_cache[idx] = m;
-   return m;
+  struct dvm_class *cls = dvm__class_by_desc(vm, cd);
+  *out_cls = cls;
+  *out_name = name;
+  if (!cls) return NULL;
+
+  struct dvm_method *m = dvm_find_method(vm, cls, name, *out_sig);
+  if (m && dd->method_cache && idx < dd->file.method_ids_size)
+    dd->method_cache[idx] = m;
+  return m;
 }
 
 static struct dvm_field *resolve_field_slow(struct dvm *vm, struct dvm_dex *dd,
-                                            uint32_t idx, bool statics,
-                                            struct dvm_class **out_cls,
-                                            const char **out_name, const char **out_type);
+    uint32_t idx, bool statics,
+    struct dvm_class **out_cls,
+    const char **out_name, const char **out_type);
 
 static inline __attribute__((always_inline))
 struct dvm_field *resolve_field(struct dvm *vm, struct dvm_dex *dd,
@@ -2187,392 +2309,399 @@ struct dvm_field *resolve_field(struct dvm *vm, struct dvm_dex *dd,
                                 struct dvm_class **out_cls,
                                 const char **out_name, const char **out_type)
 {
-   if (__builtin_expect(dd->field_cache && idx < dd->file.field_ids_size, 1)) {
-      struct dvm_field *f = dd->field_cache[idx];
-      if (__builtin_expect(f != NULL, 1)) {
-         *out_cls = f->cls; *out_name = f->name; *out_type = f->type;
-         return f->slot == DVM_FIELD_MISSING ? NULL : f;
-      }
-   }
-   return resolve_field_slow(vm, dd, idx, statics, out_cls, out_name, out_type);
-}
-
-static struct dvm_field *resolve_field_slow(struct dvm *vm, struct dvm_dex *dd,
-                                            uint32_t idx, bool statics,
-                                            struct dvm_class **out_cls,
-                                            const char **out_name, const char **out_type)
-{
-   if (dd->field_cache && idx < dd->file.field_ids_size && dd->field_cache[idx]) {
-      struct dvm_field *f = dd->field_cache[idx];
+  if (__builtin_expect(dd->field_cache && idx < dd->file.field_ids_size, 1)) {
+    struct dvm_field *f = dd->field_cache[idx];
+    if (__builtin_expect(f != NULL, 1)) {
       *out_cls = f->cls;
       *out_name = f->name;
       *out_type = f->type;
       return f->slot == DVM_FIELD_MISSING ? NULL : f;
-   }
-   struct dex_field_id fid;
-   if (!dex_field_id(&dd->file, idx, &fid)) return NULL;
-   const char *cd = dex_type(&dd->file, fid.class_idx);
-   *out_name = dex_string(&dd->file, fid.name_idx);
-   *out_type = dex_type(&dd->file, fid.type_idx);
-   if (!cd || !*out_name) return NULL;
-   struct dvm_class *cls = dvm__class_by_desc(vm, cd);
-   *out_cls = cls;
-   if (!cls) return NULL;
-   struct dvm_field *f = class_find_field(vm, cls, *out_name, *out_type, statics);
-   if (dd->field_cache && idx < dd->file.field_ids_size) {
-      if (f) dd->field_cache[idx] = f;
-      else {
-         /* Remember the miss too: a field the class does not have is probed
-          * on every execution of the instruction, and each probe was a class
-          * lookup plus string compares up the whole super chain. */
-         if (!dd->field_miss)
-            dd->field_miss = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_miss);
-         if (dd->field_miss) {
-            struct dvm_field *miss = &dd->field_miss[idx];
-            miss->name = *out_name; miss->type = *out_type; miss->cls = cls;
-            miss->slot = DVM_FIELD_MISSING;
-            dd->field_cache[idx] = miss;
-         }
+    }
+  }
+  return resolve_field_slow(vm, dd, idx, statics, out_cls, out_name, out_type);
+}
+
+static struct dvm_field *resolve_field_slow(struct dvm *vm, struct dvm_dex *dd,
+    uint32_t idx, bool statics,
+    struct dvm_class **out_cls,
+    const char **out_name, const char **out_type)
+{
+  if (dd->field_cache && idx < dd->file.field_ids_size && dd->field_cache[idx]) {
+    struct dvm_field *f = dd->field_cache[idx];
+    *out_cls = f->cls;
+    *out_name = f->name;
+    *out_type = f->type;
+    return f->slot == DVM_FIELD_MISSING ? NULL : f;
+  }
+  struct dex_field_id fid;
+  if (!dex_field_id(&dd->file, idx, &fid)) return NULL;
+  const char *cd = dex_type(&dd->file, fid.class_idx);
+  *out_name = dex_string(&dd->file, fid.name_idx);
+  *out_type = dex_type(&dd->file, fid.type_idx);
+  if (!cd || !*out_name) return NULL;
+  struct dvm_class *cls = dvm__class_by_desc(vm, cd);
+  *out_cls = cls;
+  if (!cls) return NULL;
+  struct dvm_field *f = class_find_field(vm, cls, *out_name, *out_type, statics);
+  if (dd->field_cache && idx < dd->file.field_ids_size) {
+    if (f) dd->field_cache[idx] = f;
+    else {
+      /* Remember the miss too: a field the class does not have is probed
+       * on every execution of the instruction, and each probe was a class
+       * lookup plus string compares up the whole super chain. */
+      if (!dd->field_miss)
+        dd->field_miss = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_miss);
+      if (dd->field_miss) {
+        struct dvm_field *miss = &dd->field_miss[idx];
+        miss->name = *out_name;
+        miss->type = *out_type;
+        miss->cls = cls;
+        miss->slot = DVM_FIELD_MISSING;
+        dd->field_cache[idx] = miss;
       }
-   }
-   return f;
+    }
+  }
+  return f;
 }
 
 static int dex_index(struct dvm *vm, struct dvm_dex *dd)
 {
-   for (int i = 0; i < vm->ndexes; ++i)
-      if (vm->dexes[i] == dd) return i;
-   return -1;
+  for (int i = 0; i < vm->ndexes; ++i)
+    if (vm->dexes[i] == dd) return i;
+  return -1;
 }
 
 static dvm_ref const_string(struct dvm *vm, struct dvm_dex *dd, uint32_t idx)
 {
-   if (dd->string_cache && idx < dd->file.string_ids_size && dd->string_cache[idx])
-      return dd->string_cache[idx];
-   const char *s = dex_string(&dd->file, idx);
-   {
-      const char *want = dvm__env_strwatch();
-      if (want && s && strstr(s, want))
-         fprintf(stderr, "[dvm] const-string[%u] = \"%s\" in %s.%s (dex %d)\n",
-                 idx, s,
-                 vm->cur_method && vm->cur_method->cls
-                    ? vm->cur_method->cls->name : "?",
-                 vm->cur_method ? vm->cur_method->name : "?",
-                 dex_index(vm, dd));
-   }
-   dvm_ref r = dvm__intern(vm, s ? s : "");
-   if (dd->string_cache && idx < dd->file.string_ids_size)
-      dd->string_cache[idx] = r;
-   return r;
+  if (dd->string_cache && idx < dd->file.string_ids_size && dd->string_cache[idx])
+    return dd->string_cache[idx];
+  const char *s = dex_string(&dd->file, idx);
+  {
+    const char *want = dvm__env_strwatch();
+    if (want && s && strstr(s, want))
+      fprintf(stderr, "[dvm] const-string[%u] = \"%s\" in %s.%s (dex %d)\n",
+              idx, s,
+              vm->cur_method && vm->cur_method->cls
+              ? vm->cur_method->cls->name : "?",
+              vm->cur_method ? vm->cur_method->name : "?",
+              dex_index(vm, dd));
+  }
+  dvm_ref r = dvm__intern(vm, s ? s : "");
+  if (dd->string_cache && idx < dd->file.string_ids_size)
+    dd->string_cache[idx] = r;
+  return r;
 }
 
 static dvm_ref class_object(struct dvm *vm, struct dvm_class *cls)
 {
-   if (!cls) return 0;
-   if (cls->class_object) return cls->class_object;
-   dvm_ref r = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/lang/Class;"));
-   struct dvm_object *o = dvm__obj(vm, r);
-   if (o) {
-      o->kind = DVM_OBJ_CLASS;
-      o->klass = cls;
-      ++o->pins;
-   }
-   cls->class_object = r;
-   return r;
+  if (!cls) return 0;
+  if (cls->class_object) return cls->class_object;
+  dvm_ref r = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/lang/Class;"));
+  struct dvm_object *o = dvm__obj(vm, r);
+  if (o) {
+    o->kind = DVM_OBJ_CLASS;
+    o->klass = cls;
+    ++o->pins;
+  }
+  cls->class_object = r;
+  return r;
 }
 
 dvm_ref dvm_class_object(struct dvm *vm, struct dvm_class *cls)
 {
-   return class_object(vm, cls);
+  return class_object(vm, cls);
 }
 
 /* Array element access shared by aget/aput. */
 static bool array_check(struct dvm *vm, struct dvm_object *a, uint32_t idx)
 {
-   if (!a || a->kind != DVM_OBJ_ARRAY) {
-      dvm__throw(vm, "java/lang/NullPointerException", "array is null");
-      return false;
-   }
-   if (idx >= a->length) {
-      dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException",
-                 "length=%u index=%u", a->length, idx);
-      return false;
-   }
-   return true;
+  if (!a || a->kind != DVM_OBJ_ARRAY) {
+    dvm__throw(vm, "java/lang/NullPointerException", "array is null");
+    return false;
+  }
+  if (idx >= a->length) {
+    dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException",
+               "length=%u index=%u", a->length, idx);
+    return false;
+  }
+  return true;
 }
 
 static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
 {
-   struct dvm_method *m = fr->m;
-   const char *trace_class = dvm__env_trace_class();
-   bool trace_this = !trace_class ||
-      (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
-   const uint16_t *insns = m->code.insns;
-   uint32_t nins = m->code.insns_size;
-   uint32_t nregs = fr->nregs;
-   uint32_t *r = fr->regs;
-   struct dvm_dex *dd = m->dd_cache;
-   if (!dd) { dd = dex_of(vm, m->dex); m->dd_cache = dd; }
-   if (m->dex && !dd) {
-      /* Every constant-pool index in this method is meaningless without its
-       * own dex; resolving against another one silently returns the wrong
-       * class and method.  Fail loudly instead. */
-      static bool warned;
-      if (!warned) {
-         warned = true;
-         fprintf(stderr, "[dvm] %s.%s: dex not registered — constant pool "
-                 "cannot be resolved\n", m->cls ? m->cls->name : "?", m->name);
-      }
-   }
-   const char *sigbuf = "";
+  struct dvm_method *m = fr->m;
+  const char *trace_class = dvm__env_trace_class();
+  bool trace_this = !trace_class ||
+                    (m->cls && m->cls->name && strstr(m->cls->name, trace_class));
+  const uint16_t *insns = m->code.insns;
+  uint32_t nins = m->code.insns_size;
+  uint32_t nregs = fr->nregs;
+  uint32_t *r = fr->regs;
+  struct dvm_dex *dd = m->dd_cache;
+  if (!dd) {
+    dd = dex_of(vm, m->dex);
+    m->dd_cache = dd;
+  }
+  if (m->dex && !dd) {
+    /* Every constant-pool index in this method is meaningless without its
+     * own dex; resolving against another one silently returns the wrong
+     * class and method.  Fail loudly instead. */
+    static bool warned;
+    if (!warned) {
+      warned = true;
+      fprintf(stderr, "[dvm] %s.%s: dex not registered — constant pool "
+                      "cannot be resolved\n", m->cls ? m->cls->name : "?", m->name);
+    }
+  }
+  const char *sigbuf = "";
 
-   memset(out, 0, sizeof *out);
+  memset(out, 0, sizeof *out);
 
-/* Operand fetch.  A truncated method would otherwise read past the end of the
- * instruction array; the dex is third-party input, so read zero instead. */
+  /* Operand fetch.  A truncated method would otherwise read past the end of the
+   * instruction array; the dex is third-party input, so read zero instead. */
 #define IU(k) ((pc + (uint32_t)(k) < nins) ? insns[pc + (uint32_t)(k)] : (uint16_t)0)
 #define REQ(reg) do { if ((uint32_t)(reg) >= nregs) { \
       dvm__throw(vm, "java/lang/VerifyError", "%s.%s register %u of %u", \
                  m->cls->name, m->name, (unsigned)(reg), nregs); \
       goto exception; } } while (0)
 
-   uint32_t pc;
-   uint16_t u0;
-   uint8_t op;
-   /* Threaded dispatch.  Every handler that finishes normally ends in
-    * DISPATCH(), which fetches the next instruction and jumps straight to its
-    * handler through this table: one indirect jump per handler instead of one
-    * shared jump at the top of the loop, so the CPU predicts each opcode's
-    * successor separately.  The rare work (lock hand-over, step budget,
-    * tracing, the end of the method) stays at the top of the loop, and
-    * DISPATCH() falls back to it whenever any of that is due. */
-   static const void *const dtab[256] = {
-      [0 ... 255] = &&L_switch,
-      [0x00] = &&L_00,
-      [0x01] = &&L_01,
-      [0x02] = &&L_02,
-      [0x03] = &&L_03,
-      [0x04] = &&L_04,
-      [0x05] = &&L_05,
-      [0x06] = &&L_06,
-      [0x07] = &&L_07,
-      [0x08] = &&L_08,
-      [0x09] = &&L_09,
-      [0x0a] = &&L_0a,
-      [0x0b] = &&L_0b,
-      [0x0c] = &&L_0c,
-      [0x0d] = &&L_0d,
-      [0x0e] = &&L_0e,
-      [0x0f] = &&L_0f,
-      [0x10] = &&L_10,
-      [0x11] = &&L_11,
-      [0x12] = &&L_12,
-      [0x13] = &&L_13,
-      [0x14] = &&L_14,
-      [0x15] = &&L_15,
-      [0x16] = &&L_16,
-      [0x17] = &&L_17,
-      [0x18] = &&L_18,
-      [0x19] = &&L_19,
-      [0x1a] = &&L_1a,
-      [0x1b] = &&L_1b,
-      [0x1c] = &&L_1c,
-      [0x1d] = &&L_1d,
-      [0x1e] = &&L_1e,
-      [0x1f] = &&L_1f,
-      [0x20] = &&L_20,
-      [0x21] = &&L_21,
-      [0x22] = &&L_22,
-      [0x23] = &&L_23,
-      [0x24] = &&L_24,
-      [0x25] = &&L_25,
-      [0x26] = &&L_26,
-      [0x27] = &&L_27,
-      [0x28] = &&L_28,
-      [0x29] = &&L_29,
-      [0x2a] = &&L_2a,
-      [0x2b] = &&L_2b,
-      [0x2c] = &&L_2c,
-      [0x2d] = &&L_2d,
-      [0x2e] = &&L_2e,
-      [0x2f] = &&L_2f,
-      [0x30] = &&L_30,
-      [0x31] = &&L_31,
-      [0x32] = &&L_32,
-      [0x33] = &&L_33,
-      [0x34] = &&L_34,
-      [0x35] = &&L_35,
-      [0x36] = &&L_36,
-      [0x37] = &&L_37,
-      [0x38] = &&L_38,
-      [0x39] = &&L_39,
-      [0x3a] = &&L_3a,
-      [0x3b] = &&L_3b,
-      [0x3c] = &&L_3c,
-      [0x3d] = &&L_3d,
-      [0x44] = &&L_44,
-      [0x45] = &&L_45,
-      [0x46] = &&L_46,
-      [0x47] = &&L_47,
-      [0x48] = &&L_48,
-      [0x49] = &&L_49,
-      [0x4a] = &&L_4a,
-      [0x4b] = &&L_4b,
-      [0x4c] = &&L_4c,
-      [0x4d] = &&L_4d,
-      [0x4e] = &&L_4e,
-      [0x4f] = &&L_4f,
-      [0x50] = &&L_50,
-      [0x51] = &&L_51,
-      [0x52] = &&L_52,
-      [0x53] = &&L_53,
-      [0x54] = &&L_54,
-      [0x55] = &&L_55,
-      [0x56] = &&L_56,
-      [0x57] = &&L_57,
-      [0x58] = &&L_58,
-      [0x59] = &&L_59,
-      [0x5a] = &&L_5a,
-      [0x5b] = &&L_5b,
-      [0x5c] = &&L_5c,
-      [0x5d] = &&L_5d,
-      [0x5e] = &&L_5e,
-      [0x5f] = &&L_5f,
-      [0x60] = &&L_60,
-      [0x61] = &&L_61,
-      [0x62] = &&L_62,
-      [0x63] = &&L_63,
-      [0x64] = &&L_64,
-      [0x65] = &&L_65,
-      [0x66] = &&L_66,
-      [0x67] = &&L_67,
-      [0x68] = &&L_68,
-      [0x69] = &&L_69,
-      [0x6a] = &&L_6a,
-      [0x6b] = &&L_6b,
-      [0x6c] = &&L_6c,
-      [0x6d] = &&L_6d,
-      [0x6e] = &&L_6e,
-      [0x6f] = &&L_6f,
-      [0x70] = &&L_70,
-      [0x71] = &&L_71,
-      [0x72] = &&L_72,
-      [0x74] = &&L_74,
-      [0x75] = &&L_75,
-      [0x76] = &&L_76,
-      [0x77] = &&L_77,
-      [0x78] = &&L_78,
-      [0x7b] = &&L_7b,
-      [0x7c] = &&L_7c,
-      [0x7d] = &&L_7d,
-      [0x7e] = &&L_7e,
-      [0x7f] = &&L_7f,
-      [0x80] = &&L_80,
-      [0x81] = &&L_81,
-      [0x82] = &&L_82,
-      [0x83] = &&L_83,
-      [0x84] = &&L_84,
-      [0x85] = &&L_85,
-      [0x86] = &&L_86,
-      [0x87] = &&L_87,
-      [0x88] = &&L_88,
-      [0x89] = &&L_89,
-      [0x8a] = &&L_8a,
-      [0x8b] = &&L_8b,
-      [0x8c] = &&L_8c,
-      [0x8d] = &&L_8d,
-      [0x8e] = &&L_8e,
-      [0x8f] = &&L_8f,
-      [0x90] = &&L_90,
-      [0x91] = &&L_91,
-      [0x92] = &&L_92,
-      [0x93] = &&L_93,
-      [0x94] = &&L_94,
-      [0x95] = &&L_95,
-      [0x96] = &&L_96,
-      [0x97] = &&L_97,
-      [0x98] = &&L_98,
-      [0x99] = &&L_99,
-      [0x9a] = &&L_9a,
-      [0x9b] = &&L_9b,
-      [0x9c] = &&L_9c,
-      [0x9d] = &&L_9d,
-      [0x9e] = &&L_9e,
-      [0x9f] = &&L_9f,
-      [0xa0] = &&L_a0,
-      [0xa1] = &&L_a1,
-      [0xa2] = &&L_a2,
-      [0xa3] = &&L_a3,
-      [0xa4] = &&L_a4,
-      [0xa5] = &&L_a5,
-      [0xa6] = &&L_a6,
-      [0xa7] = &&L_a7,
-      [0xa8] = &&L_a8,
-      [0xa9] = &&L_a9,
-      [0xaa] = &&L_aa,
-      [0xab] = &&L_ab,
-      [0xac] = &&L_ac,
-      [0xad] = &&L_ad,
-      [0xae] = &&L_ae,
-      [0xaf] = &&L_af,
-      [0xb0] = &&L_b0,
-      [0xb1] = &&L_b1,
-      [0xb2] = &&L_b2,
-      [0xb3] = &&L_b3,
-      [0xb4] = &&L_b4,
-      [0xb5] = &&L_b5,
-      [0xb6] = &&L_b6,
-      [0xb7] = &&L_b7,
-      [0xb8] = &&L_b8,
-      [0xb9] = &&L_b9,
-      [0xba] = &&L_ba,
-      [0xbb] = &&L_bb,
-      [0xbc] = &&L_bc,
-      [0xbd] = &&L_bd,
-      [0xbe] = &&L_be,
-      [0xbf] = &&L_bf,
-      [0xc0] = &&L_c0,
-      [0xc1] = &&L_c1,
-      [0xc2] = &&L_c2,
-      [0xc3] = &&L_c3,
-      [0xc4] = &&L_c4,
-      [0xc5] = &&L_c5,
-      [0xc6] = &&L_c6,
-      [0xc7] = &&L_c7,
-      [0xc8] = &&L_c8,
-      [0xc9] = &&L_c9,
-      [0xca] = &&L_ca,
-      [0xcb] = &&L_cb,
-      [0xcc] = &&L_cc,
-      [0xcd] = &&L_cd,
-      [0xce] = &&L_ce,
-      [0xcf] = &&L_cf,
-      [0xd0] = &&L_d0,
-      [0xd1] = &&L_d1,
-      [0xd2] = &&L_d2,
-      [0xd3] = &&L_d3,
-      [0xd4] = &&L_d4,
-      [0xd5] = &&L_d5,
-      [0xd6] = &&L_d6,
-      [0xd7] = &&L_d7,
-      [0xd8] = &&L_d8,
-      [0xd9] = &&L_d9,
-      [0xda] = &&L_da,
-      [0xdb] = &&L_db,
-      [0xdc] = &&L_dc,
-      [0xdd] = &&L_dd,
-      [0xde] = &&L_de,
-      [0xdf] = &&L_df,
-      [0xe0] = &&L_e0,
-      [0xe1] = &&L_e1,
-      [0xe2] = &&L_e2,
-      [0xfa] = &&L_fa,
-      [0xfb] = &&L_fb,
-      [0xfc] = &&L_fc,
-      [0xfd] = &&L_fd,
-      [0xfe] = &&L_fe,
-      [0xff] = &&L_ff
-   };
+  uint32_t pc;
+  uint16_t u0;
+  uint8_t op;
+  /* Threaded dispatch.  Every handler that finishes normally ends in
+   * DISPATCH(), which fetches the next instruction and jumps straight to its
+   * handler through this table: one indirect jump per handler instead of one
+   * shared jump at the top of the loop, so the CPU predicts each opcode's
+   * successor separately.  The rare work (lock hand-over, step budget,
+   * tracing, the end of the method) stays at the top of the loop, and
+   * DISPATCH() falls back to it whenever any of that is due. */
+  static const void *const dtab[256] = {
+    [0 ... 255] = &&L_switch,
+    [0x00] = &&L_00,
+    [0x01] = &&L_01,
+    [0x02] = &&L_02,
+    [0x03] = &&L_03,
+    [0x04] = &&L_04,
+    [0x05] = &&L_05,
+    [0x06] = &&L_06,
+    [0x07] = &&L_07,
+    [0x08] = &&L_08,
+    [0x09] = &&L_09,
+    [0x0a] = &&L_0a,
+    [0x0b] = &&L_0b,
+    [0x0c] = &&L_0c,
+    [0x0d] = &&L_0d,
+    [0x0e] = &&L_0e,
+    [0x0f] = &&L_0f,
+    [0x10] = &&L_10,
+    [0x11] = &&L_11,
+    [0x12] = &&L_12,
+    [0x13] = &&L_13,
+    [0x14] = &&L_14,
+    [0x15] = &&L_15,
+    [0x16] = &&L_16,
+    [0x17] = &&L_17,
+    [0x18] = &&L_18,
+    [0x19] = &&L_19,
+    [0x1a] = &&L_1a,
+    [0x1b] = &&L_1b,
+    [0x1c] = &&L_1c,
+    [0x1d] = &&L_1d,
+    [0x1e] = &&L_1e,
+    [0x1f] = &&L_1f,
+    [0x20] = &&L_20,
+    [0x21] = &&L_21,
+    [0x22] = &&L_22,
+    [0x23] = &&L_23,
+    [0x24] = &&L_24,
+    [0x25] = &&L_25,
+    [0x26] = &&L_26,
+    [0x27] = &&L_27,
+    [0x28] = &&L_28,
+    [0x29] = &&L_29,
+    [0x2a] = &&L_2a,
+    [0x2b] = &&L_2b,
+    [0x2c] = &&L_2c,
+    [0x2d] = &&L_2d,
+    [0x2e] = &&L_2e,
+    [0x2f] = &&L_2f,
+    [0x30] = &&L_30,
+    [0x31] = &&L_31,
+    [0x32] = &&L_32,
+    [0x33] = &&L_33,
+    [0x34] = &&L_34,
+    [0x35] = &&L_35,
+    [0x36] = &&L_36,
+    [0x37] = &&L_37,
+    [0x38] = &&L_38,
+    [0x39] = &&L_39,
+    [0x3a] = &&L_3a,
+    [0x3b] = &&L_3b,
+    [0x3c] = &&L_3c,
+    [0x3d] = &&L_3d,
+    [0x44] = &&L_44,
+    [0x45] = &&L_45,
+    [0x46] = &&L_46,
+    [0x47] = &&L_47,
+    [0x48] = &&L_48,
+    [0x49] = &&L_49,
+    [0x4a] = &&L_4a,
+    [0x4b] = &&L_4b,
+    [0x4c] = &&L_4c,
+    [0x4d] = &&L_4d,
+    [0x4e] = &&L_4e,
+    [0x4f] = &&L_4f,
+    [0x50] = &&L_50,
+    [0x51] = &&L_51,
+    [0x52] = &&L_52,
+    [0x53] = &&L_53,
+    [0x54] = &&L_54,
+    [0x55] = &&L_55,
+    [0x56] = &&L_56,
+    [0x57] = &&L_57,
+    [0x58] = &&L_58,
+    [0x59] = &&L_59,
+    [0x5a] = &&L_5a,
+    [0x5b] = &&L_5b,
+    [0x5c] = &&L_5c,
+    [0x5d] = &&L_5d,
+    [0x5e] = &&L_5e,
+    [0x5f] = &&L_5f,
+    [0x60] = &&L_60,
+    [0x61] = &&L_61,
+    [0x62] = &&L_62,
+    [0x63] = &&L_63,
+    [0x64] = &&L_64,
+    [0x65] = &&L_65,
+    [0x66] = &&L_66,
+    [0x67] = &&L_67,
+    [0x68] = &&L_68,
+    [0x69] = &&L_69,
+    [0x6a] = &&L_6a,
+    [0x6b] = &&L_6b,
+    [0x6c] = &&L_6c,
+    [0x6d] = &&L_6d,
+    [0x6e] = &&L_6e,
+    [0x6f] = &&L_6f,
+    [0x70] = &&L_70,
+    [0x71] = &&L_71,
+    [0x72] = &&L_72,
+    [0x74] = &&L_74,
+    [0x75] = &&L_75,
+    [0x76] = &&L_76,
+    [0x77] = &&L_77,
+    [0x78] = &&L_78,
+    [0x7b] = &&L_7b,
+    [0x7c] = &&L_7c,
+    [0x7d] = &&L_7d,
+    [0x7e] = &&L_7e,
+    [0x7f] = &&L_7f,
+    [0x80] = &&L_80,
+    [0x81] = &&L_81,
+    [0x82] = &&L_82,
+    [0x83] = &&L_83,
+    [0x84] = &&L_84,
+    [0x85] = &&L_85,
+    [0x86] = &&L_86,
+    [0x87] = &&L_87,
+    [0x88] = &&L_88,
+    [0x89] = &&L_89,
+    [0x8a] = &&L_8a,
+    [0x8b] = &&L_8b,
+    [0x8c] = &&L_8c,
+    [0x8d] = &&L_8d,
+    [0x8e] = &&L_8e,
+    [0x8f] = &&L_8f,
+    [0x90] = &&L_90,
+    [0x91] = &&L_91,
+    [0x92] = &&L_92,
+    [0x93] = &&L_93,
+    [0x94] = &&L_94,
+    [0x95] = &&L_95,
+    [0x96] = &&L_96,
+    [0x97] = &&L_97,
+    [0x98] = &&L_98,
+    [0x99] = &&L_99,
+    [0x9a] = &&L_9a,
+    [0x9b] = &&L_9b,
+    [0x9c] = &&L_9c,
+    [0x9d] = &&L_9d,
+    [0x9e] = &&L_9e,
+    [0x9f] = &&L_9f,
+    [0xa0] = &&L_a0,
+    [0xa1] = &&L_a1,
+    [0xa2] = &&L_a2,
+    [0xa3] = &&L_a3,
+    [0xa4] = &&L_a4,
+    [0xa5] = &&L_a5,
+    [0xa6] = &&L_a6,
+    [0xa7] = &&L_a7,
+    [0xa8] = &&L_a8,
+    [0xa9] = &&L_a9,
+    [0xaa] = &&L_aa,
+    [0xab] = &&L_ab,
+    [0xac] = &&L_ac,
+    [0xad] = &&L_ad,
+    [0xae] = &&L_ae,
+    [0xaf] = &&L_af,
+    [0xb0] = &&L_b0,
+    [0xb1] = &&L_b1,
+    [0xb2] = &&L_b2,
+    [0xb3] = &&L_b3,
+    [0xb4] = &&L_b4,
+    [0xb5] = &&L_b5,
+    [0xb6] = &&L_b6,
+    [0xb7] = &&L_b7,
+    [0xb8] = &&L_b8,
+    [0xb9] = &&L_b9,
+    [0xba] = &&L_ba,
+    [0xbb] = &&L_bb,
+    [0xbc] = &&L_bc,
+    [0xbd] = &&L_bd,
+    [0xbe] = &&L_be,
+    [0xbf] = &&L_bf,
+    [0xc0] = &&L_c0,
+    [0xc1] = &&L_c1,
+    [0xc2] = &&L_c2,
+    [0xc3] = &&L_c3,
+    [0xc4] = &&L_c4,
+    [0xc5] = &&L_c5,
+    [0xc6] = &&L_c6,
+    [0xc7] = &&L_c7,
+    [0xc8] = &&L_c8,
+    [0xc9] = &&L_c9,
+    [0xca] = &&L_ca,
+    [0xcb] = &&L_cb,
+    [0xcc] = &&L_cc,
+    [0xcd] = &&L_cd,
+    [0xce] = &&L_ce,
+    [0xcf] = &&L_cf,
+    [0xd0] = &&L_d0,
+    [0xd1] = &&L_d1,
+    [0xd2] = &&L_d2,
+    [0xd3] = &&L_d3,
+    [0xd4] = &&L_d4,
+    [0xd5] = &&L_d5,
+    [0xd6] = &&L_d6,
+    [0xd7] = &&L_d7,
+    [0xd8] = &&L_d8,
+    [0xd9] = &&L_d9,
+    [0xda] = &&L_da,
+    [0xdb] = &&L_db,
+    [0xdc] = &&L_dc,
+    [0xdd] = &&L_dd,
+    [0xde] = &&L_de,
+    [0xdf] = &&L_df,
+    [0xe0] = &&L_e0,
+    [0xe1] = &&L_e1,
+    [0xe2] = &&L_e2,
+    [0xfa] = &&L_fa,
+    [0xfb] = &&L_fb,
+    [0xfc] = &&L_fc,
+    [0xfd] = &&L_fd,
+    [0xfe] = &&L_fe,
+    [0xff] = &&L_ff
+  };
 #define DISPATCH() { \
       pc = fr->pc; \
       if (__builtin_expect(pc >= nins || vm->trace || \
@@ -2587,1183 +2716,1927 @@ static bool execute(struct dvm *vm, struct frame *fr, union dvm_value *out)
       vm->cur_pc = pc; \
       goto *dtab[op]; \
    }
-   /* Set once: every call out restores it on the way back (invoke() saves the
-    * caller), and a lock hand-over reloads this thread's saved state, which
-    * names this method. */
-   vm->cur_method = m;
-   for (;;) {
-      pc = fr->pc;
-      if (__builtin_expect(pc >= nins, 0)) {
-         dvm__throw(vm, "java/lang/VerifyError", "%s.%s ran past the end",
-                    m->cls->name, m->name);
-         goto exception;
+  /* Set once: every call out restores it on the way back (invoke() saves the
+   * caller), and a lock hand-over reloads this thread's saved state, which
+   * names this method. */
+  vm->cur_method = m;
+  for (;;) {
+    pc = fr->pc;
+    if (__builtin_expect(pc >= nins, 0)) {
+      dvm__throw(vm, "java/lang/VerifyError", "%s.%s ran past the end",
+                 m->cls->name, m->name);
+      goto exception;
+    }
+    ++vm->steps;
+    /* Offer the lock up periodically.  Nothing preempts bytecode, so without
+     * this a thread in a long loop starves every other one for as long as it
+     * runs.  The top of the dispatch loop is the one place in a call where
+     * nothing but frames, registers and dex mappings are live, and none of
+     * those move when another thread allocates. */
+    if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) {
+      if (luna_guest_paused()) {
+        unsigned ael = arm_lock_unlock_all();
+        unsigned gil = dvm_gil_unlock_all(vm);
+        const struct timespec interval = {0, 10000000};
+        while (luna_guest_paused() && !dvm_is_stopping(vm)) {
+          arm_exec_pause_poll();
+          nanosleep(&interval, NULL);
+        }
+        dvm_gil_relock(vm, gil);
+        arm_lock_relock(ael);
       }
-      ++vm->steps;
-      /* Offer the lock up periodically.  Nothing preempts bytecode, so without
-       * this a thread in a long loop starves every other one for as long as it
-       * runs.  The top of the dispatch loop is the one place in a call where
-       * nothing but frames, registers and dex mappings are live, and none of
-       * those move when another thread allocates. */
-      if ((vm->steps & (DVM_GIL_YIELD_STEPS - 1)) == 0) {
-         if (luna_guest_paused()) {
-            unsigned ael = arm_lock_unlock_all();
-            unsigned gil = dvm_gil_unlock_all(vm);
-            const struct timespec interval = {0, 10000000};
-            while (luna_guest_paused() && !dvm_is_stopping(vm)) {
-               arm_exec_pause_poll();
-               nanosleep(&interval, NULL);
+      dvm_gil_yield(vm);
+      if (dvm_is_stopping(vm)) return false;
+    }
+    /* And the *execution* lock with it, more often.
+     *
+     * Java reached from guest native code (dvm_jni_invoke) runs with the ARM
+     * execution lock still held, because the SVC handler that called in is
+     * holding it.  Every guest thread in the process is therefore stopped
+     * for as long as that Java call runs -- measured on Cross Worlds: a
+     * single JNI call into the security module's Java side held it for
+     * 1037 ms, and the main-Looper tick that the frame pump drives (and
+     * with it that module's own heartbeat callback) came 691 ms late.  On a
+     * device a JNI transition stops nothing.
+     *
+     * Lock order here is interpreter-outside, execution-inside, so giving
+     * the inner lock back while holding the outer one is the safe
+     * direction, and the top of the dispatch loop is the same safe point
+     * the GIL yield above uses.  arm_lock_yield() is one relaxed load when
+     * nobody is waiting, which is why this can afford the shorter
+     * interval. */
+    if ((vm->steps & (DVM_AEL_YIELD_STEPS - 1)) == 0) arm_lock_yield();
+    if (vm->step_limit && ++vm->call_steps > vm->step_limit) {
+      fprintf(stderr, "[dvm] step limit reached in %s.%s — aborting the call "
+                      "(%llu steps, depth=%d, limit=%llu); call stack:\n",
+              m->cls->name, m->name, (unsigned long long)vm->call_steps,
+              vm->depth, (unsigned long long)vm->step_limit);
+      for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 12; --i, ++shown) {
+        const struct dvm_method *f = vm->callstack[i];
+        if (!f) continue;
+        fprintf(stderr, "[dvm]   #%d %s.%s%s\n", shown,
+                f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+      }
+      dvm__throw(vm, "java/lang/Error", "dvm step limit");
+      goto exception;
+    }
+
+    u0 = insns[pc];
+    op = OPCODE(u0);
+    vm->cur_pc = pc;
+
+    if (vm->trace >= 2 && trace_this)
+      fprintf(stderr, "[dvm]   %s.%s @%04x op=%02x words=%04x,%04x,%04x\n",
+              m->cls->name, m->name, pc, op, u0, IU(1), IU(2));
+    if (vm->trace >= 3 && trace_this) {
+      fprintf(stderr, "[dvm]     regs");
+      for (uint32_t i = 0; i < nregs; ++i)
+        fprintf(stderr, " v%u=%08x", i, r[i]);
+      fputc('\n', stderr);
+    }
+
+L_switch:
+    switch (op) {
+    case 0x00:
+L_00: /* nop, and the payload pseudo-ops when reached by accident */
+      fr->pc = pc + 1;
+      DISPATCH();
+
+    /* --- moves --- */
+    case 0x01:
+L_01:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = r[B4(u0)];
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x07:
+L_07:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = r[B4(u0)];
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x02:
+L_02:
+    case 0x08:
+L_08:
+      REQ(AA(u0));
+      REQ(IU(1));
+      r[AA(u0)] = r[IU(1)];
+      fr->pc = pc + 2;
+      break;
+    case 0x03:
+L_03:
+    case 0x09:
+L_09:
+      REQ(IU(1));
+      REQ(IU(2));
+      r[IU(1)] = r[IU(2)];
+      fr->pc = pc + 3;
+      break;
+    case 0x04:
+L_04:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0) + 1);
+      sw(r, A4(u0), rw(r, B4(u0)));
+      fr->pc = pc + 1;
+      break;
+    case 0x05:
+L_05:
+      REQ(AA(u0) + 1);
+      REQ(IU(1) + 1);
+      sw(r, AA(u0), rw(r, IU(1)));
+      fr->pc = pc + 2;
+      break;
+    case 0x06:
+L_06:
+      REQ(IU(1) + 1);
+      REQ(IU(2) + 1);
+      sw(r, IU(1), rw(r, IU(2)));
+      fr->pc = pc + 3;
+      break;
+
+    case 0x0a:
+L_0a: /* move-result */
+    case 0x0c:
+L_0c: /* move-result-object */
+      REQ(AA(u0));
+      r[AA(u0)] = (uint32_t)fr->result;
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x0b:
+L_0b: /* move-result-wide */
+      REQ(AA(u0) + 1);
+      sw(r, AA(u0), fr->result);
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x0d:
+L_0d: /* move-exception */
+      REQ(AA(u0));
+      /* The handler entry already cleared the pending exception; the
+       * object itself is kept in exc_ref for exactly this instruction. */
+      r[AA(u0)] = vm->exception ? vm->exception : vm->exc_ref;
+      vm->exception = 0;
+      fr->pc = pc + 1;
+      DISPATCH();
+
+    /* --- returns --- */
+    case 0x0e:
+L_0e:
+      return true;
+    case 0x0f:
+L_0f:
+    case 0x11:
+L_11:
+      REQ(AA(u0));
+      out->u = r[AA(u0)];
+      return true;
+    case 0x10:
+L_10:
+      REQ(AA(u0) + 1);
+      out->ju = rw(r, AA(u0));
+      return true;
+
+    /* --- constants --- */
+    case 0x12:
+L_12: { /* const/4 */
+        REQ(A4(u0));
+        int32_t v = (int32_t)(int8_t)(uint8_t)(B4(u0) << 4) >> 4;
+        r[A4(u0)] = (uint32_t)v;
+        fr->pc = pc + 1;
+        DISPATCH();
+      }
+    case 0x13:
+L_13: /* const/16 */
+      REQ(AA(u0));
+      r[AA(u0)] = (uint32_t)(int32_t)(int16_t)IU(1);
+      fr->pc = pc + 2;
+      DISPATCH();
+    case 0x14:
+L_14: /* const */
+      REQ(AA(u0));
+      r[AA(u0)] = (uint32_t)IU(1) | ((uint32_t)IU(2) << 16);
+      fr->pc = pc + 3;
+      DISPATCH();
+    case 0x15:
+L_15: /* const/high16 */
+      REQ(AA(u0));
+      r[AA(u0)] = (uint32_t)IU(1) << 16;
+      fr->pc = pc + 2;
+      DISPATCH();
+    case 0x16:
+L_16: /* const-wide/16 */
+      REQ(AA(u0) + 1);
+      sw(r, AA(u0), (uint64_t)(int64_t)(int16_t)IU(1));
+      fr->pc = pc + 2;
+      DISPATCH();
+    case 0x17:
+L_17: /* const-wide/32 */
+      REQ(AA(u0) + 1);
+      sw(r, AA(u0), (uint64_t)(int64_t)(int32_t)
+         ((uint32_t)IU(1) | ((uint32_t)IU(2) << 16)));
+      fr->pc = pc + 3;
+      DISPATCH();
+    case 0x18:
+L_18: { /* const-wide */
+        REQ(AA(u0) + 1);
+        uint64_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= (uint64_t)IU(1 + i) << (16 * i);
+        sw(r, AA(u0), v);
+        fr->pc = pc + 5;
+        DISPATCH();
+      }
+    case 0x19:
+L_19: /* const-wide/high16 */
+      REQ(AA(u0) + 1);
+      sw(r, AA(u0), (uint64_t)IU(1) << 48);
+      fr->pc = pc + 2;
+      DISPATCH();
+    case 0x1a:
+L_1a: /* const-string */
+      REQ(AA(u0));
+      r[AA(u0)] = dd ? const_string(vm, dd, IU(1)) : 0;
+      fr->pc = pc + 2;
+      DISPATCH();
+    case 0x1b:
+L_1b: /* const-string/jumbo */
+      REQ(AA(u0));
+      r[AA(u0)] = dd ? const_string(vm, dd,
+                                    (uint32_t)IU(1) | ((uint32_t)IU(2) << 16)) : 0;
+      fr->pc = pc + 3;
+      DISPATCH();
+    case 0x1c:
+L_1c: { /* const-class */
+        REQ(AA(u0));
+        /* A type the loader cannot produce is NoClassDefFoundError, not a
+         * null Class.  Handing back null turned "this optional component is
+         * not in the package" into a NullPointerException several frames
+         * later, inside whatever the caller did with the Class object —
+         * CrashSight's Singleton.getSingleton(clazz) reports the NPE from
+         * clazz.newInstance() and never mentions the class that is missing.
+         * new-instance has always answered this way (case 0x22); this makes
+         * the two agree. */
+        struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+        if (!t || class_absent(vm, t)) {
+          dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
+                     t && t->name ? t->name : "?");
+          goto exception;
+        }
+        r[AA(u0)] = class_object(vm, t);
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+
+    case 0x1d:
+L_1d: /* monitor-enter */
+      REQ(AA(u0));
+      if (!dvm__monitor_enter(vm, r[AA(u0)])) goto exception;
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x1e:
+L_1e: /* monitor-exit */
+      REQ(AA(u0));
+      if (!dvm__monitor_exit(vm, r[AA(u0)])) goto exception;
+      fr->pc = pc + 1;
+      DISPATCH();
+
+    case 0x1f:
+L_1f: { /* check-cast */
+        REQ(AA(u0));
+        struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+        struct dvm_object *o = obj_fast(vm, r[AA(u0)]);
+        if (o && t && !class_assignable(vm, o->cls, t)) {
+          fprintf(stderr, "[dvm] check-cast at %s.%s%s pc=%u: %s to %s\n",
+                  m->cls->name, m->name, m->sig ? m->sig : "",
+                  fr->pc, o->cls ? o->cls->name : "?", t->name);
+          if (getenv("LUNARIA_DVM_CASTVAL") && o->cls && !strcmp(o->cls->name, "java/lang/String")) {
+            const char *sv = dvm_string_utf8(vm, r[AA(u0)]);
+            fprintf(stderr, "[dvm]   value=%.200s\n", sv ? sv : "?");
+          }
+          dvm__throw(vm, "java/lang/ClassCastException", "%s to %s",
+                     o->cls ? o->cls->name : "?", t->name);
+          goto exception;
+        }
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x20:
+L_20: { /* instance-of */
+        REQ(A4(u0));
+        REQ(B4(u0));
+        struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+        struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
+        r[A4(u0)] = (o && t && class_assignable(vm, o->cls, t)) ? 1u : 0u;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x21:
+L_21: { /* array-length */
+        REQ(A4(u0));
+        REQ(B4(u0));
+        struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
+        if (!o || o->kind != DVM_OBJ_ARRAY) {
+          dvm__throw(vm, "java/lang/NullPointerException", "array-length");
+          goto exception;
+        }
+        r[A4(u0)] = o->length;
+        fr->pc = pc + 1;
+        DISPATCH();
+      }
+    case 0x22:
+L_22: { /* new-instance */
+        REQ(AA(u0));
+        struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+        if (!t || class_absent(vm, t)) {
+          dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
+                     t && t->name ? t->name : "?");
+          goto exception;
+        }
+        if (!dvm_init_class(vm, t)) goto exception;
+        if (t->external && vm->hooks.new_external) {
+          uint32_t h = vm->hooks.new_external(vm->hooks.user, vm, t->name);
+          r[AA(u0)] = h ? h : dvm_new_object(vm, t);
+        } else {
+          r[AA(u0)] = dvm_new_object(vm, t);
+        }
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x23:
+L_23: { /* new-array */
+        REQ(A4(u0));
+        REQ(B4(u0));
+        struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+        int32_t len = (int32_t)r[B4(u0)];
+        if (len < 0) {
+          dvm__throw(vm, "java/lang/NegativeArraySizeException", "%d", len);
+          goto exception;
+        }
+        const char *ed = (t && t->desc[0] == '[') ? t->desc + 1 : "I";
+        r[A4(u0)] = dvm_new_array(vm, dvm__kind_of(ed), ed, (uint32_t)len);
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x24:
+L_24:
+    case 0x25:
+L_25: { /* filled-new-array[/range] */
+        bool range = (op == 0x25);
+        struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
+        uint32_t slots[256];
+        int n = gather_args(insns, nins, pc, range, r, nregs, slots);
+        const char *ed = (t && t->desc[0] == '[') ? t->desc + 1 : "I";
+        char kind = dvm__kind_of(ed);
+        dvm_ref arr = dvm_new_array(vm, kind, ed, (uint32_t)n);
+        struct dvm_object *ao = dvm__obj(vm, arr);
+        if (ao) {
+          for (int i = 0; i < n; ++i) {
+            switch (dvm__elem_width(kind)) {
+            case 1:
+              ((uint8_t *)ao->data)[i] = (uint8_t)slots[i];
+              break;
+            case 2:
+              ((uint16_t *)ao->data)[i] = (uint16_t)slots[i];
+              break;
+            default:
+              ((uint32_t *)ao->data)[i] = slots[i];
+              break;
             }
-            dvm_gil_relock(vm, gil);
-            arm_lock_relock(ael);
-         }
-         dvm_gil_yield(vm);
-         if (dvm_is_stopping(vm)) return false;
+          }
+        }
+        fr->result = arr;
+        fr->pc = pc + 3;
+        DISPATCH();
       }
-      /* And the *execution* lock with it, more often.
-       *
-       * Java reached from guest native code (dvm_jni_invoke) runs with the ARM
-       * execution lock still held, because the SVC handler that called in is
-       * holding it.  Every guest thread in the process is therefore stopped
-       * for as long as that Java call runs -- measured on Cross Worlds: a
-       * single JNI call into the security module's Java side held it for
-       * 1037 ms, and the main-Looper tick that the frame pump drives (and
-       * with it that module's own heartbeat callback) came 691 ms late.  On a
-       * device a JNI transition stops nothing.
-       *
-       * Lock order here is interpreter-outside, execution-inside, so giving
-       * the inner lock back while holding the outer one is the safe
-       * direction, and the top of the dispatch loop is the same safe point
-       * the GIL yield above uses.  arm_lock_yield() is one relaxed load when
-       * nobody is waiting, which is why this can afford the shorter
-       * interval. */
-      if ((vm->steps & (DVM_AEL_YIELD_STEPS - 1)) == 0) arm_lock_yield();
-      if (vm->step_limit && ++vm->call_steps > vm->step_limit) {
-         fprintf(stderr, "[dvm] step limit reached in %s.%s — aborting the call "
-                 "(%llu steps, depth=%d, limit=%llu); call stack:\n",
-                 m->cls->name, m->name, (unsigned long long)vm->call_steps,
-                 vm->depth, (unsigned long long)vm->step_limit);
-         for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 12; --i, ++shown) {
-            const struct dvm_method *f = vm->callstack[i];
-            if (!f) continue;
-            fprintf(stderr, "[dvm]   #%d %s.%s%s\n", shown,
-                    f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
-         }
-         dvm__throw(vm, "java/lang/Error", "dvm step limit");
-         goto exception;
+    case 0x26:
+L_26: { /* fill-array-data */
+        REQ(AA(u0));
+        int32_t off = (int32_t)((uint32_t)IU(1) | ((uint32_t)IU(2) << 16));
+        uint32_t poff = pc + (uint32_t)off;
+        struct dvm_object *ao = obj_fast(vm, r[AA(u0)]);
+        if (!ao || ao->kind != DVM_OBJ_ARRAY) {
+          dvm__throw(vm, "java/lang/NullPointerException", "fill-array-data");
+          goto exception;
+        }
+        if (poff + 4 <= nins && insns[poff] == 0x0300) {
+          uint16_t width = insns[poff + 1];
+          uint32_t count = (uint32_t)insns[poff + 2] | ((uint32_t)insns[poff + 3] << 16);
+          uint32_t n = count < ao->length ? count : ao->length;
+          /* The payload is `count * width` bytes; a truncated one would
+           * read past the code array. */
+          uint64_t units = ((uint64_t)count * width + 1u) / 2u;
+          if (poff + 4u + units <= nins && width == (uint16_t)dvm__elem_width(ao->elem_kind))
+            memcpy(ao->data, (const uint8_t *)&insns[poff + 4], (size_t)n * width);
+        }
+        fr->pc = pc + 3;
+        DISPATCH();
       }
-
-      u0 = insns[pc];
-      op = OPCODE(u0);
-      vm->cur_pc = pc;
-
-      if (vm->trace >= 2 && trace_this)
-         fprintf(stderr, "[dvm]   %s.%s @%04x op=%02x words=%04x,%04x,%04x\n",
-                 m->cls->name, m->name, pc, op, u0, IU(1), IU(2));
-      if (vm->trace >= 3 && trace_this) {
-         fprintf(stderr, "[dvm]     regs");
-         for (uint32_t i = 0; i < nregs; ++i)
-            fprintf(stderr, " v%u=%08x", i, r[i]);
-         fputc('\n', stderr);
-      }
-
-   L_switch:
-      switch (op) {
-      case 0x00: L_00: /* nop, and the payload pseudo-ops when reached by accident */
-         fr->pc = pc + 1;
-         DISPATCH();
-
-      /* --- moves --- */
-      case 0x01: L_01: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
-      case 0x07: L_07: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
-      case 0x02: L_02: case 0x08: L_08:
-         REQ(AA(u0)); REQ(IU(1));
-         r[AA(u0)] = r[IU(1)];
-         fr->pc = pc + 2;
-         break;
-      case 0x03: L_03: case 0x09: L_09:
-         REQ(IU(1)); REQ(IU(2));
-         r[IU(1)] = r[IU(2)];
-         fr->pc = pc + 3;
-         break;
-      case 0x04: L_04:
-         REQ(A4(u0) + 1); REQ(B4(u0) + 1);
-         sw(r, A4(u0), rw(r, B4(u0)));
-         fr->pc = pc + 1;
-         break;
-      case 0x05: L_05:
-         REQ(AA(u0) + 1); REQ(IU(1) + 1);
-         sw(r, AA(u0), rw(r, IU(1)));
-         fr->pc = pc + 2;
-         break;
-      case 0x06: L_06:
-         REQ(IU(1) + 1); REQ(IU(2) + 1);
-         sw(r, IU(1), rw(r, IU(2)));
-         fr->pc = pc + 3;
-         break;
-
-      case 0x0a: L_0a: /* move-result */
-      case 0x0c: L_0c: /* move-result-object */
-         REQ(AA(u0));
-         r[AA(u0)] = (uint32_t)fr->result;
-         fr->pc = pc + 1;
-         DISPATCH();
-      case 0x0b: L_0b: /* move-result-wide */
-         REQ(AA(u0) + 1);
-         sw(r, AA(u0), fr->result);
-         fr->pc = pc + 1;
-         DISPATCH();
-      case 0x0d: L_0d: /* move-exception */
-         REQ(AA(u0));
-         /* The handler entry already cleared the pending exception; the
-          * object itself is kept in exc_ref for exactly this instruction. */
-         r[AA(u0)] = vm->exception ? vm->exception : vm->exc_ref;
-         vm->exception = 0;
-         fr->pc = pc + 1;
-         DISPATCH();
-
-      /* --- returns --- */
-      case 0x0e: L_0e:
-         return true;
-      case 0x0f: L_0f: case 0x11: L_11:
-         REQ(AA(u0));
-         out->u = r[AA(u0)];
-         return true;
-      case 0x10: L_10:
-         REQ(AA(u0) + 1);
-         out->ju = rw(r, AA(u0));
-         return true;
-
-      /* --- constants --- */
-      case 0x12: L_12: { /* const/4 */
-         REQ(A4(u0));
-         int32_t v = (int32_t)(int8_t)(uint8_t)(B4(u0) << 4) >> 4;
-         r[A4(u0)] = (uint32_t)v;
-         fr->pc = pc + 1;
-         DISPATCH();
-      }
-      case 0x13: L_13: /* const/16 */
-         REQ(AA(u0));
-         r[AA(u0)] = (uint32_t)(int32_t)(int16_t)IU(1);
-         fr->pc = pc + 2;
-         DISPATCH();
-      case 0x14: L_14: /* const */
-         REQ(AA(u0));
-         r[AA(u0)] = (uint32_t)IU(1) | ((uint32_t)IU(2) << 16);
-         fr->pc = pc + 3;
-         DISPATCH();
-      case 0x15: L_15: /* const/high16 */
-         REQ(AA(u0));
-         r[AA(u0)] = (uint32_t)IU(1) << 16;
-         fr->pc = pc + 2;
-         DISPATCH();
-      case 0x16: L_16: /* const-wide/16 */
-         REQ(AA(u0) + 1);
-         sw(r, AA(u0), (uint64_t)(int64_t)(int16_t)IU(1));
-         fr->pc = pc + 2;
-         DISPATCH();
-      case 0x17: L_17: /* const-wide/32 */
-         REQ(AA(u0) + 1);
-         sw(r, AA(u0), (uint64_t)(int64_t)(int32_t)
-            ((uint32_t)IU(1) | ((uint32_t)IU(2) << 16)));
-         fr->pc = pc + 3;
-         DISPATCH();
-      case 0x18: L_18: { /* const-wide */
-         REQ(AA(u0) + 1);
-         uint64_t v = 0;
-         for (int i = 0; i < 4; ++i) v |= (uint64_t)IU(1 + i) << (16 * i);
-         sw(r, AA(u0), v);
-         fr->pc = pc + 5;
-         DISPATCH();
-      }
-      case 0x19: L_19: /* const-wide/high16 */
-         REQ(AA(u0) + 1);
-         sw(r, AA(u0), (uint64_t)IU(1) << 48);
-         fr->pc = pc + 2;
-         DISPATCH();
-      case 0x1a: L_1a: /* const-string */
-         REQ(AA(u0));
-         r[AA(u0)] = dd ? const_string(vm, dd, IU(1)) : 0;
-         fr->pc = pc + 2;
-         DISPATCH();
-      case 0x1b: L_1b: /* const-string/jumbo */
-         REQ(AA(u0));
-         r[AA(u0)] = dd ? const_string(vm, dd,
-                        (uint32_t)IU(1) | ((uint32_t)IU(2) << 16)) : 0;
-         fr->pc = pc + 3;
-         DISPATCH();
-      case 0x1c: L_1c: { /* const-class */
-         REQ(AA(u0));
-         /* A type the loader cannot produce is NoClassDefFoundError, not a
-          * null Class.  Handing back null turned "this optional component is
-          * not in the package" into a NullPointerException several frames
-          * later, inside whatever the caller did with the Class object —
-          * CrashSight's Singleton.getSingleton(clazz) reports the NPE from
-          * clazz.newInstance() and never mentions the class that is missing.
-          * new-instance has always answered this way (case 0x22); this makes
-          * the two agree. */
-         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         if (!t || class_absent(vm, t)) {
-            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
-                       t && t->name ? t->name : "?");
-            goto exception;
-         }
-         r[AA(u0)] = class_object(vm, t);
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-
-      case 0x1d: L_1d: /* monitor-enter */
-         REQ(AA(u0));
-         if (!dvm__monitor_enter(vm, r[AA(u0)])) goto exception;
-         fr->pc = pc + 1;
-         DISPATCH();
-      case 0x1e: L_1e: /* monitor-exit */
-         REQ(AA(u0));
-         if (!dvm__monitor_exit(vm, r[AA(u0)])) goto exception;
-         fr->pc = pc + 1;
-         DISPATCH();
-
-      case 0x1f: L_1f: { /* check-cast */
-         REQ(AA(u0));
-         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         struct dvm_object *o = obj_fast(vm, r[AA(u0)]);
-         if (o && t && !class_assignable(vm, o->cls, t)) {
-            fprintf(stderr, "[dvm] check-cast at %s.%s%s pc=%u: %s to %s\n",
-                    m->cls->name, m->name, m->sig ? m->sig : "",
-                    fr->pc, o->cls ? o->cls->name : "?", t->name);
-            if (getenv("LUNARIA_DVM_CASTVAL") && o->cls && !strcmp(o->cls->name, "java/lang/String")) {
-               const char *sv = dvm_string_utf8(vm, r[AA(u0)]);
-               fprintf(stderr, "[dvm]   value=%.200s\n", sv ? sv : "?");
+    case 0x27:
+L_27: /* throw */
+      REQ(AA(u0));
+      if (!r[AA(u0)]) {
+        dvm__throw(vm, "java/lang/NullPointerException", "throw null");
+      } else {
+        /* An explicit throw skips dvm__throw, so stamp the origin here or
+         * the backtrace would attribute it to whichever frame unwinds
+         * first.  A rethrow of the same object — the `move-exception;
+         * monitor-exit; throw` shape a synchronized block compiles to —
+         * must keep the origin it already has, or the frame that really
+         * failed is lost. */
+        vm->exception = r[AA(u0)];
+        if (vm->exc_ref != r[AA(u0)]) {
+          /* LUNARIA_DVM_THROWS covers the exceptions app code throws
+           * itself too, not only the VM's own: a library that turns a
+           * platform gap into its own exception (Gson's
+           * JsonSyntaxException, a Kotlin check()) is otherwise
+           * invisible between the gap and the catch that swallows it. */
+          if (dvm__env_throws()) {
+            char desc[384];
+            dvm_describe_exception(vm, r[AA(u0)], desc, sizeof desc);
+            fprintf(stderr, "[dvm] throw %s (in %s.%s @%04x)\n", desc,
+                    m->cls && m->cls->name ? m->cls->name : "?",
+                    m->name, pc * 2);
+          }
+          {
+            /* LUNARIA_DVM_THROW_STACK=<text>: the call chain of an app throw
+             * whose description contains <text> (see dvm__throw). */
+            static const char *stack_filter = (const char *)-1;
+            if (stack_filter == (const char *)-1) stack_filter = getenv("LUNARIA_DVM_THROW_STACK");
+            char desc[384];
+            if (stack_filter && *stack_filter) {
+              dvm_describe_exception(vm, r[AA(u0)], desc, sizeof desc);
+              if (strstr(desc, stack_filter)) {
+                fprintf(stderr, "[dvm] throw %s — call chain, innermost first:\n", desc);
+                const struct dvm_call_frame *f = vm->invoke_frame;
+                for (int shown = 0; f && shown < 14; f = f->previous, ++shown)
+                  if (f->method)
+                    fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
+                            f->method->cls ? f->method->cls->name : "?", f->method->name,
+                            f->method->sig ? f->method->sig : "");
+              }
             }
-            dvm__throw(vm, "java/lang/ClassCastException", "%s to %s",
-                       o->cls ? o->cls->name : "?", t->name);
-            goto exception;
-         }
-         fr->pc = pc + 2;
-         DISPATCH();
+          }
+          vm->exc_ref = r[AA(u0)];
+          vm->nexc_trace = 0;
+          vm->exc_trace[vm->nexc_trace++] = m;
+          vm->exc_pc = pc;
+        } else if (vm->nexc_trace <
+                   (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]) &&
+                   (vm->nexc_trace == 0 ||
+                    vm->exc_trace[vm->nexc_trace - 1] != m)) {
+          vm->exc_trace[vm->nexc_trace++] = m;
+        }
       }
-      case 0x20: L_20: { /* instance-of */
-         REQ(A4(u0)); REQ(B4(u0));
-         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
-         r[A4(u0)] = (o && t && class_assignable(vm, o->cls, t)) ? 1u : 0u;
-         fr->pc = pc + 2;
-         DISPATCH();
+      goto exception;
+
+    /* --- branches --- */
+    case 0x28:
+L_28: { /* goto */
+        int32_t off = (int8_t)AA(u0);
+        if (!off) {
+          dvm__throw(vm, "java/lang/VerifyError", "goto 0");
+          goto exception;
+        }
+        fr->pc = (uint32_t)((int32_t)pc + off);
+        DISPATCH();
       }
-      case 0x21: L_21: { /* array-length */
-         REQ(A4(u0)); REQ(B4(u0));
-         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
-         if (!o || o->kind != DVM_OBJ_ARRAY) {
-            dvm__throw(vm, "java/lang/NullPointerException", "array-length");
-            goto exception;
-         }
-         r[A4(u0)] = o->length;
-         fr->pc = pc + 1;
-         DISPATCH();
-      }
-      case 0x22: L_22: { /* new-instance */
-         REQ(AA(u0));
-         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         if (!t || class_absent(vm, t)) {
-            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
-                       t && t->name ? t->name : "?");
-            goto exception;
-         }
-         if (!dvm_init_class(vm, t)) goto exception;
-         if (t->external && vm->hooks.new_external) {
-            uint32_t h = vm->hooks.new_external(vm->hooks.user, vm, t->name);
-            r[AA(u0)] = h ? h : dvm_new_object(vm, t);
-         } else {
-            r[AA(u0)] = dvm_new_object(vm, t);
-         }
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x23: L_23: { /* new-array */
-         REQ(A4(u0)); REQ(B4(u0));
-         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         int32_t len = (int32_t)r[B4(u0)];
-         if (len < 0) {
-            dvm__throw(vm, "java/lang/NegativeArraySizeException", "%d", len);
-            goto exception;
-         }
-         const char *ed = (t && t->desc[0] == '[') ? t->desc + 1 : "I";
-         r[A4(u0)] = dvm_new_array(vm, dvm__kind_of(ed), ed, (uint32_t)len);
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x24: L_24: case 0x25: L_25: { /* filled-new-array[/range] */
-         bool range = (op == 0x25);
-         struct dvm_class *t = dd ? resolve_type(vm, dd, IU(1)) : NULL;
-         uint32_t slots[256];
-         int n = gather_args(insns, nins, pc, range, r, nregs, slots);
-         const char *ed = (t && t->desc[0] == '[') ? t->desc + 1 : "I";
-         char kind = dvm__kind_of(ed);
-         dvm_ref arr = dvm_new_array(vm, kind, ed, (uint32_t)n);
-         struct dvm_object *ao = dvm__obj(vm, arr);
-         if (ao) {
-            for (int i = 0; i < n; ++i) {
-               switch (dvm__elem_width(kind)) {
-                  case 1: ((uint8_t *)ao->data)[i] = (uint8_t)slots[i]; break;
-                  case 2: ((uint16_t *)ao->data)[i] = (uint16_t)slots[i]; break;
-                  default: ((uint32_t *)ao->data)[i] = slots[i]; break;
-               }
+    case 0x29:
+L_29:
+      fr->pc = (uint32_t)((int32_t)pc + (int16_t)IU(1));
+      break;
+    case 0x2a:
+L_2a:
+      fr->pc = (uint32_t)((int32_t)pc + (int32_t)
+                          ((uint32_t)IU(1) | ((uint32_t)IU(2) << 16)));
+      break;
+
+    case 0x2b:
+L_2b:
+    case 0x2c:
+L_2c: { /* packed-switch / sparse-switch */
+        REQ(AA(u0));
+        int32_t off = (int32_t)((uint32_t)IU(1) | ((uint32_t)IU(2) << 16));
+        uint32_t poff = pc + (uint32_t)off;
+        int32_t val = (int32_t)r[AA(u0)];
+        uint32_t target = pc + 3;
+        if (poff + 2 <= nins) {
+          uint16_t ident = insns[poff];
+          uint16_t size = insns[poff + 1];
+          if (ident == 0x0100 && op == 0x2b &&
+              (uint64_t)poff + 4u + (uint64_t)size * 2u <= nins) {
+            int32_t first = (int32_t)((uint32_t)insns[poff + 2] |
+                                      ((uint32_t)insns[poff + 3] << 16));
+            int64_t k = (int64_t)val - first;
+            if (k >= 0 && k < size) {
+              uint32_t e = poff + 4 + (uint32_t)k * 2u;
+              target = (uint32_t)((int32_t)pc + (int32_t)
+                                  ((uint32_t)insns[e] | ((uint32_t)insns[e + 1] << 16)));
             }
-         }
-         fr->result = arr;
-         fr->pc = pc + 3;
-         DISPATCH();
-      }
-      case 0x26: L_26: { /* fill-array-data */
-         REQ(AA(u0));
-         int32_t off = (int32_t)((uint32_t)IU(1) | ((uint32_t)IU(2) << 16));
-         uint32_t poff = pc + (uint32_t)off;
-         struct dvm_object *ao = obj_fast(vm, r[AA(u0)]);
-         if (!ao || ao->kind != DVM_OBJ_ARRAY) {
-            dvm__throw(vm, "java/lang/NullPointerException", "fill-array-data");
-            goto exception;
-         }
-         if (poff + 4 <= nins && insns[poff] == 0x0300) {
-            uint16_t width = insns[poff + 1];
-            uint32_t count = (uint32_t)insns[poff + 2] | ((uint32_t)insns[poff + 3] << 16);
-            uint32_t n = count < ao->length ? count : ao->length;
-            /* The payload is `count * width` bytes; a truncated one would
-             * read past the code array. */
-            uint64_t units = ((uint64_t)count * width + 1u) / 2u;
-            if (poff + 4u + units <= nins && width == (uint16_t)dvm__elem_width(ao->elem_kind))
-               memcpy(ao->data, (const uint8_t *)&insns[poff + 4], (size_t)n * width);
-         }
-         fr->pc = pc + 3;
-         DISPATCH();
-      }
-      case 0x27: L_27: /* throw */
-         REQ(AA(u0));
-         if (!r[AA(u0)]) {
-            dvm__throw(vm, "java/lang/NullPointerException", "throw null");
-         } else {
-            /* An explicit throw skips dvm__throw, so stamp the origin here or
-             * the backtrace would attribute it to whichever frame unwinds
-             * first.  A rethrow of the same object — the `move-exception;
-             * monitor-exit; throw` shape a synchronized block compiles to —
-             * must keep the origin it already has, or the frame that really
-             * failed is lost. */
-            vm->exception = r[AA(u0)];
-            if (vm->exc_ref != r[AA(u0)]) {
-               /* LUNARIA_DVM_THROWS covers the exceptions app code throws
-                * itself too, not only the VM's own: a library that turns a
-                * platform gap into its own exception (Gson's
-                * JsonSyntaxException, a Kotlin check()) is otherwise
-                * invisible between the gap and the catch that swallows it. */
-               if (dvm__env_throws()) {
-                  char desc[384];
-                  dvm_describe_exception(vm, r[AA(u0)], desc, sizeof desc);
-                  fprintf(stderr, "[dvm] throw %s (in %s.%s @%04x)\n", desc,
-                          m->cls && m->cls->name ? m->cls->name : "?",
-                          m->name, pc * 2);
-               }
-               {
-                  /* LUNARIA_DVM_THROW_STACK=<text>: the call chain of an app throw
-                   * whose description contains <text> (see dvm__throw). */
-                  static const char *stack_filter = (const char *)-1;
-                  if (stack_filter == (const char *)-1) stack_filter = getenv("LUNARIA_DVM_THROW_STACK");
-                  char desc[384];
-                  if (stack_filter && *stack_filter) {
-                     dvm_describe_exception(vm, r[AA(u0)], desc, sizeof desc);
-                     if (strstr(desc, stack_filter)) {
-                        fprintf(stderr, "[dvm] throw %s — call chain, innermost first:\n", desc);
-                        const struct dvm_call_frame *f = vm->invoke_frame;
-                        for (int shown = 0; f && shown < 14; f = f->previous, ++shown)
-                           if (f->method)
-                              fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown,
-                                      f->method->cls ? f->method->cls->name : "?", f->method->name,
-                                      f->method->sig ? f->method->sig : "");
-                     }
-                  }
-               }
-               vm->exc_ref = r[AA(u0)];
-               vm->nexc_trace = 0;
-               vm->exc_trace[vm->nexc_trace++] = m;
-               vm->exc_pc = pc;
-            } else if (vm->nexc_trace <
-                       (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]) &&
-                       (vm->nexc_trace == 0 ||
-                        vm->exc_trace[vm->nexc_trace - 1] != m)) {
-               vm->exc_trace[vm->nexc_trace++] = m;
+          } else if (ident == 0x0200 && op == 0x2c &&
+                     (uint64_t)poff + 2u + (uint64_t)size * 4u <= nins) {
+            for (uint16_t k = 0; k < size; ++k) {
+              uint32_t ke = poff + 2 + (uint32_t)k * 2u;
+              int32_t key = (int32_t)((uint32_t)insns[ke] |
+                                      ((uint32_t)insns[ke + 1] << 16));
+              if (key != val) continue;
+              uint32_t te = poff + 2 + (uint32_t)size * 2u + (uint32_t)k * 2u;
+              target = (uint32_t)((int32_t)pc + (int32_t)
+                                  ((uint32_t)insns[te] | ((uint32_t)insns[te + 1] << 16)));
+              break;
             }
-         }
-         goto exception;
-
-      /* --- branches --- */
-      case 0x28: L_28: { /* goto */
-         int32_t off = (int8_t)AA(u0);
-         if (!off) { dvm__throw(vm, "java/lang/VerifyError", "goto 0"); goto exception; }
-         fr->pc = (uint32_t)((int32_t)pc + off);
-         DISPATCH();
+          }
+        }
+        fr->pc = target;
+        DISPATCH();
       }
-      case 0x29: L_29:
-         fr->pc = (uint32_t)((int32_t)pc + (int16_t)IU(1));
-         break;
-      case 0x2a: L_2a:
-         fr->pc = (uint32_t)((int32_t)pc + (int32_t)
-                  ((uint32_t)IU(1) | ((uint32_t)IU(2) << 16)));
-         break;
 
-      case 0x2b: L_2b: case 0x2c: L_2c: { /* packed-switch / sparse-switch */
-         REQ(AA(u0));
-         int32_t off = (int32_t)((uint32_t)IU(1) | ((uint32_t)IU(2) << 16));
-         uint32_t poff = pc + (uint32_t)off;
-         int32_t val = (int32_t)r[AA(u0)];
-         uint32_t target = pc + 3;
-         if (poff + 2 <= nins) {
-            uint16_t ident = insns[poff];
-            uint16_t size = insns[poff + 1];
-            if (ident == 0x0100 && op == 0x2b &&
-                (uint64_t)poff + 4u + (uint64_t)size * 2u <= nins) {
-               int32_t first = (int32_t)((uint32_t)insns[poff + 2] |
-                                         ((uint32_t)insns[poff + 3] << 16));
-               int64_t k = (int64_t)val - first;
-               if (k >= 0 && k < size) {
-                  uint32_t e = poff + 4 + (uint32_t)k * 2u;
-                  target = (uint32_t)((int32_t)pc + (int32_t)
-                     ((uint32_t)insns[e] | ((uint32_t)insns[e + 1] << 16)));
-               }
-            } else if (ident == 0x0200 && op == 0x2c &&
-                       (uint64_t)poff + 2u + (uint64_t)size * 4u <= nins) {
-               for (uint16_t k = 0; k < size; ++k) {
-                  uint32_t ke = poff + 2 + (uint32_t)k * 2u;
-                  int32_t key = (int32_t)((uint32_t)insns[ke] |
-                                          ((uint32_t)insns[ke + 1] << 16));
-                  if (key != val) continue;
-                  uint32_t te = poff + 2 + (uint32_t)size * 2u + (uint32_t)k * 2u;
-                  target = (uint32_t)((int32_t)pc + (int32_t)
-                     ((uint32_t)insns[te] | ((uint32_t)insns[te + 1] << 16)));
-                  break;
-               }
+    /* --- comparisons --- */
+    case 0x2d:
+L_2d:
+    case 0x2e:
+L_2e: { /* cmpl-float / cmpg-float */
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ(bc & 0xff);
+        REQ(bc >> 8);
+        float a = bits_to_f(r[bc & 0xff]), b = bits_to_f(r[bc >> 8]);
+        int32_t v;
+        if (isunordered(a, b)) v = (op == 0x2d) ? -1 : 1;   /* NaN */
+        else if (isgreater(a, b)) v = 1;
+        else if (isless(a, b)) v = -1;
+        else v = 0;
+        r[AA(u0)] = (uint32_t)v;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x2f:
+L_2f:
+    case 0x30:
+L_30: { /* cmpl-double / cmpg-double */
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ((bc & 0xff) + 1);
+        REQ((bc >> 8) + 1);
+        double a = bits_to_d(rw(r, bc & 0xff)), b = bits_to_d(rw(r, bc >> 8));
+        int32_t v;
+        if (isunordered(a, b)) v = (op == 0x2f) ? -1 : 1;   /* NaN */
+        else if (isgreater(a, b)) v = 1;
+        else if (isless(a, b)) v = -1;
+        else v = 0;
+        r[AA(u0)] = (uint32_t)v;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x31:
+L_31: { /* cmp-long */
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ((bc & 0xff) + 1);
+        REQ((bc >> 8) + 1);
+        int64_t a = (int64_t)rw(r, bc & 0xff), b = (int64_t)rw(r, bc >> 8);
+        r[AA(u0)] = (uint32_t)(a > b ? 1 : (a == b ? 0 : -1));
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+
+    case 0x32:
+L_32:
+    case 0x33:
+L_33:
+    case 0x34:
+L_34:
+    case 0x35:
+L_35:
+    case 0x36:
+L_36:
+    case 0x37:
+L_37: {
+        REQ(A4(u0));
+        REQ(B4(u0));
+        int32_t a = (int32_t)r[A4(u0)], b = (int32_t)r[B4(u0)];
+        bool t;
+        switch (op) {
+        case 0x32:
+          t = (a == b);
+          break;
+        case 0x33:
+          t = (a != b);
+          break;
+        case 0x34:
+          t = (a < b);
+          break;
+        case 0x35:
+          t = (a >= b);
+          break;
+        case 0x36:
+          t = (a > b);
+          break;
+        default:
+          t = (a <= b);
+          break;
+        }
+        fr->pc = t ? (uint32_t)((int32_t)pc + (int16_t)IU(1)) : pc + 2;
+        DISPATCH();
+      }
+    case 0x38:
+L_38:
+    case 0x39:
+L_39:
+    case 0x3a:
+L_3a:
+    case 0x3b:
+L_3b:
+    case 0x3c:
+L_3c:
+    case 0x3d:
+L_3d: {
+        REQ(AA(u0));
+        int32_t a = (int32_t)r[AA(u0)];
+        bool t;
+        switch (op) {
+        case 0x38:
+          t = (a == 0);
+          break;
+        case 0x39:
+          t = (a != 0);
+          break;
+        case 0x3a:
+          t = (a < 0);
+          break;
+        case 0x3b:
+          t = (a >= 0);
+          break;
+        case 0x3c:
+          t = (a > 0);
+          break;
+        default:
+          t = (a <= 0);
+          break;
+        }
+        fr->pc = t ? (uint32_t)((int32_t)pc + (int16_t)IU(1)) : pc + 2;
+        DISPATCH();
+      }
+
+    /* --- arrays --- */
+    case 0x44:
+L_44:
+    case 0x45:
+L_45:
+    case 0x46:
+L_46:
+    case 0x47:
+L_47:
+    case 0x48:
+L_48:
+    case 0x49:
+L_49:
+    case 0x4a:
+L_4a: {
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ(bc & 0xff);
+        REQ(bc >> 8);
+        struct dvm_object *a = obj_fast(vm, r[bc & 0xff]);
+        uint32_t idx = r[bc >> 8];
+        if (!array_check(vm, a, idx)) goto exception;
+        switch (op) {
+        case 0x44:
+          r[AA(u0)] = ((uint32_t *)a->data)[idx];
+          break;
+        case 0x45:
+          REQ(AA(u0) + 1);
+          sw(r, AA(u0), ((uint64_t *)a->data)[idx]);
+          break;
+        case 0x46:
+          r[AA(u0)] = ((uint32_t *)a->data)[idx];
+          break;
+        case 0x47:
+          r[AA(u0)] = ((uint8_t *)a->data)[idx] ? 1u : 0u;
+          break;
+        case 0x48:
+          r[AA(u0)] = (uint32_t)(int32_t)(int8_t)((uint8_t *)a->data)[idx];
+          break;
+        case 0x49:
+          r[AA(u0)] = ((uint16_t *)a->data)[idx];
+          break;
+        default:
+          r[AA(u0)] = (uint32_t)(int32_t)(int16_t)((uint16_t *)a->data)[idx];
+          break;
+        }
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x4b:
+L_4b:
+    case 0x4c:
+L_4c:
+    case 0x4d:
+L_4d:
+    case 0x4e:
+L_4e:
+    case 0x4f:
+L_4f:
+    case 0x50:
+L_50:
+    case 0x51:
+L_51: {
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ(bc & 0xff);
+        REQ(bc >> 8);
+        struct dvm_object *a = obj_fast(vm, r[bc & 0xff]);
+        uint32_t idx = r[bc >> 8];
+        if (!array_check(vm, a, idx)) goto exception;
+        switch (op) {
+        case 0x4b:
+          ((uint32_t *)a->data)[idx] = r[AA(u0)];
+          break;
+        case 0x4c:
+          REQ(AA(u0) + 1);
+          ((uint64_t *)a->data)[idx] = rw(r, AA(u0));
+          break;
+        case 0x4d:
+          ((uint32_t *)a->data)[idx] = r[AA(u0)];
+          break;
+        case 0x4e:
+          ((uint8_t *)a->data)[idx] = r[AA(u0)] ? 1u : 0u;
+          break;
+        case 0x4f:
+          ((uint8_t *)a->data)[idx] = (uint8_t)r[AA(u0)];
+          break;
+        case 0x50:
+          ((uint16_t *)a->data)[idx] = (uint16_t)r[AA(u0)];
+          break;
+        default:
+          ((uint16_t *)a->data)[idx] = (uint16_t)r[AA(u0)];
+          break;
+        }
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+
+    /* --- instance fields --- */
+    case 0x52:
+L_52:
+    case 0x53:
+L_53:
+    case 0x54:
+L_54:
+    case 0x55:
+L_55:
+    case 0x56:
+L_56:
+    case 0x57:
+L_57:
+    case 0x58:
+L_58: {
+        REQ(A4(u0));
+        REQ(B4(u0));
+        struct dvm_class *fc;
+        const char *fn, *ft;
+        struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), false, &fc, &fn, &ft)
+                              : NULL;
+        struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
+        if (!o) {
+          /* Name the field's declaring class as well.  Obfuscated code
+           * reuses one identifier for dozens of unrelated fields, so
+           * "iget getMonetizationNetwork" fits every link of a chain like
+           * a.b.c.d and says nothing about which one is null. */
+          /* The bytecode offset as well: one method can read the same
+           * field name from several places, and the offset is what maps the
+           * report back to a single instruction in the dex. */
+          dvm__throw(vm, "java/lang/NullPointerException",
+                     "iget %s.%s:%s at %s.%s@%04x",
+                     fc && fc->name ? fc->name : "?", fn ? fn : "?",
+                     ft ? ft : "?", m->cls ? m->cls->name : "?", m->name, pc);
+          goto exception;
+        }
+        /* A field the object does not have belongs to a host-backed class;
+         * those carry no state on this side, so it reads as zero — the same
+         * answer the stub layer gave before this module existed. */
+        union dvm_value v = { 0 };
+        if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
+          v = o->slots[f->slot];
+        if (vm->trace && trace_this && op == 0x54)
+          fprintf(stderr, "[dvm] %*siget-object @%x.%s:%s -> @%x\n",
+                  vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
+                  ft ? ft : "?", v.l);
+        if (op == 0x53) {
+          REQ(A4(u0) + 1);
+          sw(r, A4(u0), v.ju);
+        }
+        else r[A4(u0)] = v.u;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x59:
+L_59:
+    case 0x5a:
+L_5a:
+    case 0x5b:
+L_5b:
+    case 0x5c:
+L_5c:
+    case 0x5d:
+L_5d:
+    case 0x5e:
+L_5e:
+    case 0x5f:
+L_5f: {
+        REQ(A4(u0));
+        REQ(B4(u0));
+        struct dvm_class *fc;
+        const char *fn, *ft;
+        struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), false, &fc, &fn, &ft)
+                              : NULL;
+        struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
+        if (!o) {
+          dvm__throw(vm, "java/lang/NullPointerException",
+                     "iput %s.%s:%s at %s.%s@%04x",
+                     fc && fc->name ? fc->name : "?", fn ? fn : "?",
+                     ft ? ft : "?", m->cls ? m->cls->name : "?", m->name, pc);
+          goto exception;
+        }
+        union dvm_value v = { 0 };
+        if (op == 0x5a) {
+          REQ(A4(u0) + 1);
+          v.ju = rw(r, A4(u0));
+        }
+        else v.u = r[A4(u0)];
+        if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
+          o->slots[f->slot] = v;
+        if (vm->trace && trace_this && op == 0x5b)
+          fprintf(stderr, "[dvm] %*siput-object @%x.%s:%s <- @%x\n",
+                  vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
+                  ft ? ft : "?", v.l);
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+
+    /* --- static fields --- */
+    case 0x60:
+L_60:
+    case 0x61:
+L_61:
+    case 0x62:
+L_62:
+    case 0x63:
+L_63:
+    case 0x64:
+L_64:
+    case 0x65:
+L_65:
+    case 0x66:
+L_66: {
+        REQ(AA(u0));
+        struct dvm_class *fc = NULL;
+        const char *fn = NULL, *ft = NULL;
+        struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), true, &fc, &fn, &ft)
+                              : NULL;
+        union dvm_value v = { 0 };
+        if (f) {
+          /* A <clinit> that throws leaves the class erroneous and its static
+           * fields unset; reading one anyway hands the app a null it can
+           * only fail on later, far from the cause. */
+          if (!dvm_init_class(vm, f->cls)) goto exception;
+          if (f->cls->sslots && f->slot < f->cls->nsslots)
+            v = f->cls->sslots[f->slot];
+          /* Dex static that the host publishes after attach (e.g.
+           * UnityPlayer.currentActivity).  A null sslot here is not "no
+           * field" — ask the external hook before handing out null. */
+          if (op == 0x62 && !v.l && fc && fn && ft &&
+              !strcmp(fn, "currentActivity") &&
+              vm->hooks.get_external_static) {
+            union dvm_value host = { 0 };
+            if (vm->hooks.get_external_static(vm->hooks.user, vm, fc->name,
+                                              fn, ft, &host) && host.l) {
+              v = host;
+              if (f->cls->sslots && f->slot < f->cls->nsslots)
+                f->cls->sslots[f->slot] = v;
             }
-         }
-         fr->pc = target;
-         DISPATCH();
-      }
-
-      /* --- comparisons --- */
-      case 0x2d: L_2d: case 0x2e: L_2e: { /* cmpl-float / cmpg-float */
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ(bc & 0xff); REQ(bc >> 8);
-         float a = bits_to_f(r[bc & 0xff]), b = bits_to_f(r[bc >> 8]);
-         int32_t v;
-         if (isunordered(a, b)) v = (op == 0x2d) ? -1 : 1;   /* NaN */
-         else if (isgreater(a, b)) v = 1;
-         else if (isless(a, b)) v = -1;
-         else v = 0;
-         r[AA(u0)] = (uint32_t)v;
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x2f: L_2f: case 0x30: L_30: { /* cmpl-double / cmpg-double */
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ((bc & 0xff) + 1); REQ((bc >> 8) + 1);
-         double a = bits_to_d(rw(r, bc & 0xff)), b = bits_to_d(rw(r, bc >> 8));
-         int32_t v;
-         if (isunordered(a, b)) v = (op == 0x2f) ? -1 : 1;   /* NaN */
-         else if (isgreater(a, b)) v = 1;
-         else if (isless(a, b)) v = -1;
-         else v = 0;
-         r[AA(u0)] = (uint32_t)v;
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x31: L_31: { /* cmp-long */
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ((bc & 0xff) + 1); REQ((bc >> 8) + 1);
-         int64_t a = (int64_t)rw(r, bc & 0xff), b = (int64_t)rw(r, bc >> 8);
-         r[AA(u0)] = (uint32_t)(a > b ? 1 : (a == b ? 0 : -1));
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-
-      case 0x32: L_32: case 0x33: L_33: case 0x34: L_34: case 0x35: L_35: case 0x36: L_36: case 0x37: L_37: {
-         REQ(A4(u0)); REQ(B4(u0));
-         int32_t a = (int32_t)r[A4(u0)], b = (int32_t)r[B4(u0)];
-         bool t;
-         switch (op) {
-            case 0x32: t = (a == b); break;
-            case 0x33: t = (a != b); break;
-            case 0x34: t = (a < b); break;
-            case 0x35: t = (a >= b); break;
-            case 0x36: t = (a > b); break;
-            default:   t = (a <= b); break;
-         }
-         fr->pc = t ? (uint32_t)((int32_t)pc + (int16_t)IU(1)) : pc + 2;
-         DISPATCH();
-      }
-      case 0x38: L_38: case 0x39: L_39: case 0x3a: L_3a: case 0x3b: L_3b: case 0x3c: L_3c: case 0x3d: L_3d: {
-         REQ(AA(u0));
-         int32_t a = (int32_t)r[AA(u0)];
-         bool t;
-         switch (op) {
-            case 0x38: t = (a == 0); break;
-            case 0x39: t = (a != 0); break;
-            case 0x3a: t = (a < 0); break;
-            case 0x3b: t = (a >= 0); break;
-            case 0x3c: t = (a > 0); break;
-            default:   t = (a <= 0); break;
-         }
-         fr->pc = t ? (uint32_t)((int32_t)pc + (int16_t)IU(1)) : pc + 2;
-         DISPATCH();
-      }
-
-      /* --- arrays --- */
-      case 0x44: L_44: case 0x45: L_45: case 0x46: L_46: case 0x47: L_47: case 0x48: L_48: case 0x49: L_49: case 0x4a: L_4a: {
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ(bc & 0xff); REQ(bc >> 8);
-         struct dvm_object *a = obj_fast(vm, r[bc & 0xff]);
-         uint32_t idx = r[bc >> 8];
-         if (!array_check(vm, a, idx)) goto exception;
-         switch (op) {
-            case 0x44: r[AA(u0)] = ((uint32_t *)a->data)[idx]; break;
-            case 0x45: REQ(AA(u0) + 1); sw(r, AA(u0), ((uint64_t *)a->data)[idx]); break;
-            case 0x46: r[AA(u0)] = ((uint32_t *)a->data)[idx]; break;
-            case 0x47: r[AA(u0)] = ((uint8_t *)a->data)[idx] ? 1u : 0u; break;
-            case 0x48: r[AA(u0)] = (uint32_t)(int32_t)(int8_t)((uint8_t *)a->data)[idx]; break;
-            case 0x49: r[AA(u0)] = ((uint16_t *)a->data)[idx]; break;
-            default:   r[AA(u0)] = (uint32_t)(int32_t)(int16_t)((uint16_t *)a->data)[idx]; break;
-         }
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x4b: L_4b: case 0x4c: L_4c: case 0x4d: L_4d: case 0x4e: L_4e: case 0x4f: L_4f: case 0x50: L_50: case 0x51: L_51: {
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ(bc & 0xff); REQ(bc >> 8);
-         struct dvm_object *a = obj_fast(vm, r[bc & 0xff]);
-         uint32_t idx = r[bc >> 8];
-         if (!array_check(vm, a, idx)) goto exception;
-         switch (op) {
-            case 0x4b: ((uint32_t *)a->data)[idx] = r[AA(u0)]; break;
-            case 0x4c: REQ(AA(u0) + 1); ((uint64_t *)a->data)[idx] = rw(r, AA(u0)); break;
-            case 0x4d: ((uint32_t *)a->data)[idx] = r[AA(u0)]; break;
-            case 0x4e: ((uint8_t *)a->data)[idx] = r[AA(u0)] ? 1u : 0u; break;
-            case 0x4f: ((uint8_t *)a->data)[idx] = (uint8_t)r[AA(u0)]; break;
-            case 0x50: ((uint16_t *)a->data)[idx] = (uint16_t)r[AA(u0)]; break;
-            default:   ((uint16_t *)a->data)[idx] = (uint16_t)r[AA(u0)]; break;
-         }
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-
-      /* --- instance fields --- */
-      case 0x52: L_52: case 0x53: L_53: case 0x54: L_54: case 0x55: L_55: case 0x56: L_56: case 0x57: L_57: case 0x58: L_58: {
-         REQ(A4(u0)); REQ(B4(u0));
-         struct dvm_class *fc; const char *fn, *ft;
-         struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), false, &fc, &fn, &ft)
-                                  : NULL;
-         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
-         if (!o) {
-            /* Name the field's declaring class as well.  Obfuscated code
-             * reuses one identifier for dozens of unrelated fields, so
-             * "iget getMonetizationNetwork" fits every link of a chain like
-             * a.b.c.d and says nothing about which one is null. */
-            /* The bytecode offset as well: one method can read the same
-             * field name from several places, and the offset is what maps the
-             * report back to a single instruction in the dex. */
-            dvm__throw(vm, "java/lang/NullPointerException",
-                       "iget %s.%s:%s at %s.%s@%04x",
-                       fc && fc->name ? fc->name : "?", fn ? fn : "?",
-                       ft ? ft : "?", m->cls ? m->cls->name : "?", m->name, pc);
-            goto exception;
-         }
-         /* A field the object does not have belongs to a host-backed class;
-          * those carry no state on this side, so it reads as zero — the same
-          * answer the stub layer gave before this module existed. */
-         union dvm_value v = { 0 };
-         if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
-            v = o->slots[f->slot];
-         if (vm->trace && trace_this && op == 0x54)
-            fprintf(stderr, "[dvm] %*siget-object @%x.%s:%s -> @%x\n",
-                    vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
-                    ft ? ft : "?", v.l);
-         if (op == 0x53) { REQ(A4(u0) + 1); sw(r, A4(u0), v.ju); }
-         else r[A4(u0)] = v.u;
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x59: L_59: case 0x5a: L_5a: case 0x5b: L_5b: case 0x5c: L_5c: case 0x5d: L_5d: case 0x5e: L_5e: case 0x5f: L_5f: {
-         REQ(A4(u0)); REQ(B4(u0));
-         struct dvm_class *fc; const char *fn, *ft;
-         struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), false, &fc, &fn, &ft)
-                                  : NULL;
-         struct dvm_object *o = obj_fast(vm, r[B4(u0)]);
-         if (!o) {
-            dvm__throw(vm, "java/lang/NullPointerException",
-                       "iput %s.%s:%s at %s.%s@%04x",
-                       fc && fc->name ? fc->name : "?", fn ? fn : "?",
-                       ft ? ft : "?", m->cls ? m->cls->name : "?", m->name, pc);
-            goto exception;
-         }
-         union dvm_value v = { 0 };
-         if (op == 0x5a) { REQ(A4(u0) + 1); v.ju = rw(r, A4(u0)); }
-         else v.u = r[A4(u0)];
-         if (f && o->slots && f->slot < (o->cls ? o->cls->islots : 0))
-            o->slots[f->slot] = v;
-         if (vm->trace && trace_this && op == 0x5b)
-            fprintf(stderr, "[dvm] %*siput-object @%x.%s:%s <- @%x\n",
-                    vm->depth * 2, "", r[B4(u0)], fn ? fn : "?",
-                    ft ? ft : "?", v.l);
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-
-      /* --- static fields --- */
-      case 0x60: L_60: case 0x61: L_61: case 0x62: L_62: case 0x63: L_63: case 0x64: L_64: case 0x65: L_65: case 0x66: L_66: {
-         REQ(AA(u0));
-         struct dvm_class *fc = NULL; const char *fn = NULL, *ft = NULL;
-         struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), true, &fc, &fn, &ft)
-                                  : NULL;
-         union dvm_value v = { 0 };
-         if (f) {
-            /* A <clinit> that throws leaves the class erroneous and its static
-             * fields unset; reading one anyway hands the app a null it can
-             * only fail on later, far from the cause. */
-            if (!dvm_init_class(vm, f->cls)) goto exception;
-            if (f->cls->sslots && f->slot < f->cls->nsslots)
-               v = f->cls->sslots[f->slot];
-            /* Dex static that the host publishes after attach (e.g.
-             * UnityPlayer.currentActivity).  A null sslot here is not "no
-             * field" — ask the external hook before handing out null. */
-            if (op == 0x62 && !v.l && fc && fn && ft &&
-                !strcmp(fn, "currentActivity") &&
-                vm->hooks.get_external_static) {
-               union dvm_value host = { 0 };
-               if (vm->hooks.get_external_static(vm->hooks.user, vm, fc->name,
-                                                   fn, ft, &host) && host.l) {
-                  v = host;
-                  if (f->cls->sslots && f->slot < f->cls->nsslots)
-                     f->cls->sslots[f->slot] = v;
-               }
-            }
-         } else if (fc && fn && !fc->external && fc->dex) {
-            /* The class is the app's own (or a library's, from a dex) and it has no
-             * such field: a device raises NoSuchFieldError, and the code that
-             * reads it expects to catch that -- the compiler's enum switch maps
-             * wrap each constant in exactly such a try.  Answering null made the
-             * next ordinal() call fail with an NPE the app never handles, and an
-             * ad that failed to load took the whole player with it. */
-            dvm__throw(vm, "java/lang/NoSuchFieldError", "%s.%s", fc->name, fn);
-            goto exception;
+          }
+        } else if (fc && fn && !fc->external && fc->dex) {
+          /* The class is the app's own (or a library's, from a dex) and it has no
+           * such field: a device raises NoSuchFieldError, and the code that
+           * reads it expects to catch that -- the compiler's enum switch maps
+           * wrap each constant in exactly such a try.  Answering null made the
+           * next ordinal() call fail with an NPE the app never handles, and an
+           * ad that failed to load took the whole player with it. */
+          dvm__throw(vm, "java/lang/NoSuchFieldError", "%s.%s", fc->name, fn);
+          goto exception;
         } else if (fc && fn && vm->hooks.get_external_static) {
-            /* Nothing defines this class — not a dex, not a builtin, not the
-             * host stubs.  A device raises NoClassDefFoundError here, and app
-             * code guards for it: AppsFlyer probes for Xiaomi's install
-             * referrer exactly this way.  Answering null instead turns a
-             * handled absence into an NPE one call later. */
-            if (!vm->hooks.get_external_static(vm->hooks.user, vm, fc->name, fn,
-                                               ft, &v)) {
-               dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s.%s",
-                          fc->name, fn);
-               goto exception;
-            }
-         }
-         if (vm->trace && trace_this && op == 0x62)
-            fprintf(stderr, "[dvm] %*ssget-object %s.%s:%s -> @%x\n",
-                    vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
-                    ft ? ft : "?", v.l);
-         if (op == 0x61) { REQ(AA(u0) + 1); sw(r, AA(u0), v.ju); }
-         else r[AA(u0)] = v.u;
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x67: L_67: case 0x68: L_68: case 0x69: L_69: case 0x6a: L_6a: case 0x6b: L_6b: case 0x6c: L_6c: case 0x6d: L_6d: {
-         REQ(AA(u0));
-         struct dvm_class *fc; const char *fn, *ft;
-         struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), true, &fc, &fn, &ft)
-                                  : NULL;
-         union dvm_value v = { 0 };
-         if (op == 0x68) { REQ(AA(u0) + 1); v.ju = rw(r, AA(u0)); }
-         else v.u = r[AA(u0)];
-         if (f) {
-            if (!dvm_init_class(vm, f->cls)) goto exception;
-            if (f->cls->sslots && f->slot < f->cls->nsslots)
-               f->cls->sslots[f->slot] = v;
-         }
-         if (vm->trace && trace_this && op == 0x69)
-            fprintf(stderr, "[dvm] %*ssput-object %s.%s:%s <- @%x\n",
-                    vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
-                    ft ? ft : "?", v.l);
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-
-      /* --- invokes --- */
-      case 0x6e: L_6e: case 0x6f: L_6f: case 0x70: L_70: case 0x71: L_71: case 0x72: L_72:
-      case 0x74: L_74: case 0x75: L_75: case 0x76: L_76: case 0x77: L_77: case 0x78: L_78: {
-         bool range = (op >= 0x74);
-         uint8_t kind = range ? (uint8_t)(op - 0x74 + 0x6e) : op;
-         uint32_t midx = IU(1);
-
-         struct dvm_class *cls = NULL;
-         const char *name = NULL;
-         struct dvm_method *target =
-            dd ? resolve_method(vm, dd, midx, &cls, &name, &sigbuf) : NULL;
-
-         if (vm->trace >= 2 && trace_this)
-            fprintf(stderr, "[dvm]     invoke %s.%s%s\n",
-                    cls ? cls->name : "?", name ? name : "?", sigbuf);
-
-         uint32_t slots[256];
-         int n = gather_args(insns, nins, pc, range, r, nregs, slots);
-
-         bool is_static = (kind == 0x71);
-         dvm_ref self = 0;
-         const uint32_t *argslots = slots;
-         int nargslots = n;
-         if (!is_static) {
-            if (n < 1) {
-               dvm__throw(vm, "java/lang/VerifyError", "invoke with no receiver");
-               goto exception;
-            }
-            self = slots[0];
-            argslots = slots + 1;
-            nargslots = n - 1;
-            if (!self) {
-               /* The method index pins which constant-pool entry resolved to
-                * this name, which matters when the resolution itself looks
-                * wrong. */
-               dvm__throw(vm, "java/lang/NullPointerException",
-                          "receiver %s.%s meth@%u (insns@0x%lx w0=%04x w1=%04x)",
-                          cls ? cls->name : "?", name ? name : "?", midx,
-                          dd ? (unsigned long)((const uint8_t *)insns - dd->file.p)
-                             : 0UL,
-                          (unsigned)insns[pc], (unsigned)IU(1));
-               goto exception;
-            }
-         }
-
-         /* invoke-super searches from the calling class's direct superclass,
-          * even when the method reference names a more distant ancestor.
-          * Interface super calls retain their declared interface target. */
-         if (kind == 0x6f && cls && !(cls->access & DEX_ACC_INTERFACE) &&
-             m->cls && m->cls->super)
-            target = dvm_find_method(vm, m->cls->super, name, sigbuf);
-
-         /* invoke-virtual / -interface re-dispatch on the receiver. */
-         if (target && (kind == 0x6e || kind == 0x72))
-            target = virtual_target(vm, self, target);
-         else if (!target && self && (kind == 0x6e || kind == 0x72)) {
-            /* The declared type carries no such method — an interface whose
-             * definition is not in the dex, or one modelled here without it.
-             * Dispatch is on the receiver, so look there before giving up and
-             * handing the call to the host stubs, which would answer null.
-             * Iterable.iterator() reached this path constantly: the sequence
-             * types Kotlin's split() builds implement it, but the interface
-             * itself declares nothing the VM can see. */
-            struct dvm_object *ro = dvm__obj(vm, self);
-            if (ro && ro->cls)
-               target = dvm_find_method(vm, ro->cls, name, sigbuf);
-         }
-
-         union dvm_value ret;
-         bool ok;
-         if (target) {
-            ok = invoke(vm, target, self, argslots, nargslots, &ret);
-         } else if (cls && class_absent(vm, cls)) {
-            /* Same as new-instance: the call names a class the APK does not
-             * carry and the platform does not have.  Answering it with a stub
-             * that returns zero tells the app the optional component is there
-             * and it keeps using it. */
-            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
-                       cls->name ? cls->name : "?");
+          /* Nothing defines this class — not a dex, not a builtin, not the
+           * host stubs.  A device raises NoClassDefFoundError here, and app
+           * code guards for it: AppsFlyer probes for Xiaomi's install
+           * referrer exactly this way.  Answering null instead turns a
+           * handled absence into an NPE one call later. */
+          if (!vm->hooks.get_external_static(vm->hooks.user, vm, fc->name, fn,
+                                             ft, &v)) {
+            dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s.%s",
+                       fc->name, fn);
             goto exception;
-         } else if (cls && name) {
-            ++vm->depth;
-            ok = dvm__call_out(vm, cls, name, sigbuf,
-                          is_static, false, self, argslots, nargslots, &ret);
-            --vm->depth;
-            ok = ok && !vm->exception;
-         } else {
-            memset(&ret, 0, sizeof ret);
-            ok = true;
-         }
-         if (!ok || vm->exception) goto exception;
-
-         fr->result = ret.ju;
-         fr->pc = pc + 3;   /* 35c and 3rc are both three code units */
-         DISPATCH();
+          }
+        }
+        if (vm->trace && trace_this && op == 0x62)
+          fprintf(stderr, "[dvm] %*ssget-object %s.%s:%s -> @%x\n",
+                  vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
+                  ft ? ft : "?", v.l);
+        if (op == 0x61) {
+          REQ(AA(u0) + 1);
+          sw(r, AA(u0), v.ju);
+        }
+        else r[AA(u0)] = v.u;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x67:
+L_67:
+    case 0x68:
+L_68:
+    case 0x69:
+L_69:
+    case 0x6a:
+L_6a:
+    case 0x6b:
+L_6b:
+    case 0x6c:
+L_6c:
+    case 0x6d:
+L_6d: {
+        REQ(AA(u0));
+        struct dvm_class *fc;
+        const char *fn, *ft;
+        struct dvm_field *f = dd ? resolve_field(vm, dd, IU(1), true, &fc, &fn, &ft)
+                              : NULL;
+        union dvm_value v = { 0 };
+        if (op == 0x68) {
+          REQ(AA(u0) + 1);
+          v.ju = rw(r, AA(u0));
+        }
+        else v.u = r[AA(u0)];
+        if (f) {
+          if (!dvm_init_class(vm, f->cls)) goto exception;
+          if (f->cls->sslots && f->slot < f->cls->nsslots)
+            f->cls->sslots[f->slot] = v;
+        }
+        if (vm->trace && trace_this && op == 0x69)
+          fprintf(stderr, "[dvm] %*ssput-object %s.%s:%s <- @%x\n",
+                  vm->depth * 2, "", fc ? fc->name : "?", fn ? fn : "?",
+                  ft ? ft : "?", v.l);
+        fr->pc = pc + 2;
+        DISPATCH();
       }
 
-      /* --- unary --- */
-      case 0x7b: L_7b: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(-(int32_t)r[B4(u0)]); fr->pc = pc + 1; DISPATCH();
-      case 0x7c: L_7c: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = ~r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
-      case 0x7d: L_7d: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), (uint64_t)(-(int64_t)rw(r, B4(u0)))); fr->pc = pc + 1; DISPATCH();
-      case 0x7e: L_7e: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), ~rw(r, B4(u0))); fr->pc = pc + 1; DISPATCH();
-      case 0x7f: L_7f: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = f_to_bits(-bits_to_f(r[B4(u0)])); fr->pc = pc + 1; DISPATCH();
-      case 0x80: L_80: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), d_to_bits(-bits_to_d(rw(r, B4(u0))))); fr->pc = pc + 1; break;
+    /* --- invokes --- */
+    case 0x6e:
+L_6e:
+    case 0x6f:
+L_6f:
+    case 0x70:
+L_70:
+    case 0x71:
+L_71:
+    case 0x72:
+L_72:
+    case 0x74:
+L_74:
+    case 0x75:
+L_75:
+    case 0x76:
+L_76:
+    case 0x77:
+L_77:
+    case 0x78:
+L_78: {
+        bool range = (op >= 0x74);
+        uint8_t kind = range ? (uint8_t)(op - 0x74 + 0x6e) : op;
+        uint32_t midx = IU(1);
 
-      case 0x81: L_81: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), (uint64_t)(int64_t)(int32_t)r[B4(u0)]); fr->pc = pc + 1; DISPATCH();
-      case 0x82: L_82: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = f_to_bits((float)(int32_t)r[B4(u0)]); fr->pc = pc + 1; DISPATCH();
-      case 0x83: L_83: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), d_to_bits((double)(int32_t)r[B4(u0)])); fr->pc = pc + 1; DISPATCH();
-      case 0x84: L_84: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = (uint32_t)rw(r, B4(u0)); fr->pc = pc + 1; DISPATCH();
-      case 0x85: L_85: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = f_to_bits((float)(int64_t)rw(r, B4(u0))); fr->pc = pc + 1; DISPATCH();
-      case 0x86: L_86: REQ(A4(u0) + 1); REQ(B4(u0) + 1); sw(r, A4(u0), d_to_bits((double)(int64_t)rw(r, B4(u0)))); fr->pc = pc + 1; DISPATCH();
-      case 0x87: L_87: { /* float-to-int, with Java's saturating semantics */
-         REQ(A4(u0)); REQ(B4(u0));
-         float f = bits_to_f(r[B4(u0)]);
-         int32_t v;
-         if (isnan(f)) v = 0;
-         else if (f >= 2147483647.0f) v = INT32_MAX;
-         else if (f <= -2147483648.0f) v = INT32_MIN;
-         else v = (int32_t)f;
-         r[A4(u0)] = (uint32_t)v;
-         fr->pc = pc + 1;
-         DISPATCH();
-      }
-      case 0x88: L_88: {
-         REQ(A4(u0) + 1); REQ(B4(u0));
-         float f = bits_to_f(r[B4(u0)]);
-         int64_t v;
-         if (isnan(f)) v = 0;
-         else if (f >= 9223372036854775807.0f) v = INT64_MAX;
-         else if (f <= -9223372036854775808.0f) v = INT64_MIN;
-         else v = (int64_t)f;
-         sw(r, A4(u0), (uint64_t)v);
-         fr->pc = pc + 1;
-         DISPATCH();
-      }
-      case 0x89: L_89: REQ(A4(u0) + 1); REQ(B4(u0)); sw(r, A4(u0), d_to_bits((double)bits_to_f(r[B4(u0)]))); fr->pc = pc + 1; DISPATCH();
-      case 0x8a: L_8a: {
-         REQ(A4(u0)); REQ(B4(u0) + 1);
-         double f = bits_to_d(rw(r, B4(u0)));
-         int32_t v;
-         if (isnan(f)) v = 0;
-         else if (f >= 2147483647.0) v = INT32_MAX;
-         else if (f <= -2147483648.0) v = INT32_MIN;
-         else v = (int32_t)f;
-         r[A4(u0)] = (uint32_t)v;
-         fr->pc = pc + 1;
-         DISPATCH();
-      }
-      case 0x8b: L_8b: {
-         REQ(A4(u0) + 1); REQ(B4(u0) + 1);
-         double f = bits_to_d(rw(r, B4(u0)));
-         int64_t v;
-         if (isnan(f)) v = 0;
-         else if (f >= 9223372036854775807.0) v = INT64_MAX;
-         else if (f <= -9223372036854775808.0) v = INT64_MIN;
-         else v = (int64_t)f;
-         sw(r, A4(u0), (uint64_t)v);
-         fr->pc = pc + 1;
-         DISPATCH();
-      }
-      case 0x8c: L_8c: REQ(A4(u0)); REQ(B4(u0) + 1); r[A4(u0)] = f_to_bits((float)bits_to_d(rw(r, B4(u0)))); fr->pc = pc + 1; DISPATCH();
-      case 0x8d: L_8d: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(int32_t)(int8_t)r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
-      case 0x8e: L_8e: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint16_t)r[B4(u0)]; fr->pc = pc + 1; DISPATCH();
-      case 0x8f: L_8f: REQ(A4(u0)); REQ(B4(u0)); r[A4(u0)] = (uint32_t)(int32_t)(int16_t)r[B4(u0)]; fr->pc = pc + 1; break;
+        struct dvm_class *cls = NULL;
+        const char *name = NULL;
+        struct dvm_method *target =
+          dd ? resolve_method(vm, dd, midx, &cls, &name, &sigbuf) : NULL;
 
-      /* --- binary op vAA, vBB, vCC --- */
-      case 0x90: L_90: case 0x91: L_91: case 0x92: L_92: case 0x93: L_93: case 0x94: L_94: case 0x95: L_95:
-      case 0x96: L_96: case 0x97: L_97: case 0x98: L_98: case 0x99: L_99: case 0x9a: L_9a: {
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ(bc & 0xff); REQ(bc >> 8);
-         int32_t a = (int32_t)r[bc & 0xff], b = (int32_t)r[bc >> 8];
-         int32_t v = 0;
-         switch (op) {
-            case 0x90: v = (int32_t)((uint32_t)a + (uint32_t)b); break;
-            case 0x91: v = (int32_t)((uint32_t)a - (uint32_t)b); break;
-            case 0x92: v = (int32_t)((uint32_t)a * (uint32_t)b); break;
-            case 0x93:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
-               break;
-            case 0x94:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? 0 : a % b;
-               break;
-            case 0x95: v = a & b; break;
-            case 0x96: v = a | b; break;
-            case 0x97: v = a ^ b; break;
-            case 0x98: v = (int32_t)((uint32_t)a << (b & 31)); break;
-            case 0x99: v = a >> (b & 31); break;
-            default:   v = (int32_t)((uint32_t)a >> (b & 31)); break;
-         }
-         r[AA(u0)] = (uint32_t)v;
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0x9b: L_9b: case 0x9c: L_9c: case 0x9d: L_9d: case 0x9e: L_9e: case 0x9f: L_9f: case 0xa0: L_a0:
-      case 0xa1: L_a1: case 0xa2: L_a2: case 0xa3: L_a3: case 0xa4: L_a4: case 0xa5: L_a5: {
-         REQ(AA(u0) + 1);
-         uint16_t bc = IU(1);
-         bool shift = (op >= 0xa3);
-         REQ((bc & 0xff) + 1);
-         REQ(shift ? (uint32_t)(bc >> 8) : (uint32_t)((bc >> 8) + 1));
-         int64_t a = (int64_t)rw(r, bc & 0xff);
-         int64_t b = shift ? (int32_t)r[bc >> 8] : (int64_t)rw(r, bc >> 8);
-         int64_t v = 0;
-         switch (op) {
-            case 0x9b: v = (int64_t)((uint64_t)a + (uint64_t)b); break;
-            case 0x9c: v = (int64_t)((uint64_t)a - (uint64_t)b); break;
-            case 0x9d: v = (int64_t)((uint64_t)a * (uint64_t)b); break;
-            case 0x9e:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT64_MIN && b == -1) ? INT64_MIN : a / b;
-               break;
-            case 0x9f:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT64_MIN && b == -1) ? 0 : a % b;
-               break;
-            case 0xa0: v = a & b; break;
-            case 0xa1: v = a | b; break;
-            case 0xa2: v = a ^ b; break;
-            case 0xa3: v = (int64_t)((uint64_t)a << (b & 63)); break;
-            case 0xa4: v = a >> (b & 63); break;
-            default:   v = (int64_t)((uint64_t)a >> (b & 63)); break;
-         }
-         sw(r, AA(u0), (uint64_t)v);
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0xa6: L_a6: case 0xa7: L_a7: case 0xa8: L_a8: case 0xa9: L_a9: case 0xaa: L_aa: {
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ(bc & 0xff); REQ(bc >> 8);
-         float a = bits_to_f(r[bc & 0xff]), b = bits_to_f(r[bc >> 8]), v;
-         switch (op) {
-            case 0xa6: v = a + b; break;
-            case 0xa7: v = a - b; break;
-            case 0xa8: v = a * b; break;
-            case 0xa9: v = a / b; break;
-            default:   v = fmodf(a, b); break;
-         }
-         r[AA(u0)] = f_to_bits(v);
-         fr->pc = pc + 2;
-         DISPATCH();
-      }
-      case 0xab: L_ab: case 0xac: L_ac: case 0xad: L_ad: case 0xae: L_ae: case 0xaf: L_af: {
-         REQ(AA(u0) + 1);
-         uint16_t bc = IU(1);
-         REQ((bc & 0xff) + 1); REQ((bc >> 8) + 1);
-         double a = bits_to_d(rw(r, bc & 0xff)), b = bits_to_d(rw(r, bc >> 8)), v;
-         switch (op) {
-            case 0xab: v = a + b; break;
-            case 0xac: v = a - b; break;
-            case 0xad: v = a * b; break;
-            case 0xae: v = a / b; break;
-            default:   v = fmod(a, b); break;
-         }
-         sw(r, AA(u0), d_to_bits(v));
-         fr->pc = pc + 2;
-         DISPATCH();
+        if (vm->trace >= 2 && trace_this)
+          fprintf(stderr, "[dvm]     invoke %s.%s%s\n",
+                  cls ? cls->name : "?", name ? name : "?", sigbuf);
+
+        uint32_t slots[256];
+        int n = gather_args(insns, nins, pc, range, r, nregs, slots);
+
+        bool is_static = (kind == 0x71);
+        dvm_ref self = 0;
+        const uint32_t *argslots = slots;
+        int nargslots = n;
+        if (!is_static) {
+          if (n < 1) {
+            dvm__throw(vm, "java/lang/VerifyError", "invoke with no receiver");
+            goto exception;
+          }
+          self = slots[0];
+          argslots = slots + 1;
+          nargslots = n - 1;
+          if (!self) {
+            /* The method index pins which constant-pool entry resolved to
+             * this name, which matters when the resolution itself looks
+             * wrong. */
+            dvm__throw(vm, "java/lang/NullPointerException",
+                       "receiver %s.%s meth@%u (insns@0x%lx w0=%04x w1=%04x)",
+                       cls ? cls->name : "?", name ? name : "?", midx,
+                       dd ? (unsigned long)((const uint8_t *)insns - dd->file.p)
+                       : 0UL,
+                       (unsigned)insns[pc], (unsigned)IU(1));
+            goto exception;
+          }
+        }
+
+        /* invoke-super searches from the calling class's direct superclass,
+         * even when the method reference names a more distant ancestor.
+         * Interface super calls retain their declared interface target. */
+        if (kind == 0x6f && cls && !(cls->access & DEX_ACC_INTERFACE) &&
+            m->cls && m->cls->super)
+          target = dvm_find_method(vm, m->cls->super, name, sigbuf);
+
+        /* invoke-virtual / -interface re-dispatch on the receiver. */
+        if (target && (kind == 0x6e || kind == 0x72))
+          target = virtual_target(vm, self, target);
+        else if (!target && self && (kind == 0x6e || kind == 0x72)) {
+          /* The declared type carries no such method — an interface whose
+           * definition is not in the dex, or one modelled here without it.
+           * Dispatch is on the receiver, so look there before giving up and
+           * handing the call to the host stubs, which would answer null.
+           * Iterable.iterator() reached this path constantly: the sequence
+           * types Kotlin's split() builds implement it, but the interface
+           * itself declares nothing the VM can see. */
+          struct dvm_object *ro = dvm__obj(vm, self);
+          if (ro && ro->cls)
+            target = dvm_find_method(vm, ro->cls, name, sigbuf);
+        }
+
+        union dvm_value ret;
+        bool ok;
+        if (target) {
+          ok = invoke(vm, target, self, argslots, nargslots, &ret);
+        } else if (cls && class_absent(vm, cls)) {
+          /* Same as new-instance: the call names a class the APK does not
+           * carry and the platform does not have.  Answering it with a stub
+           * that returns zero tells the app the optional component is there
+           * and it keeps using it. */
+          dvm__throw(vm, "java/lang/NoClassDefFoundError", "%s",
+                     cls->name ? cls->name : "?");
+          goto exception;
+        } else if (cls && name) {
+          ++vm->depth;
+          ok = dvm__call_out(vm, cls, name, sigbuf,
+                             is_static, false, self, argslots, nargslots, &ret);
+          --vm->depth;
+          ok = ok && !vm->exception;
+        } else {
+          memset(&ret, 0, sizeof ret);
+          ok = true;
+        }
+        if (!ok || vm->exception) goto exception;
+
+        fr->result = ret.ju;
+        fr->pc = pc + 3;   /* 35c and 3rc are both three code units */
+        DISPATCH();
       }
 
-      /* --- binary op/2addr --- */
-      case 0xb0: L_b0: case 0xb1: L_b1: case 0xb2: L_b2: case 0xb3: L_b3: case 0xb4: L_b4: case 0xb5: L_b5:
-      case 0xb6: L_b6: case 0xb7: L_b7: case 0xb8: L_b8: case 0xb9: L_b9: case 0xba: L_ba: {
-         REQ(A4(u0)); REQ(B4(u0));
-         int32_t a = (int32_t)r[A4(u0)], b = (int32_t)r[B4(u0)];
-         int32_t v = 0;
-         switch (op) {
-            case 0xb0: v = (int32_t)((uint32_t)a + (uint32_t)b); break;
-            case 0xb1: v = (int32_t)((uint32_t)a - (uint32_t)b); break;
-            case 0xb2: v = (int32_t)((uint32_t)a * (uint32_t)b); break;
-            case 0xb3:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
-               break;
-            case 0xb4:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? 0 : a % b;
-               break;
-            case 0xb5: v = a & b; break;
-            case 0xb6: v = a | b; break;
-            case 0xb7: v = a ^ b; break;
-            case 0xb8: v = (int32_t)((uint32_t)a << (b & 31)); break;
-            case 0xb9: v = a >> (b & 31); break;
-            default:   v = (int32_t)((uint32_t)a >> (b & 31)); break;
-         }
-         r[A4(u0)] = (uint32_t)v;
-         fr->pc = pc + 1;
-         DISPATCH();
+    /* --- unary --- */
+    case 0x7b:
+L_7b:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = (uint32_t)(-(int32_t)r[B4(u0)]);
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x7c:
+L_7c:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = ~r[B4(u0)];
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x7d:
+L_7d:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0) + 1);
+      sw(r, A4(u0), (uint64_t)(-(int64_t)rw(r, B4(u0))));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x7e:
+L_7e:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0) + 1);
+      sw(r, A4(u0), ~rw(r, B4(u0)));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x7f:
+L_7f:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = f_to_bits(-bits_to_f(r[B4(u0)]));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x80:
+L_80:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0) + 1);
+      sw(r, A4(u0), d_to_bits(-bits_to_d(rw(r, B4(u0)))));
+      fr->pc = pc + 1;
+      break;
+
+    case 0x81:
+L_81:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0));
+      sw(r, A4(u0), (uint64_t)(int64_t)(int32_t)r[B4(u0)]);
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x82:
+L_82:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = f_to_bits((float)(int32_t)r[B4(u0)]);
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x83:
+L_83:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0));
+      sw(r, A4(u0), d_to_bits((double)(int32_t)r[B4(u0)]));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x84:
+L_84:
+      REQ(A4(u0));
+      REQ(B4(u0) + 1);
+      r[A4(u0)] = (uint32_t)rw(r, B4(u0));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x85:
+L_85:
+      REQ(A4(u0));
+      REQ(B4(u0) + 1);
+      r[A4(u0)] = f_to_bits((float)(int64_t)rw(r, B4(u0)));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x86:
+L_86:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0) + 1);
+      sw(r, A4(u0), d_to_bits((double)(int64_t)rw(r, B4(u0))));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x87:
+L_87: { /* float-to-int, with Java's saturating semantics */
+        REQ(A4(u0));
+        REQ(B4(u0));
+        float f = bits_to_f(r[B4(u0)]);
+        int32_t v;
+        if (isnan(f)) v = 0;
+        else if (f >= 2147483647.0f) v = INT32_MAX;
+        else if (f <= -2147483648.0f) v = INT32_MIN;
+        else v = (int32_t)f;
+        r[A4(u0)] = (uint32_t)v;
+        fr->pc = pc + 1;
+        DISPATCH();
       }
-      case 0xbb: L_bb: case 0xbc: L_bc: case 0xbd: L_bd: case 0xbe: L_be: case 0xbf: L_bf: case 0xc0: L_c0:
-      case 0xc1: L_c1: case 0xc2: L_c2: case 0xc3: L_c3: case 0xc4: L_c4: case 0xc5: L_c5: {
-         bool shift = (op >= 0xc3);
-         REQ(A4(u0) + 1);
-         REQ(shift ? (uint32_t)B4(u0) : (uint32_t)(B4(u0) + 1));
-         int64_t a = (int64_t)rw(r, A4(u0));
-         int64_t b = shift ? (int32_t)r[B4(u0)] : (int64_t)rw(r, B4(u0));
-         int64_t v = 0;
-         switch (op) {
-            case 0xbb: v = (int64_t)((uint64_t)a + (uint64_t)b); break;
-            case 0xbc: v = (int64_t)((uint64_t)a - (uint64_t)b); break;
-            case 0xbd: v = (int64_t)((uint64_t)a * (uint64_t)b); break;
-            case 0xbe:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT64_MIN && b == -1) ? INT64_MIN : a / b;
-               break;
-            case 0xbf:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT64_MIN && b == -1) ? 0 : a % b;
-               break;
-            case 0xc0: v = a & b; break;
-            case 0xc1: v = a | b; break;
-            case 0xc2: v = a ^ b; break;
-            case 0xc3: v = (int64_t)((uint64_t)a << (b & 63)); break;
-            case 0xc4: v = a >> (b & 63); break;
-            default:   v = (int64_t)((uint64_t)a >> (b & 63)); break;
-         }
-         sw(r, A4(u0), (uint64_t)v);
-         fr->pc = pc + 1;
-         DISPATCH();
+    case 0x88:
+L_88: {
+        REQ(A4(u0) + 1);
+        REQ(B4(u0));
+        float f = bits_to_f(r[B4(u0)]);
+        int64_t v;
+        if (isnan(f)) v = 0;
+        else if (f >= 9223372036854775807.0f) v = INT64_MAX;
+        else if (f <= -9223372036854775808.0f) v = INT64_MIN;
+        else v = (int64_t)f;
+        sw(r, A4(u0), (uint64_t)v);
+        fr->pc = pc + 1;
+        DISPATCH();
       }
-      case 0xc6: L_c6: case 0xc7: L_c7: case 0xc8: L_c8: case 0xc9: L_c9: case 0xca: L_ca: {
-         REQ(A4(u0)); REQ(B4(u0));
-         float a = bits_to_f(r[A4(u0)]), b = bits_to_f(r[B4(u0)]), v;
-         switch (op) {
-            case 0xc6: v = a + b; break;
-            case 0xc7: v = a - b; break;
-            case 0xc8: v = a * b; break;
-            case 0xc9: v = a / b; break;
-            default:   v = fmodf(a, b); break;
-         }
-         r[A4(u0)] = f_to_bits(v);
-         fr->pc = pc + 1;
-         DISPATCH();
+    case 0x89:
+L_89:
+      REQ(A4(u0) + 1);
+      REQ(B4(u0));
+      sw(r, A4(u0), d_to_bits((double)bits_to_f(r[B4(u0)])));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x8a:
+L_8a: {
+        REQ(A4(u0));
+        REQ(B4(u0) + 1);
+        double f = bits_to_d(rw(r, B4(u0)));
+        int32_t v;
+        if (isnan(f)) v = 0;
+        else if (f >= 2147483647.0) v = INT32_MAX;
+        else if (f <= -2147483648.0) v = INT32_MIN;
+        else v = (int32_t)f;
+        r[A4(u0)] = (uint32_t)v;
+        fr->pc = pc + 1;
+        DISPATCH();
       }
-      case 0xcb: L_cb: case 0xcc: L_cc: case 0xcd: L_cd: case 0xce: L_ce: case 0xcf: L_cf: {
-         REQ(A4(u0) + 1); REQ(B4(u0) + 1);
-         double a = bits_to_d(rw(r, A4(u0))), b = bits_to_d(rw(r, B4(u0))), v;
-         switch (op) {
-            case 0xcb: v = a + b; break;
-            case 0xcc: v = a - b; break;
-            case 0xcd: v = a * b; break;
-            case 0xce: v = a / b; break;
-            default:   v = fmod(a, b); break;
-         }
-         sw(r, A4(u0), d_to_bits(v));
-         fr->pc = pc + 1;
-         DISPATCH();
+    case 0x8b:
+L_8b: {
+        REQ(A4(u0) + 1);
+        REQ(B4(u0) + 1);
+        double f = bits_to_d(rw(r, B4(u0)));
+        int64_t v;
+        if (isnan(f)) v = 0;
+        else if (f >= 9223372036854775807.0) v = INT64_MAX;
+        else if (f <= -9223372036854775808.0) v = INT64_MIN;
+        else v = (int64_t)f;
+        sw(r, A4(u0), (uint64_t)v);
+        fr->pc = pc + 1;
+        DISPATCH();
+      }
+    case 0x8c:
+L_8c:
+      REQ(A4(u0));
+      REQ(B4(u0) + 1);
+      r[A4(u0)] = f_to_bits((float)bits_to_d(rw(r, B4(u0))));
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x8d:
+L_8d:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = (uint32_t)(int32_t)(int8_t)r[B4(u0)];
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x8e:
+L_8e:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = (uint16_t)r[B4(u0)];
+      fr->pc = pc + 1;
+      DISPATCH();
+    case 0x8f:
+L_8f:
+      REQ(A4(u0));
+      REQ(B4(u0));
+      r[A4(u0)] = (uint32_t)(int32_t)(int16_t)r[B4(u0)];
+      fr->pc = pc + 1;
+      break;
+
+    /* --- binary op vAA, vBB, vCC --- */
+    case 0x90:
+L_90:
+    case 0x91:
+L_91:
+    case 0x92:
+L_92:
+    case 0x93:
+L_93:
+    case 0x94:
+L_94:
+    case 0x95:
+L_95:
+    case 0x96:
+L_96:
+    case 0x97:
+L_97:
+    case 0x98:
+L_98:
+    case 0x99:
+L_99:
+    case 0x9a:
+L_9a: {
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ(bc & 0xff);
+        REQ(bc >> 8);
+        int32_t a = (int32_t)r[bc & 0xff], b = (int32_t)r[bc >> 8];
+        int32_t v = 0;
+        switch (op) {
+        case 0x90:
+          v = (int32_t)((uint32_t)a + (uint32_t)b);
+          break;
+        case 0x91:
+          v = (int32_t)((uint32_t)a - (uint32_t)b);
+          break;
+        case 0x92:
+          v = (int32_t)((uint32_t)a * (uint32_t)b);
+          break;
+        case 0x93:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
+          break;
+        case 0x94:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? 0 : a % b;
+          break;
+        case 0x95:
+          v = a & b;
+          break;
+        case 0x96:
+          v = a | b;
+          break;
+        case 0x97:
+          v = a ^ b;
+          break;
+        case 0x98:
+          v = (int32_t)((uint32_t)a << (b & 31));
+          break;
+        case 0x99:
+          v = a >> (b & 31);
+          break;
+        default:
+          v = (int32_t)((uint32_t)a >> (b & 31));
+          break;
+        }
+        r[AA(u0)] = (uint32_t)v;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0x9b:
+L_9b:
+    case 0x9c:
+L_9c:
+    case 0x9d:
+L_9d:
+    case 0x9e:
+L_9e:
+    case 0x9f:
+L_9f:
+    case 0xa0:
+L_a0:
+    case 0xa1:
+L_a1:
+    case 0xa2:
+L_a2:
+    case 0xa3:
+L_a3:
+    case 0xa4:
+L_a4:
+    case 0xa5:
+L_a5: {
+        REQ(AA(u0) + 1);
+        uint16_t bc = IU(1);
+        bool shift = (op >= 0xa3);
+        REQ((bc & 0xff) + 1);
+        REQ(shift ? (uint32_t)(bc >> 8) : (uint32_t)((bc >> 8) + 1));
+        int64_t a = (int64_t)rw(r, bc & 0xff);
+        int64_t b = shift ? (int32_t)r[bc >> 8] : (int64_t)rw(r, bc >> 8);
+        int64_t v = 0;
+        switch (op) {
+        case 0x9b:
+          v = (int64_t)((uint64_t)a + (uint64_t)b);
+          break;
+        case 0x9c:
+          v = (int64_t)((uint64_t)a - (uint64_t)b);
+          break;
+        case 0x9d:
+          v = (int64_t)((uint64_t)a * (uint64_t)b);
+          break;
+        case 0x9e:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT64_MIN && b == -1) ? INT64_MIN : a / b;
+          break;
+        case 0x9f:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT64_MIN && b == -1) ? 0 : a % b;
+          break;
+        case 0xa0:
+          v = a & b;
+          break;
+        case 0xa1:
+          v = a | b;
+          break;
+        case 0xa2:
+          v = a ^ b;
+          break;
+        case 0xa3:
+          v = (int64_t)((uint64_t)a << (b & 63));
+          break;
+        case 0xa4:
+          v = a >> (b & 63);
+          break;
+        default:
+          v = (int64_t)((uint64_t)a >> (b & 63));
+          break;
+        }
+        sw(r, AA(u0), (uint64_t)v);
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0xa6:
+L_a6:
+    case 0xa7:
+L_a7:
+    case 0xa8:
+L_a8:
+    case 0xa9:
+L_a9:
+    case 0xaa:
+L_aa: {
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ(bc & 0xff);
+        REQ(bc >> 8);
+        float a = bits_to_f(r[bc & 0xff]), b = bits_to_f(r[bc >> 8]), v;
+        switch (op) {
+        case 0xa6:
+          v = a + b;
+          break;
+        case 0xa7:
+          v = a - b;
+          break;
+        case 0xa8:
+          v = a * b;
+          break;
+        case 0xa9:
+          v = a / b;
+          break;
+        default:
+          v = fmodf(a, b);
+          break;
+        }
+        r[AA(u0)] = f_to_bits(v);
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+    case 0xab:
+L_ab:
+    case 0xac:
+L_ac:
+    case 0xad:
+L_ad:
+    case 0xae:
+L_ae:
+    case 0xaf:
+L_af: {
+        REQ(AA(u0) + 1);
+        uint16_t bc = IU(1);
+        REQ((bc & 0xff) + 1);
+        REQ((bc >> 8) + 1);
+        double a = bits_to_d(rw(r, bc & 0xff)), b = bits_to_d(rw(r, bc >> 8)), v;
+        switch (op) {
+        case 0xab:
+          v = a + b;
+          break;
+        case 0xac:
+          v = a - b;
+          break;
+        case 0xad:
+          v = a * b;
+          break;
+        case 0xae:
+          v = a / b;
+          break;
+        default:
+          v = fmod(a, b);
+          break;
+        }
+        sw(r, AA(u0), d_to_bits(v));
+        fr->pc = pc + 2;
+        DISPATCH();
       }
 
-      /* --- literal ops --- */
-      case 0xd0: L_d0: case 0xd1: L_d1: case 0xd2: L_d2: case 0xd3: L_d3: case 0xd4: L_d4:
-      case 0xd5: L_d5: case 0xd6: L_d6: case 0xd7: L_d7: {
-         REQ(A4(u0)); REQ(B4(u0));
-         int32_t a = (int32_t)r[B4(u0)];
-         int32_t b = (int16_t)IU(1);
-         int32_t v = 0;
-         switch (op) {
-            case 0xd0: v = (int32_t)((uint32_t)a + (uint32_t)b); break;
-            case 0xd1: v = (int32_t)((uint32_t)b - (uint32_t)a); break;  /* rsub */
-            case 0xd2: v = (int32_t)((uint32_t)a * (uint32_t)b); break;
-            case 0xd3:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
-               break;
-            case 0xd4:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? 0 : a % b;
-               break;
-            case 0xd5: v = a & b; break;
-            case 0xd6: v = a | b; break;
-            default:   v = a ^ b; break;
-         }
-         r[A4(u0)] = (uint32_t)v;
-         fr->pc = pc + 2;
-         DISPATCH();
+    /* --- binary op/2addr --- */
+    case 0xb0:
+L_b0:
+    case 0xb1:
+L_b1:
+    case 0xb2:
+L_b2:
+    case 0xb3:
+L_b3:
+    case 0xb4:
+L_b4:
+    case 0xb5:
+L_b5:
+    case 0xb6:
+L_b6:
+    case 0xb7:
+L_b7:
+    case 0xb8:
+L_b8:
+    case 0xb9:
+L_b9:
+    case 0xba:
+L_ba: {
+        REQ(A4(u0));
+        REQ(B4(u0));
+        int32_t a = (int32_t)r[A4(u0)], b = (int32_t)r[B4(u0)];
+        int32_t v = 0;
+        switch (op) {
+        case 0xb0:
+          v = (int32_t)((uint32_t)a + (uint32_t)b);
+          break;
+        case 0xb1:
+          v = (int32_t)((uint32_t)a - (uint32_t)b);
+          break;
+        case 0xb2:
+          v = (int32_t)((uint32_t)a * (uint32_t)b);
+          break;
+        case 0xb3:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
+          break;
+        case 0xb4:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? 0 : a % b;
+          break;
+        case 0xb5:
+          v = a & b;
+          break;
+        case 0xb6:
+          v = a | b;
+          break;
+        case 0xb7:
+          v = a ^ b;
+          break;
+        case 0xb8:
+          v = (int32_t)((uint32_t)a << (b & 31));
+          break;
+        case 0xb9:
+          v = a >> (b & 31);
+          break;
+        default:
+          v = (int32_t)((uint32_t)a >> (b & 31));
+          break;
+        }
+        r[A4(u0)] = (uint32_t)v;
+        fr->pc = pc + 1;
+        DISPATCH();
       }
-      case 0xd8: L_d8: case 0xd9: L_d9: case 0xda: L_da: case 0xdb: L_db: case 0xdc: L_dc: case 0xdd: L_dd:
-      case 0xde: L_de: case 0xdf: L_df: case 0xe0: L_e0: case 0xe1: L_e1: case 0xe2: L_e2: {
-         REQ(AA(u0));
-         uint16_t bc = IU(1);
-         REQ(bc & 0xff);
-         int32_t a = (int32_t)r[bc & 0xff];
-         int32_t b = (int8_t)(uint8_t)(bc >> 8);
-         int32_t v = 0;
-         switch (op) {
-            case 0xd8: v = (int32_t)((uint32_t)a + (uint32_t)b); break;
-            case 0xd9: v = (int32_t)((uint32_t)b - (uint32_t)a); break;
-            case 0xda: v = (int32_t)((uint32_t)a * (uint32_t)b); break;
-            case 0xdb:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
-               break;
-            case 0xdc:
-               if (!b) { dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero"); goto exception; }
-               v = (a == INT32_MIN && b == -1) ? 0 : a % b;
-               break;
-            case 0xdd: v = a & b; break;
-            case 0xde: v = a | b; break;
-            case 0xdf: v = a ^ b; break;
-            case 0xe0: v = (int32_t)((uint32_t)a << (b & 31)); break;
-            case 0xe1: v = a >> (b & 31); break;
-            default:   v = (int32_t)((uint32_t)a >> (b & 31)); break;
-         }
-         r[AA(u0)] = (uint32_t)v;
-         fr->pc = pc + 2;
-         DISPATCH();
+    case 0xbb:
+L_bb:
+    case 0xbc:
+L_bc:
+    case 0xbd:
+L_bd:
+    case 0xbe:
+L_be:
+    case 0xbf:
+L_bf:
+    case 0xc0:
+L_c0:
+    case 0xc1:
+L_c1:
+    case 0xc2:
+L_c2:
+    case 0xc3:
+L_c3:
+    case 0xc4:
+L_c4:
+    case 0xc5:
+L_c5: {
+        bool shift = (op >= 0xc3);
+        REQ(A4(u0) + 1);
+        REQ(shift ? (uint32_t)B4(u0) : (uint32_t)(B4(u0) + 1));
+        int64_t a = (int64_t)rw(r, A4(u0));
+        int64_t b = shift ? (int32_t)r[B4(u0)] : (int64_t)rw(r, B4(u0));
+        int64_t v = 0;
+        switch (op) {
+        case 0xbb:
+          v = (int64_t)((uint64_t)a + (uint64_t)b);
+          break;
+        case 0xbc:
+          v = (int64_t)((uint64_t)a - (uint64_t)b);
+          break;
+        case 0xbd:
+          v = (int64_t)((uint64_t)a * (uint64_t)b);
+          break;
+        case 0xbe:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT64_MIN && b == -1) ? INT64_MIN : a / b;
+          break;
+        case 0xbf:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT64_MIN && b == -1) ? 0 : a % b;
+          break;
+        case 0xc0:
+          v = a & b;
+          break;
+        case 0xc1:
+          v = a | b;
+          break;
+        case 0xc2:
+          v = a ^ b;
+          break;
+        case 0xc3:
+          v = (int64_t)((uint64_t)a << (b & 63));
+          break;
+        case 0xc4:
+          v = a >> (b & 63);
+          break;
+        default:
+          v = (int64_t)((uint64_t)a >> (b & 63));
+          break;
+        }
+        sw(r, A4(u0), (uint64_t)v);
+        fr->pc = pc + 1;
+        DISPATCH();
+      }
+    case 0xc6:
+L_c6:
+    case 0xc7:
+L_c7:
+    case 0xc8:
+L_c8:
+    case 0xc9:
+L_c9:
+    case 0xca:
+L_ca: {
+        REQ(A4(u0));
+        REQ(B4(u0));
+        float a = bits_to_f(r[A4(u0)]), b = bits_to_f(r[B4(u0)]), v;
+        switch (op) {
+        case 0xc6:
+          v = a + b;
+          break;
+        case 0xc7:
+          v = a - b;
+          break;
+        case 0xc8:
+          v = a * b;
+          break;
+        case 0xc9:
+          v = a / b;
+          break;
+        default:
+          v = fmodf(a, b);
+          break;
+        }
+        r[A4(u0)] = f_to_bits(v);
+        fr->pc = pc + 1;
+        DISPATCH();
+      }
+    case 0xcb:
+L_cb:
+    case 0xcc:
+L_cc:
+    case 0xcd:
+L_cd:
+    case 0xce:
+L_ce:
+    case 0xcf:
+L_cf: {
+        REQ(A4(u0) + 1);
+        REQ(B4(u0) + 1);
+        double a = bits_to_d(rw(r, A4(u0))), b = bits_to_d(rw(r, B4(u0))), v;
+        switch (op) {
+        case 0xcb:
+          v = a + b;
+          break;
+        case 0xcc:
+          v = a - b;
+          break;
+        case 0xcd:
+          v = a * b;
+          break;
+        case 0xce:
+          v = a / b;
+          break;
+        default:
+          v = fmod(a, b);
+          break;
+        }
+        sw(r, A4(u0), d_to_bits(v));
+        fr->pc = pc + 1;
+        DISPATCH();
       }
 
-      /* --- invoke-polymorphic / -custom, const-method-*: these need a
-       * MethodHandle runtime.  Java 8 lambdas in an APK are desugared by d8
-       * into ordinary classes, so this only shows up in code that reflects on
-       * method handles.  Skip the call and yield zero rather than derail the
-       * whole method. */
-      case 0xfa: L_fa: case 0xfb: L_fb: fr->pc = pc + 4; fr->result = 0; DISPATCH();
-      case 0xfc: L_fc: case 0xfd: L_fd: fr->pc = pc + 3; fr->result = 0; DISPATCH();
-      case 0xfe: L_fe: case 0xff: L_ff: REQ(AA(u0)); r[AA(u0)] = 0; fr->pc = pc + 2; break;
-
-      default:
-         dvm__throw(vm, "java/lang/VerifyError", "%s.%s: opcode %02x at %04x",
-                    m->cls->name, m->name, op, pc);
-         goto exception;
+    /* --- literal ops --- */
+    case 0xd0:
+L_d0:
+    case 0xd1:
+L_d1:
+    case 0xd2:
+L_d2:
+    case 0xd3:
+L_d3:
+    case 0xd4:
+L_d4:
+    case 0xd5:
+L_d5:
+    case 0xd6:
+L_d6:
+    case 0xd7:
+L_d7: {
+        REQ(A4(u0));
+        REQ(B4(u0));
+        int32_t a = (int32_t)r[B4(u0)];
+        int32_t b = (int16_t)IU(1);
+        int32_t v = 0;
+        switch (op) {
+        case 0xd0:
+          v = (int32_t)((uint32_t)a + (uint32_t)b);
+          break;
+        case 0xd1:
+          v = (int32_t)((uint32_t)b - (uint32_t)a);
+          break;  /* rsub */
+        case 0xd2:
+          v = (int32_t)((uint32_t)a * (uint32_t)b);
+          break;
+        case 0xd3:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
+          break;
+        case 0xd4:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? 0 : a % b;
+          break;
+        case 0xd5:
+          v = a & b;
+          break;
+        case 0xd6:
+          v = a | b;
+          break;
+        default:
+          v = a ^ b;
+          break;
+        }
+        r[A4(u0)] = (uint32_t)v;
+        fr->pc = pc + 2;
+        DISPATCH();
       }
-      continue;
+    case 0xd8:
+L_d8:
+    case 0xd9:
+L_d9:
+    case 0xda:
+L_da:
+    case 0xdb:
+L_db:
+    case 0xdc:
+L_dc:
+    case 0xdd:
+L_dd:
+    case 0xde:
+L_de:
+    case 0xdf:
+L_df:
+    case 0xe0:
+L_e0:
+    case 0xe1:
+L_e1:
+    case 0xe2:
+L_e2: {
+        REQ(AA(u0));
+        uint16_t bc = IU(1);
+        REQ(bc & 0xff);
+        int32_t a = (int32_t)r[bc & 0xff];
+        int32_t b = (int8_t)(uint8_t)(bc >> 8);
+        int32_t v = 0;
+        switch (op) {
+        case 0xd8:
+          v = (int32_t)((uint32_t)a + (uint32_t)b);
+          break;
+        case 0xd9:
+          v = (int32_t)((uint32_t)b - (uint32_t)a);
+          break;
+        case 0xda:
+          v = (int32_t)((uint32_t)a * (uint32_t)b);
+          break;
+        case 0xdb:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? INT32_MIN : a / b;
+          break;
+        case 0xdc:
+          if (!b) {
+            dvm__throw(vm, "java/lang/ArithmeticException", "divide by zero");
+            goto exception;
+          }
+          v = (a == INT32_MIN && b == -1) ? 0 : a % b;
+          break;
+        case 0xdd:
+          v = a & b;
+          break;
+        case 0xde:
+          v = a | b;
+          break;
+        case 0xdf:
+          v = a ^ b;
+          break;
+        case 0xe0:
+          v = (int32_t)((uint32_t)a << (b & 31));
+          break;
+        case 0xe1:
+          v = a >> (b & 31);
+          break;
+        default:
+          v = (int32_t)((uint32_t)a >> (b & 31));
+          break;
+        }
+        r[AA(u0)] = (uint32_t)v;
+        fr->pc = pc + 2;
+        DISPATCH();
+      }
+
+    /* --- invoke-polymorphic / -custom, const-method-*: these need a
+     * MethodHandle runtime.  Java 8 lambdas in an APK are desugared by d8
+     * into ordinary classes, so this only shows up in code that reflects on
+     * method handles.  Skip the call and yield zero rather than derail the
+     * whole method. */
+    case 0xfa:
+L_fa:
+    case 0xfb:
+L_fb:
+      fr->pc = pc + 4;
+      fr->result = 0;
+      DISPATCH();
+    case 0xfc:
+L_fc:
+    case 0xfd:
+L_fd:
+      fr->pc = pc + 3;
+      fr->result = 0;
+      DISPATCH();
+    case 0xfe:
+L_fe:
+    case 0xff:
+L_ff:
+      REQ(AA(u0));
+      r[AA(u0)] = 0;
+      fr->pc = pc + 2;
+      break;
+
+    default:
+      dvm__throw(vm, "java/lang/VerifyError", "%s.%s: opcode %02x at %04x",
+                 m->cls->name, m->name, op, pc);
+      goto exception;
+    }
+    continue;
 
 exception:
-      {
-         /* Process death is not a Java exception that guest code can catch
-          * and restart.  Unwind to the host thread owner for joining. */
-         if (dvm_is_stopping(vm)) return false;
-         if (!vm->exception)
-            dvm__throw(vm, "java/lang/Error", "internal: no exception object");
-         struct dvm_object *eo = dvm__obj(vm, vm->exception);
-         uint32_t handler;
-         /* A parked thread is not a failure the app can handle: it is a
-          * thread that would be waiting inside the platform right now.  The
-          * unwind therefore passes catch clauses by and ends the thread — a
-          * dispatcher's `catch (InterruptedException e) { continue; }` would
-          * otherwise put it straight back on the empty queue it just parked
-          * on, and spin for the whole time slice. */
-         if (vm->parked) {
-            if (find_catchall_handler(m, fr->pc, &handler) == 0) {
-               vm->exc_ref = vm->exception;
-               vm->exception = 0;
-               fr->pc = handler;
-               continue;
-            }
-            return false;
-         }
-         if (find_handler(vm, m, fr->pc, eo ? eo->cls : NULL, &handler) == 0) {
-            /* Dalvik clears the pending exception when control reaches the
-             * handler; move-exception only *retrieves* it, and dx omits that
-             * instruction entirely when the catch variable is unused.  Leaving
-             * the exception set meant such a handler ran with the throw still
-             * pending, so the first call it made returned "exception" and the
-             * caught error escaped anyway — `catch (ClassNotFoundException e)`
-             * blocks that merely log were the common shape.  Keep the object
-             * reachable for a move-exception that does follow. */
-            vm->exc_ref = vm->exception;
-            vm->exception = 0;
-            fr->pc = handler;
-            continue;
-         }
-         return false;
+    {
+      /* Process death is not a Java exception that guest code can catch
+       * and restart.  Unwind to the host thread owner for joining. */
+      if (dvm_is_stopping(vm)) return false;
+      if (!vm->exception)
+        dvm__throw(vm, "java/lang/Error", "internal: no exception object");
+      struct dvm_object *eo = dvm__obj(vm, vm->exception);
+      uint32_t handler;
+      /* A parked thread is not a failure the app can handle: it is a
+       * thread that would be waiting inside the platform right now.  The
+       * unwind therefore passes catch clauses by and ends the thread — a
+       * dispatcher's `catch (InterruptedException e) { continue; }` would
+       * otherwise put it straight back on the empty queue it just parked
+       * on, and spin for the whole time slice. */
+      if (vm->parked) {
+        if (find_catchall_handler(m, fr->pc, &handler) == 0) {
+          vm->exc_ref = vm->exception;
+          vm->exception = 0;
+          fr->pc = handler;
+          continue;
+        }
+        return false;
       }
-   }
+      if (find_handler(vm, m, fr->pc, eo ? eo->cls : NULL, &handler) == 0) {
+        /* Dalvik clears the pending exception when control reaches the
+         * handler; move-exception only *retrieves* it, and dx omits that
+         * instruction entirely when the catch variable is unused.  Leaving
+         * the exception set meant such a handler ran with the throw still
+         * pending, so the first call it made returned "exception" and the
+         * caught error escaped anyway — `catch (ClassNotFoundException e)`
+         * blocks that merely log were the common shape.  Keep the object
+         * reachable for a move-exception that does follow. */
+        vm->exc_ref = vm->exception;
+        vm->exception = 0;
+        fr->pc = handler;
+        continue;
+      }
+      return false;
+    }
+  }
 #undef REQ
 #undef THROW_AND_DISPATCH
 }
@@ -3774,311 +4647,330 @@ static bool annotation_value_to_dvm(struct dvm *vm, struct dex_file *dex,
                                     const char *expected,
                                     union dvm_value *out)
 {
-   memset(out, 0, sizeof *out);
-   if (!value) return false;
-   switch (value->type) {
-      case DEX_VALUE_NULL:
-         return true;
-      case DEX_VALUE_BOOLEAN: case DEX_VALUE_BYTE: case DEX_VALUE_SHORT:
-      case DEX_VALUE_CHAR: case DEX_VALUE_INT: case DEX_VALUE_LONG:
-      case DEX_VALUE_FLOAT: case DEX_VALUE_DOUBLE:
-         out->ju = value->bits;
-         return true;
-      case DEX_VALUE_STRING: {
-         const char *s = dex_string(dex, (uint32_t)value->bits);
-         out->l = s ? dvm__intern(vm, s) : 0;
-         return s != NULL;
+  memset(out, 0, sizeof *out);
+  if (!value) return false;
+  switch (value->type) {
+  case DEX_VALUE_NULL:
+    return true;
+  case DEX_VALUE_BOOLEAN:
+  case DEX_VALUE_BYTE:
+  case DEX_VALUE_SHORT:
+  case DEX_VALUE_CHAR:
+  case DEX_VALUE_INT:
+  case DEX_VALUE_LONG:
+  case DEX_VALUE_FLOAT:
+  case DEX_VALUE_DOUBLE:
+    out->ju = value->bits;
+    return true;
+  case DEX_VALUE_STRING: {
+    const char *s = dex_string(dex, (uint32_t)value->bits);
+    out->l = s ? dvm__intern(vm, s) : 0;
+    return s != NULL;
+  }
+  case DEX_VALUE_TYPE: {
+    const char *desc = dex_type(dex, (uint32_t)value->bits);
+    out->l = desc ? class_object(vm, dvm__class_by_desc(vm, desc)) : 0;
+    return desc != NULL;
+  }
+  case DEX_VALUE_ENUM: {
+    struct dex_field_id field;
+    if (!dex_field_id(dex, (uint32_t)value->bits, &field)) return false;
+    const char *desc = dex_type(dex, field.class_idx);
+    const char *name = dex_string(dex, field.name_idx);
+    struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
+    if (!cls || !name) return false;
+    if (!dvm_init_class(vm, cls)) return false;
+    return dvm_get_static(vm, cls, name, desc, out);
+  }
+  case DEX_VALUE_ANNOTATION: {
+    if (value->bits > UINT32_MAX) return false;
+    const char *desc = dex_annotation_type(dex, (uint32_t)value->bits);
+    struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
+    dvm_ref ref = cls ? dvm_new_object(vm, cls) : 0;
+    struct dvm_object *obj = dvm__obj(vm, ref);
+    if (!obj) return false;
+    obj->annotation_dex = dex;
+    obj->annotation_off = (uint32_t)value->bits;
+    out->l = ref;
+    return true;
+  }
+  case DEX_VALUE_ARRAY: {
+    if (!expected || expected[0] != '[') return false;
+    int count = dex_value_array(dex, value, NULL, 0);
+    if (count < 0) return false;
+    struct dex_value *items = count
+                              ? calloc((size_t)count, sizeof *items) : NULL;
+    if (count && !items) return false;
+    if (count && dex_value_array(dex, value, items, count) != count) {
+      free(items);
+      return false;
+    }
+    char element_kind = expected[1] == '[' || expected[1] == 'L'
+                        ? 'L' : expected[1];
+    dvm_ref array = dvm_new_array(vm, element_kind, expected + 1,
+                                  (uint32_t)count);
+    struct dvm_object *obj = dvm__obj(vm, array);
+    if (!obj) {
+      free(items);
+      return false;
+    }
+    for (int i = 0; i < count; ++i) {
+      union dvm_value item;
+      if (!annotation_value_to_dvm(vm, dex, &items[i], expected + 1,
+                                   &item)) {
+        free(items);
+        return false;
       }
-      case DEX_VALUE_TYPE: {
-         const char *desc = dex_type(dex, (uint32_t)value->bits);
-         out->l = desc ? class_object(vm, dvm__class_by_desc(vm, desc)) : 0;
-         return desc != NULL;
-      }
-      case DEX_VALUE_ENUM: {
-         struct dex_field_id field;
-         if (!dex_field_id(dex, (uint32_t)value->bits, &field)) return false;
-         const char *desc = dex_type(dex, field.class_idx);
-         const char *name = dex_string(dex, field.name_idx);
-         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
-         if (!cls || !name) return false;
-         if (!dvm_init_class(vm, cls)) return false;
-         return dvm_get_static(vm, cls, name, desc, out);
-      }
-      case DEX_VALUE_ANNOTATION: {
-         if (value->bits > UINT32_MAX) return false;
-         const char *desc = dex_annotation_type(dex, (uint32_t)value->bits);
-         struct dvm_class *cls = desc ? dvm__class_by_desc(vm, desc) : NULL;
-         dvm_ref ref = cls ? dvm_new_object(vm, cls) : 0;
-         struct dvm_object *obj = dvm__obj(vm, ref);
-         if (!obj) return false;
-         obj->annotation_dex = dex;
-         obj->annotation_off = (uint32_t)value->bits;
-         out->l = ref;
-         return true;
-      }
-      case DEX_VALUE_ARRAY: {
-         if (!expected || expected[0] != '[') return false;
-         int count = dex_value_array(dex, value, NULL, 0);
-         if (count < 0) return false;
-         struct dex_value *items = count
-            ? calloc((size_t)count, sizeof *items) : NULL;
-         if (count && !items) return false;
-         if (count && dex_value_array(dex, value, items, count) != count) {
-            free(items);
-            return false;
-         }
-         char element_kind = expected[1] == '[' || expected[1] == 'L'
-            ? 'L' : expected[1];
-         dvm_ref array = dvm_new_array(vm, element_kind, expected + 1,
-                                       (uint32_t)count);
-         struct dvm_object *obj = dvm__obj(vm, array);
-         if (!obj) { free(items); return false; }
-         for (int i = 0; i < count; ++i) {
-            union dvm_value item;
-            if (!annotation_value_to_dvm(vm, dex, &items[i], expected + 1,
-                                         &item)) {
-               free(items);
-               return false;
-            }
-            switch (element_kind) {
-               case 'Z': case 'B':
-                  ((uint8_t *)obj->data)[i] = (uint8_t)item.u;
-                  break;
-               case 'C': case 'S':
-                  ((uint16_t *)obj->data)[i] = (uint16_t)item.u;
-                  break;
-               case 'J': case 'D':
-                  ((uint64_t *)obj->data)[i] = item.ju;
-                  break;
-               default:
-                  ((uint32_t *)obj->data)[i] = item.u;
-                  break;
-            }
-         }
-         free(items);
-         out->l = array;
-         return true;
-      }
+      switch (element_kind) {
+      case 'Z':
+      case 'B':
+        ((uint8_t *)obj->data)[i] = (uint8_t)item.u;
+        break;
+      case 'C':
+      case 'S':
+        ((uint16_t *)obj->data)[i] = (uint16_t)item.u;
+        break;
+      case 'J':
+      case 'D':
+        ((uint64_t *)obj->data)[i] = item.ju;
+        break;
       default:
-         return false;
-   }
+        ((uint32_t *)obj->data)[i] = item.u;
+        break;
+      }
+    }
+    free(items);
+    out->l = array;
+    return true;
+  }
+  default:
+    return false;
+  }
 }
 
 static bool annotation_element_builtin(struct dvm *vm, dvm_ref self,
                                        const union dvm_value *args, int nargs,
                                        union dvm_value *out)
 {
-   (void)args;
-   (void)nargs;
-   struct dvm_method *method = g_builtin_method;
-   struct dvm_object *obj = dvm__obj(vm, self);
-   struct dex_value value;
-   if (!method || !method->name || !method->sig || !obj ||
-       !obj->annotation_dex || !obj->annotation_off) {
-      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
-                 "annotation element has no encoded value");
-      return false;
-   }
-   /* An encoded value is offsets into the dex it was read from.  An element
-    * the use site left out takes the default declared on the annotation
-    * type, which may live in another dex of a multidex APK; decoding it
-    * against the use site's dex read unrelated bytes as nested arrays. */
-   struct dex_file *value_dex = obj->annotation_dex;
-   bool found = dex_annotation_element(obj->annotation_dex,
-                                       obj->annotation_off,
-                                       method->name, &value);
-   if (!found && method->cls && method->cls->dex) {
-      found = dex_annotation_default(method->cls->dex,
-                                     method->cls->class_def_idx,
-                                     method->name, &value);
-      value_dex = method->cls->dex;
-   }
-   if (!found) {
-      dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
-                 "%s.%s", method->cls && method->cls->name
-                    ? method->cls->name : "?", method->name);
-      return false;
-   }
-   const char *returns = strchr(method->sig, ')');
-   if (!returns || !annotation_value_to_dvm(vm, value_dex, &value,
-                                            returns + 1, out)) {
-      dvm__throw(vm, "java/lang/AnnotationFormatError", "%s.%s",
-                 method->cls && method->cls->name ? method->cls->name : "?",
-                 method->name);
-      return false;
-   }
-   return true;
+  (void)args;
+  (void)nargs;
+  struct dvm_method *method = g_builtin_method;
+  struct dvm_object *obj = dvm__obj(vm, self);
+  struct dex_value value;
+  if (!method || !method->name || !method->sig || !obj ||
+      !obj->annotation_dex || !obj->annotation_off) {
+    dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
+               "annotation element has no encoded value");
+    return false;
+  }
+  /* An encoded value is offsets into the dex it was read from.  An element
+   * the use site left out takes the default declared on the annotation
+   * type, which may live in another dex of a multidex APK; decoding it
+   * against the use site's dex read unrelated bytes as nested arrays. */
+  struct dex_file *value_dex = obj->annotation_dex;
+  bool found = dex_annotation_element(obj->annotation_dex,
+                                      obj->annotation_off,
+                                      method->name, &value);
+  if (!found && method->cls && method->cls->dex) {
+    found = dex_annotation_default(method->cls->dex,
+                                   method->cls->class_def_idx,
+                                   method->name, &value);
+    value_dex = method->cls->dex;
+  }
+  if (!found) {
+    dvm__throw(vm, "java/lang/annotation/IncompleteAnnotationException",
+               "%s.%s", method->cls && method->cls->name
+               ? method->cls->name : "?", method->name);
+    return false;
+  }
+  const char *returns = strchr(method->sig, ')');
+  if (!returns || !annotation_value_to_dvm(vm, value_dex, &value,
+      returns + 1, out)) {
+    dvm__throw(vm, "java/lang/AnnotationFormatError", "%s.%s",
+               method->cls && method->cls->name ? method->cls->name : "?",
+               method->name);
+    return false;
+  }
+  return true;
 }
 
 static uint64_t monitor_thread_token(struct dvm *vm)
 {
-   /* Guest threads can share a host executor or migrate between executors.
-    * Ownership belongs to the Java Thread identity, never the host TLS. */
-   return dvm__current_thread_id(vm);
+  /* Guest threads can share a host executor or migrate between executors.
+   * Ownership belongs to the Java Thread identity, never the host TLS. */
+  return dvm__current_thread_id(vm);
 }
 
 static uintptr_t monitor_channel(dvm_ref ref, unsigned kind)
 {
-   return ((uintptr_t)ref << 2) | (uintptr_t)kind;
+  return ((uintptr_t)ref << 2) | (uintptr_t)kind;
 }
 
 static uint64_t monitor_now_ms(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
 bool dvm__monitor_try_enter(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (!o) {
-      dvm__throw(vm, "java/lang/NullPointerException", "monitor-enter null");
-      return false;
-   }
-   const uint64_t me = monitor_thread_token(vm);
-   if (!me) {
-      dvm__throw(vm, "java/lang/OutOfMemoryError", "monitor thread identity");
-      return false;
-   }
-   if (o->monitor_owner && o->monitor_owner != me) return false;
-   o->monitor_owner = me;
-   ++o->monitor_depth;
-   return true;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  if (!o) {
+    dvm__throw(vm, "java/lang/NullPointerException", "monitor-enter null");
+    return false;
+  }
+  const uint64_t me = monitor_thread_token(vm);
+  if (!me) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "monitor thread identity");
+    return false;
+  }
+  if (o->monitor_owner && o->monitor_owner != me) return false;
+  o->monitor_owner = me;
+  ++o->monitor_depth;
+  return true;
 }
 
 bool dvm__monitor_enter(struct dvm *vm, dvm_ref ref)
 {
-   for (;;) {
-      if (dvm_is_stopping(vm)) return false;
-      if (dvm__monitor_try_enter(vm, ref)) return true;
-      if (vm->exception) return false;
-      /* Notification is the mechanism.  The long timeout only permits state
-       * validation if a producer disappears; it never grants ownership. */
-      dvm_ref thread = dvm__current_thread(vm);
-      dvm__thread_set_state(vm, thread, DVM_THREAD_BLOCKED);
-      dvm_gil_wait_for(vm, monitor_channel(ref, 1), 60000u);
-      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
-   }
+  for (;;) {
+    if (dvm_is_stopping(vm)) return false;
+    if (dvm__monitor_try_enter(vm, ref)) return true;
+    if (vm->exception) return false;
+    /* Notification is the mechanism.  The long timeout only permits state
+     * validation if a producer disappears; it never grants ownership. */
+    dvm_ref thread = dvm__current_thread(vm);
+    dvm__thread_set_state(vm, thread, DVM_THREAD_BLOCKED);
+    dvm_gil_wait_for(vm, monitor_channel(ref, 1), 60000u);
+    dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
+  }
 }
 
 /* Thread.holdsLock: the calling thread owns this object's monitor. */
 bool dvm__monitor_held(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   return o && o->monitor_depth && o->monitor_owner == monitor_thread_token(vm);
+  struct dvm_object *o = dvm__obj(vm, ref);
+  return o && o->monitor_depth && o->monitor_owner == monitor_thread_token(vm);
 }
 
 bool dvm__monitor_exit(struct dvm *vm, dvm_ref ref)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   const uint64_t me = monitor_thread_token(vm);
-   if (!o || o->monitor_owner != me || !o->monitor_depth) {
-      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
-                 "monitor-exit without ownership");
-      return false;
-   }
-   if (--o->monitor_depth) return true;
-   o->monitor_owner = 0;
-   dvm_gil_notify_one_for(monitor_channel(ref, 1));
-   return true;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  const uint64_t me = monitor_thread_token(vm);
+  if (!o || o->monitor_owner != me || !o->monitor_depth) {
+    dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+               "monitor-exit without ownership");
+    return false;
+  }
+  if (--o->monitor_depth) return true;
+  o->monitor_owner = 0;
+  dvm_gil_notify_one_for(monitor_channel(ref, 1));
+  return true;
 }
 
 bool dvm__monitor_wait(struct dvm *vm, dvm_ref ref, uint64_t timeout_ms,
                        bool *notified)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   const uint64_t me = monitor_thread_token(vm);
-   if (!o || o->monitor_owner != me || !o->monitor_depth) {
-      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
-                 "wait without monitor ownership");
-      return false;
-   }
-   if (dvm__thread_take_interrupt(vm)) {
-      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
-      return false;
-   }
-   const uint32_t saved_depth = o->monitor_depth;
-   const uint64_t seen = o->monitor_seq;
-   const uint64_t deadline = timeout_ms ? monitor_now_ms() + timeout_ms : 0;
-   o->monitor_owner = 0;
-   o->monitor_depth = 0;
-   dvm_gil_notify_one_for(monitor_channel(ref, 1));
+  struct dvm_object *o = dvm__obj(vm, ref);
+  const uint64_t me = monitor_thread_token(vm);
+  if (!o || o->monitor_owner != me || !o->monitor_depth) {
+    dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+               "wait without monitor ownership");
+    return false;
+  }
+  if (dvm__thread_take_interrupt(vm)) {
+    dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+    return false;
+  }
+  const uint32_t saved_depth = o->monitor_depth;
+  const uint64_t seen = o->monitor_seq;
+  const uint64_t deadline = timeout_ms ? monitor_now_ms() + timeout_ms : 0;
+  o->monitor_owner = 0;
+  o->monitor_depth = 0;
+  dvm_gil_notify_one_for(monitor_channel(ref, 1));
 
-   bool signalled = false, interrupted = false;
-   for (;;) {
-      if (dvm_is_stopping(vm)) return false;
-      uint64_t now = monitor_now_ms();
-      if (deadline && now >= deadline) break;
-      uint64_t left = deadline ? deadline - now : 60000u;
-      if (left > 60000u) left = 60000u;
-      dvm_ref thread = dvm__current_thread(vm);
-      dvm__thread_set_state(vm, thread, deadline ? DVM_THREAD_TIMED_WAITING : DVM_THREAD_WAITING);
-      dvm__thread_set_wait(vm, monitor_channel(ref, 2));
-      dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
-      dvm__thread_set_wait(vm, 0);
-      dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
-      o = dvm__obj(vm, ref);
-      if (!o) {
-         dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
-         return false;
-      }
-      if (o->monitor_seq != seen) { signalled = true; break; }
-      if (dvm__thread_take_interrupt(vm)) { interrupted = true; break; }
-   }
-   if (!dvm__monitor_enter(vm, ref)) return false;
-   o = dvm__obj(vm, ref);
-   o->monitor_depth = saved_depth;
-   if (notified) *notified = signalled;
-   /* The monitor is owned again before the interrupt is reported, as
-    * Object.wait() specifies. */
-   if (interrupted) {
-      dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+  bool signalled = false, interrupted = false;
+  for (;;) {
+    if (dvm_is_stopping(vm)) return false;
+    uint64_t now = monitor_now_ms();
+    if (deadline && now >= deadline) break;
+    uint64_t left = deadline ? deadline - now : 60000u;
+    if (left > 60000u) left = 60000u;
+    dvm_ref thread = dvm__current_thread(vm);
+    dvm__thread_set_state(vm, thread, deadline ? DVM_THREAD_TIMED_WAITING : DVM_THREAD_WAITING);
+    dvm__thread_set_wait(vm, monitor_channel(ref, 2));
+    dvm_gil_wait_for(vm, monitor_channel(ref, 2), (unsigned)left);
+    dvm__thread_set_wait(vm, 0);
+    dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
+    o = dvm__obj(vm, ref);
+    if (!o) {
+      dvm__throw(vm, "java/lang/NullPointerException", "waited object freed");
       return false;
-   }
-   return true;
+    }
+    if (o->monitor_seq != seen) {
+      signalled = true;
+      break;
+    }
+    if (dvm__thread_take_interrupt(vm)) {
+      interrupted = true;
+      break;
+    }
+  }
+  if (!dvm__monitor_enter(vm, ref)) return false;
+  o = dvm__obj(vm, ref);
+  o->monitor_depth = saved_depth;
+  if (notified) *notified = signalled;
+  /* The monitor is owned again before the interrupt is reported, as
+   * Object.wait() specifies. */
+  if (interrupted) {
+    dvm__throw(vm, "java/lang/InterruptedException", "wait interrupted");
+    return false;
+  }
+  return true;
 }
 
 bool dvm__monitor_notify(struct dvm *vm, dvm_ref ref, bool all)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (!o || o->monitor_owner != monitor_thread_token(vm) || !o->monitor_depth) {
-      dvm__throw(vm, "java/lang/IllegalMonitorStateException",
-                 "notify without monitor ownership");
-      return false;
-   }
-   ++o->monitor_seq;
-   if (all) dvm_gil_notify_for(monitor_channel(ref, 2));
-   else     dvm_gil_notify_one_for(monitor_channel(ref, 2));
-   return true;
+  struct dvm_object *o = dvm__obj(vm, ref);
+  if (!o || o->monitor_owner != monitor_thread_token(vm) || !o->monitor_depth) {
+    dvm__throw(vm, "java/lang/IllegalMonitorStateException",
+               "notify without monitor ownership");
+    return false;
+  }
+  ++o->monitor_seq;
+  if (all) dvm_gil_notify_for(monitor_channel(ref, 2));
+  else     dvm_gil_notify_one_for(monitor_channel(ref, 2));
+  return true;
 }
 
 bool dvm__monitor_state(struct dvm *vm, dvm_ref ref, bool current,
                         uint32_t *depth)
 {
-   struct dvm_object *o = dvm__obj(vm, ref);
-   if (depth) *depth = o ? o->monitor_depth : 0;
-   if (!o || !o->monitor_owner) return false;
-   return !current || o->monitor_owner == monitor_thread_token(vm);
+  struct dvm_object *o = dvm__obj(vm, ref);
+  if (depth) *depth = o ? o->monitor_depth : 0;
+  if (!o || !o->monitor_owner) return false;
+  return !current || o->monitor_owner == monitor_thread_token(vm);
 }
 
-struct dvm_method *dvm__builtin_method(void) { return g_builtin_method; }
+struct dvm_method *dvm__builtin_method(void) {
+  return g_builtin_method;
+}
 
 void dvm__warn_placeholder(struct dvm *vm)
 {
-   struct dvm_method *m = g_builtin_method;
-   if (!m || m->placeholder_warned) return;
-   m->placeholder_warned = true;
-   /* Name the caller too.  "Paint.<init> is a no-op" is a fact about the
-    * emulator; "…and app code X called it" is the only half that can explain
-    * what X does next, and it is the reason this is reported at call time
-    * rather than when the method table was built. */
-   struct dvm_method *from = vm ? vm->cur_method : NULL;
-   fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s (from %s.%s)\n",
-           m->cls && m->cls->name ? m->cls->name : "?",
-           m->name ? m->name : "?", m->sig ? m->sig : "",
-           from && from->cls && from->cls->name ? from->cls->name : "?",
-           from && from->name ? from->name : "?");
+  struct dvm_method *m = g_builtin_method;
+  if (!m || m->placeholder_warned) return;
+  m->placeholder_warned = true;
+  /* Name the caller too.  "Paint.<init> is a no-op" is a fact about the
+   * emulator; "…and app code X called it" is the only half that can explain
+   * what X does next, and it is the reason this is reported at call time
+   * rather than when the method table was built. */
+  struct dvm_method *from = vm ? vm->cur_method : NULL;
+  fprintf(stderr, "[dvm] placeholder no-op invoked: %s.%s%s (from %s.%s)\n",
+          m->cls && m->cls->name ? m->cls->name : "?",
+          m->name ? m->name : "?", m->sig ? m->sig : "",
+          from && from->cls && from->cls->name ? from->cls->name : "?",
+          from && from->name ? from->name : "?");
 }
 
 static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
@@ -4092,53 +4984,53 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
 static void trace_return(struct dvm *vm, const struct dvm_method *m, char kind,
                          const union dvm_value *v)
 {
-   const char *cls = m && m->cls && m->cls->name ? m->cls->name : "?";
-   const char *name = m && m->name ? m->name : "?";
-   if (kind == 'V') {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s\n", vm->depth * 2, "", cls, name);
-      return;
-   }
-   if (kind == 'J') {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %lld (wide)\n", vm->depth * 2,
-              "", cls, name, (long long)v->j);
-      return;
-   }
-   if (strchr("ZBCSI", kind)) {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %d\n", vm->depth * 2, "", cls,
-              name, v->i);
-      return;
-   }
-   if (kind == 'F' || kind == 'D') {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> %.17g (%s)\n", vm->depth * 2,
-              "", cls, name, kind == 'F' ? (double)v->f : v->d,
-              kind == 'F' ? "float" : "double");
-      return;
-   }
-   dvm_ref r = (dvm_ref)v->u;
-   struct dvm_object *o = r ? dvm__obj(vm, r) : NULL;
-   if (!o) {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> null\n", vm->depth * 2, "",
-              cls, name);
-   } else if (o->kind == DVM_OBJ_STRING) {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> \"%.200s\" (%u bytes)\n",
-              vm->depth * 2, "", cls, name, o->utf8 ? o->utf8 : "",
-              (unsigned)o->utf8_len);
-   } else {
-      fprintf(stderr, "[dvm] %*sreturn %s.%s -> @%x %s\n", vm->depth * 2, "",
-              cls, name, (unsigned)r,
-              o->cls && o->cls->name ? o->cls->name : "?");
-   }
+  const char *cls = m && m->cls && m->cls->name ? m->cls->name : "?";
+  const char *name = m && m->name ? m->name : "?";
+  if (kind == 'V') {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s\n", vm->depth * 2, "", cls, name);
+    return;
+  }
+  if (kind == 'J') {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s -> %lld (wide)\n", vm->depth * 2,
+            "", cls, name, (long long)v->j);
+    return;
+  }
+  if (strchr("ZBCSI", kind)) {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s -> %d\n", vm->depth * 2, "", cls,
+            name, v->i);
+    return;
+  }
+  if (kind == 'F' || kind == 'D') {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s -> %.17g (%s)\n", vm->depth * 2,
+            "", cls, name, kind == 'F' ? (double)v->f : v->d,
+            kind == 'F' ? "float" : "double");
+    return;
+  }
+  dvm_ref r = (dvm_ref)v->u;
+  struct dvm_object *o = r ? dvm__obj(vm, r) : NULL;
+  if (!o) {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s -> null\n", vm->depth * 2, "",
+            cls, name);
+  } else if (o->kind == DVM_OBJ_STRING) {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s -> \"%.200s\" (%u bytes)\n",
+            vm->depth * 2, "", cls, name, o->utf8 ? o->utf8 : "",
+            (unsigned)o->utf8_len);
+  } else {
+    fprintf(stderr, "[dvm] %*sreturn %s.%s -> @%x %s\n", vm->depth * 2, "",
+            cls, name, (unsigned)r,
+            o->cls && o->cls->name ? o->cls->name : "?");
+  }
 }
 
 static bool trace_call_enabled(struct dvm *vm, const struct dvm_method *m,
-                                const struct dvm_call_frame *caller)
+                               const struct dvm_call_frame *caller)
 {
-   if (!vm->trace) return false;
-   const char *filter = dvm__env_trace_class();
-   if (!filter) return true;
-   if (m && m->cls && m->cls->name && strstr(m->cls->name, filter)) return true;
-   return caller && caller->method && caller->method->cls &&
-      caller->method->cls->name && strstr(caller->method->cls->name, filter);
+  if (!vm->trace) return false;
+  const char *filter = dvm__env_trace_class();
+  if (!filter) return true;
+  if (m && m->cls && m->cls->name && strstr(m->cls->name, filter)) return true;
+  return caller && caller->method && caller->method->cls &&
+         caller->method->cls->name && strstr(caller->method->cls->name, filter);
 }
 
 static void call_histogram(const struct dvm_method *m);
@@ -4146,207 +5038,207 @@ static void call_histogram(const struct dvm_method *m);
 static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                    const uint32_t *slots, int nslots, union dvm_value *out)
 {
-   call_histogram(m);
-   struct dvm_call_frame frame = { .method = m, .previous = vm->invoke_frame };
-   struct dvm_method *caller = vm->cur_method;
-   const uint32_t caller_pc = vm->cur_pc;
-   vm->invoke_frame = &frame;
-   bool ok = invoke_body(vm, m, self, slots, nslots, out);
-   if (ok && m && trace_call_enabled(vm, m, frame.previous))
-      trace_return(vm, m, m->ret_kind, out);
-   vm->invoke_frame = frame.previous;
-   /* A returned bytecode frame is no longer the current frame. Retaining it
-    * misattributes later builtin exceptions and can outlive the method. */
-   vm->cur_method = caller;
-   vm->cur_pc = caller_pc;
-   return ok;
+  call_histogram(m);
+  struct dvm_call_frame frame = { .method = m, .previous = vm->invoke_frame };
+  struct dvm_method *caller = vm->cur_method;
+  const uint32_t caller_pc = vm->cur_pc;
+  vm->invoke_frame = &frame;
+  bool ok = invoke_body(vm, m, self, slots, nslots, out);
+  if (ok && m && trace_call_enabled(vm, m, frame.previous))
+    trace_return(vm, m, m->ret_kind, out);
+  vm->invoke_frame = frame.previous;
+  /* A returned bytecode frame is no longer the current frame. Retaining it
+   * misattributes later builtin exceptions and can outlive the method. */
+  vm->cur_method = caller;
+  vm->cur_pc = caller_pc;
+  return ok;
 }
 
 static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                         const uint32_t *slots, int nslots, union dvm_value *out)
 {
-   memset(out, 0, sizeof *out);
-   if (dvm_is_stopping(vm)) return false;
-   if (!m) return true;
+  memset(out, 0, sizeof *out);
+  if (dvm_is_stopping(vm)) return false;
+  if (!m) return true;
 
-   /* The return slot is defined before the callee runs.
-    *
-    * Dalvik's result register always holds a value: a void method leaves it
-    * zero, and a method returning int leaves the upper half of the wide view
-    * zero rather than whatever was there.  Here it is a `union dvm_value ret`
-    * declared on the interpreter's own stack at every call site, and the
-    * builtin path writes only as many bytes as the return type has -- RETI
-    * writes four, RETV writes none -- so without this the caller's
-    * `fr->result` carries the bytes that happened to be in that stack slot.
-    * move-result truncates and hides it; anything that reads the wide value,
-    * or a builtin that returns nothing at all, does not.  That is how a 400
-    * from getResponseCode() reached Volley as 0xb021_0000_0190.
-    *
-    * dvm__call_out() already did this for the calls that leave the VM; doing
-    * it here covers every callee kind at the one point they share. */
-   memset(out, 0, sizeof *out);
+  /* The return slot is defined before the callee runs.
+   *
+   * Dalvik's result register always holds a value: a void method leaves it
+   * zero, and a method returning int leaves the upper half of the wide view
+   * zero rather than whatever was there.  Here it is a `union dvm_value ret`
+   * declared on the interpreter's own stack at every call site, and the
+   * builtin path writes only as many bytes as the return type has -- RETI
+   * writes four, RETV writes none -- so without this the caller's
+   * `fr->result` carries the bytes that happened to be in that stack slot.
+   * move-result truncates and hides it; anything that reads the wide value,
+   * or a builtin that returns nothing at all, does not.  That is how a 400
+   * from getResponseCode() reached Volley as 0xb021_0000_0190.
+   *
+   * dvm__call_out() already did this for the calls that leave the VM; doing
+   * it here covers every callee kind at the one point they share. */
+  memset(out, 0, sizeof *out);
 
-   /* Java and native calls share this host thread's stack. Leave room to
-    * construct the exception and unwind rather than limiting Java depth. */
-   /* Reading the stack bounds costs a thread-local lookup, and one call level
-    * uses a few kilobytes against the 64 KB kept in reserve, so every fourth
-    * level is looked at -- the margin still covers the ones in between. */
-   size_t stack_remaining = (vm->depth & 3) == 0 ? luna_os_stack_remaining() : SIZE_MAX - 1;
-   if (stack_remaining < 64u * 1024u ||
-       (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
-      if (getenv("LUNARIA_DVM_STACK")) {
-         unsigned depth = 0;
-         for (const struct dvm_call_frame *f = vm->invoke_frame;
-              f && depth <= (unsigned)vm->depth + 1u; f = f->previous, ++depth) {
-            const struct dvm_method *method = f->method;
-            fprintf(stderr, "[dvm-stack] %u %s.%s%s\n", depth,
-               method && method->cls ? method->cls->name : "?",
-               method ? method->name : "?", method && method->sig ? method->sig : "");
-         }
+  /* Java and native calls share this host thread's stack. Leave room to
+   * construct the exception and unwind rather than limiting Java depth. */
+  /* Reading the stack bounds costs a thread-local lookup, and one call level
+   * uses a few kilobytes against the 64 KB kept in reserve, so every fourth
+   * level is looked at -- the margin still covers the ones in between. */
+  size_t stack_remaining = (vm->depth & 3) == 0 ? luna_os_stack_remaining() : SIZE_MAX - 1;
+  if (stack_remaining < 64u * 1024u ||
+      (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
+    if (getenv("LUNARIA_DVM_STACK")) {
+      unsigned depth = 0;
+      for (const struct dvm_call_frame *f = vm->invoke_frame;
+           f && depth <= (unsigned)vm->depth + 1u; f = f->previous, ++depth) {
+        const struct dvm_method *method = f->method;
+        fprintf(stderr, "[dvm-stack] %u %s.%s%s\n", depth,
+                method && method->cls ? method->cls->name : "?",
+                method ? method->name : "?", method && method->sig ? method->sig : "");
       }
-      dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
-      return false;
-   }
+    }
+    dvm__throw(vm, "java/lang/StackOverflowError", "%d frames", vm->depth);
+    return false;
+  }
 
-   /* Every call passes through here: test the first character before comparing names. */
-   if (nslots >= 2 && m->name && m->name[0] == 'u' && m->sig &&
-       !strcmp(m->name, "uncaughtException") &&
-       !strcmp(m->sig, "(Ljava/lang/Thread;Ljava/lang/Throwable;)V"))
-      log_forwarded_uncaught(vm, (dvm_ref)slots[1], m);
+  /* Every call passes through here: test the first character before comparing names. */
+  if (nslots >= 2 && m->name && m->name[0] == 'u' && m->sig &&
+      !strcmp(m->name, "uncaughtException") &&
+      !strcmp(m->sig, "(Ljava/lang/Thread;Ljava/lang/Throwable;)V"))
+    log_forwarded_uncaught(vm, (dvm_ref)slots[1], m);
 
-   bool is_static = (m->access & DEX_ACC_STATIC) != 0;
-   if (!is_static && !self && !(m->access & DEX_ACC_NATIVE)) {
-      /* "self" marks the callee-side check, so a null receiver can be told
-       * apart from the call-site one below. */
-      dvm__throw(vm, "java/lang/NullPointerException", "self %s.%s%s",
-                 m->cls->name, m->name, m->sig ? m->sig : "");
-      return false;
-   }
+  bool is_static = (m->access & DEX_ACC_STATIC) != 0;
+  if (!is_static && !self && !(m->access & DEX_ACC_NATIVE)) {
+    /* "self" marks the callee-side check, so a null receiver can be told
+     * apart from the call-site one below. */
+    dvm__throw(vm, "java/lang/NullPointerException", "self %s.%s%s",
+               m->cls->name, m->name, m->sig ? m->sig : "");
+    return false;
+  }
 
-   /* A class is initialised by its first static call or its first
-    * construction.  A host that builds an object through JNI (AllocObject +
-    * constructor, as the process Application is) never executes new-instance,
-    * so its <clinit> -- System.loadLibrary of the app's own natives, say --
-    * has to run here, before the constructor. */
-   if (m->cls && (is_static || (m->name && m->name[0] == '<' && !strcmp(m->name, "<init>"))) &&
-       !dvm_init_class(vm, m->cls)) return false;
+  /* A class is initialised by its first static call or its first
+   * construction.  A host that builds an object through JNI (AllocObject +
+   * constructor, as the process Application is) never executes new-instance,
+   * so its <clinit> -- System.loadLibrary of the app's own natives, say --
+   * has to run here, before the constructor. */
+  if (m->cls && (is_static || (m->name && m->name[0] == '<' && !strcmp(m->name, "<init>"))) &&
+      !dvm_init_class(vm, m->cls)) return false;
 
-   const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
-   dvm_ref monitor = 0;
-   if (synchronized) {
-      monitor = is_static ? class_object(vm, m->cls) : self;
-      if (!dvm__monitor_enter(vm, monitor)) return false;
-   }
+  const bool synchronized = (m->access & DEX_ACC_SYNCHRONIZED) != 0;
+  dvm_ref monitor = 0;
+  if (synchronized) {
+    monitor = is_static ? class_object(vm, m->cls) : self;
+    if (!dvm__monitor_enter(vm, monitor)) return false;
+  }
 
-   bool trace_this = trace_call_enabled(vm, m,
-      vm->invoke_frame ? vm->invoke_frame->previous : NULL);
-   if (vm->trace && trace_this) {
-      fprintf(stderr, "[dvm] %*scall %s.%s%s", vm->depth * 2, "",
-              m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
-      if (self) fprintf(stderr, " on @%x", (unsigned)self);
-      fputc('\n', stderr);
-      /* What the reference arguments are: the declared type says little
-       * when the caller passes a subclass (which Throwable reached an error
-       * handler, which listener was registered). */
-      char one[256];
-      for (int i = 0, slot = 0; m->sig && slot < nslots &&
-           dvm__sig_param(m->sig, i, one, sizeof one); ++i) {
-         const bool wide = one[0] == 'J' || one[0] == 'D';
-         if ((one[0] == 'L' || one[0] == '[') && slots[slot]) {
-            struct dvm_object *o = dvm__obj(vm, (dvm_ref)slots[slot]);
-            char desc[384] = "";
-            if (o && o->cls && o->kind != DVM_OBJ_STRING)
-               dvm_describe_exception(vm, (dvm_ref)slots[slot], desc,
-                                      sizeof desc);
-            fprintf(stderr, "[dvm] %*s  arg%d = %s%s%s\n", vm->depth * 2, "", i,
-                    o && o->kind == DVM_OBJ_STRING ? "\""
-                       : o && o->cls && o->cls->name ? o->cls->name : "?",
-                    o && o->kind == DVM_OBJ_STRING
-                       ? (dvm_string_utf8(vm, (dvm_ref)slots[slot]) ?: "") : "",
-                    o && o->kind == DVM_OBJ_STRING ? "\"" : "");
-            if (desc[0] && (strstr(desc, "Exception") || strstr(desc, "Error")))
-               fprintf(stderr, "[dvm] %*s    (%s)\n", vm->depth * 2, "", desc);
-         } else if (one[0] != 'L' && one[0] != '[') {
-            union dvm_value value = {0};
-            value.ju = slots[slot];
-            if (wide && slot + 1 < nslots) value.ju |= (uint64_t)slots[slot + 1] << 32;
-            if (one[0] == 'F')
-               fprintf(stderr, "[dvm] %*s  arg%d = %.9g (float)\n", vm->depth * 2, "", i, (double)value.f);
-            else if (one[0] == 'D')
-               fprintf(stderr, "[dvm] %*s  arg%d = %.17g (double)\n", vm->depth * 2, "", i, value.d);
-            else if (one[0] == 'J')
-               fprintf(stderr, "[dvm] %*s  arg%d = %lld (wide)\n", vm->depth * 2, "", i, (long long)value.j);
-            else
-               fprintf(stderr, "[dvm] %*s  arg%d = %d\n", vm->depth * 2, "", i, value.i);
-         }
-         slot += wide ? 2 : 1;
+  bool trace_this = trace_call_enabled(vm, m,
+                                       vm->invoke_frame ? vm->invoke_frame->previous : NULL);
+  if (vm->trace && trace_this) {
+    fprintf(stderr, "[dvm] %*scall %s.%s%s", vm->depth * 2, "",
+            m->cls ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
+    if (self) fprintf(stderr, " on @%x", (unsigned)self);
+    fputc('\n', stderr);
+    /* What the reference arguments are: the declared type says little
+     * when the caller passes a subclass (which Throwable reached an error
+     * handler, which listener was registered). */
+    char one[256];
+    for (int i = 0, slot = 0; m->sig && slot < nslots &&
+         dvm__sig_param(m->sig, i, one, sizeof one); ++i) {
+      const bool wide = one[0] == 'J' || one[0] == 'D';
+      if ((one[0] == 'L' || one[0] == '[') && slots[slot]) {
+        struct dvm_object *o = dvm__obj(vm, (dvm_ref)slots[slot]);
+        char desc[384] = "";
+        if (o && o->cls && o->kind != DVM_OBJ_STRING)
+          dvm_describe_exception(vm, (dvm_ref)slots[slot], desc,
+                                 sizeof desc);
+        fprintf(stderr, "[dvm] %*s  arg%d = %s%s%s\n", vm->depth * 2, "", i,
+                o && o->kind == DVM_OBJ_STRING ? "\""
+                : o && o->cls && o->cls->name ? o->cls->name : "?",
+                o && o->kind == DVM_OBJ_STRING
+                ? (dvm_string_utf8(vm, (dvm_ref)slots[slot]) ?: "") : "",
+                o && o->kind == DVM_OBJ_STRING ? "\"" : "");
+        if (desc[0] && (strstr(desc, "Exception") || strstr(desc, "Error")))
+          fprintf(stderr, "[dvm] %*s    (%s)\n", vm->depth * 2, "", desc);
+      } else if (one[0] != 'L' && one[0] != '[') {
+        union dvm_value value = {0};
+        value.ju = slots[slot];
+        if (wide && slot + 1 < nslots) value.ju |= (uint64_t)slots[slot + 1] << 32;
+        if (one[0] == 'F')
+          fprintf(stderr, "[dvm] %*s  arg%d = %.9g (float)\n", vm->depth * 2, "", i, (double)value.f);
+        else if (one[0] == 'D')
+          fprintf(stderr, "[dvm] %*s  arg%d = %.17g (double)\n", vm->depth * 2, "", i, value.d);
+        else if (one[0] == 'J')
+          fprintf(stderr, "[dvm] %*s  arg%d = %lld (wide)\n", vm->depth * 2, "", i, (long long)value.j);
+        else
+          fprintf(stderr, "[dvm] %*s  arg%d = %d\n", vm->depth * 2, "", i, value.i);
       }
-   }
+      slot += wide ? 2 : 1;
+    }
+  }
 
-   if (m->builtin) {
-      union dvm_value args[64];
-      int nargs;
-      if (m->sig && m->sig[0] == '(' && m->sig[1] == ')')
-         nargs = 0;          /* nothing to unpack */
-      else
-         nargs = slots_to_values(m->sig, slots, nslots, args, 64);
-      ++vm->depth;
-      struct dvm_method *previous_builtin = g_builtin_method;
-      g_builtin_method = m;
-      bool ok = m->builtin(vm, self, args, nargs, out);
-      g_builtin_method = previous_builtin;
-      --vm->depth;
-      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
-      return ok && !vm->exception;
-   }
+  if (m->builtin) {
+    union dvm_value args[64];
+    int nargs;
+    if (m->sig && m->sig[0] == '(' && m->sig[1] == ')')
+      nargs = 0;          /* nothing to unpack */
+    else
+      nargs = slots_to_values(m->sig, slots, nslots, args, 64);
+    ++vm->depth;
+    struct dvm_method *previous_builtin = g_builtin_method;
+    g_builtin_method = m;
+    bool ok = m->builtin(vm, self, args, nargs, out);
+    g_builtin_method = previous_builtin;
+    --vm->depth;
+    if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
+    return ok && !vm->exception;
+  }
 
-   if (!m->has_code) {
-      bool native = (m->access & DEX_ACC_NATIVE) != 0;
-      ++vm->depth;
-      bool ok = dvm__call_out(vm, m->cls, m->name, m->sig, is_static, native,
-                         self, slots, nslots, out);
-      --vm->depth;
-      if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
-      return ok && !vm->exception;
-   }
+  if (!m->has_code) {
+    bool native = (m->access & DEX_ACC_NATIVE) != 0;
+    ++vm->depth;
+    bool ok = dvm__call_out(vm, m->cls, m->name, m->sig, is_static, native,
+                            self, slots, nslots, out);
+    --vm->depth;
+    if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
+    return ok && !vm->exception;
+  }
 
-   uint16_t nregs = m->code.registers_size;
-   uint16_t nins = m->code.ins_size;
-   if (nregs < nins) nregs = nins;
+  uint16_t nregs = m->code.registers_size;
+  uint16_t nins = m->code.ins_size;
+  if (nregs < nins) nregs = nins;
 
-   uint32_t stackbuf[64];
-   uint32_t *regs = nregs <= 64 ? stackbuf : calloc(nregs ? nregs : 1, sizeof *regs);
-   if (!regs) {
-      dvm__throw(vm, "java/lang/OutOfMemoryError", "%u registers", nregs);
-      if (synchronized) (void)dvm__monitor_exit(vm, monitor);
-      return false;
-   }
-   memset(regs, 0, (size_t)nregs * sizeof *regs);
+  uint32_t stackbuf[64];
+  uint32_t *regs = nregs <= 64 ? stackbuf : calloc(nregs ? nregs : 1, sizeof *regs);
+  if (!regs) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "%u registers", nregs);
+    if (synchronized) (void)dvm__monitor_exit(vm, monitor);
+    return false;
+  }
+  memset(regs, 0, (size_t)nregs * sizeof *regs);
 
-   /* Parameters occupy the last ins_size registers, `this` first. */
-   int base = (int)nregs - (int)nins;
-   int w = base;
-   if (!is_static && w < nregs) regs[w++] = self;
-   for (int i = 0; i < nslots && w < nregs; ++i)
-      regs[w++] = slots[i];
+  /* Parameters occupy the last ins_size registers, `this` first. */
+  int base = (int)nregs - (int)nins;
+  int w = base;
+  if (!is_static && w < nregs) regs[w++] = self;
+  for (int i = 0; i < nslots && w < nregs; ++i)
+    regs[w++] = slots[i];
 
-   struct frame fr = { .m = m, .regs = regs, .nregs = nregs, .pc = 0 };
-   ++vm->depth;
-   bool pushed = vm->ncallstack <
-                 (int)(sizeof vm->callstack / sizeof vm->callstack[0]);
-   if (pushed) vm->callstack[vm->ncallstack++] = m;
-   bool ok = execute(vm, &fr, out);
-   if (pushed) --vm->ncallstack;
-   --vm->depth;
+  struct frame fr = { .m = m, .regs = regs, .nregs = nregs, .pc = 0 };
+  ++vm->depth;
+  bool pushed = vm->ncallstack <
+                (int)(sizeof vm->callstack / sizeof vm->callstack[0]);
+  if (pushed) vm->callstack[vm->ncallstack++] = m;
+  bool ok = execute(vm, &fr, out);
+  if (pushed) --vm->ncallstack;
+  --vm->depth;
 
-   /* Record the frames the exception passes on its way out, innermost first. */
-   if (!ok && vm->exception && m != vm->exc_trace[0] &&
-       vm->nexc_trace < (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]))
-      vm->exc_trace[vm->nexc_trace++] = m;
+  /* Record the frames the exception passes on its way out, innermost first. */
+  if (!ok && vm->exception && m != vm->exc_trace[0] &&
+      vm->nexc_trace < (int)(sizeof vm->exc_trace / sizeof vm->exc_trace[0]))
+    vm->exc_trace[vm->nexc_trace++] = m;
 
-   if (regs != stackbuf) free(regs);
-   if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
-   return ok;
+  if (regs != stackbuf) free(regs);
+  if (synchronized && !dvm__monitor_exit(vm, monitor)) ok = false;
+  return ok;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -4358,9 +5250,9 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
  * would otherwise spin against the ordinary step limit and stall the frame. */
 uint64_t dvm__now_ms(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
 }
 
 /* Scheduler-only tracing.  LUNARIA_DVM_TRACE prints every bytecode call, which
@@ -4368,12 +5260,12 @@ uint64_t dvm__now_ms(void)
  * one question a blocked wait raises — what the queue was allowed to run. */
 bool dvm__sched_trace(void)
 {
-   static int on = -1;
-   if (on < 0) {
-      const char *s = getenv("LUNARIA_DVM_SCHED");
-      on = s && *s && strcmp(s, "0") ? 1 : 0;
-   }
-   return on == 1;
+  static int on = -1;
+  if (on < 0) {
+    const char *s = getenv("LUNARIA_DVM_SCHED");
+    on = s && *s && strcmp(s, "0") ? 1 : 0;
+  }
+  return on == 1;
 }
 
 /* Volley parks its dispatchers on an empty queue and re-queues them every few
@@ -4383,14 +5275,14 @@ bool dvm__sched_trace(void)
  * keeps only the classes whose name contains it; =1 keeps everything. */
 bool dvm__sched_trace_for(const char *class_name)
 {
-   if (!dvm__sched_trace()) return false;
-   static const char *filter = (const char *)-1;
-   if (filter == (const char *)-1) {
-      const char *s = getenv("LUNARIA_DVM_SCHED");
-      filter = (s && strcmp(s, "1") && strcmp(s, "on")) ? s : NULL;
-   }
-   if (!filter) return true;
-   return class_name && strstr(class_name, filter) != NULL;
+  if (!dvm__sched_trace()) return false;
+  static const char *filter = (const char *)-1;
+  if (filter == (const char *)-1) {
+    const char *s = getenv("LUNARIA_DVM_SCHED");
+    filter = (s && strcmp(s, "1") && strcmp(s, "on")) ? s : NULL;
+  }
+  if (!filter) return true;
+  return class_name && strstr(class_name, filter) != NULL;
 }
 
 /* `nested` separates the two callers.  The drain at a call boundary is
@@ -4405,287 +5297,302 @@ bool dvm__sched_trace_for(const char *class_name)
 
 static int drain_pending(struct dvm *vm, bool nested)
 {
-   if (dvm_is_stopping(vm)) return 0;
-   dvm_nsd_poll(vm);
-   dvm_alarm_poll(vm);
-   if (!vm->npending) return 0;
-   if (!nested && vm->drain_depth) return 0;
-   if (vm->drain_depth >= DVM_DRAIN_MAX_DEPTH) {
-      if (dvm__sched_trace())
-         fprintf(stderr, "[sched] drain refused: depth=%d pending=%d\n",
-                 vm->drain_depth, vm->npending);
-      return 0;
-   }
-   int ran = 0;
-   ++vm->drain_depth;
-   uint64_t saved_limit = vm->step_limit;
-   bool saved_quiet = vm->quiet_uncaught;
+  if (dvm_is_stopping(vm)) return 0;
+  dvm_nsd_poll(vm);
+  dvm_alarm_poll(vm);
+  if (!vm->npending) return 0;
+  if (!nested && vm->drain_depth) return 0;
+  if (vm->drain_depth >= DVM_DRAIN_MAX_DEPTH) {
+    if (dvm__sched_trace())
+      fprintf(stderr, "[sched] drain refused: depth=%d pending=%d\n",
+              vm->drain_depth, vm->npending);
+    return 0;
+  }
+  int ran = 0;
+  ++vm->drain_depth;
+  uint64_t saved_limit = vm->step_limit;
+  bool saved_quiet = vm->quiet_uncaught;
 
-   /* One entry is taken from the queue at a time, immediately before it runs.
-    *
-    * This used to detach every due entry up front and then run the batch.  A
-    * Runnable that blocks then made the rest of its own batch unreachable: the
-    * entries were already off the queue, so the nested drain its wait performs
-    * could not see them.  Volley's NetworkDispatcher sat in exactly that hole
-    * — dispatcher and requester were picked up by the same drain, the
-    * requester ran first and waited, and the dispatcher that would have served
-    * it was invisible until the wait had timed out (15 s, every time).
-    *
-    * `runs` bounds the work one drain does so a runnable that re-queues itself
-    * with no delay cannot spin here forever. */
-   for (int runs = 0; runs < DVM_DRAIN_MAX_RUNS; ++runs) {
-      /* Oldest due entry first.  Taking one at a time means the choice is a
-       * scheduling policy rather than an ordering within a batch, and
-       * newest-first starves under it: a daemon that parks is re-queued at the
-       * tail and would be picked again immediately, forever, while the work it
-       * is waiting for sits in front of it.  Idle daemons carry
-       * DVM_PARK_RETRY_MS, so they are not due most of the time and cannot
-       * crowd out freshly started work either.  Entries whose delay has not
-       * elapsed stay queued for a later drain. */
-      uint64_t now = dvm__now_ms();
-      int pick = -1;
-      for (int i = 0; i < vm->npending; ++i) {
-         /* Background Looper.loop() owns its tagged entries. */
-         if (!vm->pending_is_thread[i] && vm->pending_looper[i])
-            continue;
-         /* The rest are the main Looper's, and only the main thread runs
-          * them — whatever wait or call boundary brought another thread
-          * here.  (Queued green threads belong to no Looper.) */
-         if (!vm->pending_is_thread[i] && !dvm_on_main_thread())
-            continue;
-         if (!vm->pending_is_thread[i] && vm->main_transaction_depth)
-            continue;
-         /* sleep/yield/park do not run the caller's next Looper message.
-          * A nested wait may advance cooperative threads, never Handler work
-          * on the main thread whose current call is still on the stack. */
-         if (nested && !vm->pending_is_thread[i])
-            continue;
-         if (vm->pending_due_ms[i] <= now) { pick = i; break; }
+  /* One entry is taken from the queue at a time, immediately before it runs.
+   *
+   * This used to detach every due entry up front and then run the batch.  A
+   * Runnable that blocks then made the rest of its own batch unreachable: the
+   * entries were already off the queue, so the nested drain its wait performs
+   * could not see them.  Volley's NetworkDispatcher sat in exactly that hole
+   * — dispatcher and requester were picked up by the same drain, the
+   * requester ran first and waited, and the dispatcher that would have served
+   * it was invisible until the wait had timed out (15 s, every time).
+   *
+   * `runs` bounds the work one drain does so a runnable that re-queues itself
+   * with no delay cannot spin here forever. */
+  for (int runs = 0; runs < DVM_DRAIN_MAX_RUNS; ++runs) {
+    /* Oldest due entry first.  Taking one at a time means the choice is a
+     * scheduling policy rather than an ordering within a batch, and
+     * newest-first starves under it: a daemon that parks is re-queued at the
+     * tail and would be picked again immediately, forever, while the work it
+     * is waiting for sits in front of it.  Idle daemons carry
+     * DVM_PARK_RETRY_MS, so they are not due most of the time and cannot
+     * crowd out freshly started work either.  Entries whose delay has not
+     * elapsed stay queued for a later drain. */
+    uint64_t now = dvm__now_ms();
+    int pick = -1;
+    for (int i = 0; i < vm->npending; ++i) {
+      /* Background Looper.loop() owns its tagged entries. */
+      if (!vm->pending_is_thread[i] && vm->pending_looper[i])
+        continue;
+      /* The rest are the main Looper's, and only the main thread runs
+       * them — whatever wait or call boundary brought another thread
+       * here.  (Queued green threads belong to no Looper.) */
+      if (!vm->pending_is_thread[i] && !dvm_on_main_thread())
+        continue;
+      if (!vm->pending_is_thread[i] && vm->main_transaction_depth)
+        continue;
+      /* sleep/yield/park do not run the caller's next Looper message.
+       * A nested wait may advance cooperative threads, never Handler work
+       * on the main thread whose current call is still on the stack. */
+      if (nested && !vm->pending_is_thread[i])
+        continue;
+      if (vm->pending_due_ms[i] <= now) {
+        pick = i;
+        break;
       }
-      if (pick < 0) break;
-      ++ran;
+    }
+    if (pick < 0) break;
+    ++ran;
 
-      dvm_ref entry = vm->pending_threads[pick];
-      bool entry_is_thread = vm->pending_is_thread[pick];
-      const uint64_t entry_due = vm->pending_due_ms[pick];
-      for (int i = pick; i + 1 < vm->npending; ++i) {
-         vm->pending_threads[i] = vm->pending_threads[i + 1];
-         vm->pending_is_thread[i] = vm->pending_is_thread[i + 1];
-         vm->pending_due_ms[i] = vm->pending_due_ms[i + 1];
-         vm->pending_looper[i] = vm->pending_looper[i + 1];
-         vm->pending_owner[i] = vm->pending_owner[i + 1];
-         vm->pending_token[i] = vm->pending_token[i + 1];
+    dvm_ref entry = vm->pending_threads[pick];
+    bool entry_is_thread = vm->pending_is_thread[pick];
+    const uint64_t entry_due = vm->pending_due_ms[pick];
+    for (int i = pick; i + 1 < vm->npending; ++i) {
+      vm->pending_threads[i] = vm->pending_threads[i + 1];
+      vm->pending_is_thread[i] = vm->pending_is_thread[i + 1];
+      vm->pending_due_ms[i] = vm->pending_due_ms[i + 1];
+      vm->pending_looper[i] = vm->pending_looper[i + 1];
+      vm->pending_owner[i] = vm->pending_owner[i + 1];
+      vm->pending_token[i] = vm->pending_token[i + 1];
+    }
+    --vm->npending;
+
+    dvm_ref list[1] = { entry };
+    bool is_thread[1] = { entry_is_thread };
+    {
+      const int i = 0;
+      struct dvm_class *c = dvm_object_class(vm, list[i]);
+      struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
+      bool proxy_run = !run && c && c->super && c->super->name &&
+                       !strcmp(c->super->name, "java/lang/reflect/Proxy");
+      /* How late this looper is.
+       *
+       * A Handler.postDelayed() callback is a deadline the app may be
+       * relying on, not a hint.  Cross Worlds' anti-tamper module arms one
+       * (NmssSa.TDThreadWait -> Handler(mainLooper).postDelayed(->
+       * nmssNativeSignalToTDThread, ms)) and its native side treats a
+       * signal that does not arrive before its own timer expires as the app
+       * having been frozen.  On a device the main looper is a thread of its
+       * own and fires within a millisecond or two of the due time; here the
+       * queue is drained once per pump frame and only when the guest is
+       * between slices, so a long stretch of native code makes every armed
+       * callback late.  That lateness is invisible unless it is measured,
+       * and it is the difference between an emulator that a timing check
+       * accepts and one it does not. */
+      if (entry_due && now > entry_due + DVM_LOOPER_LATE_MS) {
+        static int late_warned;
+        /* The line below is capped to keep a log readable; the count is
+         * not, and a summary says how many ran late and by how much. */
+        static uint64_t late_total, late_ms_total, late_worst, late_last_report;
+        ++late_total;
+        late_ms_total += now - entry_due;
+        if (now - entry_due > late_worst) late_worst = now - entry_due;
+        if (now - late_last_report >= 10000) {
+          if (late_last_report)
+            fprintf(stderr, "[sched-late] %llu callbacks ran late so far, %.0f ms on average, worst %llu ms\n",
+                    (unsigned long long)late_total, (double)late_ms_total / (double)late_total,
+                    (unsigned long long)late_worst);
+          late_last_report = now;
+        }
+        if (late_warned++ < 64 || dvm__sched_trace())
+          fprintf(stderr, "[sched] %s.run() ran %llu ms after its due "
+                          "time (main-looper callback)\n",
+                  run && run->cls ? run->cls->name : "?",
+                  (unsigned long long)(now - entry_due));
       }
-      --vm->npending;
-
-      dvm_ref list[1] = { entry };
-      bool is_thread[1] = { entry_is_thread };
-      {
-         const int i = 0;
-         struct dvm_class *c = dvm_object_class(vm, list[i]);
-         struct dvm_method *run = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
-         bool proxy_run = !run && c && c->super && c->super->name &&
-                          !strcmp(c->super->name, "java/lang/reflect/Proxy");
-         /* How late this looper is.
-          *
-          * A Handler.postDelayed() callback is a deadline the app may be
-          * relying on, not a hint.  Cross Worlds' anti-tamper module arms one
-          * (NmssSa.TDThreadWait -> Handler(mainLooper).postDelayed(->
-          * nmssNativeSignalToTDThread, ms)) and its native side treats a
-          * signal that does not arrive before its own timer expires as the app
-          * having been frozen.  On a device the main looper is a thread of its
-          * own and fires within a millisecond or two of the due time; here the
-          * queue is drained once per pump frame and only when the guest is
-          * between slices, so a long stretch of native code makes every armed
-          * callback late.  That lateness is invisible unless it is measured,
-          * and it is the difference between an emulator that a timing check
-          * accepts and one it does not. */
-         if (entry_due && now > entry_due + DVM_LOOPER_LATE_MS) {
-            static int late_warned;
-            /* The line below is capped to keep a log readable; the count is
-             * not, and a summary says how many ran late and by how much. */
-            static uint64_t late_total, late_ms_total, late_worst, late_last_report;
-            ++late_total; late_ms_total += now - entry_due;
-            if (now - entry_due > late_worst) late_worst = now - entry_due;
-            if (now - late_last_report >= 10000) {
-               if (late_last_report)
-                  fprintf(stderr, "[sched-late] %llu callbacks ran late so far, %.0f ms on average, worst %llu ms\n",
-                          (unsigned long long)late_total, (double)late_ms_total / (double)late_total,
-                          (unsigned long long)late_worst);
-               late_last_report = now;
+      if ((run && (run->has_code || run->builtin)) || proxy_run) {
+        union dvm_value ret;
+        uint64_t before = vm->steps;
+        struct timespec looper_t0;
+        clock_gettime(CLOCK_MONOTONIC, &looper_t0);
+        /* The Runnable gets a slice of its own, so it starts from zero.
+         * call_steps is only reset by dvm_call() at depth 0, and a drain
+         * runs nested inside whatever call asked to wait — so without this
+         * the Runnable inherits every step that call had already spent and
+         * blows the slice on its first instruction.  It surfaced once
+         * Thread.sleep() stopped holding the ARM execution lock: the Java
+         * wait loops around it started really turning, and each turn
+         * drains, so a long-running JNI call reached the limit within a
+         * couple of Runnables. */
+        uint64_t saved_steps = vm->call_steps;
+        vm->call_steps = 0;
+        /* Only a thread that fell back to this queue has a slice: it is the
+         * cooperative scheduler's way of noticing that a green thread is
+         * spinning rather than getting anywhere.  A main-Looper callback
+         * is not a thread — on a device it simply runs on the main thread
+         * until it returns, however long that takes.  Giving it the slice
+         * killed ordinary work: the HoYoverse SDK's language table is a
+         * Gson parse of a large JSON file, took more than two million
+         * instructions, and was aborted with java.lang.Error, so every
+         * SDK string lookup failed ("load resource failed"). */
+        vm->step_limit = is_thread[i] ? DVM_THREAD_SLICE : 0;
+        vm->quiet_uncaught = true;
+        /* A Runnable handed to Handler.post() runs on the main thread; one
+         * started with Thread.start() runs as itself.  App code asserts on
+         * the difference, so Thread.currentThread() has to follow it. */
+        dvm_ref saved_thread = vm->cur_thread;
+        vm->cur_thread = is_thread[i] ? list[i] : vm->main_thread;
+        bool ok;
+        if (!is_thread[i]) dvm_runtime_looper_log(vm, 0, true, list[i]);
+        if (proxy_run) {
+          struct dvm_class *iface =
+            dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
+          ok = dvm_proxy_try_invoke(vm, list[i], iface, "run", "()V",
+                                    NULL, 0, &ret) && !vm->exception;
+        } else {
+          ok = dvm_call(vm, run, list[i], NULL, 0, &ret);
+        }
+        vm->cur_thread = saved_thread;
+        vm->quiet_uncaught = saved_quiet;
+        vm->step_limit = saved_limit;
+        vm->call_steps = saved_steps;
+        /* LUNARIA_TRACE_LOOPER: where the main looper's time goes, by
+         * callback class, every five seconds. */
+        if (!is_thread[i]) {
+          static int looper_trace = -1;
+          static struct {
+            const char *name;
+            unsigned runs;
+            uint64_t ns, steps;
+          } top[24];
+          static struct timespec looper_last;
+          if (looper_trace < 0) looper_trace = getenv("LUNARIA_TRACE_LOOPER") != NULL;
+          if (looper_trace) {
+            struct timespec t1;
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            const char *cname = c && c->name ? c->name : "?";
+            int slot = -1;
+            for (int k = 0; k < 24 && slot < 0; ++k)
+              if (top[k].name && !strcmp(top[k].name, cname)) slot = k;
+            for (int k = 0; k < 24 && slot < 0; ++k)
+              if (!top[k].name) {
+                top[k].name = cname;
+                slot = k;
+              }
+            if (slot >= 0) {
+              ++top[slot].runs;
+              top[slot].ns += (uint64_t)(t1.tv_sec - looper_t0.tv_sec) * 1000000000ull +
+                              (uint64_t)(t1.tv_nsec - looper_t0.tv_nsec);
+              top[slot].steps += vm->steps - before;
             }
-            if (late_warned++ < 64 || dvm__sched_trace())
-               fprintf(stderr, "[sched] %s.run() ran %llu ms after its due "
-                       "time (main-looper callback)\n",
-                       run && run->cls ? run->cls->name : "?",
-                       (unsigned long long)(now - entry_due));
-         }
-         if ((run && (run->has_code || run->builtin)) || proxy_run) {
-            union dvm_value ret;
-            uint64_t before = vm->steps;
-            struct timespec looper_t0;
-            clock_gettime(CLOCK_MONOTONIC, &looper_t0);
-            /* The Runnable gets a slice of its own, so it starts from zero.
-             * call_steps is only reset by dvm_call() at depth 0, and a drain
-             * runs nested inside whatever call asked to wait — so without this
-             * the Runnable inherits every step that call had already spent and
-             * blows the slice on its first instruction.  It surfaced once
-             * Thread.sleep() stopped holding the ARM execution lock: the Java
-             * wait loops around it started really turning, and each turn
-             * drains, so a long-running JNI call reached the limit within a
-             * couple of Runnables. */
-            uint64_t saved_steps = vm->call_steps;
-            vm->call_steps = 0;
-            /* Only a thread that fell back to this queue has a slice: it is the
-             * cooperative scheduler's way of noticing that a green thread is
-             * spinning rather than getting anywhere.  A main-Looper callback
-             * is not a thread — on a device it simply runs on the main thread
-             * until it returns, however long that takes.  Giving it the slice
-             * killed ordinary work: the HoYoverse SDK's language table is a
-             * Gson parse of a large JSON file, took more than two million
-             * instructions, and was aborted with java.lang.Error, so every
-             * SDK string lookup failed ("load resource failed"). */
-            vm->step_limit = is_thread[i] ? DVM_THREAD_SLICE : 0;
-            vm->quiet_uncaught = true;
-            /* A Runnable handed to Handler.post() runs on the main thread; one
-             * started with Thread.start() runs as itself.  App code asserts on
-             * the difference, so Thread.currentThread() has to follow it. */
-            dvm_ref saved_thread = vm->cur_thread;
-            vm->cur_thread = is_thread[i] ? list[i] : vm->main_thread;
-            bool ok;
-            if (!is_thread[i]) dvm_runtime_looper_log(vm, 0, true, list[i]);
-            if (proxy_run) {
-               struct dvm_class *iface =
-                  dvm__class_by_desc(vm, "Ljava/lang/Runnable;");
-               ok = dvm_proxy_try_invoke(vm, list[i], iface, "run", "()V",
-                                         NULL, 0, &ret) && !vm->exception;
-            } else {
-               ok = dvm_call(vm, run, list[i], NULL, 0, &ret);
+            if (t1.tv_sec - looper_last.tv_sec >= 5) {
+              for (int k = 0; k < 24; ++k)
+                if (top[k].name && top[k].ns > 20000000ull)
+                  fprintf(stderr, "[looper] %6.0f ms %6u runs %10llu steps  %s\n", top[k].ns / 1e6,
+                          top[k].runs, (unsigned long long)top[k].steps, top[k].name);
+              memset(top, 0, sizeof top);
+              looper_last = t1;
             }
-            vm->cur_thread = saved_thread;
-            vm->quiet_uncaught = saved_quiet;
-            vm->step_limit = saved_limit;
-            vm->call_steps = saved_steps;
-            /* LUNARIA_TRACE_LOOPER: where the main looper's time goes, by
-             * callback class, every five seconds. */
-            if (!is_thread[i]) {
-               static int looper_trace = -1;
-               static struct { const char *name; unsigned runs; uint64_t ns, steps; } top[24];
-               static struct timespec looper_last;
-               if (looper_trace < 0) looper_trace = getenv("LUNARIA_TRACE_LOOPER") != NULL;
-               if (looper_trace) {
-                  struct timespec t1;
-                  clock_gettime(CLOCK_MONOTONIC, &t1);
-                  const char *cname = c && c->name ? c->name : "?";
-                  int slot = -1;
-                  for (int k = 0; k < 24 && slot < 0; ++k)
-                     if (top[k].name && !strcmp(top[k].name, cname)) slot = k;
-                  for (int k = 0; k < 24 && slot < 0; ++k)
-                     if (!top[k].name) { top[k].name = cname; slot = k; }
-                  if (slot >= 0) {
-                     ++top[slot].runs;
-                     top[slot].ns += (uint64_t)(t1.tv_sec - looper_t0.tv_sec) * 1000000000ull +
-                                     (uint64_t)(t1.tv_nsec - looper_t0.tv_nsec);
-                     top[slot].steps += vm->steps - before;
-                  }
-                  if (t1.tv_sec - looper_last.tv_sec >= 5) {
-                     for (int k = 0; k < 24; ++k)
-                        if (top[k].name && top[k].ns > 20000000ull)
-                           fprintf(stderr, "[looper] %6.0f ms %6u runs %10llu steps  %s\n", top[k].ns / 1e6,
-                                   top[k].runs, (unsigned long long)top[k].steps, top[k].name);
-                     memset(top, 0, sizeof top);
-                     looper_last = t1;
-                  }
-               }
-            }
-            char how[256];
-            how[0] = '\0';
-            if (!ok && vm->exception)
-               dvm_describe_exception(vm, vm->exception, how, sizeof how);
-            /* A thread that parked has not finished: it is blocked inside the
-             * platform on something another thread must produce — a Volley
-             * dispatcher sitting in BlockingQueue.take() before the first
-             * request is added is the standard shape.  Dropping it ended the
-             * thread for good, so every request queued afterwards had no
-             * consumer and the caller waiting on the response timed out.  Put
-             * it back, so a later drain retries the wait the way the blocked
-             * thread would have resumed on a real runtime. */
-            const bool parked_here = vm->parked;
-            if (entry_is_thread && !parked_here) {
-               (void)dvm_set_field(vm, entry, "alive", "Z", (union dvm_value){.i = 0});
-               dvm__thread_set_state(vm, entry, DVM_THREAD_TERMINATED);
-               dvm_gil_notify_for(entry);
-            }
-            dvm_clear_exception(vm);
-            if (parked_here) {
-               /* The exception only exists to unwind the wait. It is not a
-                * failure, and reporting it would print one line per park. */
-               how[0] = '\0';
-               bool requeued = dvm__queue_runnable_at(vm, list[i], is_thread[i],
-                                                      DVM_PARK_RETRY_MS);
-               if (dvm__sched_trace_for(c ? c->name : NULL))
-                  fprintf(stderr, "[sched] parked %s.run() depth=%d %s\n",
-                          c && c->name ? c->name : "?", vm->drain_depth,
-                          requeued ? "requeued" : "DROPPED (queue full)");
-            } else if (dvm__sched_trace_for(c ? c->name : NULL)) {
-               fprintf(stderr, "[sched] ran %s.run() depth=%d steps=%llu\n",
-                       c && c->name ? c->name : "?", vm->drain_depth,
-                       (unsigned long long)(vm->steps - before));
-            }
-            static int log_n = 0;
-            /* The cap keeps startup readable; a trace run wants every one of
-               them, because a runnable that keeps re-queueing is the symptom.
-               An exception is not startup noise: it is dropped together with
-               the rest of the Runnable (Volley's Request.finish never runs),
-               and once the first two dozen callbacks have passed it used to
-               vanish entirely. Cross Worlds' sign-in delivery is one of those. */
-            const bool failed = how[0] != '\0';
-            const bool report = failed || log_n < 24 || vm->trace;
-            if (!failed) ++log_n;
-            if (report)
-               fprintf(stderr, "[dvm] thread %s.run() ran %llu steps%s%s\n",
-                       c && c->name ? c->name : "?",
-                       (unsigned long long)(vm->steps - before),
-                       how[0] ? " — " : "", how[0] ? how : "");
-            /* A Runnable that died of an exception is the interesting case, and
-             * the class of the Runnable says nothing about where it died — the
-             * throw is usually several frames down inside an SDK.  Print the
-             * unwind path for it exactly as dvm_call() does for an uncaught
-             * exception on the main thread. */
-            if (report && how[0])
-               for (int f_i = 0; f_i < vm->nexc_trace; ++f_i) {
-                  struct dvm_method *f = vm->exc_trace[f_i];
-                  if (!f) continue;
-                  if (f_i == 0)
-                     fprintf(stderr, "[dvm]   at %s.%s%s +0x%x\n",
-                             f->cls ? f->cls->name : "?", f->name,
-                             f->sig ? f->sig : "", vm->exc_pc * 2);
-                  else
-                     fprintf(stderr, "[dvm]   at %s.%s%s\n",
-                             f->cls ? f->cls->name : "?", f->name,
-                             f->sig ? f->sig : "");
-               }
-            vm->nexc_trace = 0;
-            if (!is_thread[i]) dvm_runtime_looper_log(vm, 0, false, list[i]);
-         }
-         dvm_unpin(vm, list[i]);
+          }
+        }
+        char how[256];
+        how[0] = '\0';
+        if (!ok && vm->exception)
+          dvm_describe_exception(vm, vm->exception, how, sizeof how);
+        /* A thread that parked has not finished: it is blocked inside the
+         * platform on something another thread must produce — a Volley
+         * dispatcher sitting in BlockingQueue.take() before the first
+         * request is added is the standard shape.  Dropping it ended the
+         * thread for good, so every request queued afterwards had no
+         * consumer and the caller waiting on the response timed out.  Put
+         * it back, so a later drain retries the wait the way the blocked
+         * thread would have resumed on a real runtime. */
+        const bool parked_here = vm->parked;
+        if (entry_is_thread && !parked_here) {
+          (void)dvm_set_field(vm, entry, "alive", "Z", (union dvm_value) {
+            .i = 0
+          });
+          dvm__thread_set_state(vm, entry, DVM_THREAD_TERMINATED);
+          dvm_gil_notify_for(entry);
+        }
+        dvm_clear_exception(vm);
+        if (parked_here) {
+          /* The exception only exists to unwind the wait. It is not a
+           * failure, and reporting it would print one line per park. */
+          how[0] = '\0';
+          bool requeued = dvm__queue_runnable_at(vm, list[i], is_thread[i],
+                                                 DVM_PARK_RETRY_MS);
+          if (dvm__sched_trace_for(c ? c->name : NULL))
+            fprintf(stderr, "[sched] parked %s.run() depth=%d %s\n",
+                    c && c->name ? c->name : "?", vm->drain_depth,
+                    requeued ? "requeued" : "DROPPED (queue full)");
+        } else if (dvm__sched_trace_for(c ? c->name : NULL)) {
+          fprintf(stderr, "[sched] ran %s.run() depth=%d steps=%llu\n",
+                  c && c->name ? c->name : "?", vm->drain_depth,
+                  (unsigned long long)(vm->steps - before));
+        }
+        static int log_n = 0;
+        /* The cap keeps startup readable; a trace run wants every one of
+           them, because a runnable that keeps re-queueing is the symptom.
+           An exception is not startup noise: it is dropped together with
+           the rest of the Runnable (Volley's Request.finish never runs),
+           and once the first two dozen callbacks have passed it used to
+           vanish entirely. Cross Worlds' sign-in delivery is one of those. */
+        const bool failed = how[0] != '\0';
+        const bool report = failed || log_n < 24 || vm->trace;
+        if (!failed) ++log_n;
+        if (report)
+          fprintf(stderr, "[dvm] thread %s.run() ran %llu steps%s%s\n",
+                  c && c->name ? c->name : "?",
+                  (unsigned long long)(vm->steps - before),
+                  how[0] ? " — " : "", how[0] ? how : "");
+        /* A Runnable that died of an exception is the interesting case, and
+         * the class of the Runnable says nothing about where it died — the
+         * throw is usually several frames down inside an SDK.  Print the
+         * unwind path for it exactly as dvm_call() does for an uncaught
+         * exception on the main thread. */
+        if (report && how[0])
+          for (int f_i = 0; f_i < vm->nexc_trace; ++f_i) {
+            struct dvm_method *f = vm->exc_trace[f_i];
+            if (!f) continue;
+            if (f_i == 0)
+              fprintf(stderr, "[dvm]   at %s.%s%s +0x%x\n",
+                      f->cls ? f->cls->name : "?", f->name,
+                      f->sig ? f->sig : "", vm->exc_pc * 2);
+            else
+              fprintf(stderr, "[dvm]   at %s.%s%s\n",
+                      f->cls ? f->cls->name : "?", f->name,
+                      f->sig ? f->sig : "");
+          }
+        vm->nexc_trace = 0;
+        if (!is_thread[i]) dvm_runtime_looper_log(vm, 0, false, list[i]);
       }
-   }
+      dvm_unpin(vm, list[i]);
+    }
+  }
 
-   vm->step_limit = saved_limit;
-   vm->quiet_uncaught = saved_quiet;
-   --vm->drain_depth;
-   return ran;
+  vm->step_limit = saved_limit;
+  vm->quiet_uncaught = saved_quiet;
+  --vm->drain_depth;
+  return ran;
 }
 
 void dvm__run_pending_threads(struct dvm *vm)
 {
-   (void)drain_pending(vm, false);
-   /* Only at the top: a nested drain is inside somebody's Runnable, and a
-    * click callback dispatched there would run underneath a wait. */
-   if (vm->drain_depth == 0) dvm__ui_tick(vm);
+  (void)drain_pending(vm, false);
+  /* Only at the top: a nested drain is inside somebody's Runnable, and a
+   * click callback dispatched there would run underneath a wait. */
+  if (vm->drain_depth == 0) dvm__ui_tick(vm);
 }
-int dvm__drain_for_wait(struct dvm *vm) { return drain_pending(vm, true); }
+int dvm__drain_for_wait(struct dvm *vm) {
+  return drain_pending(vm, true);
+}
 
 /* Whether the main Looper has a message whose time has come.  The frame pump
  * asks it while the guest is parked: waiting out the rest of the frame then
@@ -4702,47 +5609,48 @@ static bool g_pump_woken;
 static clockid_t g_pump_clock = CLOCK_REALTIME;
 static void pump_cv_init(void)
 {
-   pthread_condattr_t at;
-   pthread_condattr_init(&at);
+  pthread_condattr_t at;
+  pthread_condattr_init(&at);
 #if defined(__linux__)
-   if (!pthread_condattr_setclock(&at, CLOCK_MONOTONIC))
-      g_pump_clock = CLOCK_MONOTONIC;
+  if (!pthread_condattr_setclock(&at, CLOCK_MONOTONIC))
+    g_pump_clock = CLOCK_MONOTONIC;
 #endif
-   pthread_cond_init(&g_pump_cv, &at);
-   pthread_condattr_destroy(&at);
+  pthread_cond_init(&g_pump_cv, &at);
+  pthread_condattr_destroy(&at);
 }
 void dvm_pump_wake(void)
 {
-   pthread_once(&g_pump_once, pump_cv_init);
-   pthread_mutex_lock(&g_pump_mu);
-   g_pump_woken = true;
-   pthread_cond_signal(&g_pump_cv);
-   pthread_mutex_unlock(&g_pump_mu);
+  pthread_once(&g_pump_once, pump_cv_init);
+  pthread_mutex_lock(&g_pump_mu);
+  g_pump_woken = true;
+  pthread_cond_signal(&g_pump_cv);
+  pthread_mutex_unlock(&g_pump_mu);
 }
 /* Sleeps up to `us`; true when input woke it early. */
 bool dvm_pump_wait_us(unsigned us)
 {
-   pthread_once(&g_pump_once, pump_cv_init);
-   struct timespec t;
-   clock_gettime(g_pump_clock, &t);
-   t.tv_nsec += (long)us * 1000L;
-   t.tv_sec += t.tv_nsec / 1000000000L; t.tv_nsec %= 1000000000L;
-   pthread_mutex_lock(&g_pump_mu);
-   while (!g_pump_woken && pthread_cond_timedwait(&g_pump_cv, &g_pump_mu, &t) == 0) {}
-   const bool woken = g_pump_woken;
-   g_pump_woken = false;
-   pthread_mutex_unlock(&g_pump_mu);
-   return woken;
+  pthread_once(&g_pump_once, pump_cv_init);
+  struct timespec t;
+  clock_gettime(g_pump_clock, &t);
+  t.tv_nsec += (long)us * 1000L;
+  t.tv_sec += t.tv_nsec / 1000000000L;
+  t.tv_nsec %= 1000000000L;
+  pthread_mutex_lock(&g_pump_mu);
+  while (!g_pump_woken && pthread_cond_timedwait(&g_pump_cv, &g_pump_mu, &t) == 0) {}
+  const bool woken = g_pump_woken;
+  g_pump_woken = false;
+  pthread_mutex_unlock(&g_pump_mu);
+  return woken;
 }
 
 bool dvm_main_work_due(struct dvm *vm)
 {
-   if (!vm || vm->main_transaction_depth) return false;
-   const uint64_t now = dvm__now_ms();
-   for (int i = 0; i < vm->npending; ++i)
-      if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
-          (!vm->pending_due_ms[i] || vm->pending_due_ms[i] <= now)) return true;
-   return false;
+  if (!vm || vm->main_transaction_depth) return false;
+  const uint64_t now = dvm__now_ms();
+  for (int i = 0; i < vm->npending; ++i)
+    if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
+        (!vm->pending_due_ms[i] || vm->pending_due_ms[i] <= now)) return true;
+  return false;
 }
 
 /* One turn of the main thread's Looper, for the frame pump to call.
@@ -4762,49 +5670,52 @@ bool dvm_main_work_due(struct dvm *vm)
  * next to the other things a device's main thread does every turn. */
 void dvm_main_looper_tick(struct dvm *vm)
 {
-   /* Not only when a message is pending: input the emulator's own windows
-    * took (a tap on a guest dialog) and their redraws are the main thread's
-    * work too, and they arrive with nothing queued. */
-   if (!vm) return;
-   /* Same contract as dvm_media_pump_active(): called from the frame pump,
-    * which does not carry the interpreter lock. */
-   unsigned cookie = dvm_gil_enter_from_guest(vm);
-   if (dvm__sched_trace()) {
-      static uint64_t last;
-      const uint64_t t = dvm__now_ms();
-      if (t - last > 5000) {
-         last = t;
-         fprintf(stderr, "[sched] main tick pid=%d: transaction=%u drain_depth=%d on_main=%d pending=%d\n", (int)getpid(),
-                 vm->main_transaction_depth, vm->drain_depth, (int)dvm_on_main_thread(), vm->npending);
-      }
-   }
-   if (vm->main_transaction_depth) {
-      dvm_gil_leave_to_guest(vm, cookie);
-      return;
-   }
-   /* A pump turn belongs to Android's main Looper, not to the guest JNI
-    * invocation that last used this host thread. That invocation may have
-    * parked inside a modal wait with drain_depth > 0. Borrowing its state
-    * suppresses UI redraws and clicks forever, while preserving it lets the
-    * suspended invocation resume with its own stack and exception intact. */
-   struct dvm_tstate saved, main_turn = { 0 };
-   dvm__tstate_save(vm, &saved);
-   main_turn.cur_thread = vm->main_thread;
-   dvm__tstate_load(vm, &main_turn);
-   extern __thread dvm_ref g_current_looper;
-   const dvm_ref saved_looper = g_current_looper;
-   g_current_looper = 0;
-   dvm__network_tick(vm);
-   bool dispatched = false;
-   const uint64_t now = dvm__now_ms();
-   for (int i = 0; i < vm->npending; ++i)
-      if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
-          (!vm->pending_due_ms[i] || vm->pending_due_ms[i] <= now)) { dispatched = true; break; }
-   dvm__run_pending_threads(vm);
-   dvm__main_queue_idle(vm, dispatched);
-   g_current_looper = saved_looper;
-   dvm__tstate_load(vm, &saved);
-   dvm_gil_leave_to_guest(vm, cookie);
+  /* Not only when a message is pending: input the emulator's own windows
+   * took (a tap on a guest dialog) and their redraws are the main thread's
+   * work too, and they arrive with nothing queued. */
+  if (!vm) return;
+  /* Same contract as dvm_media_pump_active(): called from the frame pump,
+   * which does not carry the interpreter lock. */
+  unsigned cookie = dvm_gil_enter_from_guest(vm);
+  if (dvm__sched_trace()) {
+    static uint64_t last;
+    const uint64_t t = dvm__now_ms();
+    if (t - last > 5000) {
+      last = t;
+      fprintf(stderr, "[sched] main tick pid=%d: transaction=%u drain_depth=%d on_main=%d pending=%d\n", (int)getpid(),
+              vm->main_transaction_depth, vm->drain_depth, (int)dvm_on_main_thread(), vm->npending);
+    }
+  }
+  if (vm->main_transaction_depth) {
+    dvm_gil_leave_to_guest(vm, cookie);
+    return;
+  }
+  /* A pump turn belongs to Android's main Looper, not to the guest JNI
+   * invocation that last used this host thread. That invocation may have
+   * parked inside a modal wait with drain_depth > 0. Borrowing its state
+   * suppresses UI redraws and clicks forever, while preserving it lets the
+   * suspended invocation resume with its own stack and exception intact. */
+  struct dvm_tstate saved, main_turn = { 0 };
+  dvm__tstate_save(vm, &saved);
+  main_turn.cur_thread = vm->main_thread;
+  dvm__tstate_load(vm, &main_turn);
+  extern __thread dvm_ref g_current_looper;
+  const dvm_ref saved_looper = g_current_looper;
+  g_current_looper = 0;
+  dvm__network_tick(vm);
+  bool dispatched = false;
+  const uint64_t now = dvm__now_ms();
+  for (int i = 0; i < vm->npending; ++i)
+    if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
+        (!vm->pending_due_ms[i] || vm->pending_due_ms[i] <= now)) {
+      dispatched = true;
+      break;
+    }
+  dvm__run_pending_threads(vm);
+  dvm__main_queue_idle(vm, dispatched);
+  g_current_looper = saved_looper;
+  dvm__tstate_load(vm, &saved);
+  dvm_gil_leave_to_guest(vm, cookie);
 }
 
 
@@ -4818,54 +5729,54 @@ void dvm_main_looper_tick(struct dvm *vm)
 
 void dvm__tstate_save(struct dvm *vm, struct dvm_tstate *t)
 {
-   TS_COPY(t, vm, exception);
-   TS_COPY(t, vm, nexc_trace);
-   TS_COPY(t, vm, exc_ref);
-   TS_COPY(t, vm, exc_pc);
-   TS_COPY(t, vm, cur_thread);
-   TS_COPY(t, vm, drain_depth);
-   TS_COPY(t, vm, quiet_uncaught);
-   TS_COPY(t, vm, parked);
-   TS_COPY(t, vm, cur_method);
-   TS_COPY(t, vm, cur_pc);
-   TS_COPY(t, vm, ncallstack);
-   TS_COPY(t, vm, invoke_frame);
-   TS_COPY(t, vm, depth);
-   TS_COPY(t, vm, call_steps);
-   TS_COPY(t, vm, step_limit);
-   memcpy(t->exc_trace, vm->exc_trace, sizeof t->exc_trace);
-   /* Only the live part: the array is 128 entries and this copy happens on
-    * every handover, so copying the tail would cost more than the switch. */
-   int n = vm->ncallstack;
-   if (n < 0) n = 0;
-   if (n > (int)(sizeof t->callstack / sizeof t->callstack[0]))
-      n = (int)(sizeof t->callstack / sizeof t->callstack[0]);
-   memcpy(t->callstack, vm->callstack, (size_t)n * sizeof t->callstack[0]);
+  TS_COPY(t, vm, exception);
+  TS_COPY(t, vm, nexc_trace);
+  TS_COPY(t, vm, exc_ref);
+  TS_COPY(t, vm, exc_pc);
+  TS_COPY(t, vm, cur_thread);
+  TS_COPY(t, vm, drain_depth);
+  TS_COPY(t, vm, quiet_uncaught);
+  TS_COPY(t, vm, parked);
+  TS_COPY(t, vm, cur_method);
+  TS_COPY(t, vm, cur_pc);
+  TS_COPY(t, vm, ncallstack);
+  TS_COPY(t, vm, invoke_frame);
+  TS_COPY(t, vm, depth);
+  TS_COPY(t, vm, call_steps);
+  TS_COPY(t, vm, step_limit);
+  memcpy(t->exc_trace, vm->exc_trace, sizeof t->exc_trace);
+  /* Only the live part: the array is 128 entries and this copy happens on
+   * every handover, so copying the tail would cost more than the switch. */
+  int n = vm->ncallstack;
+  if (n < 0) n = 0;
+  if (n > (int)(sizeof t->callstack / sizeof t->callstack[0]))
+    n = (int)(sizeof t->callstack / sizeof t->callstack[0]);
+  memcpy(t->callstack, vm->callstack, (size_t)n * sizeof t->callstack[0]);
 }
 
 void dvm__tstate_load(struct dvm *vm, const struct dvm_tstate *t)
 {
-   TS_COPY(vm, t, exception);
-   TS_COPY(vm, t, nexc_trace);
-   TS_COPY(vm, t, exc_ref);
-   TS_COPY(vm, t, exc_pc);
-   TS_COPY(vm, t, cur_thread);
-   TS_COPY(vm, t, drain_depth);
-   TS_COPY(vm, t, quiet_uncaught);
-   TS_COPY(vm, t, parked);
-   TS_COPY(vm, t, cur_method);
-   TS_COPY(vm, t, cur_pc);
-   TS_COPY(vm, t, ncallstack);
-   TS_COPY(vm, t, invoke_frame);
-   TS_COPY(vm, t, depth);
-   TS_COPY(vm, t, call_steps);
-   TS_COPY(vm, t, step_limit);
-   memcpy(vm->exc_trace, t->exc_trace, sizeof vm->exc_trace);
-   int n = t->ncallstack;
-   if (n < 0) n = 0;
-   if (n > (int)(sizeof t->callstack / sizeof t->callstack[0]))
-      n = (int)(sizeof t->callstack / sizeof t->callstack[0]);
-   memcpy(vm->callstack, t->callstack, (size_t)n * sizeof t->callstack[0]);
+  TS_COPY(vm, t, exception);
+  TS_COPY(vm, t, nexc_trace);
+  TS_COPY(vm, t, exc_ref);
+  TS_COPY(vm, t, exc_pc);
+  TS_COPY(vm, t, cur_thread);
+  TS_COPY(vm, t, drain_depth);
+  TS_COPY(vm, t, quiet_uncaught);
+  TS_COPY(vm, t, parked);
+  TS_COPY(vm, t, cur_method);
+  TS_COPY(vm, t, cur_pc);
+  TS_COPY(vm, t, ncallstack);
+  TS_COPY(vm, t, invoke_frame);
+  TS_COPY(vm, t, depth);
+  TS_COPY(vm, t, call_steps);
+  TS_COPY(vm, t, step_limit);
+  memcpy(vm->exc_trace, t->exc_trace, sizeof vm->exc_trace);
+  int n = t->ncallstack;
+  if (n < 0) n = 0;
+  if (n > (int)(sizeof t->callstack / sizeof t->callstack[0]))
+    n = (int)(sizeof t->callstack / sizeof t->callstack[0]);
+  memcpy(vm->callstack, t->callstack, (size_t)n * sizeof t->callstack[0]);
 }
 
 #undef TS_COPY
@@ -4882,66 +5793,70 @@ static _Thread_local bool g_tstate_valid;
  * thread of its own, a Thread.sleep(500) can simply take 500 ms. */
 static _Thread_local bool g_is_bytecode_thread;
 
-bool dvm_on_bytecode_thread(void) { return g_is_bytecode_thread; }
-void dvm__mark_bytecode_thread(void) { g_is_bytecode_thread = true; }
+bool dvm_on_bytecode_thread(void) {
+  return g_is_bytecode_thread;
+}
+void dvm__mark_bytecode_thread(void) {
+  g_is_bytecode_thread = true;
+}
 
 /* Android's main thread.  See dvm_on_main_thread() in dvm.h. */
 static _Thread_local bool g_is_main_thread;
 
 bool dvm_on_main_thread(void)
 {
-   return g_is_main_thread && dvm__logical_main_thread(dvm_current());
+  return g_is_main_thread && dvm__logical_main_thread(dvm_current());
 }
 
 void dvm__tstate_reset(struct dvm *vm)
 {
-   /* Zero throughout, including the step limit: that budget exists to bound a
-    * call the VM cannot preempt, and a thread with its own stack is preempted
-    * every DVM_GIL_YIELD_STEPS instructions instead.  A caller that wants a
-    * budget sets one after this returns.
-    *
-    * Installed into the VM as well as saved, because the fields still hold
-    * whatever the previous holder of the lock left in them — this thread has
-    * no saved state to load, which is exactly why it is calling this. */
-   memset(&g_tstate, 0, sizeof g_tstate);
-   g_tstate_valid = true;
-   if (vm) dvm__tstate_load(vm, &g_tstate);
+  /* Zero throughout, including the step limit: that budget exists to bound a
+   * call the VM cannot preempt, and a thread with its own stack is preempted
+   * every DVM_GIL_YIELD_STEPS instructions instead.  A caller that wants a
+   * budget sets one after this returns.
+   *
+   * Installed into the VM as well as saved, because the fields still hold
+   * whatever the previous holder of the lock left in them — this thread has
+   * no saved state to load, which is exactly why it is calling this. */
+  memset(&g_tstate, 0, sizeof g_tstate);
+  g_tstate_valid = true;
+  if (vm) dvm__tstate_load(vm, &g_tstate);
 }
 
 static struct {
-   pthread_mutex_t m;
-   pthread_cond_t cv;
-   pthread_t owner;
-   _Atomic unsigned depth; /* 0 = nobody holds it */
-   /* Threads blocked in acquire.  dvm_gil_yield() is called from the
-    * interpreter's dispatch loop and from the guest scheduler's spin, both of
-    * them hot; with nobody waiting there is nothing to hand the lock to, and
-    * the handover would cost a thread-state save and load for nothing. */
-   _Atomic unsigned waiters;
-   /* Handed out in the order it was asked for, for the same reason the ARM
-    * execution lock is (src/arm.c).  Every wait in this VM is "give the lock
-    * up and take it again until somebody else makes my condition true" — a
-    * java.util.concurrent queue's take(), a Thread.sleep() poll loop.  With an
-    * unfair lock the thread that just released it is the one already running,
-    * so it wins the race back every time and the thread it is waiting for
-    * never gets in: a UE modal box looping `Thread.sleep(100)` on an engine
-    * worker held the interpreter for good while every bytecode thread sat in
-    * dvm_gil_acquire(), and the frame pump waited on the worker.
-    *
-    * The queue is explicit rather than a ticket counter over a shared condvar:
-    * with a shared one every release has to be a broadcast, because only the
-    * holder of the next ticket may proceed, so each hand-off woke every waiter
-    * and all but one went straight back to sleep.  One condvar per waiter lets
-    * the releaser signal exactly the thread whose turn it is.
-    *
-    * Recursion depth is a thread-local, so a recursive acquire and "do I hold
-    * it?" - both on the hot JNI path - cost nothing at all. */
+  pthread_mutex_t m;
+  pthread_cond_t cv;
+  pthread_t owner;
+  _Atomic unsigned depth; /* 0 = nobody holds it */
+  /* Threads blocked in acquire.  dvm_gil_yield() is called from the
+   * interpreter's dispatch loop and from the guest scheduler's spin, both of
+   * them hot; with nobody waiting there is nothing to hand the lock to, and
+   * the handover would cost a thread-state save and load for nothing. */
+  _Atomic unsigned waiters;
+  /* Handed out in the order it was asked for, for the same reason the ARM
+   * execution lock is (src/arm.c).  Every wait in this VM is "give the lock
+   * up and take it again until somebody else makes my condition true" — a
+   * java.util.concurrent queue's take(), a Thread.sleep() poll loop.  With an
+   * unfair lock the thread that just released it is the one already running,
+   * so it wins the race back every time and the thread it is waiting for
+   * never gets in: a UE modal box looping `Thread.sleep(100)` on an engine
+   * worker held the interpreter for good while every bytecode thread sat in
+   * dvm_gil_acquire(), and the frame pump waited on the worker.
+   *
+   * The queue is explicit rather than a ticket counter over a shared condvar:
+   * with a shared one every release has to be a broadcast, because only the
+   * holder of the next ticket may proceed, so each hand-off woke every waiter
+   * and all but one went straight back to sleep.  One condvar per waiter lets
+   * the releaser signal exactly the thread whose turn it is.
+   *
+   * Recursion depth is a thread-local, so a recursive acquire and "do I hold
+   * it?" - both on the hot JNI path - cost nothing at all. */
 } g_gil = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0 };
 
 struct dvm_gil_waiter {
-   pthread_cond_t         cv;
-   struct dvm_gil_waiter *next;
-   bool                   go;   /* the lock has been handed to me */
+  pthread_cond_t         cv;
+  struct dvm_gil_waiter *next;
+  bool                   go;   /* the lock has been handed to me */
 };
 static struct dvm_gil_waiter *g_gil_head, *g_gil_tail;
 static __thread unsigned      t_gil_depth;
@@ -4987,10 +5902,10 @@ static _Atomic unsigned   g_gil_next_id;
  * g_gil.m — so it must not take it.  An atomic counter needs no lock. */
 static unsigned gil_self_id(void)
 {
-   if (!t_gil_id)
-      t_gil_id = atomic_fetch_add_explicit(&g_gil_next_id, 1u,
-                                           memory_order_relaxed) + 1u;
-   return t_gil_id;
+  if (!t_gil_id)
+    t_gil_id = atomic_fetch_add_explicit(&g_gil_next_id, 1u,
+                                         memory_order_relaxed) + 1u;
+  return t_gil_id;
 }
 
 /* Long enough that a healthy JNI call never trips it; short enough that a
@@ -4998,22 +5913,22 @@ static unsigned gil_self_id(void)
 #define GIL_SLOW_WAIT_NS 50000000ull   /* 50 ms */
 unsigned long long dvm_gil_wait_ns(void)
 {
-   return atomic_load_explicit(&g_gil_wait_ns, memory_order_relaxed);
+  return atomic_load_explicit(&g_gil_wait_ns, memory_order_relaxed);
 }
 unsigned long long dvm_gil_held_ns(void)
 {
-   return atomic_load_explicit(&g_gil_held_ns, memory_order_relaxed);
+  return atomic_load_explicit(&g_gil_held_ns, memory_order_relaxed);
 }
 unsigned long long dvm_gil_max_wait_ns(void)
 {
-   return atomic_exchange_explicit(&g_gil_max_wait_ns, 0,
-                                   memory_order_relaxed);
+  return atomic_exchange_explicit(&g_gil_max_wait_ns, 0,
+                                  memory_order_relaxed);
 }
 static unsigned long long gil_ns_since(const struct timespec *a,
                                        const struct timespec *b)
 {
-   return (unsigned long long)(b->tv_sec - a->tv_sec) * 1000000000ull
-        + (unsigned long long)(b->tv_nsec - a->tv_nsec);
+  return (unsigned long long)(b->tv_sec - a->tv_sec) * 1000000000ull
+         + (unsigned long long)(b->tv_nsec - a->tv_nsec);
 }
 
 /* Signalled whenever a thread changes something another thread might be
@@ -5033,11 +5948,11 @@ static unsigned long long g_gil_change_seq;
  * and removal all happen under g_gil.m, and the notifier only sets `ready`, so
  * it never retains a stack pointer after the waiter removes itself. */
 struct dvm_event_waiter {
-   pthread_cond_t cv;
-   struct dvm_event_waiter *next;
-   uintptr_t channel;
-   bool ready;
-   char where[480];      /* the Java frames the waiter is parked in (diagnostics) */
+  pthread_cond_t cv;
+  struct dvm_event_waiter *next;
+  uintptr_t channel;
+  bool ready;
+  char where[480];      /* the Java frames the waiter is parked in (diagnostics) */
 };
 static struct dvm_event_waiter *g_event_waiters;
 
@@ -5049,98 +5964,104 @@ static struct dvm_event_waiter *g_event_waiters;
 #ifndef _WIN32
 static void dvm_waitdump(int sig)
 {
-   (void)sig;
-   fprintf(stderr, "[waitdump] parked Java threads:\n");
-   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next)
-      fprintf(stderr, "[waitdump]   channel=%lu ready=%d  %s\n",
-              (unsigned long)w->channel, (int)w->ready, w->where);
-   if (g_gil_vm) {
-      struct dvm *vm = g_gil_vm;
-      const uint64_t now = dvm__now_ms();
-      fprintf(stderr, "[waitdump] pending Runnables: %d\n", vm->npending);
-      for (int i = 0; i < vm->npending; ++i) {
-         struct dvm_class *c = vm->pending_threads[i] ? dvm_object_class(vm, vm->pending_threads[i]) : NULL;
-         fprintf(stderr, "[waitdump]   #%d %s thread=%d looper=%u due=%+lldms\n", i,
-                 c && c->name ? c->name : "?", (int)vm->pending_is_thread[i],
-                 (unsigned)vm->pending_looper[i],
-                 vm->pending_due_ms[i] ? (long long)vm->pending_due_ms[i] - (long long)now : 0ll);
-      }
-   }
+  (void)sig;
+  fprintf(stderr, "[waitdump] parked Java threads:\n");
+  for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next)
+    fprintf(stderr, "[waitdump]   channel=%lu ready=%d  %s\n",
+            (unsigned long)w->channel, (int)w->ready, w->where);
+  if (g_gil_vm) {
+    struct dvm *vm = g_gil_vm;
+    const uint64_t now = dvm__now_ms();
+    fprintf(stderr, "[waitdump] pending Runnables: %d\n", vm->npending);
+    for (int i = 0; i < vm->npending; ++i) {
+      struct dvm_class *c = vm->pending_threads[i] ? dvm_object_class(vm, vm->pending_threads[i]) : NULL;
+      fprintf(stderr, "[waitdump]   #%d %s thread=%d looper=%u due=%+lldms\n", i,
+              c && c->name ? c->name : "?", (int)vm->pending_is_thread[i],
+              (unsigned)vm->pending_looper[i],
+              vm->pending_due_ms[i] ? (long long)vm->pending_due_ms[i] - (long long)now : 0ll);
+    }
+  }
 }
 #endif
 
 void dvm_gil_notify(void)
 {
-   pthread_mutex_lock(&g_gil.m);
-   ++g_gil_change_seq;
-   pthread_cond_broadcast(&g_gil_change);
-   pthread_mutex_unlock(&g_gil.m);
+  pthread_mutex_lock(&g_gil.m);
+  ++g_gil_change_seq;
+  pthread_cond_broadcast(&g_gil_change);
+  pthread_mutex_unlock(&g_gil.m);
 }
 
 bool dvm_is_stopping(struct dvm *vm)
 {
-   return vm && atomic_load_explicit(&vm->stopping, memory_order_relaxed);
+  return vm && atomic_load_explicit(&vm->stopping, memory_order_relaxed);
 }
 
 bool dvm_process_exited(struct dvm *vm, int *status)
 {
-   if (!vm || atomic_load_explicit(&vm->process_exit_phase,memory_order_acquire)!=2) return false;
-   if (status) *status=atomic_load_explicit(&vm->process_exit_status,memory_order_relaxed);
-   return true;
+  if (!vm || atomic_load_explicit(&vm->process_exit_phase,memory_order_acquire)!=2) return false;
+  if (status) *status=atomic_load_explicit(&vm->process_exit_status,memory_order_relaxed);
+  return true;
 }
 
 void dvm_exit_process(struct dvm *vm, int status)
 {
-   if (!vm) return;
-   int live=0;
-   if (!atomic_compare_exchange_strong_explicit(&vm->process_exit_phase,&live,1,
-         memory_order_relaxed,memory_order_relaxed)) return;
-   atomic_store_explicit(&vm->process_exit_status,status,memory_order_relaxed);
-   atomic_store_explicit(&vm->process_exit_phase,2,memory_order_release);
-   dvm_request_stop(vm);
+  if (!vm) return;
+  int live=0;
+  if (!atomic_compare_exchange_strong_explicit(&vm->process_exit_phase,&live,1,
+      memory_order_relaxed,memory_order_relaxed)) return;
+  atomic_store_explicit(&vm->process_exit_status,status,memory_order_relaxed);
+  atomic_store_explicit(&vm->process_exit_phase,2,memory_order_release);
+  dvm_request_stop(vm);
 }
 
 void dvm_request_stop(struct dvm *vm)
 {
-   if (!vm) return;
-   if (!atomic_exchange_explicit(&vm->stopping, true, memory_order_relaxed)) {
-      const char wake = 1;
-      /* One byte, never drained: every concurrent network waiter wakes. */
-      luna_socket_send(vm->io_cancel[1], &wake, 1, LUNA_SEND_NOSIGNAL);
-   }
-   pthread_mutex_lock(&g_gil.m);
-   ++g_gil_change_seq;
-   pthread_cond_broadcast(&g_gil_change);
-   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
-      w->ready = true;
-      pthread_cond_signal(&w->cv);
-   }
-   pthread_mutex_unlock(&g_gil.m);
+  if (!vm) return;
+  if (!atomic_exchange_explicit(&vm->stopping, true, memory_order_relaxed)) {
+    const char wake = 1;
+    /* One byte, never drained: every concurrent network waiter wakes. */
+    luna_socket_send(vm->io_cancel[1], &wake, 1, LUNA_SEND_NOSIGNAL);
+  }
+  pthread_mutex_lock(&g_gil.m);
+  ++g_gil_change_seq;
+  pthread_cond_broadcast(&g_gil_change);
+  for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
+    w->ready = true;
+    pthread_cond_signal(&w->cv);
+  }
+  pthread_mutex_unlock(&g_gil.m);
 }
 
 void dvm_gil_notify_for(uintptr_t channel)
 {
-   if (!channel) { dvm_gil_notify(); return; }
-   pthread_mutex_lock(&g_gil.m);
-   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
-      if (w->channel != channel) continue;
-      w->ready = true;
-      pthread_cond_signal(&w->cv);
-   }
-   pthread_mutex_unlock(&g_gil.m);
+  if (!channel) {
+    dvm_gil_notify();
+    return;
+  }
+  pthread_mutex_lock(&g_gil.m);
+  for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
+    if (w->channel != channel) continue;
+    w->ready = true;
+    pthread_cond_signal(&w->cv);
+  }
+  pthread_mutex_unlock(&g_gil.m);
 }
 
 void dvm_gil_notify_one_for(uintptr_t channel)
 {
-   if (!channel) { dvm_gil_notify(); return; }
-   pthread_mutex_lock(&g_gil.m);
-   for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
-      if (w->channel != channel) continue;
-      w->ready = true;
-      pthread_cond_signal(&w->cv);
-      break;
-   }
-   pthread_mutex_unlock(&g_gil.m);
+  if (!channel) {
+    dvm_gil_notify();
+    return;
+  }
+  pthread_mutex_lock(&g_gil.m);
+  for (struct dvm_event_waiter *w = g_event_waiters; w; w = w->next) {
+    if (w->channel != channel) continue;
+    w->ready = true;
+    pthread_cond_signal(&w->cv);
+    break;
+  }
+  pthread_mutex_unlock(&g_gil.m);
 }
 
 /* Wait for such a change, or for `ms` to pass, without holding the
@@ -5174,54 +6095,57 @@ void dvm_gil_notify_one_for(uintptr_t channel)
  * lock order and needs no dance with the execution lock. */
 static bool gil_tryacquire(struct dvm *vm)
 {
-   if (t_gil_depth) { ++t_gil_depth; return true; }
-   bool got = false;
-   pthread_mutex_lock(&g_gil.m);
-   /* Free *and* nobody queued: barging past a waiter would undo the fairness
-    * the queue exists for. */
-   if (!atomic_load_explicit(&g_gil.depth, memory_order_relaxed) &&
-       !g_gil_head) {
-      atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
-      g_gil.owner = pthread_self();
-      clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
-      g_gil_owner_id = gil_self_id();
-      g_gil_owner_what = t_gil_what;
-      got = true;
-   }
-   pthread_mutex_unlock(&g_gil.m);
-   if (got) {
-      t_gil_depth = 1;
-      if (!g_tstate_valid) dvm__tstate_reset(vm);
-      else                 dvm__tstate_load(vm, &g_tstate);
-   }
-   return got;
+  if (t_gil_depth) {
+    ++t_gil_depth;
+    return true;
+  }
+  bool got = false;
+  pthread_mutex_lock(&g_gil.m);
+  /* Free *and* nobody queued: barging past a waiter would undo the fairness
+   * the queue exists for. */
+  if (!atomic_load_explicit(&g_gil.depth, memory_order_relaxed) &&
+      !g_gil_head) {
+    atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
+    g_gil.owner = pthread_self();
+    clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
+    g_gil_owner_id = gil_self_id();
+    g_gil_owner_what = t_gil_what;
+    got = true;
+  }
+  pthread_mutex_unlock(&g_gil.m);
+  if (got) {
+    t_gil_depth = 1;
+    if (!g_tstate_valid) dvm__tstate_reset(vm);
+    else                 dvm__tstate_load(vm, &g_tstate);
+  }
+  return got;
 }
 
 unsigned dvm_gil_enter_from_guest(struct dvm *vm)
 {
-   t_gil_what = "guest JNI";
-   /* No VM at all — a title with no classes*.dex runs with bytecode emulation
-    * off, and its JNI entry points still come through here. */
-   if (!vm) return 0u;
-   if (dvm_gil_held(vm)) return 0u;      /* already ours: nothing to order */
-   /* The common case by far: no Java thread is inside the VM, so the lock is
-    * free and this costs one mutex.  Dropping and re-taking the execution lock
-    * unconditionally would be three lock operations per JNI call — and the
-    * execution lock is a ticket, so re-taking it means going to the back of
-    * the queue and sleeping.  UnitySampleGame, which calls into Java every
-    * frame, lost four fifths of its frame rate to exactly that. */
-   if (gil_tryacquire(vm)) return 1u;
-   unsigned ael = arm_lock_unlock_all();
-   dvm_gil_acquire(vm);
-   arm_lock_relock(ael);
-   return 1u;
+  t_gil_what = "guest JNI";
+  /* No VM at all — a title with no classes*.dex runs with bytecode emulation
+   * off, and its JNI entry points still come through here. */
+  if (!vm) return 0u;
+  if (dvm_gil_held(vm)) return 0u;      /* already ours: nothing to order */
+  /* The common case by far: no Java thread is inside the VM, so the lock is
+   * free and this costs one mutex.  Dropping and re-taking the execution lock
+   * unconditionally would be three lock operations per JNI call — and the
+   * execution lock is a ticket, so re-taking it means going to the back of
+   * the queue and sleeping.  UnitySampleGame, which calls into Java every
+   * frame, lost four fifths of its frame rate to exactly that. */
+  if (gil_tryacquire(vm)) return 1u;
+  unsigned ael = arm_lock_unlock_all();
+  dvm_gil_acquire(vm);
+  arm_lock_relock(ael);
+  return 1u;
 }
 
 void dvm_gil_leave_to_guest(struct dvm *vm, unsigned cookie)
 {
-   /* Releasing never blocks, so the execution lock can stay where it is. */
-   if (!vm || !cookie) return;
-   dvm_gil_release(vm);
+  /* Releasing never blocks, so the execution lock can stay where it is. */
+  if (!vm || !cookie) return;
+  dvm_gil_release(vm);
 }
 
 extern int arm_exec_host_ui_thread(void) __attribute__((weak));
@@ -5234,326 +6158,358 @@ extern void arm_exec_main_looper_leave(void) __attribute__((weak));
  * thread itself must not re-enter that thread's Handler callbacks. */
 static void ui_before_platform_wait(struct dvm *vm)
 {
-   static _Thread_local bool active;
-   if (active || !arm_exec_host_ui_thread || !arm_exec_host_ui_thread()) return;
-   active = true;
-   if (!dvm__logical_main_thread(vm) && arm_exec_main_looper_enter &&
-       arm_exec_main_looper_leave && arm_exec_main_looper_enter()) {
-      /* The host executor is borrowed by a suspended non-main guest. Run
-       * the main Looper as its own Java/native identity, then restore it. */
-      dvm_main_looper_tick(vm);
-      arm_exec_main_looper_leave();
-      if (arm_exec_service_host_ui) arm_exec_service_host_ui();
-      active = false;
-      return;
-   }
-   struct dvm_tstate saved, main_turn = { 0 };
-   dvm__tstate_save(vm, &saved);
-   main_turn.cur_thread = vm->main_thread;
-   dvm__tstate_load(vm, &main_turn);
-   dvm__ui_tick(vm);
-   dvm__tstate_load(vm, &saved);
-   if (arm_exec_service_host_ui) arm_exec_service_host_ui();
-   active = false;
+  static _Thread_local bool active;
+  if (active || !arm_exec_host_ui_thread || !arm_exec_host_ui_thread()) return;
+  active = true;
+  if (!dvm__logical_main_thread(vm) && arm_exec_main_looper_enter &&
+      arm_exec_main_looper_leave && arm_exec_main_looper_enter()) {
+    /* The host executor is borrowed by a suspended non-main guest. Run
+     * the main Looper as its own Java/native identity, then restore it. */
+    dvm_main_looper_tick(vm);
+    arm_exec_main_looper_leave();
+    if (arm_exec_service_host_ui) arm_exec_service_host_ui();
+    active = false;
+    return;
+  }
+  struct dvm_tstate saved, main_turn = { 0 };
+  dvm__tstate_save(vm, &saved);
+  main_turn.cur_thread = vm->main_thread;
+  dvm__tstate_load(vm, &main_turn);
+  dvm__ui_tick(vm);
+  dvm__tstate_load(vm, &saved);
+  if (arm_exec_service_host_ui) arm_exec_service_host_ui();
+  active = false;
 }
 
 void dvm_gil_wait(struct dvm *vm, unsigned ms)
 {
-   if (dvm_is_stopping(vm)) return;
-   ui_before_platform_wait(vm);
-   /* Snapshot while still owning GIL.  A producer cannot change a VM
-    * condition until this thread releases GIL, so any later condition change
-    * also advances the sequence. */
-   pthread_mutex_lock(&g_gil.m);
-   unsigned long long seen = g_gil_change_seq;
-   pthread_mutex_unlock(&g_gil.m);
+  if (dvm_is_stopping(vm)) return;
+  ui_before_platform_wait(vm);
+  /* Snapshot while still owning GIL.  A producer cannot change a VM
+   * condition until this thread releases GIL, so any later condition change
+   * also advances the sequence. */
+  pthread_mutex_lock(&g_gil.m);
+  unsigned long long seen = g_gil_change_seq;
+  pthread_mutex_unlock(&g_gil.m);
 
-   unsigned d = dvm_gil_unlock_all(vm);
-   /* A blocking VM wait reached from a guest JNI call still owns the ARM
-    * execution lock, and what it is waiting for almost always needs it: the
-    * joined Java thread's own native calls, and the pump that drains the
-    * pending-Runnable queue.  Holding it here stopped every guest thread --
-    * and the pump with them -- for the whole wait, which is the one thing that
-    * guarantees the condition never becomes true.  Give it up for the
-    * duration, exactly as dvm_gil_enter_from_guest() does when GIL is
-    * contended, and take it back in lock order (GIL, then AEL). */
-   unsigned ael = arm_lock_unlock_all();
-   struct timespec ts;
-   clock_gettime(CLOCK_REALTIME, &ts);
-   ts.tv_sec  += (time_t)(ms / 1000u);
-   ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
-   if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
-   pthread_mutex_lock(&g_gil.m);
-   while (g_gil_change_seq == seen && !dvm_is_stopping(vm)) {
-      int rc = pthread_cond_timedwait(&g_gil_change, &g_gil.m, &ts);
-      if (rc != 0) break;
-   }
-   pthread_mutex_unlock(&g_gil.m);
-   dvm_gil_relock(vm, d);
-   arm_lock_relock(ael);
+  unsigned d = dvm_gil_unlock_all(vm);
+  /* A blocking VM wait reached from a guest JNI call still owns the ARM
+   * execution lock, and what it is waiting for almost always needs it: the
+   * joined Java thread's own native calls, and the pump that drains the
+   * pending-Runnable queue.  Holding it here stopped every guest thread --
+   * and the pump with them -- for the whole wait, which is the one thing that
+   * guarantees the condition never becomes true.  Give it up for the
+   * duration, exactly as dvm_gil_enter_from_guest() does when GIL is
+   * contended, and take it back in lock order (GIL, then AEL). */
+  unsigned ael = arm_lock_unlock_all();
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec  += (time_t)(ms / 1000u);
+  ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_nsec -= 1000000000L;
+    ++ts.tv_sec;
+  }
+  pthread_mutex_lock(&g_gil.m);
+  while (g_gil_change_seq == seen && !dvm_is_stopping(vm)) {
+    int rc = pthread_cond_timedwait(&g_gil_change, &g_gil.m, &ts);
+    if (rc != 0) break;
+  }
+  pthread_mutex_unlock(&g_gil.m);
+  dvm_gil_relock(vm, d);
+  arm_lock_relock(ael);
 }
 
 void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
 {
-   if (!channel) { dvm_gil_wait(vm, ms); return; }
-   dvm_gil_wait_for_ns(vm, channel, (uint64_t)ms * 1000000ull);
+  if (!channel) {
+    dvm_gil_wait(vm, ms);
+    return;
+  }
+  dvm_gil_wait_for_ns(vm, channel, (uint64_t)ms * 1000000ull);
 }
 
 void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
 {
-   if (dvm_is_stopping(vm)) return;
+  if (dvm_is_stopping(vm)) return;
 
-   struct dvm_event_waiter w;
-   pthread_condattr_t attr;
-   pthread_condattr_init(&attr);
-   clockid_t clock = CLOCK_REALTIME;
+  struct dvm_event_waiter w;
+  pthread_condattr_t attr;
+  pthread_condattr_init(&attr);
+  clockid_t clock = CLOCK_REALTIME;
 #if defined(__linux__)
-   if (!pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)) clock = CLOCK_MONOTONIC;
+  if (!pthread_condattr_setclock(&attr, CLOCK_MONOTONIC)) clock = CLOCK_MONOTONIC;
 #endif
-   pthread_cond_init(&w.cv, &attr);
-   pthread_condattr_destroy(&attr);
-   w.channel = channel;
-   w.ready = false;
-   {
-      static int dump_on = -1;
-      if (dump_on < 0) {
-         const char *e = getenv("LUNARIA_DVM_WAITDUMP");
-         dump_on = e && *e && *e != '0';
+  pthread_cond_init(&w.cv, &attr);
+  pthread_condattr_destroy(&attr);
+  w.channel = channel;
+  w.ready = false;
+  {
+    static int dump_on = -1;
+    if (dump_on < 0) {
+      const char *e = getenv("LUNARIA_DVM_WAITDUMP");
+      dump_on = e && *e && *e != '0';
 #ifndef _WIN32
-         if (dump_on) signal(SIGUSR2, dvm_waitdump);
+      if (dump_on) signal(SIGUSR2, dvm_waitdump);
 #endif
+    }
+    w.where[0] = 0;
+    if (dump_on && vm) {
+      size_t n = 0;
+      for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 5 && n + 2 < sizeof w.where; --i, ++shown) {
+        const struct dvm_method *f = vm->callstack[i];
+        if (!f) continue;
+        n += (size_t)snprintf(w.where + n, sizeof w.where - n, "%s%s.%s", shown ? " <- " : "",
+                              f->cls && f->cls->name ? f->cls->name : "?", f->name ? f->name : "?");
+        if (n >= sizeof w.where) {
+          n = sizeof w.where - 1;
+          break;
+        }
       }
-      w.where[0] = 0;
-      if (dump_on && vm) {
-         size_t n = 0;
-         for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 5 && n + 2 < sizeof w.where; --i, ++shown) {
-            const struct dvm_method *f = vm->callstack[i];
-            if (!f) continue;
-            n += (size_t)snprintf(w.where + n, sizeof w.where - n, "%s%s.%s", shown ? " <- " : "",
-                                  f->cls && f->cls->name ? f->cls->name : "?", f->name ? f->name : "?");
-            if (n >= sizeof w.where) { n = sizeof w.where - 1; break; }
-         }
-      }
-   }
+    }
+  }
 
-   /* Register before dropping GIL.  A producer cannot change the protected VM
-    * state before GIL is released, so it cannot notify in the registration
-    * gap.  This gives condvars event semantics without a polling timeout. */
-   pthread_mutex_lock(&g_gil.m);
-   w.next = g_event_waiters;
-   g_event_waiters = &w;
-   pthread_mutex_unlock(&g_gil.m);
+  /* Register before dropping GIL.  A producer cannot change the protected VM
+   * state before GIL is released, so it cannot notify in the registration
+   * gap.  This gives condvars event semantics without a polling timeout. */
+  pthread_mutex_lock(&g_gil.m);
+  w.next = g_event_waiters;
+  g_event_waiters = &w;
+  pthread_mutex_unlock(&g_gil.m);
 
-   /* Main work can notify this very waiter. Register first so a notification
-    * delivered while the borrowed host executor services UI is not lost. */
-   ui_before_platform_wait(vm);
+  /* Main work can notify this very waiter. Register first so a notification
+   * delivered while the borrowed host executor services UI is not lost. */
+  ui_before_platform_wait(vm);
 
-   unsigned d = dvm_gil_unlock_all(vm);
-   /* See dvm_gil_wait(): the execution lock cannot be held across a wait for
-    * something that needs it to happen. */
-   unsigned ael = arm_lock_unlock_all();
-   struct timespec ts;
-   if (ns != UINT64_MAX) {
-      clock_gettime(clock, &ts);
-      ts.tv_sec  += (time_t)(ns / 1000000000ull);
-      ts.tv_nsec += (long)(ns % 1000000000ull);
-      if (ts.tv_nsec >= 1000000000L) { ts.tv_nsec -= 1000000000L; ++ts.tv_sec; }
-   }
+  unsigned d = dvm_gil_unlock_all(vm);
+  /* See dvm_gil_wait(): the execution lock cannot be held across a wait for
+   * something that needs it to happen. */
+  unsigned ael = arm_lock_unlock_all();
+  struct timespec ts;
+  if (ns != UINT64_MAX) {
+    clock_gettime(clock, &ts);
+    ts.tv_sec  += (time_t)(ns / 1000000000ull);
+    ts.tv_nsec += (long)(ns % 1000000000ull);
+    if (ts.tv_nsec >= 1000000000L) {
+      ts.tv_nsec -= 1000000000L;
+      ++ts.tv_sec;
+    }
+  }
 
-   pthread_mutex_lock(&g_gil.m);
-   while (!w.ready && !dvm_is_stopping(vm)) {
-      int rc = ns == UINT64_MAX ? pthread_cond_wait(&w.cv, &g_gil.m)
-                               : pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
-      if (rc != 0) break;
-   }
-   struct dvm_event_waiter **link = &g_event_waiters;
-   while (*link && *link != &w) link = &(*link)->next;
-   if (*link) *link = w.next;
-   pthread_mutex_unlock(&g_gil.m);
+  pthread_mutex_lock(&g_gil.m);
+  while (!w.ready && !dvm_is_stopping(vm)) {
+    int rc = ns == UINT64_MAX ? pthread_cond_wait(&w.cv, &g_gil.m)
+             : pthread_cond_timedwait(&w.cv, &g_gil.m, &ts);
+    if (rc != 0) break;
+  }
+  struct dvm_event_waiter **link = &g_event_waiters;
+  while (*link && *link != &w) link = &(*link)->next;
+  if (*link) *link = w.next;
+  pthread_mutex_unlock(&g_gil.m);
 
-   pthread_cond_destroy(&w.cv);
-   dvm_gil_relock(vm, d);
-   arm_lock_relock(ael);
+  pthread_cond_destroy(&w.cv);
+  dvm_gil_relock(vm, d);
+  arm_lock_relock(ael);
 }
 
-struct dvm *dvm_current(void) { return g_gil_vm; }
+struct dvm *dvm_current(void) {
+  return g_gil_vm;
+}
 
 bool dvm_gil_held(struct dvm *vm)
 {
-   (void)vm;
-   return t_gil_depth != 0u;
+  (void)vm;
+  return t_gil_depth != 0u;
 }
 
 void dvm_gil_acquire(struct dvm *vm)
 {
-   if (t_gil_depth) { ++t_gil_depth; return; }
+  if (t_gil_depth) {
+    ++t_gil_depth;
+    return;
+  }
 
-   /* Keep the global lock order GIL -> AEL at the primitive boundary.
-    *
-    * Most callers are pure bytecode threads and do not own the ARM execution
-    * lock.  A Java -> native -> Java callback is different: the native half
-    * can return to dvm__call_out() while its callback SVC still owns AEL, and
-    * the old dvm_gil_relock() then waited here without dropping AEL.  At the
-    * same time the pump could own GIL and be re-taking AEL after a JNI call:
-    * a real ABBA deadlock.
-    *
-    * Preserve the uncontended hot path.  Taking a free GIL cannot wait and is
-    * therefore safe while AEL is held.  On contention, release every recursive
-    * AEL level before joining the FIFO GIL queue and restore it only after GIL
-    * ownership has been handed to us.  Putting this here, rather than in each
-    * callback path, makes the ordering invariant apply to every current and
-    * future GIL acquisition. */
-   if (gil_tryacquire(vm)) return;
-   unsigned ael_depth = arm_lock_unlock_all();
+  /* Keep the global lock order GIL -> AEL at the primitive boundary.
+   *
+   * Most callers are pure bytecode threads and do not own the ARM execution
+   * lock.  A Java -> native -> Java callback is different: the native half
+   * can return to dvm__call_out() while its callback SVC still owns AEL, and
+   * the old dvm_gil_relock() then waited here without dropping AEL.  At the
+   * same time the pump could own GIL and be re-taking AEL after a JNI call:
+   * a real ABBA deadlock.
+   *
+   * Preserve the uncontended hot path.  Taking a free GIL cannot wait and is
+   * therefore safe while AEL is held.  On contention, release every recursive
+   * AEL level before joining the FIFO GIL queue and restore it only after GIL
+   * ownership has been handed to us.  Putting this here, rather than in each
+   * callback path, makes the ordering invariant apply to every current and
+   * future GIL acquisition. */
+  if (gil_tryacquire(vm)) return;
+  unsigned ael_depth = arm_lock_unlock_all();
 
-   pthread_mutex_lock(&g_gil.m);
-   if (!atomic_load_explicit(&g_gil.depth, memory_order_relaxed) &&
-       !g_gil_head) {
-      atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
-   } else {
-      /* The waiter lives on this thread's stack.  Safe: the releaser only
-       * touches it under g_gil.m, and this thread does not leave the wait
-       * until it has been dequeued under the same mutex. */
-      struct dvm_gil_waiter w;
-      pthread_cond_init(&w.cv, NULL);
-      w.next = NULL;
-      w.go   = false;
-      if (g_gil_tail) g_gil_tail->next = &w; else g_gil_head = &w;
-      g_gil_tail = &w;
-      atomic_fetch_add_explicit(&g_gil.waiters, 1, memory_order_relaxed);
-      struct timespec w0, w1;
-      clock_gettime(CLOCK_MONOTONIC, &w0);
-      while (!w.go)
-         pthread_cond_wait(&w.cv, &g_gil.m);
-      clock_gettime(CLOCK_MONOTONIC, &w1);
-      atomic_fetch_sub_explicit(&g_gil.waiters, 1, memory_order_relaxed);
-      pthread_cond_destroy(&w.cv);
-      const unsigned long long d = gil_ns_since(&w0, &w1);
-      atomic_fetch_add_explicit(&g_gil_wait_ns, d, memory_order_relaxed);
-      unsigned long long old = atomic_load_explicit(
-         &g_gil_max_wait_ns, memory_order_relaxed);
-      while (old < d && !atomic_compare_exchange_weak_explicit(
-               &g_gil_max_wait_ns, &old, d,
-               memory_order_relaxed, memory_order_relaxed)) {}
-      if (d >= GIL_SLOW_WAIT_NS) {
-         static unsigned said;
-         if (said < 64u || (said % 200u) == 0u)
-            fprintf(stderr, "[gil] thread %u (%s) waited %.1f ms for the "
-                    "interpreter lock; it was held by thread %u (%s)\n",
-                    gil_self_id(), t_gil_what, (double)d / 1e6,
-                    g_gil_owner_id, g_gil_owner_what);
-         ++said;
-      }
-      /* g_gil.depth stayed 1: the releaser handed ownership straight over. */
-   }
-   g_gil.owner = pthread_self();
-   clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
-   g_gil_owner_id = gil_self_id();
-   g_gil_owner_what = t_gil_what;
-   pthread_mutex_unlock(&g_gil.m);
-   t_gil_depth = 1;
-   /* Nobody else can be interpreting now, so the VM's per-thread fields are
-    * free for this thread to install its own into.
-    *
-    * A thread that has never held the lock has nothing saved, and the fields
-    * still hold the previous holder's — its call stack, its pending exception
-    * and the steps it has already spent.  Leaving them was survivable while a
-    * new thread always called dvm__tstate_reset() before it first interpreted;
-    * it stopped being so once threads take the lock more often, and a freshly
-    * started java/lang/Thread inherited a call_steps that was already at the
-    * limit, so its first method aborted with "step limit reached". */
-   if (!g_tstate_valid) dvm__tstate_reset(vm);
-   else                 dvm__tstate_load(vm, &g_tstate);
+  pthread_mutex_lock(&g_gil.m);
+  if (!atomic_load_explicit(&g_gil.depth, memory_order_relaxed) &&
+      !g_gil_head) {
+    atomic_store_explicit(&g_gil.depth, 1, memory_order_relaxed);
+  } else {
+    /* The waiter lives on this thread's stack.  Safe: the releaser only
+     * touches it under g_gil.m, and this thread does not leave the wait
+     * until it has been dequeued under the same mutex. */
+    struct dvm_gil_waiter w;
+    pthread_cond_init(&w.cv, NULL);
+    w.next = NULL;
+    w.go   = false;
+    if (g_gil_tail) g_gil_tail->next = &w;
+    else g_gil_head = &w;
+    g_gil_tail = &w;
+    atomic_fetch_add_explicit(&g_gil.waiters, 1, memory_order_relaxed);
+    struct timespec w0, w1;
+    clock_gettime(CLOCK_MONOTONIC, &w0);
+    while (!w.go)
+      pthread_cond_wait(&w.cv, &g_gil.m);
+    clock_gettime(CLOCK_MONOTONIC, &w1);
+    atomic_fetch_sub_explicit(&g_gil.waiters, 1, memory_order_relaxed);
+    pthread_cond_destroy(&w.cv);
+    const unsigned long long d = gil_ns_since(&w0, &w1);
+    atomic_fetch_add_explicit(&g_gil_wait_ns, d, memory_order_relaxed);
+    unsigned long long old = atomic_load_explicit(
+                               &g_gil_max_wait_ns, memory_order_relaxed);
+    while (old < d && !atomic_compare_exchange_weak_explicit(
+             &g_gil_max_wait_ns, &old, d,
+             memory_order_relaxed, memory_order_relaxed)) {}
+    if (d >= GIL_SLOW_WAIT_NS) {
+      static unsigned said;
+      if (said < 64u || (said % 200u) == 0u)
+        fprintf(stderr, "[gil] thread %u (%s) waited %.1f ms for the "
+                        "interpreter lock; it was held by thread %u (%s)\n",
+                gil_self_id(), t_gil_what, (double)d / 1e6,
+                g_gil_owner_id, g_gil_owner_what);
+      ++said;
+    }
+    /* g_gil.depth stayed 1: the releaser handed ownership straight over. */
+  }
+  g_gil.owner = pthread_self();
+  clock_gettime(CLOCK_MONOTONIC, &g_gil_held_since);
+  g_gil_owner_id = gil_self_id();
+  g_gil_owner_what = t_gil_what;
+  pthread_mutex_unlock(&g_gil.m);
+  t_gil_depth = 1;
+  /* Nobody else can be interpreting now, so the VM's per-thread fields are
+   * free for this thread to install its own into.
+   *
+   * A thread that has never held the lock has nothing saved, and the fields
+   * still hold the previous holder's — its call stack, its pending exception
+   * and the steps it has already spent.  Leaving them was survivable while a
+   * new thread always called dvm__tstate_reset() before it first interpreted;
+   * it stopped being so once threads take the lock more often, and a freshly
+   * started java/lang/Thread inherited a call_steps that was already at the
+   * limit, so its first method aborted with "step limit reached". */
+  if (!g_tstate_valid) dvm__tstate_reset(vm);
+  else                 dvm__tstate_load(vm, &g_tstate);
 
-   arm_lock_relock(ael_depth);
+  arm_lock_relock(ael_depth);
 }
 
 /* LUNARIA_PROF_GIL=1: who holds the interpreter lock, per thread, every 5 s. */
-struct gil_prof { unsigned id; const char *what; const char *root; unsigned long long ns; };
+struct gil_prof {
+  unsigned id;
+  const char *what;
+  const char *root;
+  unsigned long long ns;
+};
 static struct gil_prof g_gil_prof[48];
 static int g_gil_prof_n;
 static unsigned long long g_gil_prof_last;
 static void gil_prof_account(struct dvm *vm, unsigned long long held_ns)
 {
-   static int on = -1;
-   if (on < 0) on = getenv("LUNARIA_PROF_GIL") != NULL;
-   if (!on) return;
-   const unsigned id = g_gil_owner_id;
-   struct gil_prof *e = NULL;
-   for (int i = 0; i < g_gil_prof_n; ++i) if (g_gil_prof[i].id == id) { e = &g_gil_prof[i]; break; }
-   if (!e && g_gil_prof_n < 48) { e = &g_gil_prof[g_gil_prof_n++]; e->id = id; e->root = "?"; }
-   if (e) {
-      e->ns += held_ns; e->what = g_gil_owner_what;
-      if (vm->ncallstack > 0 && vm->ncallstack <= 128 && vm->callstack[0] && vm->callstack[0]->cls)
-         e->root = vm->callstack[0]->cls->name;
-   }
-   struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-   const unsigned long long now = (unsigned long long)t.tv_sec * 1000000000ull + t.tv_nsec;
-   if (!g_gil_prof_last) g_gil_prof_last = now;
-   if (now - g_gil_prof_last >= 5000000000ull) {
-      for (int i = 0; i < g_gil_prof_n; ++i) {
-         if (g_gil_prof[i].ns > 20000000ull)
-            fprintf(stderr, "[gil-prof] thread %u (%s) %s: %.0f ms of 5000\n", g_gil_prof[i].id,
-                    g_gil_prof[i].what ? g_gil_prof[i].what : "?", g_gil_prof[i].root, (double)g_gil_prof[i].ns / 1e6);
-         g_gil_prof[i].ns = 0;
-      }
-      g_gil_prof_last = now;
-   }
+  static int on = -1;
+  if (on < 0) on = getenv("LUNARIA_PROF_GIL") != NULL;
+  if (!on) return;
+  const unsigned id = g_gil_owner_id;
+  struct gil_prof *e = NULL;
+  for (int i = 0; i < g_gil_prof_n; ++i) if (g_gil_prof[i].id == id) {
+      e = &g_gil_prof[i];
+      break;
+    }
+  if (!e && g_gil_prof_n < 48) {
+    e = &g_gil_prof[g_gil_prof_n++];
+    e->id = id;
+    e->root = "?";
+  }
+  if (e) {
+    e->ns += held_ns;
+    e->what = g_gil_owner_what;
+    if (vm->ncallstack > 0 && vm->ncallstack <= 128 && vm->callstack[0] && vm->callstack[0]->cls)
+      e->root = vm->callstack[0]->cls->name;
+  }
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  const unsigned long long now = (unsigned long long)t.tv_sec * 1000000000ull + t.tv_nsec;
+  if (!g_gil_prof_last) g_gil_prof_last = now;
+  if (now - g_gil_prof_last >= 5000000000ull) {
+    for (int i = 0; i < g_gil_prof_n; ++i) {
+      if (g_gil_prof[i].ns > 20000000ull)
+        fprintf(stderr, "[gil-prof] thread %u (%s) %s: %.0f ms of 5000\n", g_gil_prof[i].id,
+                g_gil_prof[i].what ? g_gil_prof[i].what : "?", g_gil_prof[i].root, (double)g_gil_prof[i].ns / 1e6);
+      g_gil_prof[i].ns = 0;
+    }
+    g_gil_prof_last = now;
+  }
 }
 
 void dvm_gil_release(struct dvm *vm)
 {
-   if (!t_gil_depth) return;      /* not ours to release */
-   if (--t_gil_depth) return;     /* still held by an outer acquire */
-   /* Still the owner here — g_gil.depth is only cleared below — so this reads
-    * a VM no other thread can be touching. */
-   dvm__tstate_save(vm, &g_tstate);
-   g_tstate_valid = true;
-   pthread_mutex_lock(&g_gil.m);
-   {
-      struct timespec now;
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      const unsigned long long held = gil_ns_since(&g_gil_held_since, &now);
-      atomic_fetch_add_explicit(&g_gil_held_ns, held, memory_order_relaxed);
-      gil_prof_account(vm, held);
-   }
-   struct dvm_gil_waiter *w = g_gil_head;
-   if (w) {
-      g_gil_head = w->next;
-      if (!g_gil_head) g_gil_tail = NULL;
-      w->go = true;
-      pthread_cond_signal(&w->cv);
-   } else {
-      atomic_store_explicit(&g_gil.depth, 0, memory_order_release);
-   }
-   pthread_mutex_unlock(&g_gil.m);
+  if (!t_gil_depth) return;      /* not ours to release */
+  if (--t_gil_depth) return;     /* still held by an outer acquire */
+  /* Still the owner here — g_gil.depth is only cleared below — so this reads
+   * a VM no other thread can be touching. */
+  dvm__tstate_save(vm, &g_tstate);
+  g_tstate_valid = true;
+  pthread_mutex_lock(&g_gil.m);
+  {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const unsigned long long held = gil_ns_since(&g_gil_held_since, &now);
+    atomic_fetch_add_explicit(&g_gil_held_ns, held, memory_order_relaxed);
+    gil_prof_account(vm, held);
+  }
+  struct dvm_gil_waiter *w = g_gil_head;
+  if (w) {
+    g_gil_head = w->next;
+    if (!g_gil_head) g_gil_tail = NULL;
+    w->go = true;
+    pthread_cond_signal(&w->cv);
+  } else {
+    atomic_store_explicit(&g_gil.depth, 0, memory_order_release);
+  }
+  pthread_mutex_unlock(&g_gil.m);
 }
 
 unsigned dvm_gil_unlock_all(struct dvm *vm)
 {
-   unsigned d = t_gil_depth;
-   if (d) {
-      t_gil_depth = 1u;
-      dvm_gil_release(vm);
-   }
-   return d;
+  unsigned d = t_gil_depth;
+  if (d) {
+    t_gil_depth = 1u;
+    dvm_gil_release(vm);
+  }
+  return d;
 }
 
 void dvm_gil_relock(struct dvm *vm, unsigned depth)
 {
-   if (!depth) return;
-   dvm_gil_acquire(vm);
-   t_gil_depth = depth;
+  if (!depth) return;
+  dvm_gil_acquire(vm);
+  t_gil_depth = depth;
 }
 
 void dvm_gil_yield(struct dvm *vm)
 {
-   if (!atomic_load_explicit(&g_gil.waiters, memory_order_relaxed)) return;
-   unsigned d = dvm_gil_unlock_all(vm);
-   if (!d) return;
-   /* No sched_yield(): dvm_gil_acquire() queues this thread behind everyone
-    * who was already waiting, which is the hand-off this call is asking for. */
-   dvm_gil_relock(vm, d);
+  if (!atomic_load_explicit(&g_gil.waiters, memory_order_relaxed)) return;
+  unsigned d = dvm_gil_unlock_all(vm);
+  if (!d) return;
+  /* No sched_yield(): dvm_gil_acquire() queues this thread behind everyone
+   * who was already waiting, which is the hand-off this call is asking for. */
+  dvm_gil_relock(vm, d);
 }
 
 /* LUNARIA_CALL_HISTO=1: which Java methods native code (or the scheduler)
@@ -5561,88 +6517,101 @@ void dvm_gil_yield(struct dvm *vm)
  * increment under a race costs a diagnostic one tick. */
 static void call_histogram(const struct dvm_method *m)
 {
-   static int enabled = -1;
-   static struct { const struct dvm_method *m; uint64_t n; } slot[512];
-   static uint64_t last_report;
-   if (enabled < 0) enabled = getenv("LUNARIA_CALL_HISTO") != NULL;
-   if (!enabled) return;
-   size_t h = ((uintptr_t)m >> 4) & 511;
-   for (size_t k = 0; k < 512; ++k, h = (h + 1) & 511) {
-      if (slot[h].m == m) { ++slot[h].n; break; }
-      if (!slot[h].m) { slot[h].m = m; slot[h].n = 1; break; }
-   }
-   const uint64_t now = dvm__now_ms();
-   if (!last_report) last_report = now;
-   if (now - last_report < 10000) return;
-   last_report = now;
-   for (int pass = 0; pass < 12; ++pass) {
-      size_t best = 512;
-      for (size_t i = 0; i < 512; ++i)
-         if (slot[i].m && (best == 512 || slot[i].n > slot[best].n)) best = i;
-      if (best == 512 || !slot[best].n) break;
-      fprintf(stderr, "[call-histo] %8llu %s.%s%s\n", (unsigned long long)slot[best].n,
-              slot[best].m->cls ? slot[best].m->cls->name : "?", slot[best].m->name,
-              slot[best].m->sig ? slot[best].m->sig : "");
-      slot[best].n = 0;
-   }
-   fprintf(stderr, "[call-histo] ----\n");
+  static int enabled = -1;
+  static struct {
+    const struct dvm_method *m;
+    uint64_t n;
+  } slot[512];
+  static uint64_t last_report;
+  if (enabled < 0) enabled = getenv("LUNARIA_CALL_HISTO") != NULL;
+  if (!enabled) return;
+  size_t h = ((uintptr_t)m >> 4) & 511;
+  for (size_t k = 0; k < 512; ++k, h = (h + 1) & 511) {
+    if (slot[h].m == m) {
+      ++slot[h].n;
+      break;
+    }
+    if (!slot[h].m) {
+      slot[h].m = m;
+      slot[h].n = 1;
+      break;
+    }
+  }
+  const uint64_t now = dvm__now_ms();
+  if (!last_report) last_report = now;
+  if (now - last_report < 10000) return;
+  last_report = now;
+  for (int pass = 0; pass < 12; ++pass) {
+    size_t best = 512;
+    for (size_t i = 0; i < 512; ++i)
+      if (slot[i].m && (best == 512 || slot[i].n > slot[best].n)) best = i;
+    if (best == 512 || !slot[best].n) break;
+    fprintf(stderr, "[call-histo] %8llu %s.%s%s\n", (unsigned long long)slot[best].n,
+            slot[best].m->cls ? slot[best].m->cls->name : "?", slot[best].m->name,
+            slot[best].m->sig ? slot[best].m->sig : "");
+    slot[best].n = 0;
+  }
+  fprintf(stderr, "[call-histo] ----\n");
 }
 
 bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
               const union dvm_value *args, int nargs, union dvm_value *out)
 {
-   union dvm_value dummy;
-   if (!out) out = &dummy;
-   memset(out, 0, sizeof *out);
-   if (!m || dvm_is_stopping(vm)) return false;
+  union dvm_value dummy;
+  if (!out) out = &dummy;
+  memset(out, 0, sizeof *out);
+  if (!m || dvm_is_stopping(vm)) return false;
 
-   uint32_t slots[256];
-   int n = values_to_slots(m->sig, args, nargs, slots, 256);
-   vm->exception = 0;
-   /* Cleared on the way in, not on the way out: the unwind path belongs to the
-    * call that just failed, and the caller (dvm__run_pending_threads(), which
-    * reports a Runnable that died) needs to read it after invoke() returns. */
-   vm->nexc_trace = 0;
-   if (!vm->depth) { vm->call_steps = 0; vm->parked = false; }
-   bool ok = invoke(vm, m, self, slots, n, out);
-   if (!ok && vm->exception && !vm->quiet_uncaught) {
-      char buf[512];
-      dvm_describe_exception(vm, vm->exception, buf, sizeof buf);
-      fprintf(stderr, "[dvm] uncaught %s in %s.%s\n", buf,
-              m->cls ? m->cls->name : "?", m->name);
-      for (int i = 0; i < vm->nexc_trace; ++i) {
-         struct dvm_method *f = vm->exc_trace[i];
-         if (i == 0)
-            fprintf(stderr, "[dvm]   at %s.%s%s +0x%x\n",
-                    f->cls ? f->cls->name : "?", f->name,
-                    f->sig ? f->sig : "", vm->exc_pc * 2);
-         else
-            fprintf(stderr, "[dvm]   at %s.%s%s\n",
-                    f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
-      }
-   }
-   /* The main Looper's queue is the main thread's to run.  A JNI call that a
-    * guest's own native thread makes returns to that thread, not to a
-    * Looper: running Handler messages there executed them on whichever
-    * thread happened to call into Java — androidx.sqlite's ProcessLock then
-    * re-entered itself from inside Thread.sleep and deadlocked the process on
-    * its own file lock, and Play services' checkMainThread() failed. */
-   /* A failed synchronous call returns its exception to its caller. Handler
-    * dispatch invokes other Java methods, which clear the exception on entry;
-    * it must wait until the caller has handled the pending exception. */
-   if (!vm->depth && dvm_on_main_thread() && !vm->exception) {
-      /* vm->parked describes the call that just returned — "this thread is
-       * blocked inside the platform", which its caller has to act on.  The
-       * drain below runs other Runnables and each clears the flag on its way
-       * out, so a thread that parked was reported as having finished normally
-       * and was dropped instead of re-queued.  Volley's NetworkDispatchers
-       * disappeared exactly this way whenever the drain had anything else to
-       * run, leaving later requests with no consumer. */
-      const bool parked_here = vm->parked;
-      dvm__run_pending_threads(vm);
-      vm->parked = parked_here;
-   }
-   return ok;
+  uint32_t slots[256];
+  int n = values_to_slots(m->sig, args, nargs, slots, 256);
+  vm->exception = 0;
+  /* Cleared on the way in, not on the way out: the unwind path belongs to the
+   * call that just failed, and the caller (dvm__run_pending_threads(), which
+   * reports a Runnable that died) needs to read it after invoke() returns. */
+  vm->nexc_trace = 0;
+  if (!vm->depth) {
+    vm->call_steps = 0;
+    vm->parked = false;
+  }
+  bool ok = invoke(vm, m, self, slots, n, out);
+  if (!ok && vm->exception && !vm->quiet_uncaught) {
+    char buf[512];
+    dvm_describe_exception(vm, vm->exception, buf, sizeof buf);
+    fprintf(stderr, "[dvm] uncaught %s in %s.%s\n", buf,
+            m->cls ? m->cls->name : "?", m->name);
+    for (int i = 0; i < vm->nexc_trace; ++i) {
+      struct dvm_method *f = vm->exc_trace[i];
+      if (i == 0)
+        fprintf(stderr, "[dvm]   at %s.%s%s +0x%x\n",
+                f->cls ? f->cls->name : "?", f->name,
+                f->sig ? f->sig : "", vm->exc_pc * 2);
+      else
+        fprintf(stderr, "[dvm]   at %s.%s%s\n",
+                f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+    }
+  }
+  /* The main Looper's queue is the main thread's to run.  A JNI call that a
+   * guest's own native thread makes returns to that thread, not to a
+   * Looper: running Handler messages there executed them on whichever
+   * thread happened to call into Java — androidx.sqlite's ProcessLock then
+   * re-entered itself from inside Thread.sleep and deadlocked the process on
+   * its own file lock, and Play services' checkMainThread() failed. */
+  /* A failed synchronous call returns its exception to its caller. Handler
+   * dispatch invokes other Java methods, which clear the exception on entry;
+   * it must wait until the caller has handled the pending exception. */
+  if (!vm->depth && dvm_on_main_thread() && !vm->exception) {
+    /* vm->parked describes the call that just returned — "this thread is
+     * blocked inside the platform", which its caller has to act on.  The
+     * drain below runs other Runnables and each clears the flag on its way
+     * out, so a thread that parked was reported as having finished normally
+     * and was dropped instead of re-queued.  Volley's NetworkDispatchers
+     * disappeared exactly this way whenever the drain had anything else to
+     * run, leaving later requests with no consumer. */
+    const bool parked_here = vm->parked;
+    dvm__run_pending_threads(vm);
+    vm->parked = parked_here;
+  }
+  return ok;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -5655,7 +6624,7 @@ bool dvm_call(struct dvm *vm, struct dvm_method *m, dvm_ref self,
  * the answer. */
 static bool gil_busy(void)
 {
-   return atomic_load_explicit(&g_gil.depth, memory_order_acquire) != 0u;
+  return atomic_load_explicit(&g_gil.depth, memory_order_acquire) != 0u;
 }
 
 /* ---- Where the Java side spends its time (LUNARIA_DVM_PROF) --------------
@@ -5679,384 +6648,412 @@ static bool gil_busy(void)
  *
  * LUNARIA_DVM_PROF=<seconds between reports> (=1 means the 5 s default). */
 #define DVM_PROF_SLOTS 4096u
-static struct { struct dvm_method *m; unsigned long long n; } g_prof[DVM_PROF_SLOTS];
+static struct {
+  struct dvm_method *m;
+  unsigned long long n;
+} g_prof[DVM_PROF_SLOTS];
 static unsigned long long g_prof_busy, g_prof_idle;
 
 static void prof_count(struct dvm_method *m)
 {
-   size_t h = ((size_t)(uintptr_t)m >> 4) & (DVM_PROF_SLOTS - 1u);
-   for (unsigned i = 0; i < DVM_PROF_SLOTS; ++i) {
-      size_t k = (h + i) & (DVM_PROF_SLOTS - 1u);
-      if (g_prof[k].m == m || !g_prof[k].m) {
-         g_prof[k].m = m;
-         ++g_prof[k].n;
-         return;
-      }
-   }
-   /* Table full: the count is a profile, not a ledger — drop the sample. */
+  size_t h = ((size_t)(uintptr_t)m >> 4) & (DVM_PROF_SLOTS - 1u);
+  for (unsigned i = 0; i < DVM_PROF_SLOTS; ++i) {
+    size_t k = (h + i) & (DVM_PROF_SLOTS - 1u);
+    if (g_prof[k].m == m || !g_prof[k].m) {
+      g_prof[k].m = m;
+      ++g_prof[k].n;
+      return;
+    }
+  }
+  /* Table full: the count is a profile, not a ledger — drop the sample. */
 }
 
 static int prof_cmp(const void *a, const void *b)
 {
-   unsigned long long x = ((const struct { struct dvm_method *m;
-                                           unsigned long long n; } *)a)->n;
-   unsigned long long y = ((const struct { struct dvm_method *m;
-                                           unsigned long long n; } *)b)->n;
-   return x < y ? 1 : x > y ? -1 : 0;
+  unsigned long long x = ((const struct { struct dvm_method *m;
+                                          unsigned long long n; } *)a)->n;
+  unsigned long long y = ((const struct { struct dvm_method *m;
+                                          unsigned long long n; } *)b)->n;
+  return x < y ? 1 : x > y ? -1 : 0;
 }
 
 static void prof_report(void)
 {
-   const unsigned long long total = g_prof_busy + g_prof_idle;
-   if (!total) return;
-   qsort(g_prof, DVM_PROF_SLOTS, sizeof g_prof[0], prof_cmp);
-   {
-      static unsigned long long steps_last, throws_last;
-      const struct dvm *vm = g_gil_vm;
-      const unsigned long long steps = vm ? vm->steps : 0ull;
-      fprintf(stderr, "[dvmprof] %llu samples: %.0f%% in the VM, %.0f%% idle, "
-              "%.1fM bytecodes/s, %llu exceptions\n",
-              total, 100.0 * (double)g_prof_busy / (double)total,
-              100.0 * (double)g_prof_idle / (double)total,
-              (double)(steps - steps_last) / 1e6 /
-                 ((double)total * 0.002),
-              g_throws - throws_last);
-      steps_last = steps;
-      throws_last = g_throws;
-      for (int shown = 0; shown < 5; ++shown) {
-         int best = -1;
-         for (int i = 0; i < DVM_THROW_TALLY; ++i)
-            if (g_throw_tally[i].cls && g_throw_tally[i].n &&
-                (best < 0 || g_throw_tally[i].n > g_throw_tally[best].n))
-               best = i;
-         if (best < 0) break;
-         fprintf(stderr, "[dvmprof]   %8llu  %s thrown in %s.%s\n",
-                 g_throw_tally[best].n, g_throw_tally[best].cls,
-                 g_throw_tally[best].in, g_throw_tally[best].method);
-         g_throw_tally[best].n = 0;
-      }
-      memset(g_throw_tally, 0, sizeof g_throw_tally);
-   }
-   for (unsigned i = 0; i < DVM_PROF_SLOTS && i < 15u; ++i) {
-      if (!g_prof[i].m || !g_prof[i].n) break;
-      const struct dvm_method *m = g_prof[i].m;
-      fprintf(stderr, "[dvmprof]   %5.1f%%  %s.%s\n",
-              100.0 * (double)g_prof[i].n / (double)total,
-              m->cls && m->cls->name ? m->cls->name : "?", m->name);
-   }
-   memset(g_prof, 0, sizeof g_prof);
-   g_prof_busy = g_prof_idle = 0;
+  const unsigned long long total = g_prof_busy + g_prof_idle;
+  if (!total) return;
+  qsort(g_prof, DVM_PROF_SLOTS, sizeof g_prof[0], prof_cmp);
+  {
+    static unsigned long long steps_last, throws_last;
+    const struct dvm *vm = g_gil_vm;
+    const unsigned long long steps = vm ? vm->steps : 0ull;
+    fprintf(stderr, "[dvmprof] %llu samples: %.0f%% in the VM, %.0f%% idle, "
+                    "%.1fM bytecodes/s, %llu exceptions\n",
+            total, 100.0 * (double)g_prof_busy / (double)total,
+            100.0 * (double)g_prof_idle / (double)total,
+            (double)(steps - steps_last) / 1e6 /
+            ((double)total * 0.002),
+            g_throws - throws_last);
+    steps_last = steps;
+    throws_last = g_throws;
+    for (int shown = 0; shown < 5; ++shown) {
+      int best = -1;
+      for (int i = 0; i < DVM_THROW_TALLY; ++i)
+        if (g_throw_tally[i].cls && g_throw_tally[i].n &&
+            (best < 0 || g_throw_tally[i].n > g_throw_tally[best].n))
+          best = i;
+      if (best < 0) break;
+      fprintf(stderr, "[dvmprof]   %8llu  %s thrown in %s.%s\n",
+              g_throw_tally[best].n, g_throw_tally[best].cls,
+              g_throw_tally[best].in, g_throw_tally[best].method);
+      g_throw_tally[best].n = 0;
+    }
+    memset(g_throw_tally, 0, sizeof g_throw_tally);
+  }
+  for (unsigned i = 0; i < DVM_PROF_SLOTS && i < 15u; ++i) {
+    if (!g_prof[i].m || !g_prof[i].n) break;
+    const struct dvm_method *m = g_prof[i].m;
+    fprintf(stderr, "[dvmprof]   %5.1f%%  %s.%s\n",
+            100.0 * (double)g_prof[i].n / (double)total,
+            m->cls && m->cls->name ? m->cls->name : "?", m->name);
+  }
+  memset(g_prof, 0, sizeof g_prof);
+  g_prof_busy = g_prof_idle = 0;
 }
 
 static void *prof_thread(void *arg)
 {
-   const double every = *(const double *)arg;
-   free(arg);
-   struct timespec tick = { 0, 2 * 1000 * 1000 };   /* 2 ms */
-   double waited = 0.0;
-   for (;;) {
-      nanosleep(&tick, NULL);
-      waited += 0.002;
-      struct dvm *vm = g_gil_vm;
-      struct dvm_method *m =
-         vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
-      if (m && gil_busy()) { ++g_prof_busy; prof_count(m); }
-      else                      ++g_prof_idle;
-      if (waited >= every) { prof_report(); waited = 0.0; }
-   }
-   return NULL;
+  const double every = *(const double *)arg;
+  free(arg);
+  struct timespec tick = { 0, 2 * 1000 * 1000 };   /* 2 ms */
+  double waited = 0.0;
+  for (;;) {
+    nanosleep(&tick, NULL);
+    waited += 0.002;
+    struct dvm *vm = g_gil_vm;
+    struct dvm_method *m =
+      vm ? atomic_load_explicit(&vm->cur_method, memory_order_relaxed) : NULL;
+    if (m && gil_busy()) {
+      ++g_prof_busy;
+      prof_count(m);
+    }
+    else                      ++g_prof_idle;
+    if (waited >= every) {
+      prof_report();
+      waited = 0.0;
+    }
+  }
+  return NULL;
 }
 
 static void prof_start(void)
 {
-   const char *e = getenv("LUNARIA_DVM_PROF");
-   if (!e || !*e || !strcmp(e, "0")) return;
-   double every = atof(e);
-   if (every < 0.5) every = 5.0;
-   double *arg = malloc(sizeof *arg);
-   if (!arg) return;
-   *arg = every;
-   pthread_t th;
-   if (pthread_create(&th, NULL, prof_thread, arg) != 0) { free(arg); return; }
-   pthread_detach(th);
-   fprintf(stderr, "[dvmprof] sampling the interpreter every 2 ms, "
-                   "reporting every %.1f s\n", every);
+  const char *e = getenv("LUNARIA_DVM_PROF");
+  if (!e || !*e || !strcmp(e, "0")) return;
+  double every = atof(e);
+  if (every < 0.5) every = 5.0;
+  double *arg = malloc(sizeof *arg);
+  if (!arg) return;
+  *arg = every;
+  pthread_t th;
+  if (pthread_create(&th, NULL, prof_thread, arg) != 0) {
+    free(arg);
+    return;
+  }
+  pthread_detach(th);
+  fprintf(stderr, "[dvmprof] sampling the interpreter every 2 ms, "
+                  "reporting every %.1f s\n", every);
 }
 
 struct dvm *dvm_create(const struct dvm_hooks *hooks)
 {
-   struct dvm *vm = calloc(1, sizeof *vm);
-   if (!vm) return NULL;
-   vm->field_cache_generation = atomic_fetch_add_explicit(&field_cache_generation, 1, memory_order_relaxed);
-   vm->process_start_elapsed_ms = (int64_t)(luna_os_boottime_ns() / 1000000ULL);
-   vm->process_start_uptime_ms = (int64_t)(luna_os_uptime_ns() / 1000000ULL);
-   vm->main_host_thread=luna_os_thread_token();
-   atomic_init(&vm->device_keyguard_state,0);
-   atomic_init(&vm->stopping, false);
-   atomic_init(&vm->process_exit_phase, 0);
-   atomic_init(&vm->process_exit_status, 0);
-   vm->io_cancel[0] = vm->io_cancel[1] = -1;
-   if (luna_socket_pair(AF_UNIX, SOCK_STREAM, 0, vm->io_cancel) < 0) {
-      free(vm);
-      return NULL;
-   }
-   if (hooks) vm->hooks = *hooks;
-   /* The thread that creates the VM is the process's main thread: it goes on
-    * to launch the Activity and to drive the frame pump. */
-   g_is_main_thread = true;
-   /* No budget: a call on the main thread runs until it returns, as it does
-    * on a device.  dvm_set_step_limit() sets one for diagnosis. */
-   vm->step_limit = 0;
+  struct dvm *vm = calloc(1, sizeof *vm);
+  if (!vm) return NULL;
+  vm->field_cache_generation = atomic_fetch_add_explicit(&field_cache_generation, 1, memory_order_relaxed);
+  vm->process_start_elapsed_ms = (int64_t)(luna_os_boottime_ns() / 1000000ULL);
+  vm->process_start_uptime_ms = (int64_t)(luna_os_uptime_ns() / 1000000ULL);
+  vm->main_host_thread=luna_os_thread_token();
+  atomic_init(&vm->device_keyguard_state,0);
+  atomic_init(&vm->stopping, false);
+  atomic_init(&vm->process_exit_phase, 0);
+  atomic_init(&vm->process_exit_status, 0);
+  vm->io_cancel[0] = vm->io_cancel[1] = -1;
+  if (luna_socket_pair(AF_UNIX, SOCK_STREAM, 0, vm->io_cancel) < 0) {
+    free(vm);
+    return NULL;
+  }
+  if (hooks) vm->hooks = *hooks;
+  /* The thread that creates the VM is the process's main thread: it goes on
+   * to launch the Activity and to drive the frame pump. */
+  g_is_main_thread = true;
+  /* No budget: a call on the main thread runs until it returns, as it does
+   * on a device.  dvm_set_step_limit() sets one for diagnosis. */
+  vm->step_limit = 0;
 
-   const char *t = getenv("LUNARIA_DVM_TRACE");
-   if (t) vm->trace = atoi(t);
+  const char *t = getenv("LUNARIA_DVM_TRACE");
+  if (t) vm->trace = atoi(t);
 
-   dvm_runtime_install(vm);
-   g_gil_vm = vm;
-   prof_start();
-   /* The thread that creates the VM is the one the emulator runs its frame
-    * pump and its guest CPU on.  It used to take the interpreter lock here and
-    * keep it, giving it up only at chosen points — which bought the lock order
-    * (interpreter outside, execution inside) for free, but meant the lock was
-    * held 99-100% of the wall clock while the ARM JIT ran, so a Java thread
-    * only ever ran in the gaps and a JNI call from the guest waited behind
-    * every one of them (worst single wait measured: 416 ms).
-    *
-    * Now nobody holds it by default: each entry into the VM takes it for its
-    * own duration (dvm_gil_enter_from_guest, which drops the execution lock
-    * first so the order still holds).  The Java side and the guest CPU then
-    * run at the same time on different host threads.
-    * LUNARIA_DVM_GIL_HOLD=1 restores the old behaviour for comparison. */
-   if (getenv("LUNARIA_DVM_GIL_HOLD")) {
-      fprintf(stderr, "[dvm] pump holds the interpreter lock "
-                      "(LUNARIA_DVM_GIL_HOLD)\n");
-      dvm_gil_acquire(vm);
-   }
-   return vm;
+  dvm_runtime_install(vm);
+  g_gil_vm = vm;
+  prof_start();
+  /* The thread that creates the VM is the one the emulator runs its frame
+   * pump and its guest CPU on.  It used to take the interpreter lock here and
+   * keep it, giving it up only at chosen points — which bought the lock order
+   * (interpreter outside, execution inside) for free, but meant the lock was
+   * held 99-100% of the wall clock while the ARM JIT ran, so a Java thread
+   * only ever ran in the gaps and a JNI call from the guest waited behind
+   * every one of them (worst single wait measured: 416 ms).
+   *
+   * Now nobody holds it by default: each entry into the VM takes it for its
+   * own duration (dvm_gil_enter_from_guest, which drops the execution lock
+   * first so the order still holds).  The Java side and the guest CPU then
+   * run at the same time on different host threads.
+   * LUNARIA_DVM_GIL_HOLD=1 restores the old behaviour for comparison. */
+  if (getenv("LUNARIA_DVM_GIL_HOLD")) {
+    fprintf(stderr, "[dvm] pump holds the interpreter lock "
+                    "(LUNARIA_DVM_GIL_HOLD)\n");
+    dvm_gil_acquire(vm);
+  }
+  return vm;
 }
 
 void dvm_destroy(struct dvm *vm)
 {
-   if (!vm) return;
-   dvm_request_stop(vm);
-   dvm_threads_finish(vm);
-   free(vm->shutdown_hooks);
-   free(vm->network_callbacks);
-   /* A pending apply() must reach the disk before the process goes away. */
-   dvm_prefs_finish(vm);
-   dvm_nsd_finish(vm);
-   dvm_alarm_finish(vm);
-   dvm_glsurface_finish(vm);
-   luna_fd_close(vm->io_cancel[0]);
-   luna_fd_close(vm->io_cancel[1]);
+  if (!vm) return;
+  dvm_request_stop(vm);
+  dvm_threads_finish(vm);
+  free(vm->shutdown_hooks);
+  free(vm->network_callbacks);
+  /* A pending apply() must reach the disk before the process goes away. */
+  dvm_prefs_finish(vm);
+  dvm_nsd_finish(vm);
+  dvm_alarm_finish(vm);
+  dvm_glsurface_finish(vm);
+  luna_fd_close(vm->io_cancel[0]);
+  luna_fd_close(vm->io_cancel[1]);
 
-   free(vm->pending_threads);
-   free(vm->pending_is_thread);
-   free(vm->pending_due_ms);
-   free(vm->pending_looper);
-   free(vm->pending_owner);
-   free(vm->pending_token);
-   free(vm->active_object_animators);
-   free(vm->layout_observers);
+  free(vm->pending_threads);
+  free(vm->pending_is_thread);
+  free(vm->pending_due_ms);
+  free(vm->pending_looper);
+  free(vm->pending_owner);
+  free(vm->pending_token);
+  free(vm->active_object_animators);
+  free(vm->layout_observers);
 
-   for (uint32_t i = 0; i < vm->heap_size; ++i) {
-      struct dvm_object *o = heap_slot(vm, i + 1u);
-      free(o->utf8);
-      free(o->string_units);
-      object_data_destroy(o);
-      free(o->slots);
-   }
-   for (uint32_t b = 0; b < vm->heap_nblocks; ++b) free(vm->heap_blocks[b]);
-   free(vm->heap_blocks);
+  for (uint32_t i = 0; i < vm->heap_size; ++i) {
+    struct dvm_object *o = heap_slot(vm, i + 1u);
+    free(o->utf8);
+    free(o->string_units);
+    object_data_destroy(o);
+    free(o->slots);
+  }
+  for (uint32_t b = 0; b < vm->heap_nblocks; ++b) free(vm->heap_blocks[b]);
+  free(vm->heap_blocks);
 
-   for (int i = 0; i < vm->nclasses; ++i) {
-      struct dvm_class *c = vm->classes[i];
-      for (int k = 0; k < c->nmethods; ++k)
-         free(c->methods[k].sig);
-      free(c->methods);
-      free(c->mcache);
-      free(c->ifields);
-      free(c->sfields);
-      free(c->sslots);
-      free(c->ifaces);
-      free(c->desc);
-      free(c->name);
-      free(c);
-   }
-   free(vm->classes);
+  for (int i = 0; i < vm->nclasses; ++i) {
+    struct dvm_class *c = vm->classes[i];
+    for (int k = 0; k < c->nmethods; ++k)
+      free(c->methods[k].sig);
+    free(c->methods);
+    free(c->mcache);
+    free(c->ifields);
+    free(c->sfields);
+    free(c->sslots);
+    free(c->ifaces);
+    free(c->desc);
+    free(c->name);
+    free(c);
+  }
+  free(vm->classes);
 
-   for (int i = 0; i < vm->ndexes; ++i) {
-      free(vm->dexes[i]->type_cache);
-      free(vm->dexes[i]->method_cache);
-      if (vm->dexes[i]->proto_cache)
-         for (uint32_t j = 0; j < vm->dexes[i]->file.proto_ids_size; ++j)
-            free(vm->dexes[i]->proto_cache[j]);
-      free(vm->dexes[i]->proto_cache);
-      free(vm->dexes[i]->field_cache);
-      free(vm->dexes[i]->field_miss);
-      free(vm->dexes[i]->string_cache);
-      dex_close(&vm->dexes[i]->file);
-      free(vm->dexes[i]);
-   }
-   free(vm->dexes);
+  for (int i = 0; i < vm->ndexes; ++i) {
+    free(vm->dexes[i]->type_cache);
+    free(vm->dexes[i]->method_cache);
+    if (vm->dexes[i]->proto_cache)
+      for (uint32_t j = 0; j < vm->dexes[i]->file.proto_ids_size; ++j)
+        free(vm->dexes[i]->proto_cache[j]);
+    free(vm->dexes[i]->proto_cache);
+    free(vm->dexes[i]->field_cache);
+    free(vm->dexes[i]->field_miss);
+    free(vm->dexes[i]->string_cache);
+    dex_close(&vm->dexes[i]->file);
+    free(vm->dexes[i]);
+  }
+  free(vm->dexes);
 
-   /* intern keys alias their pinned String objects' utf8 storage. */
-   free(vm->interns);
+  /* intern keys alias their pinned String objects' utf8 storage. */
+  free(vm->interns);
 
-   for (int i = 0; i < vm->nmissing; ++i)
-      free(vm->missing[i]);
-   free(vm->missing);
+  for (int i = 0; i < vm->nmissing; ++i)
+    free(vm->missing[i]);
+  free(vm->missing);
 
-   if (g_gil_vm == vm) g_gil_vm = NULL;
-   free(vm);
+  if (g_gil_vm == vm) g_gil_vm = NULL;
+  free(vm);
 }
 
 bool dvm_add_dex(struct dvm *vm, const char *path)
 {
-   if (vm->ndexes == vm->dexes_cap) {
-      int cap = vm->dexes_cap ? vm->dexes_cap * 2 : 8;
-      struct dvm_dex **n = realloc(vm->dexes, (size_t)cap * sizeof *n);
-      if (!n) return false;
-      vm->dexes = n;
-      vm->dexes_cap = cap;
-   }
-   struct dvm_dex *dd = calloc(1, sizeof *dd);
-   if (!dd) return false;
-   if (!dex_open(&dd->file, path)) {
-      free(dd);
-      return false;
-   }
+  if (vm->ndexes == vm->dexes_cap) {
+    int cap = vm->dexes_cap ? vm->dexes_cap * 2 : 8;
+    struct dvm_dex **n = realloc(vm->dexes, (size_t)cap * sizeof *n);
+    if (!n) return false;
+    vm->dexes = n;
+    vm->dexes_cap = cap;
+  }
+  struct dvm_dex *dd = calloc(1, sizeof *dd);
+  if (!dd) return false;
+  if (!dex_open(&dd->file, path)) {
+    free(dd);
+    return false;
+  }
 
-   dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
-   dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
-   dd->proto_cache = calloc(dd->file.proto_ids_size + 1u, sizeof *dd->proto_cache);
-   dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
-   dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
+  dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
+  dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
+  dd->proto_cache = calloc(dd->file.proto_ids_size + 1u, sizeof *dd->proto_cache);
+  dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
+  dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
 
-   vm->dexes[vm->ndexes++] = dd;
-   fprintf(stderr, "[dvm] loaded %s: %u classes, %u methods\n",
-           path, dd->file.class_defs_size, dd->file.method_ids_size);
-   /* The boot card's only phase with a real denominator.  Reported after the
-    * parse, because that is the work the person watching was waiting on. */
-   {
-      struct stat st;
-      luna_boot_dex_loaded(path, dd->file.class_defs_size,
-                           dd->file.method_ids_size,
-                           stat(path, &st) == 0 ? (uint64_t)st.st_size : 0);
-      (void)arm_exec_boot_present();
-   }
-   return true;
+  vm->dexes[vm->ndexes++] = dd;
+  fprintf(stderr, "[dvm] loaded %s: %u classes, %u methods\n",
+          path, dd->file.class_defs_size, dd->file.method_ids_size);
+  /* The boot card's only phase with a real denominator.  Reported after the
+   * parse, because that is the work the person watching was waiting on. */
+  {
+    struct stat st;
+    luna_boot_dex_loaded(path, dd->file.class_defs_size,
+                         dd->file.method_ids_size,
+                         stat(path, &st) == 0 ? (uint64_t)st.st_size : 0);
+    (void)arm_exec_boot_present();
+  }
+  return true;
 }
 
 bool dvm_add_dex_memory(struct dvm *vm, const void *data, size_t len,
                         const char *name)
 {
-   if (!vm || !data || len < 112u /* dex header */) return false;
-   if (memcmp(data, "dex\n", 4) != 0) {
-      fprintf(stderr, "[dvm] %s: not a dex (magic %.4s)\n",
-              name ? name : "in-memory dex", (const char *)data);
-      return false;
-   }
-   if (vm->ndexes == vm->dexes_cap) {
-      int cap = vm->dexes_cap ? vm->dexes_cap * 2 : 8;
-      struct dvm_dex **n = realloc(vm->dexes, (size_t)cap * sizeof *n);
-      if (!n) return false;
-      vm->dexes = n;
-      vm->dexes_cap = cap;
-   }
-   struct dvm_dex *dd = calloc(1, sizeof *dd);
-   if (!dd) return false;
-   /* The buffer belongs to whoever handed it over (guest memory, for an
-    * InMemoryDexClassLoader), so keep our own copy for dex_close() to free. */
-   uint8_t *copy = malloc(len);
-   if (!copy) { free(dd); return false; }
-   memcpy(copy, data, len);
-   if (!dex_open_memory(&dd->file, copy, len, name ? name : "in-memory dex")) {
-      free(copy);
-      free(dd);
-      return false;
-   }
-   dd->file.owned = copy;
+  if (!vm || !data || len < 112u /* dex header */) return false;
+  if (memcmp(data, "dex\n", 4) != 0) {
+    fprintf(stderr, "[dvm] %s: not a dex (magic %.4s)\n",
+            name ? name : "in-memory dex", (const char *)data);
+    return false;
+  }
+  if (vm->ndexes == vm->dexes_cap) {
+    int cap = vm->dexes_cap ? vm->dexes_cap * 2 : 8;
+    struct dvm_dex **n = realloc(vm->dexes, (size_t)cap * sizeof *n);
+    if (!n) return false;
+    vm->dexes = n;
+    vm->dexes_cap = cap;
+  }
+  struct dvm_dex *dd = calloc(1, sizeof *dd);
+  if (!dd) return false;
+  /* The buffer belongs to whoever handed it over (guest memory, for an
+   * InMemoryDexClassLoader), so keep our own copy for dex_close() to free. */
+  uint8_t *copy = malloc(len);
+  if (!copy) {
+    free(dd);
+    return false;
+  }
+  memcpy(copy, data, len);
+  if (!dex_open_memory(&dd->file, copy, len, name ? name : "in-memory dex")) {
+    free(copy);
+    free(dd);
+    return false;
+  }
+  dd->file.owned = copy;
 
-   dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
-   dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
-   dd->proto_cache = calloc(dd->file.proto_ids_size + 1u, sizeof *dd->proto_cache);
-   dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
-   dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
+  dd->type_cache   = calloc(dd->file.type_ids_size + 1u, sizeof *dd->type_cache);
+  dd->method_cache = calloc(dd->file.method_ids_size + 1u, sizeof *dd->method_cache);
+  dd->proto_cache = calloc(dd->file.proto_ids_size + 1u, sizeof *dd->proto_cache);
+  dd->field_cache  = calloc(dd->file.field_ids_size + 1u, sizeof *dd->field_cache);
+  dd->string_cache = calloc(dd->file.string_ids_size + 1u, sizeof *dd->string_cache);
 
-   vm->dexes[vm->ndexes++] = dd;
-   fprintf(stderr, "[dvm] loaded %s (%zu bytes): %u classes, %u methods\n",
-           name ? name : "in-memory dex", len,
-           dd->file.class_defs_size, dd->file.method_ids_size);
-   return true;
+  vm->dexes[vm->ndexes++] = dd;
+  fprintf(stderr, "[dvm] loaded %s (%zu bytes): %u classes, %u methods\n",
+          name ? name : "in-memory dex", len,
+          dd->file.class_defs_size, dd->file.method_ids_size);
+  return true;
 }
 
 /* Preserve the Android archive origin of every DEX. Flattening split DEXes
  * into one directory loses both collision handling and ClassLoader metadata. */
 int dvm_add_apk_archive(struct dvm *vm, const char *host_path, const char *guest_path)
 {
-   int loaded = 0;
-   for (unsigned i = 1; i <= 64; ++i) {
-      char entry[48];
-      if (i == 1) snprintf(entry, sizeof entry, "classes.dex");
-      else snprintf(entry, sizeof entry, "classes%u.dex", i);
-      size_t size = 0;
-      unsigned char *data = arm_exec_zip_read(host_path, entry, &size);
-      if (!data) { if (i == 1) continue; break; }
-      size_t length = strlen(guest_path) + strlen(entry) + 2;
-      char *origin = malloc(length);
-      if (!origin) { free(data); return -1; }
-      snprintf(origin, length, "%s!%s", guest_path, entry);
-      bool ok = dvm_add_dex_memory(vm, data, size, origin);
-      free(origin); free(data);
-      if (!ok) return -1;
-      ++loaded;
-   }
-   return loaded;
+  int loaded = 0;
+  for (unsigned i = 1; i <= 64; ++i) {
+    char entry[48];
+    if (i == 1) snprintf(entry, sizeof entry, "classes.dex");
+    else snprintf(entry, sizeof entry, "classes%u.dex", i);
+    size_t size = 0;
+    unsigned char *data = arm_exec_zip_read(host_path, entry, &size);
+    if (!data) {
+      if (i == 1) continue;
+      break;
+    }
+    size_t length = strlen(guest_path) + strlen(entry) + 2;
+    char *origin = malloc(length);
+    if (!origin) {
+      free(data);
+      return -1;
+    }
+    snprintf(origin, length, "%s!%s", guest_path, entry);
+    bool ok = dvm_add_dex_memory(vm, data, size, origin);
+    free(origin);
+    free(data);
+    if (!ok) return -1;
+    ++loaded;
+  }
+  return loaded;
 }
 
 int dvm_add_apk_dir(struct dvm *vm, const char *dir)
 {
-   static const char *const subdirs[] = { "", "base/" };
-   int loaded = 0;
-   /* A first pass that only stats.  The boot card needs the total before the
-    * first file is parsed, and the files differ by megabytes, so a bar
-    * counting files rather than bytes would move in uneven jumps. */
-   {
-      int files = 0;
-      uint64_t bytes = 0;
-      for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
-         for (int i = 0; i < 64; ++i) {
-            char path[1024];
-            struct stat st;
-            if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, subdirs[s]);
-            else snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir, subdirs[s], i + 1);
-            if (stat(path, &st) != 0) {
-               if (i == 0) continue;
-               break;
-            }
-            ++files;
-            bytes += (uint64_t)st.st_size;
-         }
-      }
-      luna_boot_dex_total(files, bytes);
-      (void)arm_exec_boot_present();
-   }
-   for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
+  static const char *const subdirs[] = { "", "base/" };
+  int loaded = 0;
+  /* A first pass that only stats.  The boot card needs the total before the
+   * first file is parsed, and the files differ by megabytes, so a bar
+   * counting files rather than bytes would move in uneven jumps. */
+  {
+    int files = 0;
+    uint64_t bytes = 0;
+    for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
       for (int i = 0; i < 64; ++i) {
-         char path[1024];
-         if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, subdirs[s]);
-         else snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir, subdirs[s], i + 1);
-         if (!dvm_add_dex(vm, path)) {
-            if (i == 0) continue;   /* some APKs start at classes2.dex */
-            break;
-         }
-         ++loaded;
+        char path[1024];
+        struct stat st;
+        if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, subdirs[s]);
+        else snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir, subdirs[s], i + 1);
+        if (stat(path, &st) != 0) {
+          if (i == 0) continue;
+          break;
+        }
+        ++files;
+        bytes += (uint64_t)st.st_size;
       }
-   }
-   return loaded;
+    }
+    luna_boot_dex_total(files, bytes);
+    (void)arm_exec_boot_present();
+  }
+  for (size_t s = 0; s < sizeof subdirs / sizeof subdirs[0]; ++s) {
+    for (int i = 0; i < 64; ++i) {
+      char path[1024];
+      if (i == 0) snprintf(path, sizeof path, "%s/%sclasses.dex", dir, subdirs[s]);
+      else snprintf(path, sizeof path, "%s/%sclasses%d.dex", dir, subdirs[s], i + 1);
+      if (!dvm_add_dex(vm, path)) {
+        if (i == 0) continue;   /* some APKs start at classes2.dex */
+        break;
+      }
+      ++loaded;
+    }
+  }
+  return loaded;
 }
 
-void dvm_set_trace(struct dvm *vm, int level) { if (vm) vm->trace = level; }
-uint64_t dvm_instructions(const struct dvm *vm) { return vm ? vm->steps : 0; }
-void dvm_set_step_limit(struct dvm *vm, uint64_t limit) { if (vm) vm->step_limit = limit; }
+void dvm_set_trace(struct dvm *vm, int level) {
+  if (vm) vm->trace = level;
+}
+uint64_t dvm_instructions(const struct dvm *vm) {
+  return vm ? vm->steps : 0;
+}
+void dvm_set_step_limit(struct dvm *vm, uint64_t limit) {
+  if (vm) vm->step_limit = limit;
+}

@@ -28,43 +28,43 @@ void arm_exec_set_network_enabled(int enabled);
  * Callers serialize access to a shared state, as Bionic's random_mutex does.
  * This must never share the host libc PRNG or Java's Random state. */
 struct luna_prng31 {
-   uint32_t words[31];
-   unsigned char front, rear;
-   bool seeded;
+  uint32_t words[31];
+  unsigned char front, rear;
+  bool seeded;
 };
 
 static inline uint32_t luna_prng31_step(struct luna_prng31 *s)
 {
-   uint32_t sum = s->words[s->front] + s->words[s->rear];
-   s->words[s->front] = sum;
-   if (++s->front == 31) s->front = 0;
-   if (++s->rear == 31) s->rear = 0;
-   return sum >> 1;
+  uint32_t sum = s->words[s->front] + s->words[s->rear];
+  s->words[s->front] = sum;
+  if (++s->front == 31) s->front = 0;
+  if (++s->rear == 31) s->rear = 0;
+  return sum >> 1;
 }
 
 static inline void luna_prng31_seed(struct luna_prng31 *s, uint32_t seed)
 {
-   /* Bionic interprets the seed as a signed 32-bit word during expansion.
-    * Widen before multiplication; neither signed overflow nor a host's
-    * implementation-defined conversion of large unsigned seeds is needed. */
-   int64_t word = seed;
-   if (word > INT32_MAX) word -= INT64_C(4294967296);
-   s->words[0] = seed;
-   for (unsigned i = 1; i < 31; ++i) {
-      word = (word * 16807) % INT64_C(2147483647);
-      if (word <= 0) word += INT64_C(2147483647);
-      s->words[i] = (uint32_t)word;
-   }
-   s->front = 3;
-   s->rear = 0;
-   s->seeded = true;
-   for (unsigned i = 0; i < 310; ++i) (void)luna_prng31_step(s);
+  /* Bionic interprets the seed as a signed 32-bit word during expansion.
+   * Widen before multiplication; neither signed overflow nor a host's
+   * implementation-defined conversion of large unsigned seeds is needed. */
+  int64_t word = seed;
+  if (word > INT32_MAX) word -= INT64_C(4294967296);
+  s->words[0] = seed;
+  for (unsigned i = 1; i < 31; ++i) {
+    word = (word * 16807) % INT64_C(2147483647);
+    if (word <= 0) word += INT64_C(2147483647);
+    s->words[i] = (uint32_t)word;
+  }
+  s->front = 3;
+  s->rear = 0;
+  s->seeded = true;
+  for (unsigned i = 0; i < 310; ++i) (void)luna_prng31_step(s);
 }
 
 static inline uint32_t luna_prng31_next(struct luna_prng31 *s)
 {
-   if (!s->seeded) luna_prng31_seed(s, 1);
-   return luna_prng31_step(s);
+  if (!s->seeded) luna_prng31_seed(s, 1);
+  return luna_prng31_step(s);
 }
 
 /* ---- OpenSL PCM queues --------------------------------------------------
@@ -74,82 +74,82 @@ static inline uint32_t luna_prng31_next(struct luna_prng31 *s)
 
 #define LUNA_PCM_BUFFERS 64
 struct luna_pcm_buffer {
-    const uint8_t *data;
-    unsigned frames, position;
+  const uint8_t *data;
+  unsigned frames, position;
 };
 struct luna_pcm_queue {
-    struct luna_pcm_buffer buffers[LUNA_PCM_BUFFERS];
-    unsigned head, count, capacity, rate, channels, phase;
-    uint32_t retired;
+  struct luna_pcm_buffer buffers[LUNA_PCM_BUFFERS];
+  unsigned head, count, capacity, rate, channels, phase;
+  uint32_t retired;
 };
 static inline void luna_pcm_clear(struct luna_pcm_queue *q)
 {
-    q->head = q->count = q->phase = q->retired = 0;
-    memset(q->buffers, 0, sizeof q->buffers);
+  q->head = q->count = q->phase = q->retired = 0;
+  memset(q->buffers, 0, sizeof q->buffers);
 }
 
 static inline int luna_pcm_enqueue(struct luna_pcm_queue *q, const void *data, unsigned bytes)
 {
-    if (!data || !bytes || !q->rate || !q->channels ||
-        bytes % (q->channels * sizeof(int16_t))) return 2;
-    if (q->count >= q->capacity || q->count >= LUNA_PCM_BUFFERS) return 7;
-    struct luna_pcm_buffer *b = &q->buffers[(q->head + q->count) % LUNA_PCM_BUFFERS];
-    b->data = (const uint8_t *)data;
-    b->frames = bytes / (q->channels * sizeof(int16_t));
-    b->position = 0;
-    ++q->count;
-    return 0;
+  if (!data || !bytes || !q->rate || !q->channels ||
+      bytes % (q->channels * sizeof(int16_t))) return 2;
+  if (q->count >= q->capacity || q->count >= LUNA_PCM_BUFFERS) return 7;
+  struct luna_pcm_buffer *b = &q->buffers[(q->head + q->count) % LUNA_PCM_BUFFERS];
+  b->data = (const uint8_t *)data;
+  b->frames = bytes / (q->channels * sizeof(int16_t));
+  b->position = 0;
+  ++q->count;
+  return 0;
 }
 
 static inline void luna_pcm_advance_source(struct luna_pcm_queue *q, unsigned output_rate)
 {
-    while (q->phase >= output_rate && q->count) {
-        struct luna_pcm_buffer *b = &q->buffers[q->head];
-        q->phase -= output_rate;
-        if (++b->position == b->frames) {
-            q->head = (q->head + 1) % LUNA_PCM_BUFFERS;
-            --q->count;
-            ++q->retired;
-        }
+  while (q->phase >= output_rate && q->count) {
+    struct luna_pcm_buffer *b = &q->buffers[q->head];
+    q->phase -= output_rate;
+    if (++b->position == b->frames) {
+      q->head = (q->head + 1) % LUNA_PCM_BUFFERS;
+      --q->count;
+      ++q->retired;
     }
+  }
 }
 
 static inline unsigned luna_pcm_mix(struct luna_pcm_queue *q, int32_t *mix, unsigned frames,
-                      unsigned output_rate, unsigned output_channels)
+                                    unsigned output_rate, unsigned output_channels)
 {
-    if (!output_rate || !output_channels || !q->rate || !q->channels) return 0;
-    unsigned produced = 0;
-    /* Keep fractional phase across enqueue boundaries, including source
-     * frames skipped by the last accepted output frame of a downsample. */
-    luna_pcm_advance_source(q, output_rate);
-    while (produced < frames && q->count) {
-        struct luna_pcm_buffer *b = &q->buffers[q->head];
-        if (mix) {
-            const uint8_t *src = b->data + b->position * q->channels * sizeof(int16_t);
-            for (unsigned c = 0; c < output_channels; ++c) {
-                int32_t sample;
-                if (output_channels == 1 && q->channels > 1) {
-                    sample = 0;
-                    for (unsigned j = 0; j < q->channels; ++j) {
-                        int16_t v;
-                        memcpy(&v, src + j * sizeof v, sizeof v);
-                        sample += v;
-                    }
-                    sample /= (int32_t)q->channels;
-                } else {
-                    int16_t v;
-                    unsigned channel = q->channels == 1 ? 0 : c % q->channels;
-                    memcpy(&v, src + channel * sizeof v, sizeof v);
-                    sample = v;
-                }
-                mix[produced * output_channels + c] += sample;
-            }
+  if (!output_rate || !output_channels || !q->rate || !q->channels) return 0;
+  unsigned produced = 0;
+  /* Keep fractional phase across enqueue boundaries, including source
+   * frames skipped by the last accepted output frame of a downsample. */
+  luna_pcm_advance_source(q, output_rate);
+  while (produced < frames && q->count) {
+    struct luna_pcm_buffer *b = &q->buffers[q->head];
+    if (mix) {
+      const uint8_t *src = b->data + b->position * q->channels * sizeof(int16_t);
+      for (unsigned c = 0; c < output_channels; ++c) {
+        int32_t sample;
+        if (output_channels == 1 && q->channels > 1) {
+          sample = 0;
+          for (unsigned j = 0; j < q->channels; ++j) {
+            int16_t v;
+            memcpy(&v, src + j * sizeof v, sizeof v);
+            sample += v;
+          }
+          sample /= (int32_t)q->channels;
+        } else {
+          int16_t v;
+          unsigned channel = q->channels == 1 ? 0 : c % q->channels;
+          memcpy(&v, src + channel * sizeof v, sizeof v);
+          sample = v;
         }
-        ++produced;
-        q->phase += q->rate;
-        luna_pcm_advance_source(q, output_rate);
+        mix[produced * output_channels + c] += sample;
+      }
     }
-    return produced;
+    ++produced;
+    q->phase += q->rate;
+    luna_pcm_advance_source(q, output_rate);
+  }
+  return produced;
 }
 
 /* ---- guest RAM profile -------------------------------------------------- *
@@ -170,96 +170,96 @@ static inline unsigned luna_pcm_mix(struct luna_pcm_queue *q, int32_t *mix, unsi
  * LUNARIA_HEAP_MB / the MMAP2 layout control actual allocation. */
 static inline long lunaria_env_long(const char *name, long def)
 {
-    const char *e = getenv(name);
-    if (!e || !e[0])
-        return def;
-    char *end = NULL;
-    long v = strtol(e, &end, 0);
-    return (end != e) ? v : def;
+  const char *e = getenv(name);
+  if (!e || !e[0])
+    return def;
+  char *end = NULL;
+  long v = strtol(e, &end, 0);
+  return (end != e) ? v : def;
 }
 
 /* Guest addresses are unsigned 32-bit values even on Windows, whose host
  * long is signed 32-bit. In particular 0xF0000000 must not become LONG_MAX. */
 static inline uint32_t lunaria_env_u32(const char *name, uint32_t def)
 {
-    const char *e = getenv(name);
-    if (!e || !*e) return def;
-    char *end = NULL;
-    unsigned long long value = strtoull(e, &end, 0);
-    return end != e && value <= UINT32_MAX ? (uint32_t)value : def;
+  const char *e = getenv(name);
+  if (!e || !*e) return def;
+  char *end = NULL;
+  unsigned long long value = strtoull(e, &end, 0);
+  return end != e && value <= UINT32_MAX ? (uint32_t)value : def;
 }
 
 /* Clamp phone-class totals into a sane range for the emulator. */
 static inline long lunaria_mem_total_mb(void)
 {
-    long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", 6144);
-    if (mb < 512)
-        mb = 512;
-    if (mb > 16384)
-        mb = 16384;
-    return mb;
+  long mb = lunaria_env_long("LUNARIA_MEM_TOTAL_MB", 6144);
+  if (mb < 512)
+    mb = 512;
+  if (mb > 16384)
+    mb = 16384;
+  return mb;
 }
 
 static inline long lunaria_mem_avail_mb(void)
 {
-    long mb = lunaria_env_long("LUNARIA_MEM_AVAIL_MB", 0);
-    if (mb <= 0)
-        mb = lunaria_mem_total_mb() * 5 / 6;
-    if (mb < 256)
-        mb = 256;
-    if (mb > lunaria_mem_total_mb())
-        mb = lunaria_mem_total_mb();
-    return mb;
+  long mb = lunaria_env_long("LUNARIA_MEM_AVAIL_MB", 0);
+  if (mb <= 0)
+    mb = lunaria_mem_total_mb() * 5 / 6;
+  if (mb < 256)
+    mb = 256;
+  if (mb > lunaria_mem_total_mb())
+    mb = lunaria_mem_total_mb();
+  return mb;
 }
 
 static inline long lunaria_mem_free_mb(void)
 {
-    long mb = lunaria_env_long("LUNARIA_MEM_FREE_MB", 0);
-    if (mb <= 0)
-        mb = lunaria_mem_avail_mb() * 2 / 3;
-    if (mb < 128)
-        mb = 128;
-    if (mb > lunaria_mem_avail_mb())
-        mb = lunaria_mem_avail_mb();
-    return mb;
+  long mb = lunaria_env_long("LUNARIA_MEM_FREE_MB", 0);
+  if (mb <= 0)
+    mb = lunaria_mem_avail_mb() * 2 / 3;
+  if (mb < 128)
+    mb = 128;
+  if (mb > lunaria_mem_avail_mb())
+    mb = lunaria_mem_avail_mb();
+  return mb;
 }
 
 static inline long lunaria_mem_threshold_mb(void)
 {
-    long mb = lunaria_env_long("LUNARIA_MEM_THRESHOLD_MB", 48);
-    if (mb < 8)
-        mb = 8;
-    return mb;
+  long mb = lunaria_env_long("LUNARIA_MEM_THRESHOLD_MB", 48);
+  if (mb < 8)
+    mb = 8;
+  return mb;
 }
 
 static inline uint64_t lunaria_mem_total_bytes(void)
 {
-    return (uint64_t)lunaria_mem_total_mb() * 1024ull * 1024ull;
+  return (uint64_t)lunaria_mem_total_mb() * 1024ull * 1024ull;
 }
 
 static inline uint64_t lunaria_mem_avail_bytes(void)
 {
-    return (uint64_t)lunaria_mem_avail_mb() * 1024ull * 1024ull;
+  return (uint64_t)lunaria_mem_avail_mb() * 1024ull * 1024ull;
 }
 
 static inline uint64_t lunaria_mem_threshold_bytes(void)
 {
-    return (uint64_t)lunaria_mem_threshold_mb() * 1024ull * 1024ull;
+  return (uint64_t)lunaria_mem_threshold_mb() * 1024ull * 1024ull;
 }
 
 static inline uint64_t lunaria_mem_total_kb(void)
 {
-    return (uint64_t)lunaria_mem_total_mb() * 1024ull;
+  return (uint64_t)lunaria_mem_total_mb() * 1024ull;
 }
 
 static inline uint64_t lunaria_mem_avail_kb(void)
 {
-    return (uint64_t)lunaria_mem_avail_mb() * 1024ull;
+  return (uint64_t)lunaria_mem_avail_mb() * 1024ull;
 }
 
 static inline uint64_t lunaria_mem_free_kb(void)
 {
-    return (uint64_t)lunaria_mem_free_mb() * 1024ull;
+  return (uint64_t)lunaria_mem_free_mb() * 1024ull;
 }
 
 /*
@@ -327,7 +327,7 @@ uint32_t arm_exec_lookup_native_isig(const char *klass, const char *method,
  * completion — abandoning them mid-execution (e.g. mid-PlayerLoop) leaves
  * guest state inconsistent.  The caller must ensure the function terminates. */
 int arm_exec_call_unlimited(uint32_t fn_va, uint32_t r0, uint32_t r1,
-                             uint32_t r2, uint32_t r3);
+                            uint32_t r2, uint32_t r3);
 
 /* Return the ARM virtual address used as JNIEnv* (ENV_SLOT_BASE),
  * or 0 if no ARM context is active. */
@@ -497,184 +497,219 @@ int arm_exec_guest_is_64bit(void);
 int arm_exec_guest_uid(void);
 /* Bounded C11 reader for ResTable_map_entry. No allocation or aligned reads. */
 static inline uint16_t arsc_u16(const uint8_t *p)
-{ return (uint16_t)((uint16_t)p[0] | (uint16_t)p[1] << 8); }
+{
+  return (uint16_t)((uint16_t)p[0] | (uint16_t)p[1] << 8);
+}
 static inline uint32_t arsc_u32(const uint8_t *p)
-{ return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
-struct arsc_bag_view { const uint8_t *maps; uint32_t count, parent; };
+{
+  return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+struct arsc_bag_view {
+  const uint8_t *maps;
+  uint32_t count, parent;
+};
 typedef int (*arsc_score_fn)(const uint8_t *, size_t, uint8_t);
-struct arsc_entry_view { const uint8_t *entry; size_t available; int score; };
+struct arsc_entry_view {
+  const uint8_t *entry;
+  size_t available;
+  int score;
+};
 /* One RES_TABLE_TYPE chunk: pick the entry for `id` (when this chunk holds its
  * type) and keep it if its configuration scores at least as well as the best
  * so far.  Returns -1 for a malformed chunk, 0 otherwise. */
 static inline int arsc_type_chunk(const uint8_t *b, size_t j, uint32_t ts, uint16_t th,
-                         uint32_t id, uint8_t orientation, arsc_score_fn score_config,
-                         int *best, int *found, struct arsc_entry_view *out)
+                                  uint32_t id, uint8_t orientation, arsc_score_fn score_config,
+                                  int *best, int *found, struct arsc_entry_view *out)
 {
-   uint32_t count = arsc_u32(b+j+12), start = arsc_u32(b+j+16);
-   uint32_t entry = id & 65535, off = UINT32_MAX;
-   uint8_t flags = b[j+9];
-   size_t width = (flags & 2) ? 2 : 4;
-   if (start < th || start > ts || count > (start-th)/width) return -1;
-   const uint8_t *indices = b+j+th;
-   if (flags & 1) {
-      if (flags & 2) return -1;
-      /* Sparse indices are sorted; binary search keeps lookup bounded. */
-      uint32_t lo=0, hi=count;
-      while (lo < hi) {
-         uint32_t mid=lo+(hi-lo)/2;
-         if (arsc_u16(indices+mid*4) < entry) lo=mid+1; else hi=mid;
-      }
-      if (lo < count && arsc_u16(indices+lo*4) == entry)
-         off=(uint32_t)arsc_u16(indices+lo*4+2)*4;
-   } else if (entry < count) {
-      if (flags & 2) {
-         uint16_t v=arsc_u16(indices+entry*2);
-         if (v != 65535) off=(uint32_t)v*4;
-      } else off=arsc_u32(indices+entry*4);
-   }
-   if (off != UINT32_MAX) {
-      if (off > ts-start || ts-start-off < 8) return -1;
-      const uint8_t *e=b+j+start+off;
-      size_t available=ts-start-off;
-      uint16_t eh=arsc_u16(e);
-      if (eh < 8 || eh > available) return -1;
-      int score=score_config ? score_config(b+j+20,th-20,orientation) : 0;
-      if (score >= 0 && score >= *best) {
-         *best=score; *found=1;
-         out->entry=e; out->available=available; out->score=score;
-      }
-   }
-   return 0;
+  uint32_t count = arsc_u32(b+j+12), start = arsc_u32(b+j+16);
+  uint32_t entry = id & 65535, off = UINT32_MAX;
+  uint8_t flags = b[j+9];
+  size_t width = (flags & 2) ? 2 : 4;
+  if (start < th || start > ts || count > (start-th)/width) return -1;
+  const uint8_t *indices = b+j+th;
+  if (flags & 1) {
+    if (flags & 2) return -1;
+    /* Sparse indices are sorted; binary search keeps lookup bounded. */
+    uint32_t lo=0, hi=count;
+    while (lo < hi) {
+      uint32_t mid=lo+(hi-lo)/2;
+      if (arsc_u16(indices+mid*4) < entry) lo=mid+1;
+      else hi=mid;
+    }
+    if (lo < count && arsc_u16(indices+lo*4) == entry)
+      off=(uint32_t)arsc_u16(indices+lo*4+2)*4;
+  } else if (entry < count) {
+    if (flags & 2) {
+      uint16_t v=arsc_u16(indices+entry*2);
+      if (v != 65535) off=(uint32_t)v*4;
+    } else off=arsc_u32(indices+entry*4);
+  }
+  if (off != UINT32_MAX) {
+    if (off > ts-start || ts-start-off < 8) return -1;
+    const uint8_t *e=b+j+start+off;
+    size_t available=ts-start-off;
+    uint16_t eh=arsc_u16(e);
+    if (eh < 8 || eh > available) return -1;
+    int score=score_config ? score_config(b+j+20,th-20,orientation) : 0;
+    if (score >= 0 && score >= *best) {
+      *best=score;
+      *found=1;
+      out->entry=e;
+      out->available=available;
+      out->score=score;
+    }
+  }
+  return 0;
 }
 
 static inline int arsc_find_entry(const uint8_t *b, size_t n, uint32_t id,
-                         uint8_t orientation, arsc_score_fn score_config,
-                         struct arsc_entry_view *out)
+                                  uint8_t orientation, arsc_score_fn score_config,
+                                  struct arsc_entry_view *out)
 {
-   if (!b || n < 12 || arsc_u16(b) != 2) return 0;
-   uint32_t table_size = arsc_u32(b + 4);
-   uint16_t table_header = arsc_u16(b + 2);
-   if (table_size > n || table_size < 12 || table_header < 12 || table_header > table_size) return 0;
-   n = table_size;
-   int best = -1, found = 0;
-   for (size_t i = table_header; n - i >= 8;) {
-      uint32_t size = arsc_u32(b+i+4);
-      uint16_t header = arsc_u16(b+i+2);
-      if (size < 8 || size > n-i || header < 8 || header > size) return 0;
-      if (arsc_u16(b+i) == 0x200 && header >= 284 && arsc_u32(b+i+8) == (id >> 24)) {
-         uint32_t type_offset = header >= 288 ? arsc_u32(b+i+284) : 0;
-         size_t end = i + size;
-         for (size_t j = i+header; end-j >= 8;) {
-            uint32_t ts = arsc_u32(b+j+4);
-            uint16_t th = arsc_u16(b+j+2);
-            if (ts < 8 || ts > end-j || th < 8 || th > ts) return 0;
-            if (arsc_u16(b+j) == 0x201 && th >= 20 &&
-                (uint32_t)b[j+8] + type_offset == ((id >> 16) & 255)) {
-               if (arsc_type_chunk(b,j,ts,th,id,orientation,score_config,&best,&found,out) < 0)
-                  return 0;
-            }
-            j+=ts;
-         }
+  if (!b || n < 12 || arsc_u16(b) != 2) return 0;
+  uint32_t table_size = arsc_u32(b + 4);
+  uint16_t table_header = arsc_u16(b + 2);
+  if (table_size > n || table_size < 12 || table_header < 12 || table_header > table_size) return 0;
+  n = table_size;
+  int best = -1, found = 0;
+  for (size_t i = table_header; n - i >= 8;) {
+    uint32_t size = arsc_u32(b+i+4);
+    uint16_t header = arsc_u16(b+i+2);
+    if (size < 8 || size > n-i || header < 8 || header > size) return 0;
+    if (arsc_u16(b+i) == 0x200 && header >= 284 && arsc_u32(b+i+8) == (id >> 24)) {
+      uint32_t type_offset = header >= 288 ? arsc_u32(b+i+284) : 0;
+      size_t end = i + size;
+      for (size_t j = i+header; end-j >= 8;) {
+        uint32_t ts = arsc_u32(b+j+4);
+        uint16_t th = arsc_u16(b+j+2);
+        if (ts < 8 || ts > end-j || th < 8 || th > ts) return 0;
+        if (arsc_u16(b+j) == 0x201 && th >= 20 &&
+            (uint32_t)b[j+8] + type_offset == ((id >> 16) & 255)) {
+          if (arsc_type_chunk(b,j,ts,th,id,orientation,score_config,&best,&found,out) < 0)
+            return 0;
+        }
+        j+=ts;
       }
-      i+=size;
-   }
-   return found;
+    }
+    i+=size;
+  }
+  return found;
 }
 
 /* A table is walked once to list its type chunks by (package, type); a lookup
  * then touches only the configurations of that one type instead of every
  * chunk in the table (the framework table alone is tens of megabytes, and a
  * view inflates thousands of attributes). */
-struct arsc_type_ref { uint32_t key, size; size_t off; uint16_t header; };
-struct arsc_index { struct arsc_type_ref *refs; size_t count; int ok; };
+struct arsc_type_ref {
+  uint32_t key, size;
+  size_t off;
+  uint16_t header;
+};
+struct arsc_index {
+  struct arsc_type_ref *refs;
+  size_t count;
+  int ok;
+};
 static inline int arsc_type_ref_cmp(const void *x, const void *y)
 {
-   const struct arsc_type_ref *a=(const struct arsc_type_ref *)x, *c=(const struct arsc_type_ref *)y;
-   if (a->key != c->key) return a->key < c->key ? -1 : 1;
-   return a->off < c->off ? -1 : a->off > c->off;
+  const struct arsc_type_ref *a=(const struct arsc_type_ref *)x, *c=(const struct arsc_type_ref *)y;
+  if (a->key != c->key) return a->key < c->key ? -1 : 1;
+  return a->off < c->off ? -1 : a->off > c->off;
 }
 static inline void arsc_index_free(struct arsc_index *idx)
-{ free(idx->refs); idx->refs=NULL; idx->count=0; idx->ok=0; }
+{
+  free(idx->refs);
+  idx->refs=NULL;
+  idx->count=0;
+  idx->ok=0;
+}
 /* Same structural checks as arsc_find_entry; a table it rejects gets ok == 0
  * and arsc_find_entry_indexed falls back to the linear walk. */
 static inline void arsc_index_build(const uint8_t *b, size_t n, struct arsc_index *idx)
 {
-   size_t cap=0;
-   idx->refs=NULL; idx->count=0; idx->ok=0;
-   if (!b || n < 12 || arsc_u16(b) != 2) return;
-   uint32_t table_size = arsc_u32(b + 4);
-   uint16_t table_header = arsc_u16(b + 2);
-   if (table_size > n || table_size < 12 || table_header < 12 || table_header > table_size) return;
-   n = table_size;
-   for (size_t i = table_header; n - i >= 8;) {
-      uint32_t size = arsc_u32(b+i+4);
-      uint16_t header = arsc_u16(b+i+2);
-      if (size < 8 || size > n-i || header < 8 || header > size) goto bad;
-      if (arsc_u16(b+i) == 0x200 && header >= 284 && arsc_u32(b+i+8) <= 255) {
-         uint32_t type_offset = header >= 288 ? arsc_u32(b+i+284) : 0;
-         size_t end = i + size;
-         for (size_t j = i+header; end-j >= 8;) {
-            uint32_t ts = arsc_u32(b+j+4);
-            uint16_t th = arsc_u16(b+j+2);
-            if (ts < 8 || ts > end-j || th < 8 || th > ts) goto bad;
-            if (arsc_u16(b+j) == 0x201 && th >= 20 && (uint32_t)b[j+8] + type_offset <= 255) {
-               if (idx->count == cap) {
-                  size_t nc = cap ? cap*2 : 1024;
-                  struct arsc_type_ref *r = (struct arsc_type_ref *)realloc(idx->refs, nc*sizeof *r);
-                  if (!r) goto bad;
-                  idx->refs=r; cap=nc;
-               }
-               idx->refs[idx->count++] = (struct arsc_type_ref){
-                  .key = arsc_u32(b+i+8) << 8 | ((uint32_t)b[j+8] + type_offset),
-                  .size = ts, .off = j, .header = th };
-            }
-            j+=ts;
-         }
+  size_t cap=0;
+  idx->refs=NULL;
+  idx->count=0;
+  idx->ok=0;
+  if (!b || n < 12 || arsc_u16(b) != 2) return;
+  uint32_t table_size = arsc_u32(b + 4);
+  uint16_t table_header = arsc_u16(b + 2);
+  if (table_size > n || table_size < 12 || table_header < 12 || table_header > table_size) return;
+  n = table_size;
+  for (size_t i = table_header; n - i >= 8;) {
+    uint32_t size = arsc_u32(b+i+4);
+    uint16_t header = arsc_u16(b+i+2);
+    if (size < 8 || size > n-i || header < 8 || header > size) goto bad;
+    if (arsc_u16(b+i) == 0x200 && header >= 284 && arsc_u32(b+i+8) <= 255) {
+      uint32_t type_offset = header >= 288 ? arsc_u32(b+i+284) : 0;
+      size_t end = i + size;
+      for (size_t j = i+header; end-j >= 8;) {
+        uint32_t ts = arsc_u32(b+j+4);
+        uint16_t th = arsc_u16(b+j+2);
+        if (ts < 8 || ts > end-j || th < 8 || th > ts) goto bad;
+        if (arsc_u16(b+j) == 0x201 && th >= 20 && (uint32_t)b[j+8] + type_offset <= 255) {
+          if (idx->count == cap) {
+            size_t nc = cap ? cap*2 : 1024;
+            struct arsc_type_ref *r = (struct arsc_type_ref *)realloc(idx->refs, nc*sizeof *r);
+            if (!r) goto bad;
+            idx->refs=r;
+            cap=nc;
+          }
+          idx->refs[idx->count++] = (struct arsc_type_ref) {
+            .key = arsc_u32(b+i+8) << 8 | ((uint32_t)b[j+8] + type_offset),
+            .size = ts, .off = j, .header = th
+          };
+        }
+        j+=ts;
       }
-      i+=size;
-   }
-   qsort(idx->refs, idx->count, sizeof *idx->refs, arsc_type_ref_cmp);
-   idx->ok=1;
-   return;
+    }
+    i+=size;
+  }
+  qsort(idx->refs, idx->count, sizeof *idx->refs, arsc_type_ref_cmp);
+  idx->ok=1;
+  return;
 bad:
-   arsc_index_free(idx);
+  arsc_index_free(idx);
 }
 static inline int arsc_find_entry_indexed(const struct arsc_index *idx,
-                         const uint8_t *b, size_t n, uint32_t id,
-                         uint8_t orientation, arsc_score_fn score_config,
-                         struct arsc_entry_view *out)
+    const uint8_t *b, size_t n, uint32_t id,
+    uint8_t orientation, arsc_score_fn score_config,
+    struct arsc_entry_view *out)
 {
-   if (!idx || !idx->ok) return arsc_find_entry(b,n,id,orientation,score_config,out);
-   uint32_t key = (id >> 24) << 8 | ((id >> 16) & 255);
-   size_t lo=0, hi=idx->count;
-   while (lo < hi) {
-      size_t mid=lo+(hi-lo)/2;
-      if (idx->refs[mid].key < key) lo=mid+1; else hi=mid;
-   }
-   int best=-1, found=0;
-   for (; lo < idx->count && idx->refs[lo].key == key; ++lo) {
-      const struct arsc_type_ref *r=&idx->refs[lo];
-      if (arsc_type_chunk(b,r->off,r->size,r->header,id,orientation,score_config,&best,&found,out) < 0)
-         return 0;
-   }
-   return found;
+  if (!idx || !idx->ok) return arsc_find_entry(b,n,id,orientation,score_config,out);
+  uint32_t key = (id >> 24) << 8 | ((id >> 16) & 255);
+  size_t lo=0, hi=idx->count;
+  while (lo < hi) {
+    size_t mid=lo+(hi-lo)/2;
+    if (idx->refs[mid].key < key) lo=mid+1;
+    else hi=mid;
+  }
+  int best=-1, found=0;
+  for (; lo < idx->count && idx->refs[lo].key == key; ++lo) {
+    const struct arsc_type_ref *r=&idx->refs[lo];
+    if (arsc_type_chunk(b,r->off,r->size,r->header,id,orientation,score_config,&best,&found,out) < 0)
+      return 0;
+  }
+  return found;
 }
 
 static inline int arsc_find_bag(const uint8_t *b, size_t n, uint32_t id,
-                         uint8_t orientation, arsc_score_fn score_config,
-                         struct arsc_bag_view *out)
+                                uint8_t orientation, arsc_score_fn score_config,
+                                struct arsc_bag_view *out)
 {
-   struct arsc_entry_view view;
-   if (!arsc_find_entry(b,n,id,orientation,score_config,&view)) return 0;
-   const uint8_t *e=view.entry;
-   uint16_t eh=arsc_u16(e), ef=arsc_u16(e+2);
-   if (!(ef & 1) || eh < 16) return 0;
-   uint32_t maps=arsc_u32(e+12);
-   if (maps > (view.available-eh)/12) return 0;
-   for (uint32_t k=0;k<maps;++k)
-      if (arsc_u16(e+eh+k*12+4) != 8) return 0;
-   out->maps=e+eh; out->count=maps; out->parent=arsc_u32(e+8);
-   return 1;
+  struct arsc_entry_view view;
+  if (!arsc_find_entry(b,n,id,orientation,score_config,&view)) return 0;
+  const uint8_t *e=view.entry;
+  uint16_t eh=arsc_u16(e), ef=arsc_u16(e+2);
+  if (!(ef & 1) || eh < 16) return 0;
+  uint32_t maps=arsc_u32(e+12);
+  if (maps > (view.available-eh)/12) return 0;
+  for (uint32_t k=0; k<maps; ++k)
+    if (arsc_u16(e+eh+k*12+4) != 8) return 0;
+  out->maps=e+eh;
+  out->count=maps;
+  out->parent=arsc_u32(e+8);
+  return 1;
 }
 
 /* resources.arsc name/value lookup used by android.content.res.Resources. */
@@ -688,16 +723,16 @@ int arm_exec_apk_resource_value(uint32_t id, int32_t *iv, const char **sv);
 /* Compiled string style, inclusive UTF-16 bounds. tag is borrowed; 1 span,
  * 0 end/unstyled, -1 malformed. No text or APK modification. */
 int arm_exec_apk_resource_span(uint32_t id, size_t index, const char **tag,
-                              uint32_t *first, uint32_t *last);
+                               uint32_t *first, uint32_t *last);
 /* String-array bag: 1 success (including empty), 0 missing/invalid, -1 OOM.
  * Caller frees *values; strings are borrowed from the loaded resource table. */
 int arm_exec_apk_string_array(uint32_t id, const char ***values, size_t *count);
 /* Sorted bag entries, including inherited values and unresolved reference IDs.
  * The caller frees entries; text is borrowed from the resource string pool. */
 typedef struct {
-    uint32_t key, data;
-    int type;
-    const char *text;
+  uint32_t key, data;
+  int type;
+  const char *text;
 } ArmExecResourceValue;
 int arm_exec_apk_resource_bag(uint32_t id, ArmExecResourceValue **entries, size_t *count);
 /* Tests the selected entry itself, without resolving its parent or allocating. */
@@ -716,6 +751,12 @@ int arm_exec_fb_height(void);
 typedef luna_touch_event ArmExecTouchEvent;
 
 int       arm_exec_touch_next(ArmExecTouchEvent *out);
+
+/* Key input for the Java UI.  While an Android window (an Activity or Dialog
+ * with Views) has the keyboard, window-system keys are queued here instead of
+ * the NDK input queue; the frame pump pops them into the focused window's
+ * dispatchKeyEvent().  *action is 0 (down) or 1 (up).  Returns 0 when empty. */
+int       arm_exec_java_key_next(int *action, int *keycode, int *meta, int *repeat);
 int       arm_exec_touch_action(void);
 float     arm_exec_touch_x(void);
 float     arm_exec_touch_y(void);
@@ -759,10 +800,9 @@ void arm_exec_shutdown_engines(void);
  * threads. Keep engines and JNI alive until those threads have returned. */
 void arm_exec_begin_shutdown(void);
 
-/* One line naming which guest threads the instructions went to.  Printed
- * beside [perf]: the process-wide rate says how fast the guest is running,
- * this says whether the thread running is the one that should be. */
-void arm_exec_ticks_report(void);
+/* Scheduler watchdog: names a guest thread or heap lock that is held by
+ * something that will never release it.  Called from the pump loop. */
+void arm_exec_watchdog_tick(void);
 
 /* Run all pthread_create-queued ARM thread functions inline (up to 8 passes). */
 void arm_exec_run_pending_threads(void);
@@ -772,12 +812,6 @@ void arm_exec_run_pending_threads(void);
  * guest had work to do" from "every guest thread is parked"; see the pump
  * loops in loader.c. */
 uint64_t arm_exec_sched_ticks(void);
-/* Guest instructions the JIT has translated (not executed).  Compare with
- * arm_exec_sched_ticks(): translating far more than the guest runs means the
- * emulator is recompiling, not working. */
-uint64_t arm_exec_translated_insn(void);
-void arm_exec_translated_insn_a32(uint64_t out[3]);
-
 /* Pre-create Mono generic JIT trampolines before initJni maps mscorlib. */
 void arm_exec_ensure_mono_trampolines(void);
 
@@ -1025,21 +1059,21 @@ uint64_t arm_exec_guest_swap_count(void);
  * A64 (identity VA), so a pointer argument is a host pointer as it stands and
  * stack-passed arguments are 8-byte slots at `sp`. */
 typedef struct HostCallArgs {
-    uint64_t x[8];     /* x0..x7                                            */
-    uint64_t v[8];     /* low 64 bits of v0..v7; filled for HOSTCALL_FLOATS */
-    uint64_t sp;       /* guest SP at the call                              */
-    uint64_t ret;      /* x0 on return                                      */
+  uint64_t x[8];     /* x0..x7                                            */
+  uint64_t v[8];     /* low 64 bits of v0..v7; filled for HOSTCALL_FLOATS */
+  uint64_t sp;       /* guest SP at the call                              */
+  uint64_t ret;      /* x0 on return                                      */
 } HostCallArgs;
 
 typedef void (*HostCallFn)(struct HostCallArgs *a, uintptr_t data);
 
 enum {
-    /* The function touches no emulator state: it runs without the ARM
-     * execution lock.  Anything that may block (a driver wait, a present)
-     * must have this, or every other engine stops while it waits. */
-    HOSTCALL_LOCKFREE = 1u << 0,
-    /* The function takes float arguments: read v0..v7 before the call. */
-    HOSTCALL_FLOATS   = 1u << 1,
+  /* The function touches no emulator state: it runs without the ARM
+   * execution lock.  Anything that may block (a driver wait, a present)
+   * must have this, or every other engine stops while it waits. */
+  HOSTCALL_LOCKFREE = 1u << 0,
+  /* The function takes float arguments: read v0..v7 before the call. */
+  HOSTCALL_FLOATS   = 1u << 1,
 };
 
 /* A new trampoline for `fn(args, data)`, as a guest VA, or 0 when guest

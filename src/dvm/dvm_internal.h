@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * Shared between the interpreter (dvm.c) and the built-in class library
  * (dvm_runtime.c).  Not part of the module's public interface.
  */
@@ -25,164 +27,164 @@ typedef bool (*dvm_builtin_fn)(struct dvm *vm, dvm_ref self,
 /* Live invocation chain, including C builtins and native bridges. Nodes
  * belong to the invoking thread's C stack; the GIL switches only its head. */
 struct dvm_call_frame {
-   struct dvm_method *method;
-   struct dvm_call_frame *previous;
+  struct dvm_method *method;
+  struct dvm_call_frame *previous;
 };
 
 struct dvm_field {
-   const char *name;   /* into the dex mapping, or a literal for builtins */
-   const char *type;   /* descriptor */
-   uint32_t access;
-   struct dvm_class *cls;
-   uint16_t slot;      /* index into instance or static slot array */
-   uint8_t width;      /* 1 or 2 slots */
-   char kind;          /* Z B C S I J F D L, or '[' folded into 'L' */
+  const char *name;   /* into the dex mapping, or a literal for builtins */
+  const char *type;   /* descriptor */
+  uint32_t access;
+  struct dvm_class *cls;
+  uint16_t slot;      /* index into instance or static slot array */
+  uint8_t width;      /* 1 or 2 slots */
+  char kind;          /* Z B C S I J F D L, or '[' folded into 'L' */
 };
 
 #define DVM_FIELD_MISSING 0xffffu /* slot of a cached negative lookup */
 
 struct dvm_method {
-   struct dvm_class *cls;
-   const char *name;
-   char *sig;          /* owned */
-   const char *shorty; /* into the dex mapping, or NULL for builtins */
-   uint32_t access;
-   struct dex_file *dex;
-   struct dex_code code;
-   bool has_code;
-   dvm_builtin_fn builtin;
-   bool placeholder_warned; /* a no-op scaffold has reported itself once */
-   struct dvm_dex *dd_cache; /* the dex that owns `dex`, found once */
-   int arg_slots;      /* parameter registers, excluding `this` */
-   int arg_count;      /* declared parameters */
-   char ret_kind;
-   /* virtual_target()'s two-entry inline cache: receiver class -> override. */
-   struct dvm_class *vt_cls[2];
-   struct dvm_method *vt_m[2];
+  struct dvm_class *cls;
+  const char *name;
+  char *sig;          /* owned */
+  const char *shorty; /* into the dex mapping, or NULL for builtins */
+  uint32_t access;
+  struct dex_file *dex;
+  struct dex_code code;
+  bool has_code;
+  dvm_builtin_fn builtin;
+  bool placeholder_warned; /* a no-op scaffold has reported itself once */
+  struct dvm_dex *dd_cache; /* the dex that owns `dex`, found once */
+  int arg_slots;      /* parameter registers, excluding `this` */
+  int arg_count;      /* declared parameters */
+  char ret_kind;
+  /* virtual_target()'s two-entry inline cache: receiver class -> override. */
+  struct dvm_class *vt_cls[2];
+  struct dvm_method *vt_m[2];
 };
 
 /* One resolved lookup, cached on the class it was asked of.  `hash` is zero
  * in an unused slot, so the table needs no separate occupancy word. */
 struct dvm_mcache_slot {
-   uint32_t hash;
-   const char *name;
-   const char *sig;          /* NULL matches any signature, as in the lookup */
-   struct dvm_method *m;
+  uint32_t hash;
+  const char *name;
+  const char *sig;          /* NULL matches any signature, as in the lookup */
+  struct dvm_method *m;
 };
 
 struct dvm_class {
-   char *desc;         /* "Lcom/foo/Bar;" */
-   char *name;         /* "com/foo/Bar" */
-   struct dvm_class *super;
-   struct dvm_class **ifaces;
-   int nifaces;
-   uint32_t access;
+  char *desc;         /* "Lcom/foo/Bar;" */
+  char *name;         /* "com/foo/Bar" */
+  struct dvm_class *super;
+  struct dvm_class **ifaces;
+  int nifaces;
+  uint32_t access;
 
-   struct dex_file *dex;
-   uint32_t class_def_idx;
-   uint32_t static_values_off;
-   /* Generic metadata for builtins comes from the Android boot class path,
-    * which is not a dex in this VM.  DEX classes read their Signature
-    * annotation instead. */
-   const char *runtime_signature;
-   dvm_ref type_parameters; /* cached TypeVariable[] for stable identity */
+  struct dex_file *dex;
+  uint32_t class_def_idx;
+  uint32_t static_values_off;
+  /* Generic metadata for builtins comes from the Android boot class path,
+   * which is not a dex in this VM.  DEX classes read their Signature
+   * annotation instead. */
+  const char *runtime_signature;
+  dvm_ref type_parameters; /* cached TypeVariable[] for stable identity */
 
-   struct dvm_field *ifields;
-   int nifields;
-   struct dvm_field *sfields;
-   int nsfields;
-   union dvm_value *sslots;    /* one per static field, wide fits in one */
-   int nsslots;
+  struct dvm_field *ifields;
+  int nifields;
+  struct dvm_field *sfields;
+  int nsfields;
+  union dvm_value *sslots;    /* one per static field, wide fits in one */
+  int nsslots;
 
-   struct dvm_method *methods;
-   int nmethods;
+  struct dvm_method *methods;
+  int nmethods;
 
-   int islots;                 /* instance slots including the superclass */
-   int init_state;             /* 0 unloaded, 1 running <clinit>, 2 done, 3 erroneous */
-   uint64_t init_owner;        /* logical Java Thread while initialising */
+  int islots;                 /* instance slots including the superclass */
+  int init_state;             /* 0 unloaded, 1 running <clinit>, 2 done, 3 erroneous */
+  uint64_t init_owner;        /* logical Java Thread while initialising */
 
-   bool is_array;
-   bool is_primitive;
-   bool is_interface;
-   bool external;              /* no dex definition: host stubs own it */
-   /* Invented by dvm__class_by_desc()'s last resort: no dex defines it and the
-    * emulator does not implement it either.  For the platform's namespaces
-    * that is a stub standing in for something a device really has; for the
-    * application's own namespace it is a class that does not exist, and
-    * bytecode that names it must be told so.  See new-instance in dvm.c. */
-   bool synthesized;
-   int unresolved_dexes;       /* DEX count at the last unsuccessful lookup */
-   char elem_kind;             /* arrays */
-   struct dvm_class *elem;     /* arrays */
+  bool is_array;
+  bool is_primitive;
+  bool is_interface;
+  bool external;              /* no dex definition: host stubs own it */
+  /* Invented by dvm__class_by_desc()'s last resort: no dex defines it and the
+   * emulator does not implement it either.  For the platform's namespaces
+   * that is a stub standing in for something a device really has; for the
+   * application's own namespace it is a class that does not exist, and
+   * bytecode that names it must be told so.  See new-instance in dvm.c. */
+  bool synthesized;
+  int unresolved_dexes;       /* DEX count at the last unsuccessful lookup */
+  char elem_kind;             /* arrays */
+  struct dvm_class *elem;     /* arrays */
 
-   dvm_ref class_object;       /* the java.lang.Class instance, made lazily */
-   dvm_ref defining_loader;    /* generated classes retain their loader */
-   bool generated_proxy;
-   struct dvm_class *hash_next;
+  dvm_ref class_object;       /* the java.lang.Class instance, made lazily */
+  dvm_ref defining_loader;    /* generated classes retain their loader */
+  bool generated_proxy;
+  struct dvm_class *hash_next;
 
-   /* Methods already looked up on this class — see dvm_find_method(). */
-   struct dvm_mcache_slot *mcache;
-   uint32_t mcache_cap;        /* a power of two, or 0 before the first put */
-   uint32_t mcache_len;
+  /* Methods already looked up on this class — see dvm_find_method(). */
+  struct dvm_mcache_slot *mcache;
+  uint32_t mcache_cap;        /* a power of two, or 0 before the first put */
+  uint32_t mcache_len;
 };
 
 enum dvm_obj_kind {
-   DVM_OBJ_PLAIN,
-   DVM_OBJ_STRING,
-   DVM_OBJ_ARRAY,
-   DVM_OBJ_CLASS,      /* a java.lang.Class */
-   DVM_OBJ_EXTERNAL,   /* wraps a host jobject */
+  DVM_OBJ_PLAIN,
+  DVM_OBJ_STRING,
+  DVM_OBJ_ARRAY,
+  DVM_OBJ_CLASS,      /* a java.lang.Class */
+  DVM_OBJ_EXTERNAL,   /* wraps a host jobject */
 };
 
 struct dvm_object {
-   struct dvm_class *cls;
-   enum dvm_obj_kind kind;
-   uint32_t pins;
-   uint32_t host_handle;   /* jobject, for DVM_OBJ_EXTERNAL and lazily bound */
+  struct dvm_class *cls;
+  enum dvm_obj_kind kind;
+  uint32_t pins;
+  uint32_t host_handle;   /* jobject, for DVM_OBJ_EXTERNAL and lazily bound */
 
-   /* strings */
-   char *utf8;
-   uint32_t utf8_len;
-   uint32_t builder_capacity; /* bytes including NUL; mutable builders only */
-   uint16_t *string_units; /* lazy immutable String index; NULL for ASCII */
-   uint32_t string_length;
-   bool string_index_ready;
+  /* strings */
+  char *utf8;
+  uint32_t utf8_len;
+  uint32_t builder_capacity; /* bytes including NUL; mutable builders only */
+  uint16_t *string_units; /* lazy immutable String index; NULL for ASCII */
+  uint32_t string_length;
+  bool string_index_ready;
 
-   /* arrays */
-   uint32_t length;
-   char elem_kind;
-   void *data;
-   /* Builtin payloads may own nested allocations. The callback releases
-    * those allocations and the payload itself; plain arrays use free(). */
-   void (*data_destroy)(void *);
-   /* Optional owner passed to data_destroy when data is an interior pointer
-    * (for example an unaligned window into a file mapping). */
-   void *data_owner;
+  /* arrays */
+  uint32_t length;
+  char elem_kind;
+  void *data;
+  /* Builtin payloads may own nested allocations. The callback releases
+   * those allocations and the payload itself; plain arrays use free(). */
+  void (*data_destroy)(void *);
+  /* Optional owner passed to data_destroy when data is an interior pointer
+   * (for example an unaligned window into a file mapping). */
+  void *data_owner;
 
-   /* java.lang.Class */
-   struct dvm_class *klass;
+  /* java.lang.Class */
+  struct dvm_class *klass;
 
-   /* A materialised DEX annotation.  Its object class is the annotation
-    * interface, while these two words identify the encoded element values.
-    * Keeping the immutable mapping reference on the object avoids a global
-    * side table and needs no lock beyond the VM GIL. */
-   struct dex_file *annotation_dex;
-   uint32_t annotation_off;
+  /* A materialised DEX annotation.  Its object class is the annotation
+   * interface, while these two words identify the encoded element values.
+   * Keeping the immutable mapping reference on the object avoids a global
+   * side table and needs no lock beyond the VM GIL. */
+  struct dex_file *annotation_dex;
+  uint32_t annotation_off;
 
-   /* instance fields */
-   union dvm_value *slots;
+  /* instance fields */
+  union dvm_value *slots;
 
-   /* Java object monitor.  VM state is inspected while GIL is held; waits
-    * release GIL through dvm_gil_wait_for(), so no host mutex is needed per
-    * object.  The owner is a small process-local thread token, not pthread_t,
-    * keeping this representation plain C and comparable. */
-   uint64_t monitor_owner;
-   uint32_t monitor_depth;
-   uint64_t monitor_seq;
+  /* Java object monitor.  VM state is inspected while GIL is held; waits
+   * release GIL through dvm_gil_wait_for(), so no host mutex is needed per
+   * object.  The owner is a small process-local thread token, not pthread_t,
+   * keeping this representation plain C and comparable. */
+  uint64_t monitor_owner;
+  uint32_t monitor_depth;
+  uint64_t monitor_seq;
 
-   /* Free-list link; also marks a dead slot when `cls` is NULL. */
-   uint32_t next_free;
-   bool live;
+  /* Free-list link; also marks a dead slot when `cls` is NULL. */
+  uint32_t next_free;
+  bool live;
 };
 
 /* Objects per heap block.  Big enough that growth is rare, small enough that
@@ -193,183 +195,196 @@ struct dvm_object {
 #define DVM_CLASS_HASH 1024
 
 struct dvm_dex {
-   struct dex_file file;
-   dvm_ref defining_loader; /* null for the application class path */
-   /* Per-index resolution caches.  A dex index is only meaningful inside its
-    * own file, so the caches live here rather than in the VM. */
-   struct dvm_class **type_cache;
-   struct dvm_method **method_cache;
-   char **proto_cache;
-   struct dvm_field **field_cache;
-   /* Backing for field_cache entries that resolved to nothing (fields of
-    * host-backed classes carry no state here).  Allocated lazily, one slot
-    * per field index; the slot is marked with DVM_FIELD_MISSING. */
-   struct dvm_field *field_miss;
-   dvm_ref *string_cache;
+  struct dex_file file;
+  dvm_ref defining_loader; /* null for the application class path */
+  /* Per-index resolution caches.  A dex index is only meaningful inside its
+   * own file, so the caches live here rather than in the VM. */
+  struct dvm_class **type_cache;
+  struct dvm_method **method_cache;
+  char **proto_cache;
+  struct dvm_field **field_cache;
+  /* Backing for field_cache entries that resolved to nothing (fields of
+   * host-backed classes carry no state here).  Allocated lazily, one slot
+   * per field index; the slot is marked with DVM_FIELD_MISSING. */
+  struct dvm_field *field_miss;
+  dvm_ref *string_cache;
 };
 
-struct dvm_attached_thread { uint64_t token; dvm_ref thread; };
-struct dvm_network_callback { dvm_ref callback, network; bool online; };
+struct dvm_attached_thread {
+  uint64_t token;
+  dvm_ref thread;
+};
+struct dvm_network_callback {
+  dvm_ref callback, network;
+  bool online;
+};
 struct dvm {
-   dvm_ref application_class_loader, bootstrap_class_loader;
-   dvm_ref legacy_http_class_loader;
-   uint64_t field_cache_generation;
-   /* Android's default-network InetAddress cache, MRU last, under the GIL.
-    * Both references are pinned; the result is InetAddress[] or an error String. */
-   struct {dvm_ref host,result;uint64_t expires;} inet_address_cache[16];
-   unsigned inet_address_cache_count;
-   /* ui_is_a(): view class names already resolved to their classes, keyed by
-    * the caller's string literal.  Per VM because classes belong to one. */
-   struct { const char *key; struct dvm_class *cls; int missing_at; } is_a_cache[1024];
-   _Atomic unsigned device_keyguard_state;
-   _Atomic bool stopping;
-   _Atomic int process_exit_phase; /* 0 live, 1 publishing, 2 terminal */
-   _Atomic int process_exit_status;
-   dvm_ref runtime_instance, shutdown_hooks_lock;
-   bool runtime_shutting_down; /* hooks and registration are under the GIL */
-   dvm_ref *shutdown_hooks;
-   size_t shutdown_hook_count, shutdown_hook_capacity;
-   int io_cancel[2]; /* readable until destruction once process stop is requested */
-   struct bytecode_thread *host_threads; /* joinable Java threads, under GIL */
-   struct dvm_hooks hooks;
-   int (*service_submit)(void *,const char *,const void *,size_t);
-   void *service_submit_user; /* configured before Application startup, under GIL */
-   dvm_ref pending_intents; /* live IntentSender tokens, under GIL */
-   uint64_t executor_sequence; /* FIFO order of equal-deadline tasks, under GIL */
-   struct dvm_alarm *alarms; /* process-local AlarmManager service, under GIL */
-   struct rt_codec *active_codecs; /* asynchronous MediaCodec, under GIL */
-   struct rt_surface_texture *surface_textures; /* frame listeners, under GIL */
-   dvm_ref content_providers; /* attached local providers, under GIL */
-   bool providers_starting; /* external acquisition waits for batch publication */
-   struct dvm_network_callback *network_callbacks;
-   size_t nnetwork_callbacks;
-   dvm_ref *layout_observers;
-   size_t nlayout_observers,layout_observer_capacity;
-   bool insets_pass_pending;
-   bool network_dispatching;
+  dvm_ref application_class_loader, bootstrap_class_loader;
+  dvm_ref legacy_http_class_loader;
+  uint64_t field_cache_generation;
+  /* Android's default-network InetAddress cache, MRU last, under the GIL.
+   * Both references are pinned; the result is InetAddress[] or an error String. */
+  struct {
+    dvm_ref host,result;
+    uint64_t expires;
+  } inet_address_cache[16];
+  unsigned inet_address_cache_count;
+  /* ui_is_a(): view class names already resolved to their classes, keyed by
+   * the caller's string literal.  Per VM because classes belong to one. */
+  struct {
+    const char *key;
+    struct dvm_class *cls;
+    int missing_at;
+  } is_a_cache[1024];
+  _Atomic unsigned device_keyguard_state;
+  _Atomic bool stopping;
+  _Atomic int process_exit_phase; /* 0 live, 1 publishing, 2 terminal */
+  _Atomic int process_exit_status;
+  dvm_ref runtime_instance, shutdown_hooks_lock;
+  bool runtime_shutting_down; /* hooks and registration are under the GIL */
+  dvm_ref *shutdown_hooks;
+  size_t shutdown_hook_count, shutdown_hook_capacity;
+  int io_cancel[2]; /* readable until destruction once process stop is requested */
+  struct bytecode_thread *host_threads; /* joinable Java threads, under GIL */
+  struct dvm_hooks hooks;
+  int (*service_submit)(void *,const char *,const void *,size_t);
+  void *service_submit_user; /* configured before Application startup, under GIL */
+  dvm_ref pending_intents; /* live IntentSender tokens, under GIL */
+  uint64_t executor_sequence; /* FIFO order of equal-deadline tasks, under GIL */
+  struct dvm_alarm *alarms; /* process-local AlarmManager service, under GIL */
+  struct rt_codec *active_codecs; /* asynchronous MediaCodec, under GIL */
+  struct rt_surface_texture *surface_textures; /* frame listeners, under GIL */
+  dvm_ref content_providers; /* attached local providers, under GIL */
+  bool providers_starting; /* external acquisition waits for batch publication */
+  struct dvm_network_callback *network_callbacks;
+  size_t nnetwork_callbacks;
+  dvm_ref *layout_observers;
+  size_t nlayout_observers,layout_observer_capacity;
+  bool insets_pass_pending;
+  bool network_dispatching;
 
-   /* Each dex is its own allocation.  Methods and classes keep a
-    * `struct dex_file *` into it, and dex_of() resolves that pointer back to
-    * its dvm_dex, so the storage must never move — an array grown with
-    * realloc() left those pointers dangling, and constant-pool indices then
-    * resolved against whatever dex happened to land at the old address. */
-   struct dvm_dex **dexes;
-   int ndexes, dexes_cap;
+  /* Each dex is its own allocation.  Methods and classes keep a
+   * `struct dex_file *` into it, and dex_of() resolves that pointer back to
+   * its dvm_dex, so the storage must never move — an array grown with
+   * realloc() left those pointers dangling, and constant-pool indices then
+   * resolved against whatever dex happened to land at the old address. */
+  struct dvm_dex **dexes;
+  int ndexes, dexes_cap;
 
-   struct dvm_class *class_hash[DVM_CLASS_HASH];
-   struct dvm_class **classes;    /* every class, for teardown */
-   int nclasses, classes_cap;
+  struct dvm_class *class_hash[DVM_CLASS_HASH];
+  struct dvm_class **classes;    /* every class, for teardown */
+  int nclasses, classes_cap;
 
-   /* Objects, in blocks that never move — see heap_slot() in dvm.c. */
-   struct dvm_object **heap_blocks;
-   uint32_t heap_nblocks;
-   uint32_t heap_size, heap_cap;
-   uint32_t free_head;
+  /* Objects, in blocks that never move — see heap_slot() in dvm.c. */
+  struct dvm_object **heap_blocks;
+  uint32_t heap_nblocks;
+  uint32_t heap_size, heap_cap;
+  uint32_t free_head;
 
-   dvm_ref exception;
-   dvm_ref content_observers; /* process ContentResolver registrations */
-   /* Frames the current exception unwound through, innermost first.  A bare
-    * "NullPointerException: String.length" says nothing about which of the
-    * app's methods hit it; this makes an uncaught throw locatable without
-    * turning on the full call trace. */
-   struct dvm_method *exc_trace[16];
-   int nexc_trace;
-   dvm_ref exc_ref;      /* the object the trace belongs to */
+  dvm_ref exception;
+  dvm_ref content_observers; /* process ContentResolver registrations */
+  /* Frames the current exception unwound through, innermost first.  A bare
+   * "NullPointerException: String.length" says nothing about which of the
+   * app's methods hit it; this makes an uncaught throw locatable without
+   * turning on the full call trace. */
+  struct dvm_method *exc_trace[16];
+  int nexc_trace;
+  dvm_ref exc_ref;      /* the object the trace belongs to */
 
-   /* Handler / Looper posts, and Thread.start fallback when a host thread
-    * cannot be created (LUNARIA_DVM_THREADS=0 or pthread_create failure).
-    * Executor workers go through Thread.start → host threads; they must not
-    * live here.  Android's MessageQueue has no fixed 256-message limit;
-    * legitimate delayed posts can exceed that during a long download. */
-   dvm_ref *pending_threads;
-   /* Whether each entry came from Thread.start() rather than Handler.post():
-    * a posted Runnable runs on the main thread, and app code asserts on that. */
-   bool *pending_is_thread;
-   /* Monotonic millisecond stamp before which the entry must not run.  A
-    * postDelayed() whose delay is dropped turns every "do this unless the fast
-    * path beats me to it" timeout into an unconditional one. */
-   uint64_t *pending_due_ms;
-   /* Handler.post target Looper.  0 = main drain (also Thread.start).  A
-    * background Looper.loop() only takes entries tagged with its own ref —
-    * otherwise SwappyDisplayManager$LooperThread greedily runs every posted
-    * Runnable on the wrong thread and holds the interpreter lock for them. */
-   dvm_ref *pending_looper;
-   /* The Handler an entry was posted through, and the token it carried.
-    * Handler.removeCallbacksAndMessages(token) is defined in terms of both —
-    * "this handler's pending posts and messages, keeping only those whose
-    * token differs" — so with neither recorded the call had nothing to key on
-    * and did nothing.  A Thread.start() entry has no handler and no token. */
-   dvm_ref *pending_owner;
-   dvm_ref *pending_token;
-   dvm_ref velocity_pool[2];
-   unsigned velocity_pool_count;
-   struct dvm_nsd *nsd;
-   dvm_ref *active_object_animators;
-   size_t nactive_object_animators, active_object_animators_cap;
-   int npending, pending_cap;
-   dvm_ref message_pool[50];
-   unsigned message_pool_size;
-   dvm_ref resource_bundle_cache; /* per-VM default classpath bundle cache */
-   /* The Thread the interpreter is currently inside, or 0 for the main one. */
-   dvm_ref cur_thread;
-   dvm_ref default_trust_manager, keystore_entries;
-   bool keystore_hydrated;
-   dvm_ref accepted_issuers; /* host CA snapshot belongs to this VM */
-   dvm_ref main_thread;
-   dvm_ref main_looper; /* Process-owned Looper; never a reference into another VM. */
-   unsigned main_transaction_depth; /* lifecycle work holds the main Looper until completion */
-   uint64_t main_host_thread;
-   dvm_ref main_thread_group, system_thread_group;
-   struct dvm_attached_thread native_threads[256];
-   /* How many drains of the pending queue are on the stack.  This used to be a
-    * flat re-entrancy lock, which made every blocking wait inside a Runnable
-    * unsatisfiable: the work being waited for sits in this same queue, so a
-    * drain that refuses to nest can never deliver it.  Volley's
-    * NetworkDispatcher could not run while a Netmarble SDK call sat in
-    * CountDownLatch.await() for its response, so the wait burned its whole
-    * 15 s timeout with the VM frozen and the request "failed".  The entry
-    * being executed is taken off the pending list before it runs, so a nested
-    * drain cannot re-enter it — only the depth needs a bound. */
-   int drain_depth;
-   bool quiet_uncaught;  /* a parked worker is not an error to report */
-   /* Set when the current thread has parked rather than failed: the unwind
-    * runs to the top of the thread instead of stopping at a catch clause.
-    * See dvm__park() in dvm_runtime.c. */
-   bool parked;
-   uint32_t exc_pc;      /* bytecode offset of the throw, innermost frame */
-   /* The frame currently interpreting bytecode.  Reconstructing the innermost
-    * frame from the unwind mis-attributes a throw whenever an inner frame
-    * catches and rethrows, so the throw stamps itself here instead. */
-   /* Atomic because the sampling profiler in dvm.c reads it from its own
-    * thread while the interpreter writes it; the write is a relaxed store of
-    * a pointer, which is what it already was. */
-   struct dvm_method *_Atomic cur_method;
-   uint32_t cur_pc;
-   /* The bytecode methods currently on the interpreter's stack, outermost
-    * first.  Frames live on the C stack, so without this there is nothing to
-    * build Thread.getStackTrace() from — and SDKs log their own API calls by
-    * reading the caller's name out of that trace. */
-   struct dvm_method *callstack[128];
-   int ncallstack;
-   struct dvm_call_frame *invoke_frame;
-   int depth;
-   int trace;
-   /* Captured before runtime installation and any application code. */
-   int64_t process_start_elapsed_ms;
-   int64_t process_start_uptime_ms;
-   int32_t date_parse_century_start;
-   uint64_t steps;       /* since dvm_create, for diagnostics */
-   uint64_t call_steps;  /* since the outermost dvm_call, for the step limit */
-   uint64_t step_limit;
+  /* Handler / Looper posts, and Thread.start fallback when a host thread
+   * cannot be created (LUNARIA_DVM_THREADS=0 or pthread_create failure).
+   * Executor workers go through Thread.start → host threads; they must not
+   * live here.  Android's MessageQueue has no fixed 256-message limit;
+   * legitimate delayed posts can exceed that during a long download. */
+  dvm_ref *pending_threads;
+  /* Whether each entry came from Thread.start() rather than Handler.post():
+   * a posted Runnable runs on the main thread, and app code asserts on that. */
+  bool *pending_is_thread;
+  /* Monotonic millisecond stamp before which the entry must not run.  A
+   * postDelayed() whose delay is dropped turns every "do this unless the fast
+   * path beats me to it" timeout into an unconditional one. */
+  uint64_t *pending_due_ms;
+  /* Handler.post target Looper.  0 = main drain (also Thread.start).  A
+   * background Looper.loop() only takes entries tagged with its own ref —
+   * otherwise SwappyDisplayManager$LooperThread greedily runs every posted
+   * Runnable on the wrong thread and holds the interpreter lock for them. */
+  dvm_ref *pending_looper;
+  /* The Handler an entry was posted through, and the token it carried.
+   * Handler.removeCallbacksAndMessages(token) is defined in terms of both —
+   * "this handler's pending posts and messages, keeping only those whose
+   * token differs" — so with neither recorded the call had nothing to key on
+   * and did nothing.  A Thread.start() entry has no handler and no token. */
+  dvm_ref *pending_owner;
+  dvm_ref *pending_token;
+  dvm_ref velocity_pool[2];
+  unsigned velocity_pool_count;
+  struct dvm_nsd *nsd;
+  dvm_ref *active_object_animators;
+  size_t nactive_object_animators, active_object_animators_cap;
+  int npending, pending_cap;
+  dvm_ref message_pool[50];
+  unsigned message_pool_size;
+  dvm_ref resource_bundle_cache; /* per-VM default classpath bundle cache */
+  /* The Thread the interpreter is currently inside, or 0 for the main one. */
+  dvm_ref cur_thread;
+  dvm_ref default_trust_manager, keystore_entries;
+  bool keystore_hydrated;
+  dvm_ref accepted_issuers; /* host CA snapshot belongs to this VM */
+  dvm_ref main_thread;
+  dvm_ref main_looper; /* Process-owned Looper; never a reference into another VM. */
+  unsigned main_transaction_depth; /* lifecycle work holds the main Looper until completion */
+  uint64_t main_host_thread;
+  dvm_ref main_thread_group, system_thread_group;
+  struct dvm_attached_thread native_threads[256];
+  /* How many drains of the pending queue are on the stack.  This used to be a
+   * flat re-entrancy lock, which made every blocking wait inside a Runnable
+   * unsatisfiable: the work being waited for sits in this same queue, so a
+   * drain that refuses to nest can never deliver it.  Volley's
+   * NetworkDispatcher could not run while a Netmarble SDK call sat in
+   * CountDownLatch.await() for its response, so the wait burned its whole
+   * 15 s timeout with the VM frozen and the request "failed".  The entry
+   * being executed is taken off the pending list before it runs, so a nested
+   * drain cannot re-enter it — only the depth needs a bound. */
+  int drain_depth;
+  bool quiet_uncaught;  /* a parked worker is not an error to report */
+  /* Set when the current thread has parked rather than failed: the unwind
+   * runs to the top of the thread instead of stopping at a catch clause.
+   * See dvm__park() in dvm_runtime.c. */
+  bool parked;
+  uint32_t exc_pc;      /* bytecode offset of the throw, innermost frame */
+  /* The frame currently interpreting bytecode.  Reconstructing the innermost
+   * frame from the unwind mis-attributes a throw whenever an inner frame
+   * catches and rethrows, so the throw stamps itself here instead. */
+  /* Atomic because the sampling profiler in dvm.c reads it from its own
+   * thread while the interpreter writes it; the write is a relaxed store of
+   * a pointer, which is what it already was. */
+  struct dvm_method *_Atomic cur_method;
+  uint32_t cur_pc;
+  /* The bytecode methods currently on the interpreter's stack, outermost
+   * first.  Frames live on the C stack, so without this there is nothing to
+   * build Thread.getStackTrace() from — and SDKs log their own API calls by
+   * reading the caller's name out of that trace. */
+  struct dvm_method *callstack[128];
+  int ncallstack;
+  struct dvm_call_frame *invoke_frame;
+  int depth;
+  int trace;
+  /* Captured before runtime installation and any application code. */
+  int64_t process_start_elapsed_ms;
+  int64_t process_start_uptime_ms;
+  int32_t date_parse_century_start;
+  uint64_t steps;       /* since dvm_create, for diagnostics */
+  uint64_t call_steps;  /* since the outermost dvm_call, for the step limit */
+  uint64_t step_limit;
 
-   /* Interned string literals, keyed by contents. */
-   struct dvm_intern *interns;
-   int ninterns, interns_cap;
+  /* Interned string literals, keyed by contents. */
+  struct dvm_intern *interns;
+  int ninterns, interns_cap;
 
-   /* Names of classes we have already reported as missing, so a hot call site
-    * does not fill the log. */
-   char **missing;
-   int nmissing, missing_cap;
+  /* Names of classes we have already reported as missing, so a hot call site
+   * does not fill the log. */
+  char **missing;
+  int nmissing, missing_cap;
 };
 
 /* The interpreter state that belongs to a thread rather than to the VM.
@@ -380,23 +395,23 @@ struct dvm {
  * loading the incoming one's.  That is what keeps this change out of the
  * built-in class library entirely — see dvm_gil_acquire() in dvm.h. */
 struct dvm_tstate {
-   dvm_ref exception;
-   struct dvm_method *exc_trace[16];
-   int nexc_trace;
-   dvm_ref exc_ref;
-   uint32_t exc_pc;
-   dvm_ref cur_thread;
-   int drain_depth;
-   bool quiet_uncaught;
-   bool parked;
-   struct dvm_method *cur_method;
-   uint32_t cur_pc;
-   struct dvm_method *callstack[128];
-   int ncallstack;
-   struct dvm_call_frame *invoke_frame;
-   int depth;
-   uint64_t call_steps;
-   uint64_t step_limit;
+  dvm_ref exception;
+  struct dvm_method *exc_trace[16];
+  int nexc_trace;
+  dvm_ref exc_ref;
+  uint32_t exc_pc;
+  dvm_ref cur_thread;
+  int drain_depth;
+  bool quiet_uncaught;
+  bool parked;
+  struct dvm_method *cur_method;
+  uint32_t cur_pc;
+  struct dvm_method *callstack[128];
+  int ncallstack;
+  struct dvm_call_frame *invoke_frame;
+  int depth;
+  uint64_t call_steps;
+  uint64_t step_limit;
 };
 void dvm__tstate_save(struct dvm *vm, struct dvm_tstate *t);
 void dvm__tstate_load(struct dvm *vm, const struct dvm_tstate *t);
@@ -460,7 +475,10 @@ bool dvm__set_field_from(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
  * path. */
 /* Eight receiver classes per call site: a loop that walks every kind of view
  * reads the same field from all of them. */
-struct dvm_field_ic { _Atomic uint64_t w[8]; _Atomic unsigned next; };
+struct dvm_field_ic {
+  _Atomic uint64_t w[8];
+  _Atomic unsigned next;
+};
 bool dvm__get_field_ic(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
                        const char *name, const char *type, union dvm_value *out,
                        struct dvm_field_ic *ic);
@@ -471,7 +489,11 @@ struct dvm_class *dvm__find_class_ic(struct dvm *vm, const char *name,
                                      _Atomic uint64_t *ic);
 struct dvm_class *dvm__class_by_desc_ic(struct dvm *vm, const char *desc,
                                         _Atomic uint64_t *ic);
-struct dvm_method_ic { uint64_t generation; struct dvm_class *cls; struct dvm_method *m; };
+struct dvm_method_ic {
+  uint64_t generation;
+  struct dvm_class *cls;
+  struct dvm_method *m;
+};
 struct dvm_method *dvm__find_method_ic(struct dvm *vm, struct dvm_class *cls,
                                        const char *name, const char *sig,
                                        struct dvm_method_ic *ic);
@@ -521,8 +543,8 @@ bool dvm__thread_take_interrupt(struct dvm *vm);
 void dvm__thread_set_wait(struct dvm *vm, uintptr_t channel);
 /* java.lang.Thread.State declaration order. Updated only with the GIL held. */
 enum dvm_thread_state {
-   DVM_THREAD_NEW, DVM_THREAD_RUNNABLE, DVM_THREAD_BLOCKED,
-   DVM_THREAD_WAITING, DVM_THREAD_TIMED_WAITING, DVM_THREAD_TERMINATED
+  DVM_THREAD_NEW, DVM_THREAD_RUNNABLE, DVM_THREAD_BLOCKED,
+  DVM_THREAD_WAITING, DVM_THREAD_TIMED_WAITING, DVM_THREAD_TERMINATED
 };
 void dvm__thread_set_state(struct dvm *vm, dvm_ref thread,
                            enum dvm_thread_state state);
@@ -597,21 +619,28 @@ bool dvm__other_threads_live(void);
  * back to the element index. */
 static inline int dvm__elem_width(char kind)
 {
-   switch (kind) {
-      case 'Z': case 'B': return 1;
-      case 'C': case 'S': return 2;
-      case 'J': case 'D': return 8;
-      default: return 4;
-   }
+  switch (kind) {
+  case 'Z':
+  case 'B':
+    return 1;
+  case 'C':
+  case 'S':
+    return 2;
+  case 'J':
+  case 'D':
+    return 8;
+  default:
+    return 4;
+  }
 }
 
 #define DVM_IO_PROGRESS_BYTES 4096u
 static inline void dvm__note_io_progress(struct dvm *vm, size_t bytes) {
-   /* Only a bulk transfer counts.  Incidental I/O — a preference file, a log
-    * line, a small config read — happens on every other call, and clearing the
-    * budget for those would disable the limit everywhere and let one Runnable
-    * hold the VM for as long as it likes. */
-   if (vm && bytes >= DVM_IO_PROGRESS_BYTES) vm->call_steps = 0;
+  /* Only a bulk transfer counts.  Incidental I/O — a preference file, a log
+   * line, a small config read — happens on every other call, and clearing the
+   * budget for those would disable the limit everywhere and let one Runnable
+   * hold the VM for as long as it likes. */
+  if (vm && bytes >= DVM_IO_PROGRESS_BYTES) vm->call_steps = 0;
 }
 
 /* Nesting bound for dvm__run_pending_threads().  Each level is a Runnable that
@@ -670,8 +699,8 @@ dvm_ref dvm_runtime_shared_prefs(struct dvm *vm, const char *name);
  * that answers getSystemService — bytecode (rt_context) and the JNI bridge —
  * resolves through these, so they cannot disagree about which services exist. */
 struct dvm_system_service {
-   const char *key;    /* "vibrator_manager" */
-   const char *desc;   /* "Landroid/os/VibratorManager;" */
+  const char *key;    /* "vibrator_manager" */
+  const char *desc;   /* "Landroid/os/VibratorManager;" */
 };
 const struct dvm_system_service *dvm_runtime_system_services(size_t *count);
 /* Matches a service key, a class descriptor or a bare class name. */
@@ -712,45 +741,45 @@ bool dvm__media_router_update_types(struct dvm *vm, dvm_ref route, int types);
 
 /* MessageFormat compiled pattern, shared with the runtime tests. */
 enum luna_message_type {
-   LUNA_MESSAGE_OBJECT, LUNA_MESSAGE_NUMBER, LUNA_MESSAGE_DATE,
-   LUNA_MESSAGE_TIME, LUNA_MESSAGE_CHOICE
+  LUNA_MESSAGE_OBJECT, LUNA_MESSAGE_NUMBER, LUNA_MESSAGE_DATE,
+  LUNA_MESSAGE_TIME, LUNA_MESSAGE_CHOICE
 };
 struct luna_message_element {
-   size_t offset; /* UTF-16 offset in the literal text, not the source pattern. */
-   int32_t argument;
-   enum luna_message_type type;
-   uint16_t *style;
-   size_t style_length;
+  size_t offset; /* UTF-16 offset in the literal text, not the source pattern. */
+  int32_t argument;
+  enum luna_message_type type;
+  uint16_t *style;
+  size_t style_length;
 };
 struct luna_message_pattern {
-   uint16_t *literal;
-   size_t literal_length;
-   struct luna_message_element *elements;
-   size_t count;
+  uint16_t *literal;
+  size_t literal_length;
+  struct luna_message_element *elements;
+  size_t count;
 };
 enum luna_message_error {
-   LUNA_MESSAGE_OK, LUNA_MESSAGE_NULL, LUNA_MESSAGE_MEMORY,
-   LUNA_MESSAGE_ARGUMENT, LUNA_MESSAGE_TYPE, LUNA_MESSAGE_BRACES
+  LUNA_MESSAGE_OK, LUNA_MESSAGE_NULL, LUNA_MESSAGE_MEMORY,
+  LUNA_MESSAGE_ARGUMENT, LUNA_MESSAGE_TYPE, LUNA_MESSAGE_BRACES
 };
 /* Output must be zero-initialized or previously compiled by this API.
  * Success replaces it; failure leaves it unchanged. Subformat style validation
  * belongs to the Number/Date/ChoiceFormat constructor, not this syntax layer.
  * Input and style strings are length-delimited: embedded NUL is significant. */
 enum luna_message_error luna_message_compile(const uint16_t *text, size_t length,
-                                             struct luna_message_pattern *out);
+    struct luna_message_pattern *out);
 void luna_message_free(struct luna_message_pattern *pattern);
 
 /* ---- android.database.sqlite over the host's SQLite (dvm_sqlite.c) ----
  * The tables have the layout of rt_method / rt_field rows and are NULL-terminated;
  * dvm_runtime.c wires them to the framework classes. */
 struct dvm_sqlite_method {
-   const char *name, *sig;
-   dvm_builtin_fn fn;
-   uint32_t access;
+  const char *name, *sig;
+  dvm_builtin_fn fn;
+  uint32_t access;
 };
 
 struct dvm_sqlite_field {
-   const char *name, *type;
+  const char *name, *type;
 };
 
 extern const struct dvm_sqlite_method dvm_sqlite_database_methods[];

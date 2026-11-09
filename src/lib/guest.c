@@ -1,4 +1,11 @@
-/* SPDX-License-Identifier: MPL-2.0 */
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 /* Small, freestanding initialization entry points. gen-guest-init.py compiles
  * one operation at a time from this same C source for each Android ABI. */
 #if defined(LUNARIA_GUEST_INIT)
@@ -7,21 +14,21 @@ static __attribute__((always_inline)) inline void
 guest_futex(unsigned *control,unsigned operation,unsigned value)
 {
 #if defined(__aarch64__)
-    register unsigned *a0 __asm__("x0")=control;
-    register unsigned long a1 __asm__("x1")=operation;
-    register unsigned long a2 __asm__("x2")=value;
-    register unsigned long a3 __asm__("x3")=0;
-    register unsigned long number __asm__("x8")=98;
-    __asm__ volatile("svc #0" : "+r"(a0)
-                     : "r"(a1),"r"(a2),"r"(a3),"r"(number) : "memory","cc");
+  register unsigned *a0 __asm__("x0")=control;
+  register unsigned long a1 __asm__("x1")=operation;
+  register unsigned long a2 __asm__("x2")=value;
+  register unsigned long a3 __asm__("x3")=0;
+  register unsigned long number __asm__("x8")=98;
+  __asm__ volatile("svc #0" : "+r"(a0)
+                   : "r"(a1),"r"(a2),"r"(a3),"r"(number) : "memory","cc");
 #elif defined(__arm__)
-    register unsigned *a0 __asm__("r0")=control;
-    register unsigned a1 __asm__("r1")=operation;
-    register unsigned a2 __asm__("r2")=value;
-    register unsigned a3 __asm__("r3")=0;
-    register unsigned number __asm__("r7")=240;
-    __asm__ volatile("svc #0" : "+r"(a0)
-                     : "r"(a1),"r"(a2),"r"(a3),"r"(number) : "memory","cc");
+  register unsigned *a0 __asm__("r0")=control;
+  register unsigned a1 __asm__("r1")=operation;
+  register unsigned a2 __asm__("r2")=value;
+  register unsigned a3 __asm__("r3")=0;
+  register unsigned number __asm__("r7")=240;
+  __asm__ volatile("svc #0" : "+r"(a0)
+                   : "r"(a1),"r"(a2),"r"(a3),"r"(number) : "memory","cc");
 #else
 #error Android ARM guest target required
 #endif
@@ -31,62 +38,56 @@ guest_futex(unsigned *control,unsigned operation,unsigned value)
 #if LUNA_GUARD_OPERATION == 0
 int luna_guest_pthread_once(unsigned *control,void (*initialize)(void))
 {
-    unsigned state=__atomic_load_n(control,__ATOMIC_ACQUIRE);
-    for (;;) {
-        if (state==2) return 0;
-        unsigned expected=0;
-        if (__atomic_compare_exchange_n(control,&expected,1,1,
-                                         __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) {
-            initialize();
-            __atomic_store_n(control,2,__ATOMIC_RELEASE);
-            guest_futex(control,129,0x7fffffff); /* FUTEX_WAKE_PRIVATE */
-            return 0;
-        }
-        if (expected==1) guest_futex(control,128,1); /* FUTEX_WAIT_PRIVATE */
-        state=__atomic_load_n(control,__ATOMIC_ACQUIRE);
+  unsigned state=__atomic_load_n(control,__ATOMIC_ACQUIRE);
+  for (;;) {
+    if (state==2) return 0;
+    unsigned expected=0;
+    if (__atomic_compare_exchange_n(control,&expected,1,1,
+                                    __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) {
+      initialize();
+      __atomic_store_n(control,2,__ATOMIC_RELEASE);
+      guest_futex(control,129,0x7fffffff); /* FUTEX_WAKE_PRIVATE */
+      return 0;
     }
+    if (expected==1) guest_futex(control,128,1); /* FUTEX_WAIT_PRIVATE */
+    state=__atomic_load_n(control,__ATOMIC_ACQUIRE);
+  }
 }
 #endif
 
 #if LUNA_GUARD_OPERATION == 1
 int luna_guest_cxa_guard_acquire(unsigned *guard)
 {
-    unsigned state=__atomic_load_n(guard,__ATOMIC_ACQUIRE);
-    for (;;) {
-        if ((state&0xff) || (state&0x100)) return 0;
-        if (!(state&0x200)) {
-            if (__atomic_compare_exchange_n(guard,&state,0x200,1,
-                                             __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) return 1;
-            continue;
-        }
-        if (!(state&0x400)) {
-            unsigned waiting=state|0x400;
-            if (!__atomic_compare_exchange_n(guard,&state,waiting,1,
-                                              __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) continue;
-            state=waiting;
-        }
-        guest_futex(guard,128,state);
-        state=__atomic_load_n(guard,__ATOMIC_ACQUIRE);
+  unsigned state=__atomic_load_n(guard,__ATOMIC_ACQUIRE);
+  for (;;) {
+    if ((state&0xff) || (state&0x100)) return 0;
+    if (!(state&0x200)) {
+      if (__atomic_compare_exchange_n(guard,&state,0x200,1,
+                                      __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) return 1;
+      continue;
     }
+    if (!(state&0x400)) {
+      unsigned waiting=state|0x400;
+      if (!__atomic_compare_exchange_n(guard,&state,waiting,1,
+                                       __ATOMIC_ACQUIRE,__ATOMIC_ACQUIRE)) continue;
+      state=waiting;
+    }
+    guest_futex(guard,128,state);
+    state=__atomic_load_n(guard,__ATOMIC_ACQUIRE);
+  }
 }
 #elif LUNA_GUARD_OPERATION == 2 || LUNA_GUARD_OPERATION == 3
 int luna_guest_cxa_guard_finish(unsigned *guard)
 {
-    unsigned state=__atomic_exchange_n(guard,LUNA_GUARD_OPERATION==2 ? 0x101 : 0,
-                                       __ATOMIC_RELEASE);
-    if (state&0x400) guest_futex(guard,129,0x7fffffff);
-    return 0;
+  unsigned state=__atomic_exchange_n(guard,LUNA_GUARD_OPERATION==2 ? 0x101 : 0,
+                                     __ATOMIC_RELEASE);
+  if (state&0x400) guest_futex(guard,129,0x7fffffff);
+  return 0;
 }
 #endif
 
 #else /* ordinary guest libc / host-shared heap */
 /*
- * Copyright © 2026 Yuichiro Nakada / Project Lunaria
- *
- * This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
  * Guest-side platform code: compiled for AArch64 Android and loaded into the
  * emulated process as liblunaria_guest.so (`make guestlib`).
  *
@@ -138,6 +139,7 @@ int luna_guest_cxa_guard_finish(unsigned *guard)
  * futex table.  The holder is recorded beside it so a waiter can ask the
  * scheduler to run the holder.
  */
+
 #ifndef LUNARIA_LIB_GUEST_C
 #define LUNARIA_LIB_GUEST_C
 
@@ -188,85 +190,85 @@ int luna_guest_cxa_guard_finish(unsigned *guard)
 #define LH_OWNER_HOST  1u
 
 struct lh_tc {
-   uint64_t tid;                  /* 0 empty, LH_TC_DEAD released */
-   uint32_t bytes;                /* cached payload bytes */
-   uint32_t pad;
-   uint16_t cnt[LH_TC_CLASSES];
-   uint32_t top[LH_TC_CLASSES];   /* newest cached block of the class */
+  uint64_t tid;                  /* 0 empty, LH_TC_DEAD released */
+  uint32_t bytes;                /* cached payload bytes */
+  uint32_t pad;
+  uint16_t cnt[LH_TC_CLASSES];
+  uint32_t top[LH_TC_CLASSES];   /* newest cached block of the class */
 };
 
 struct lh_ctl {
-   uint32_t magic;
-   uint32_t size;                 /* sizeof(struct lh_ctl), checked by both */
-   uint32_t state;                /* 0 unlocked, 1 locked, 2 contended */
-   uint32_t pad0;
-   uint64_t owner;                /* who holds it, for diagnostics and boost */
-   uint32_t start;                /* first block header */
-   uint32_t ptr;                  /* bump pointer (next header) */
-   uint32_t high_water;           /* highest bump ever: above it is zero */
-   uint32_t limit;                /* the small-mmap arena comes down to here */
-   uint64_t free_blocks;
-   uint64_t malloc_calls, malloc_reused, free_calls;
-   uint64_t contended;            /* lock waits, for the perf report */
-   uint64_t bin_map[LH_MAP_WORDS];
-   uint32_t bin[LH_NBINS];
-   struct lh_tc tc[LH_TC_SLOTS];
+  uint32_t magic;
+  uint32_t size;                 /* sizeof(struct lh_ctl), checked by both */
+  uint32_t state;                /* 0 unlocked, 1 locked, 2 contended */
+  uint32_t pad0;
+  uint64_t owner;                /* who holds it, for diagnostics and boost */
+  uint32_t start;                /* first block header */
+  uint32_t ptr;                  /* bump pointer (next header) */
+  uint32_t high_water;           /* highest bump ever: above it is zero */
+  uint32_t limit;                /* the small-mmap arena comes down to here */
+  uint64_t free_blocks;
+  uint64_t malloc_calls, malloc_reused, free_calls;
+  uint64_t contended;            /* lock waits, for the perf report */
+  uint64_t bin_map[LH_MAP_WORDS];
+  uint32_t bin[LH_NBINS];
+  struct lh_tc tc[LH_TC_SLOTS];
 };
 
 struct lh_heap {
-   uintptr_t mem;                 /* where offset 0 of the window is */
-   struct lh_ctl *ctl;
-   uint64_t tid;                  /* the thread using it; 0 bypasses its cache */
+  uintptr_t mem;                 /* where offset 0 of the window is */
+  struct lh_ctl *ctl;
+  uint64_t tid;                  /* the thread using it; 0 bypasses its cache */
 };
 
 static inline uint32_t lh_r32(const struct lh_heap *h, uint32_t off)
 {
-   uint32_t v;
-   memcpy(&v, (const void *)(h->mem + off), 4);
-   return v;
+  uint32_t v;
+  memcpy(&v, (const void *)(h->mem + off), 4);
+  return v;
 }
 
 static inline void lh_w32(const struct lh_heap *h, uint32_t off, uint32_t v)
 {
-   memcpy((void *)(h->mem + off), &v, 4);
+  memcpy((void *)(h->mem + off), &v, 4);
 }
 
 static inline uint32_t lh_align(uint32_t n)
 {
-   return (n + LH_ALIGN - 1u) & ~(LH_ALIGN - 1u);
+  return (n + LH_ALIGN - 1u) & ~(LH_ALIGN - 1u);
 }
 
 /* A guest size_t is 64 bits and the window is 32; refuse rather than
  * truncate into a much smaller successful allocation. */
 static inline bool lh_size32(uint64_t n, uint32_t *out)
 {
-   if (n > (uint64_t)UINT32_MAX - (LH_ALIGN - 1u) - LH_HDR) return false;
-   *out = (uint32_t)n;
-   return true;
+  if (n > (uint64_t)UINT32_MAX - (LH_ALIGN - 1u) - LH_HDR) return false;
+  *out = (uint32_t)n;
+  return true;
 }
 
 static inline uint32_t lh_bin_of(uint32_t size)
 {
-   if (size <= LH_SMALL_MAX) return size / LH_ALIGN;
-   uint32_t k = 31u - (uint32_t)__builtin_clz(size);
-   uint32_t b = LH_SMALL_BINS + (k - 12u);
-   return b < LH_NBINS ? b : LH_NBINS - 1u;
+  if (size <= LH_SMALL_MAX) return size / LH_ALIGN;
+  uint32_t k = 31u - (uint32_t)__builtin_clz(size);
+  uint32_t b = LH_SMALL_BINS + (k - 12u);
+  return b < LH_NBINS ? b : LH_NBINS - 1u;
 }
 
 static inline void lh_bin_mark(struct lh_ctl *c, uint32_t b, bool used)
 {
-   if (used) c->bin_map[b / 64u] |= 1ull << (b % 64u);
-   else      c->bin_map[b / 64u] &= ~(1ull << (b % 64u));
+  if (used) c->bin_map[b / 64u] |= 1ull << (b % 64u);
+  else      c->bin_map[b / 64u] &= ~(1ull << (b % 64u));
 }
 
 static inline uint32_t lh_bin_next(const struct lh_ctl *c, uint32_t b)
 {
-   for (uint32_t w = b / 64u; w < LH_MAP_WORDS; ++w) {
-      uint64_t bits = c->bin_map[w];
-      if (w == b / 64u) bits &= ~0ull << (b % 64u);
-      if (bits) return w * 64u + (uint32_t)__builtin_ctzll(bits);
-   }
-   return LH_NBINS;
+  for (uint32_t w = b / 64u; w < LH_MAP_WORDS; ++w) {
+    uint64_t bits = c->bin_map[w];
+    if (w == b / 64u) bits &= ~0ull << (b % 64u);
+    if (bits) return w * 64u + (uint32_t)__builtin_ctzll(bits);
+  }
+  return LH_NBINS;
 }
 
 /* First use of a window: an empty heap starting right after the control
@@ -274,138 +276,141 @@ static inline uint32_t lh_bin_next(const struct lh_ctl *c, uint32_t b)
  * there and grows down). */
 static inline void lh_init(struct lh_heap *h, uint32_t ctl_off, uint32_t limit)
 {
-   struct lh_ctl *c = h->ctl;
-   memset(c, 0, sizeof *c);
-   c->magic = LH_MAGIC;
-   c->size = sizeof *c;
-   c->start = lh_align(ctl_off + (uint32_t)sizeof *c);
-   c->ptr = c->start;
-   c->high_water = c->start;
-   c->limit = limit;
+  struct lh_ctl *c = h->ctl;
+  memset(c, 0, sizeof *c);
+  c->magic = LH_MAGIC;
+  c->size = sizeof *c;
+  c->start = lh_align(ctl_off + (uint32_t)sizeof *c);
+  c->ptr = c->start;
+  c->high_water = c->start;
+  c->limit = limit;
 }
 
 static inline bool lh_free_block_ok(const struct lh_heap *h, uint32_t va)
 {
-   const struct lh_ctl *c = h->ctl;
-   if (va < c->start + LH_HDR || va >= c->ptr ||
-       lh_r32(h, va - 4u) != LH_FREE_MAGIC)
-      return false;
-   const uint32_t size = lh_r32(h, va - LH_HDR);
-   return size >= LH_MIN && !(size & (LH_ALIGN - 1u)) &&
-          (uint64_t)va + size <= c->ptr &&
-          lh_r32(h, va + size - 4u) == size;
+  const struct lh_ctl *c = h->ctl;
+  if (va < c->start + LH_HDR || va >= c->ptr ||
+      lh_r32(h, va - 4u) != LH_FREE_MAGIC)
+    return false;
+  const uint32_t size = lh_r32(h, va - LH_HDR);
+  return size >= LH_MIN && !(size & (LH_ALIGN - 1u)) &&
+         (uint64_t)va + size <= c->ptr &&
+         lh_r32(h, va + size - 4u) == size;
 }
 
 /* Free-list links are {next,prev} in the first eight payload bytes. */
 static inline bool lh_bin_unlink(struct lh_heap *h, uint32_t va, uint32_t size)
 {
-   struct lh_ctl *c = h->ctl;
-   const uint32_t b = lh_bin_of(size);
-   const uint32_t next = lh_r32(h, va);
-   const uint32_t prev = lh_r32(h, va + 4u);
-   if (prev) {
-      if (lh_r32(h, prev) != va) return false;
-      lh_w32(h, prev, next);
-   } else {
-      if (c->bin[b] != va) return false;
-      c->bin[b] = next;
-   }
-   if (next) lh_w32(h, next + 4u, prev);
-   if (!c->bin[b]) lh_bin_mark(c, b, false);
-   if (c->free_blocks) --c->free_blocks;
-   return true;
+  struct lh_ctl *c = h->ctl;
+  const uint32_t b = lh_bin_of(size);
+  const uint32_t next = lh_r32(h, va);
+  const uint32_t prev = lh_r32(h, va + 4u);
+  if (prev) {
+    if (lh_r32(h, prev) != va) return false;
+    lh_w32(h, prev, next);
+  } else {
+    if (c->bin[b] != va) return false;
+    c->bin[b] = next;
+  }
+  if (next) lh_w32(h, next + 4u, prev);
+  if (!c->bin[b]) lh_bin_mark(c, b, false);
+  if (c->free_blocks) --c->free_blocks;
+  return true;
 }
 
 static inline uint32_t lh_bin_take(struct lh_heap *h, uint32_t b, uint32_t size)
 {
-   struct lh_ctl *c = h->ctl;
-   uint32_t prev = 0;
-   uint32_t va = c->bin[b];
-   const int limit = (b < LH_SMALL_BINS) ? 1 : 32;
-   for (int steps = 0; va && steps < limit; ++steps) {
-      if (!lh_free_block_ok(h, va)) {
-         /* Truncate rather than trust a chain through overwritten memory. */
-         if (prev) lh_w32(h, prev, 0u);
-         else { c->bin[b] = 0u; lh_bin_mark(c, b, false); }
-         return 0;
+  struct lh_ctl *c = h->ctl;
+  uint32_t prev = 0;
+  uint32_t va = c->bin[b];
+  const int limit = (b < LH_SMALL_BINS) ? 1 : 32;
+  for (int steps = 0; va && steps < limit; ++steps) {
+    if (!lh_free_block_ok(h, va)) {
+      /* Truncate rather than trust a chain through overwritten memory. */
+      if (prev) lh_w32(h, prev, 0u);
+      else {
+        c->bin[b] = 0u;
+        lh_bin_mark(c, b, false);
       }
-      const uint32_t blk = lh_r32(h, va - LH_HDR);
-      const uint32_t next = lh_r32(h, va);
-      if (blk >= size) return lh_bin_unlink(h, va, blk) ? va : 0u;
-      prev = va;
-      va = next;
-   }
-   return 0;
+      return 0;
+    }
+    const uint32_t blk = lh_r32(h, va - LH_HDR);
+    const uint32_t next = lh_r32(h, va);
+    if (blk >= size) return lh_bin_unlink(h, va, blk) ? va : 0u;
+    prev = va;
+    va = next;
+  }
+  return 0;
 }
 
 static inline void lh_bin_put(struct lh_heap *h, uint32_t va, uint32_t size)
 {
-   struct lh_ctl *c = h->ctl;
-   const uint32_t b = lh_bin_of(size);
-   const uint32_t old = c->bin[b];
-   lh_w32(h, va, old);
-   lh_w32(h, va + 4u, 0u);
-   if (old) lh_w32(h, old + 4u, va);
-   c->bin[b] = va;
-   lh_bin_mark(c, b, true);
-   ++c->free_blocks;
+  struct lh_ctl *c = h->ctl;
+  const uint32_t b = lh_bin_of(size);
+  const uint32_t old = c->bin[b];
+  lh_w32(h, va, old);
+  lh_w32(h, va + 4u, 0u);
+  if (old) lh_w32(h, old + 4u, va);
+  c->bin[b] = va;
+  lh_bin_mark(c, b, true);
+  ++c->free_blocks;
 }
 
 /* Header word +4 is the size of the physical left neighbour while that
  * neighbour is free, otherwise zero. */
 static inline void lh_set_next_prev_free(struct lh_heap *h, uint32_t va,
-                                         uint32_t size, uint32_t prev_size)
+    uint32_t size, uint32_t prev_size)
 {
-   const uint32_t next_hdr = va + size;
-   if (next_hdr < h->ctl->ptr) lh_w32(h, next_hdr + 4u, prev_size);
+  const uint32_t next_hdr = va + size;
+  if (next_hdr < h->ctl->ptr) lh_w32(h, next_hdr + 4u, prev_size);
 }
 
 static inline void lh_mark_allocated(struct lh_heap *h, uint32_t va, uint32_t size)
 {
-   lh_w32(h, va - LH_HDR, size);
-   lh_w32(h, va - 4u, LH_ALLOC_MAGIC);
-   lh_set_next_prev_free(h, va, size, 0u);
+  lh_w32(h, va - LH_HDR, size);
+  lh_w32(h, va - 4u, LH_ALLOC_MAGIC);
+  lh_set_next_prev_free(h, va, size, 0u);
 }
 
 static inline void lh_mark_free(struct lh_heap *h, uint32_t va, uint32_t size)
 {
-   lh_w32(h, va - LH_HDR, size);
-   lh_w32(h, va - 4u, LH_FREE_MAGIC);
-   lh_w32(h, va + size - 4u, size);
-   lh_set_next_prev_free(h, va, size, size);
+  lh_w32(h, va - LH_HDR, size);
+  lh_w32(h, va - 4u, LH_FREE_MAGIC);
+  lh_w32(h, va + size - 4u, size);
+  lh_set_next_prev_free(h, va, size, size);
 }
 
 static inline void lh_release(struct lh_heap *h, uint32_t va, uint32_t size)
 {
-   struct lh_ctl *c = h->ctl;
-   uint32_t hdr = va - LH_HDR;
+  struct lh_ctl *c = h->ctl;
+  uint32_t hdr = va - LH_HDR;
 
-   if (hdr > c->start) {
-      const uint32_t left_size = lh_r32(h, hdr + 4u);
-      if (left_size >= LH_MIN && !(left_size & (LH_ALIGN - 1u)) &&
-          left_size <= hdr - (c->start + LH_HDR)) {
-         const uint32_t left = hdr - left_size;
-         if (lh_free_block_ok(h, left) && lh_bin_unlink(h, left, left_size)) {
-            va = left;
-            size += LH_HDR + left_size;
-            hdr = va - LH_HDR;
-         }
+  if (hdr > c->start) {
+    const uint32_t left_size = lh_r32(h, hdr + 4u);
+    if (left_size >= LH_MIN && !(left_size & (LH_ALIGN - 1u)) &&
+        left_size <= hdr - (c->start + LH_HDR)) {
+      const uint32_t left = hdr - left_size;
+      if (lh_free_block_ok(h, left) && lh_bin_unlink(h, left, left_size)) {
+        va = left;
+        size += LH_HDR + left_size;
+        hdr = va - LH_HDR;
       }
-   }
+    }
+  }
 
-   const uint32_t right_hdr = va + size;
-   if ((uint64_t)right_hdr + LH_HDR < c->ptr) {
-      const uint32_t right = right_hdr + LH_HDR;
-      if (lh_free_block_ok(h, right)) {
-         const uint32_t right_size = lh_r32(h, right - LH_HDR);
-         if (lh_bin_unlink(h, right, right_size))
-            size += LH_HDR + right_size;
-      }
-   }
+  const uint32_t right_hdr = va + size;
+  if ((uint64_t)right_hdr + LH_HDR < c->ptr) {
+    const uint32_t right = right_hdr + LH_HDR;
+    if (lh_free_block_ok(h, right)) {
+      const uint32_t right_size = lh_r32(h, right - LH_HDR);
+      if (lh_bin_unlink(h, right, right_size))
+        size += LH_HDR + right_size;
+    }
+  }
 
-   lh_mark_free(h, va, size);
-   if ((uint64_t)va + size == c->ptr) c->ptr = hdr;
-   else lh_bin_put(h, va, size);
+  lh_mark_free(h, va, size);
+  if ((uint64_t)va + size == c->ptr) c->ptr = hdr;
+  else lh_bin_put(h, va, size);
 }
 
 
@@ -415,246 +420,264 @@ static inline void lh_release(struct lh_heap *h, uint32_t va, uint32_t size)
  * cache. */
 static inline struct lh_tc *lh_tc_slot(struct lh_heap *h, bool create)
 {
-   if (!h->tid) return 0;
-   struct lh_ctl *c = h->ctl;
-   struct lh_tc *spare = 0;
-   uint32_t i = (uint32_t)((h->tid * 0x9E3779B97F4A7C15ull) >> 57);
-   for (uint32_t n = 0; n < LH_TC_SLOTS; ++n, i = (i + 1u) & (LH_TC_SLOTS - 1u)) {
-      struct lh_tc *t = &c->tc[i];
-      if (t->tid == h->tid) return t;
-      if (t->tid == LH_TC_DEAD) { if (!spare) spare = t; continue; }
-      if (t->tid == 0) { if (!spare) spare = t; break; }
-   }
-   if (!create || !spare) return 0;
-   memset(spare, 0, sizeof *spare);
-   spare->tid = h->tid;
-   return spare;
+  if (!h->tid) return 0;
+  struct lh_ctl *c = h->ctl;
+  struct lh_tc *spare = 0;
+  uint32_t i = (uint32_t)((h->tid * 0x9E3779B97F4A7C15ull) >> 57);
+  for (uint32_t n = 0; n < LH_TC_SLOTS; ++n, i = (i + 1u) & (LH_TC_SLOTS - 1u)) {
+    struct lh_tc *t = &c->tc[i];
+    if (t->tid == h->tid) return t;
+    if (t->tid == LH_TC_DEAD) {
+      if (!spare) spare = t;
+      continue;
+    }
+    if (t->tid == 0) {
+      if (!spare) spare = t;
+      break;
+    }
+  }
+  if (!create || !spare) return 0;
+  memset(spare, 0, sizeof *spare);
+  spare->tid = h->tid;
+  return spare;
 }
 
 /* The newest cached block of exactly `size`, or 0.  A chain whose header was
  * overwritten is abandoned rather than followed. */
 static inline uint32_t lh_tc_take(struct lh_heap *h, uint32_t size)
 {
-   struct lh_tc *t = lh_tc_slot(h, false);
-   const uint32_t k = size / LH_ALIGN;
-   if (!t || !t->cnt[k]) return 0;
-   const uint32_t va = t->top[k];
-   if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
-       lh_r32(h, va - 4u) != LH_CACHED_MAGIC || lh_r32(h, va - LH_HDR) != size) {
-      const uint32_t lost = (uint32_t)t->cnt[k] * size;
-      t->bytes = t->bytes > lost ? t->bytes - lost : 0u;
-      t->cnt[k] = 0;
-      t->top[k] = 0;
-      return 0;
-   }
-   t->top[k] = lh_r32(h, va - LH_HDR + 8u);
-   --t->cnt[k];
-   t->bytes -= size;
-   lh_w32(h, va - 4u, LH_ALLOC_MAGIC);
-   return va;
+  struct lh_tc *t = lh_tc_slot(h, false);
+  const uint32_t k = size / LH_ALIGN;
+  if (!t || !t->cnt[k]) return 0;
+  const uint32_t va = t->top[k];
+  if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
+      lh_r32(h, va - 4u) != LH_CACHED_MAGIC || lh_r32(h, va - LH_HDR) != size) {
+    const uint32_t lost = (uint32_t)t->cnt[k] * size;
+    t->bytes = t->bytes > lost ? t->bytes - lost : 0u;
+    t->cnt[k] = 0;
+    t->top[k] = 0;
+    return 0;
+  }
+  t->top[k] = lh_r32(h, va - LH_HDR + 8u);
+  --t->cnt[k];
+  t->bytes -= size;
+  lh_w32(h, va - 4u, LH_ALLOC_MAGIC);
+  return va;
 }
 
 static inline bool lh_tc_put(struct lh_heap *h, uint32_t va, uint32_t size)
 {
-   if (size > LH_SMALL_MAX) return false;
-   struct lh_tc *t = lh_tc_slot(h, true);
-   const uint32_t k = size / LH_ALIGN;
-   if (!t || t->cnt[k] >= LH_TC_CAP || t->bytes + size > LH_TC_BYTES) return false;
-   lh_w32(h, va - LH_HDR + 8u, t->top[k]);
-   lh_w32(h, va - 4u, LH_CACHED_MAGIC);
-   t->top[k] = va;
-   ++t->cnt[k];
-   t->bytes += size;
-   return true;
+  if (size > LH_SMALL_MAX) return false;
+  struct lh_tc *t = lh_tc_slot(h, true);
+  const uint32_t k = size / LH_ALIGN;
+  if (!t || t->cnt[k] >= LH_TC_CAP || t->bytes + size > LH_TC_BYTES) return false;
+  lh_w32(h, va - LH_HDR + 8u, t->top[k]);
+  lh_w32(h, va - 4u, LH_CACHED_MAGIC);
+  t->top[k] = va;
+  ++t->cnt[k];
+  t->bytes += size;
+  return true;
 }
 
 /* A thread is gone: its cached blocks return to the shared heap. */
 static inline void lh_tc_drop(struct lh_heap *h)
 {
-   struct lh_tc *t = lh_tc_slot(h, false);
-   if (!t) return;
-   for (uint32_t k = 1; k < LH_TC_CLASSES; ++k) {
-      while (t->cnt[k]) {
-         const uint32_t va = t->top[k];
-         if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
-             lh_r32(h, va - 4u) != LH_CACHED_MAGIC) break;
-         t->top[k] = lh_r32(h, va - LH_HDR + 8u);
-         --t->cnt[k];
-         lh_release(h, va, lh_r32(h, va - LH_HDR));
-      }
-   }
-   t->tid = LH_TC_DEAD;
+  struct lh_tc *t = lh_tc_slot(h, false);
+  if (!t) return;
+  for (uint32_t k = 1; k < LH_TC_CLASSES; ++k) {
+    while (t->cnt[k]) {
+      const uint32_t va = t->top[k];
+      if (va < h->ctl->start + LH_HDR || va >= h->ctl->ptr ||
+          lh_r32(h, va - 4u) != LH_CACHED_MAGIC) break;
+      t->top[k] = lh_r32(h, va - LH_HDR + 8u);
+      --t->cnt[k];
+      lh_release(h, va, lh_r32(h, va - LH_HDR));
+    }
+  }
+  t->tid = LH_TC_DEAD;
 }
 
 /* `zeroed` reports memory that has never been handed out before. */
 static inline uint32_t lh_malloc(struct lh_heap *h, uint32_t size, bool *zeroed)
 {
-   struct lh_ctl *c = h->ctl;
-   if (zeroed) *zeroed = false;
-   if (size == 0) size = 1;
-   size = lh_align(size);
-   ++c->malloc_calls;
+  struct lh_ctl *c = h->ctl;
+  if (zeroed) *zeroed = false;
+  if (size == 0) size = 1;
+  size = lh_align(size);
+  ++c->malloc_calls;
 
-   if (size <= LH_SMALL_MAX) {
-      const uint32_t cached = lh_tc_take(h, size);
-      if (cached) { ++c->malloc_reused; return cached; }
-   }
-
-   for (uint32_t b = lh_bin_next(c, lh_bin_of(size)); b < LH_NBINS;
-        b = lh_bin_next(c, b + 1u)) {
-      uint32_t va = lh_bin_take(h, b, size);
-      if (!va) continue;
-      const uint32_t blk = lh_r32(h, va - LH_HDR);
+  if (size <= LH_SMALL_MAX) {
+    const uint32_t cached = lh_tc_take(h, size);
+    if (cached) {
       ++c->malloc_reused;
-      if (blk >= size + LH_HDR + LH_MIN) {
-         uint32_t rem_hdr = va + size;
-         uint32_t rem_payload = rem_hdr + LH_HDR;
-         uint32_t rem_size = blk - size - LH_HDR;
-         lh_w32(h, rem_hdr + 4u, 0u);
-         lh_mark_free(h, rem_payload, rem_size);
-         lh_bin_put(h, rem_payload, rem_size);
-         lh_mark_allocated(h, va, size);
-      } else {
-         lh_mark_allocated(h, va, blk);
-      }
-      return va;
-   }
+      return cached;
+    }
+  }
 
-   if ((uint64_t)c->ptr + LH_HDR + size > c->limit) return 0;   /* OOM */
-   uint32_t hdr = c->ptr;
-   uint32_t va = hdr + LH_HDR;
-   lh_w32(h, hdr + 4u, 0u);
-   lh_w32(h, hdr, size);
-   lh_w32(h, hdr + LH_HDR - 4u, LH_ALLOC_MAGIC);
-   c->ptr = va + size;
-   const bool never_used = va >= c->high_water;
-   if (c->ptr > c->high_water) c->high_water = c->ptr;
-   if (zeroed) *zeroed = never_used;
-   return va;
+  for (uint32_t b = lh_bin_next(c, lh_bin_of(size)); b < LH_NBINS;
+       b = lh_bin_next(c, b + 1u)) {
+    uint32_t va = lh_bin_take(h, b, size);
+    if (!va) continue;
+    const uint32_t blk = lh_r32(h, va - LH_HDR);
+    ++c->malloc_reused;
+    if (blk >= size + LH_HDR + LH_MIN) {
+      uint32_t rem_hdr = va + size;
+      uint32_t rem_payload = rem_hdr + LH_HDR;
+      uint32_t rem_size = blk - size - LH_HDR;
+      lh_w32(h, rem_hdr + 4u, 0u);
+      lh_mark_free(h, rem_payload, rem_size);
+      lh_bin_put(h, rem_payload, rem_size);
+      lh_mark_allocated(h, va, size);
+    } else {
+      lh_mark_allocated(h, va, blk);
+    }
+    return va;
+  }
+
+  if ((uint64_t)c->ptr + LH_HDR + size > c->limit) return 0;   /* OOM */
+  uint32_t hdr = c->ptr;
+  uint32_t va = hdr + LH_HDR;
+  lh_w32(h, hdr + 4u, 0u);
+  lh_w32(h, hdr, size);
+  lh_w32(h, hdr + LH_HDR - 4u, LH_ALLOC_MAGIC);
+  c->ptr = va + size;
+  const bool never_used = va >= c->high_water;
+  if (c->ptr > c->high_water) c->high_water = c->ptr;
+  if (zeroed) *zeroed = never_used;
+  return va;
 }
 
 static inline bool lh_owns(const struct lh_heap *h, uint32_t va)
 {
-   const struct lh_ctl *c = h->ctl;
-   return va >= c->start + LH_HDR && va < c->ptr &&
-          lh_r32(h, va - 4u) == LH_ALLOC_MAGIC;
+  const struct lh_ctl *c = h->ctl;
+  return va >= c->start + LH_HDR && va < c->ptr &&
+         lh_r32(h, va - 4u) == LH_ALLOC_MAGIC;
 }
 
 static inline void lh_free(struct lh_heap *h, uint32_t va)
 {
-   struct lh_ctl *c = h->ctl;
-   if (!va || !lh_owns(h, va)) return;              /* foreign / double free */
-   const uint32_t size = lh_r32(h, va - LH_HDR);
-   if (size < LH_MIN || (size & (LH_ALIGN - 1u)) ||
-       (uint64_t)va + size > c->ptr) return;        /* corrupt */
-   ++c->free_calls;
-   if (lh_tc_put(h, va, size)) return;
-   lh_release(h, va, size);
+  struct lh_ctl *c = h->ctl;
+  if (!va || !lh_owns(h, va)) return;              /* foreign / double free */
+  const uint32_t size = lh_r32(h, va - LH_HDR);
+  if (size < LH_MIN || (size & (LH_ALIGN - 1u)) ||
+      (uint64_t)va + size > c->ptr) return;        /* corrupt */
+  ++c->free_calls;
+  if (lh_tc_put(h, va, size)) return;
+  lh_release(h, va, size);
 }
 
 static inline void lh_trim(struct lh_heap *h, uint32_t va, uint32_t blk, uint32_t want)
 {
-   if (blk < want + LH_HDR + LH_MIN) return;
-   const uint32_t rem_hdr = va + want;
-   const uint32_t rem_size = blk - want - LH_HDR;
-   lh_w32(h, rem_hdr + 4u, 0u);
-   lh_mark_allocated(h, va, want);
-   lh_release(h, rem_hdr + LH_HDR, rem_size);
+  if (blk < want + LH_HDR + LH_MIN) return;
+  const uint32_t rem_hdr = va + want;
+  const uint32_t rem_size = blk - want - LH_HDR;
+  lh_w32(h, rem_hdr + 4u, 0u);
+  lh_mark_allocated(h, va, want);
+  lh_release(h, rem_hdr + LH_HDR, rem_size);
 }
 
 /* 0 with *foreign set: a pointer this heap never returned. */
 static inline uint32_t lh_realloc(struct lh_heap *h, uint32_t va, uint32_t newsize,
                                   bool *foreign)
 {
-   struct lh_ctl *c = h->ctl;
-   if (foreign) *foreign = false;
-   if (!va) return lh_malloc(h, newsize, NULL);
-   if (newsize == 0) { lh_free(h, va); return 0; }
-   if (!lh_owns(h, va)) { if (foreign) *foreign = true; return 0; }
-   const uint32_t blk = lh_r32(h, va - LH_HDR);
-   const uint32_t want = lh_align(newsize);
-   if (want <= blk) {
-      lh_trim(h, va, blk, want);
-      return va;
-   }
-   if ((uint64_t)va + blk == c->ptr && (uint64_t)va + want <= c->limit) {
-      lh_w32(h, va - LH_HDR, want);
-      c->ptr = va + want;
-      if (c->ptr > c->high_water) c->high_water = c->ptr;
-      return va;
-   }
-   const uint32_t right_hdr = va + blk;
-   if ((uint64_t)right_hdr + LH_HDR < c->ptr) {
-      const uint32_t right = right_hdr + LH_HDR;
-      if (lh_free_block_ok(h, right)) {
-         const uint32_t right_size = lh_r32(h, right - LH_HDR);
-         const uint32_t combined = blk + LH_HDR + right_size;
-         if (combined >= want && lh_bin_unlink(h, right, right_size)) {
-            lh_mark_allocated(h, va, combined);
-            lh_trim(h, va, combined, want);
-            return va;
-         }
+  struct lh_ctl *c = h->ctl;
+  if (foreign) *foreign = false;
+  if (!va) return lh_malloc(h, newsize, NULL);
+  if (newsize == 0) {
+    lh_free(h, va);
+    return 0;
+  }
+  if (!lh_owns(h, va)) {
+    if (foreign) *foreign = true;
+    return 0;
+  }
+  const uint32_t blk = lh_r32(h, va - LH_HDR);
+  const uint32_t want = lh_align(newsize);
+  if (want <= blk) {
+    lh_trim(h, va, blk, want);
+    return va;
+  }
+  if ((uint64_t)va + blk == c->ptr && (uint64_t)va + want <= c->limit) {
+    lh_w32(h, va - LH_HDR, want);
+    c->ptr = va + want;
+    if (c->ptr > c->high_water) c->high_water = c->ptr;
+    return va;
+  }
+  const uint32_t right_hdr = va + blk;
+  if ((uint64_t)right_hdr + LH_HDR < c->ptr) {
+    const uint32_t right = right_hdr + LH_HDR;
+    if (lh_free_block_ok(h, right)) {
+      const uint32_t right_size = lh_r32(h, right - LH_HDR);
+      const uint32_t combined = blk + LH_HDR + right_size;
+      if (combined >= want && lh_bin_unlink(h, right, right_size)) {
+        lh_mark_allocated(h, va, combined);
+        lh_trim(h, va, combined, want);
+        return va;
       }
-   }
-   uint32_t n = lh_malloc(h, want, NULL);
-   if (n) {
-      memmove((void *)(h->mem + n), (const void *)(h->mem + va), blk);
-      lh_free(h, va);
-   }
-   return n;
+    }
+  }
+  uint32_t n = lh_malloc(h, want, NULL);
+  if (n) {
+    memmove((void *)(h->mem + n), (const void *)(h->mem + va), blk);
+    lh_free(h, va);
+  }
+  return n;
 }
 
 static inline uint32_t lh_memalign(struct lh_heap *h, uint32_t align, uint32_t size)
 {
-   if (align <= LH_HDR || (align & (align - 1u))) return lh_malloc(h, size, NULL);
-   if (size == 0) size = 1;
-   size = lh_align(size);
-   if ((uint64_t)size + align + LH_HDR + LH_HDR + LH_MIN > UINT32_MAX) return 0;
-   const uint32_t raw = lh_malloc(h, size + align + LH_HDR + LH_MIN, NULL);
-   if (!raw) return 0;
-   const uint32_t blk = lh_r32(h, raw - LH_HDR);
-   if (!(raw & (align - 1u))) {
-      lh_trim(h, raw, blk, size);
-      return raw;
-   }
-   const uint32_t payload =
-      (raw + LH_HDR + LH_MIN + align - 1u) & ~(align - 1u);
-   const uint32_t prefix = payload - LH_HDR - raw;
-   lh_w32(h, payload - LH_HDR, blk - prefix - LH_HDR);
-   lh_w32(h, payload - LH_HDR + 4u, 0u);
-   lh_w32(h, payload - 4u, LH_ALLOC_MAGIC);
-   lh_release(h, raw, prefix);
-   lh_trim(h, payload, lh_r32(h, payload - LH_HDR), size);
-   return payload;
+  if (align <= LH_HDR || (align & (align - 1u))) return lh_malloc(h, size, NULL);
+  if (size == 0) size = 1;
+  size = lh_align(size);
+  if ((uint64_t)size + align + LH_HDR + LH_HDR + LH_MIN > UINT32_MAX) return 0;
+  const uint32_t raw = lh_malloc(h, size + align + LH_HDR + LH_MIN, NULL);
+  if (!raw) return 0;
+  const uint32_t blk = lh_r32(h, raw - LH_HDR);
+  if (!(raw & (align - 1u))) {
+    lh_trim(h, raw, blk, size);
+    return raw;
+  }
+  const uint32_t payload =
+    (raw + LH_HDR + LH_MIN + align - 1u) & ~(align - 1u);
+  const uint32_t prefix = payload - LH_HDR - raw;
+  lh_w32(h, payload - LH_HDR, blk - prefix - LH_HDR);
+  lh_w32(h, payload - LH_HDR + 4u, 0u);
+  lh_w32(h, payload - 4u, LH_ALLOC_MAGIC);
+  lh_release(h, raw, prefix);
+  lh_trim(h, payload, lh_r32(h, payload - LH_HDR), size);
+  return payload;
 }
 
 /* bionic memalign accepts arbitrary alignments and rounds up to a power of
  * two.  A value above 2^31 cannot be rounded within the 32-bit guest heap. */
 static inline bool lh_memalign_alignment(uint32_t align, uint32_t *rounded)
 {
-   if (align <= 1u) { *rounded = 1u; return true; }
-   if (align > 0x80000000u) return false;
-   uint32_t value = 1u;
-   while (value < align) value <<= 1;
-   *rounded = value;
-   return true;
+  if (align <= 1u) {
+    *rounded = 1u;
+    return true;
+  }
+  if (align > 0x80000000u) return false;
+  uint32_t value = 1u;
+  while (value < align) value <<= 1;
+  *rounded = value;
+  return true;
 }
 
 static inline uint32_t lh_usable_size(const struct lh_heap *h, uint32_t va)
 {
-   return lh_owns(h, va) ? lh_r32(h, va - LH_HDR) : 0u;
+  return lh_owns(h, va) ? lh_r32(h, va - LH_HDR) : 0u;
 }
 
 /* Carve `len` off the top of the window for the small-mmap arena, never
  * below what malloc has bumped to.  Returns the new top, or 0. */
 static inline uint32_t lh_take_top(struct lh_heap *h, uint32_t len, uint32_t align_mask)
 {
-   struct lh_ctl *c = h->ctl;
-   if (len > c->limit) return 0;
-   const uint32_t next = (c->limit - len) & ~align_mask;
-   if (next < c->ptr || next >= c->limit) return 0;
-   c->limit = next;
-   return next;
+  struct lh_ctl *c = h->ctl;
+  if (len > c->limit) return 0;
+  const uint32_t next = (c->limit - len) & ~align_mask;
+  if (next < c->ptr || next >= c->limit) return 0;
+  c->limit = next;
+  return next;
 }
 
 /* Android/Linux fixed clocks with no nanosleep operation must fail before
@@ -662,11 +685,11 @@ static inline uint32_t lh_take_top(struct lh_heap *h, uint32_t len, uint32_t ali
  * host errno values; both the guest provider and host dispatcher use this. */
 static inline int lunaria_sleep_clock_error(int clockid)
 {
-   if (clockid == 4 || clockid == 5 || clockid == 6)
-      return 95; /* EOPNOTSUPP: RAW and the two COARSE clocks */
-   if (clockid == 10 || clockid >= 12)
-      return 22; /* EINVAL: no such Android clock */
-   return 0;
+  if (clockid == 4 || clockid == 5 || clockid == 6)
+    return 95; /* EOPNOTSUPP: RAW and the two COARSE clocks */
+  if (clockid == 10 || clockid >= 12)
+    return 22; /* EINVAL: no such Android clock */
+  return 0;
 }
 
 #ifndef LUNARIA_GUEST_SHARED
@@ -683,7 +706,7 @@ extern int *__errno(void);
 
 static inline uint64_t self_owner(void)
 {
-   return (uint64_t)(uintptr_t)__builtin_thread_pointer();
+  return (uint64_t)(uintptr_t)__builtin_thread_pointer();
 }
 
 /* futex(addr, op, val, NULL): the kernel's own entry, as bionic calls it. */
@@ -705,170 +728,188 @@ __asm__(".text\n"
  * the kernel until the holder's unlock wakes it. */
 static inline void heap_lock(struct lh_ctl *c)
 {
-   uint32_t expected = 0;
-   if (!__builtin_expect(__atomic_compare_exchange_n(&c->state, &expected, 1u,
-                                                     0, 5, 5), 1)) {
-      ++c->contended;              /* racy statistic, never read for control */
-      while (__atomic_exchange_n(&c->state, 2u, 5) != 0u)
-         raw_futex(&c->state, FUTEX_WAIT_PRIVATE, 2u);
-   }
-   c->owner = self_owner();
+  uint32_t expected = 0;
+  if (!__builtin_expect(__atomic_compare_exchange_n(&c->state, &expected, 1u,
+                        0, 5, 5), 1)) {
+    ++c->contended;              /* racy statistic, never read for control */
+    while (__atomic_exchange_n(&c->state, 2u, 5) != 0u)
+      raw_futex(&c->state, FUTEX_WAIT_PRIVATE, 2u);
+  }
+  c->owner = self_owner();
 }
 
 static inline void heap_unlock(struct lh_ctl *c)
 {
-   c->owner = 0;
-   if (__atomic_exchange_n(&c->state, 0u, 5) == 2u)
-      raw_futex(&c->state, FUTEX_WAKE_PRIVATE, 1u);
+  c->owner = 0;
+  if (__atomic_exchange_n(&c->state, 0u, 5) == 2u)
+    raw_futex(&c->state, FUTEX_WAKE_PRIVATE, 1u);
 }
 
 static inline int heap_get(struct lh_heap *h)
 {
-   h->ctl = lunaria_heap_ctl;
-   h->mem = lunaria_heap_mem;
-   h->tid = self_owner();
-   return h->ctl != 0;
+  h->ctl = lunaria_heap_ctl;
+  h->mem = lunaria_heap_mem;
+  h->tid = self_owner();
+  return h->ctl != 0;
 }
 
 static inline void *to_ptr(const struct lh_heap *h, uint32_t off)
 {
-   return off ? (void *)(h->mem + off) : (void *)0;
+  return off ? (void *)(h->mem + off) : (void *)0;
 }
 
 /* The window offset of a guest pointer, or 0 when it is not in the window. */
 static inline uint32_t to_off(const struct lh_heap *h, void *p)
 {
-   const uintptr_t v = (uintptr_t)p;
-   if (!p || v < h->mem || v - h->mem >= 0x100000000ull) return 0;
-   return (uint32_t)(v - h->mem);
+  const uintptr_t v = (uintptr_t)p;
+  if (!p || v < h->mem || v - h->mem >= 0x100000000ull) return 0;
+  return (uint32_t)(v - h->mem);
 }
 
 static void set_errno(int e)
 {
-   int *p = __errno();
-   if (p) *p = e;
+  int *p = __errno();
+  if (p) *p = e;
 }
 
 __attribute__((visibility("default")))
 void *malloc(size_t n)
 {
-   struct lh_heap h;
-   uint32_t size;
-   if (!heap_get(&h) || !lh_size32(n, &size)) { set_errno(ENOMEM); return 0; }
-   heap_lock(h.ctl);
-   const uint32_t off = lh_malloc(&h, size, (bool *)0);
-   heap_unlock(h.ctl);
-   if (!off) set_errno(ENOMEM);
-   return to_ptr(&h, off);
+  struct lh_heap h;
+  uint32_t size;
+  if (!heap_get(&h) || !lh_size32(n, &size)) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  heap_lock(h.ctl);
+  const uint32_t off = lh_malloc(&h, size, (bool *)0);
+  heap_unlock(h.ctl);
+  if (!off) set_errno(ENOMEM);
+  return to_ptr(&h, off);
 }
 
 __attribute__((visibility("default")))
 void free(void *p)
 {
-   struct lh_heap h;
-   if (!p || !heap_get(&h)) return;
-   const uint32_t off = to_off(&h, p);
-   if (!off) return;
-   heap_lock(h.ctl);
-   lh_free(&h, off);
-   heap_unlock(h.ctl);
+  struct lh_heap h;
+  if (!p || !heap_get(&h)) return;
+  const uint32_t off = to_off(&h, p);
+  if (!off) return;
+  heap_lock(h.ctl);
+  lh_free(&h, off);
+  heap_unlock(h.ctl);
 }
 
 __attribute__((visibility("default")))
 void *calloc(size_t count, size_t n)
 {
-   struct lh_heap h;
-   uint32_t size;
-   if (n && count > (size_t)-1 / n) { set_errno(ENOMEM); return 0; }
-   if (!heap_get(&h) || !lh_size32((uint64_t)count * n, &size)) {
-      set_errno(ENOMEM);
-      return 0;
-   }
-   bool zeroed = false;
-   heap_lock(h.ctl);
-   const uint32_t off = lh_malloc(&h, size, &zeroed);
-   heap_unlock(h.ctl);
-   if (!off) { set_errno(ENOMEM); return 0; }
-   if (!zeroed) memset(to_ptr(&h, off), 0, size);
-   return to_ptr(&h, off);
+  struct lh_heap h;
+  uint32_t size;
+  if (n && count > (size_t)-1 / n) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  if (!heap_get(&h) || !lh_size32((uint64_t)count * n, &size)) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  bool zeroed = false;
+  heap_lock(h.ctl);
+  const uint32_t off = lh_malloc(&h, size, &zeroed);
+  heap_unlock(h.ctl);
+  if (!off) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  if (!zeroed) memset(to_ptr(&h, off), 0, size);
+  return to_ptr(&h, off);
 }
 
 __attribute__((visibility("default")))
 void *realloc(void *p, size_t n)
 {
-   struct lh_heap h;
-   uint32_t size;
-   if (!heap_get(&h)) return 0;
-   if (!p) return malloc(n);
-   if (!lh_size32(n, &size)) { set_errno(ENOMEM); return 0; }
-   const uint32_t off = to_off(&h, p);
-   if (!off) return 0;
-   bool foreign = false;
-   heap_lock(h.ctl);
-   const uint32_t r = lh_realloc(&h, off, size, &foreign);
-   heap_unlock(h.ctl);
-   if (!r && n) set_errno(ENOMEM);
-   return to_ptr(&h, r);
+  struct lh_heap h;
+  uint32_t size;
+  if (!heap_get(&h)) return 0;
+  if (!p) return malloc(n);
+  if (!lh_size32(n, &size)) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  const uint32_t off = to_off(&h, p);
+  if (!off) return 0;
+  bool foreign = false;
+  heap_lock(h.ctl);
+  const uint32_t r = lh_realloc(&h, off, size, &foreign);
+  heap_unlock(h.ctl);
+  if (!r && n) set_errno(ENOMEM);
+  return to_ptr(&h, r);
 }
 
 __attribute__((visibility("default")))
 void *memalign(size_t align, size_t n)
 {
-   struct lh_heap h;
-   uint32_t a, size;
-   if (!heap_get(&h) || !lh_size32(align, &a) || !lh_size32(n, &size)) {
-      set_errno(ENOMEM);
-      return 0;
-   }
-   if (!lh_memalign_alignment(a, &a)) { set_errno(ENOMEM); return 0; }
-   heap_lock(h.ctl);
-   const uint32_t off = lh_memalign(&h, a, size);
-   heap_unlock(h.ctl);
-   if (!off) set_errno(ENOMEM);
-   return to_ptr(&h, off);
+  struct lh_heap h;
+  uint32_t a, size;
+  if (!heap_get(&h) || !lh_size32(align, &a) || !lh_size32(n, &size)) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  if (!lh_memalign_alignment(a, &a)) {
+    set_errno(ENOMEM);
+    return 0;
+  }
+  heap_lock(h.ctl);
+  const uint32_t off = lh_memalign(&h, a, size);
+  heap_unlock(h.ctl);
+  if (!off) set_errno(ENOMEM);
+  return to_ptr(&h, off);
 }
 
 __attribute__((visibility("default")))
 int posix_memalign(void **out, size_t align, size_t n)
 {
-   if (!out || !align || (align & (align - 1u)) || align % sizeof(void *))
-      return EINVAL;
-   void *p = memalign(align, n);
-   if (!p) return ENOMEM;
-   *out = p;
-   return 0;
+  if (!out || !align || (align & (align - 1u)) || align % sizeof(void *))
+    return EINVAL;
+  void *p = memalign(align, n);
+  if (!p) return ENOMEM;
+  *out = p;
+  return 0;
 }
 
 __attribute__((visibility("default")))
 void *aligned_alloc(size_t align, size_t n)
 {
-   if (!align || (align & (align - 1u))) { set_errno(EINVAL); return 0; }
-   return memalign(align, n);
+  if (!align || (align & (align - 1u))) {
+    set_errno(EINVAL);
+    return 0;
+  }
+  return memalign(align, n);
 }
 
 __attribute__((visibility("default")))
 void *valloc(size_t n)
 {
-   return memalign(4096u, n);
+  return memalign(4096u, n);
 }
 
 __attribute__((visibility("default")))
 void *pvalloc(size_t n)
 {
-   return memalign(4096u, (n + 4095u) & ~(size_t)4095u);
+  return memalign(4096u, (n + 4095u) & ~(size_t)4095u);
 }
 
 __attribute__((visibility("default")))
 size_t malloc_usable_size(const void *p)
 {
-   struct lh_heap h;
-   if (!p || !heap_get(&h)) return 0;
-   const uint32_t off = to_off(&h, (void *)(uintptr_t)p);
-   if (!off) return 0;
-   heap_lock(h.ctl);
-   const uint32_t n = lh_usable_size(&h, off);
-   heap_unlock(h.ctl);
-   return n;
+  struct lh_heap h;
+  if (!p || !heap_get(&h)) return 0;
+  const uint32_t off = to_off(&h, (void *)(uintptr_t)p);
+  if (!off) return 0;
+  heap_lock(h.ctl);
+  const uint32_t n = lh_usable_size(&h, off);
+  heap_unlock(h.ctl);
+  return n;
 }
 
 
@@ -930,19 +971,28 @@ __asm__(".text\n"
 
 static int timespec_ok(const struct timespec *t)
 {
-   return t->tv_sec >= 0 && t->tv_nsec >= 0 && t->tv_nsec < 1000000000L;
+  return t->tv_sec >= 0 && t->tv_nsec >= 0 && t->tv_nsec < 1000000000L;
 }
 
 __attribute__((visibility("default")))
 int nanosleep(const struct timespec *req, struct timespec *rem)
 {
-   long rc;
-   if (!req) { set_errno(EFAULT); return -1; }
-   if (!timespec_ok(req)) { set_errno(EINVAL); return -1; }
-   if (req->tv_sec == 0 && req->tv_nsec == 0) return 0;
-   rc = lunaria_raw_nanosleep(req, rem);
-   if (rc < 0) { set_errno((int)-rc); return -1; }
-   return 0;
+  long rc;
+  if (!req) {
+    set_errno(EFAULT);
+    return -1;
+  }
+  if (!timespec_ok(req)) {
+    set_errno(EINVAL);
+    return -1;
+  }
+  if (req->tv_sec == 0 && req->tv_nsec == 0) return 0;
+  rc = lunaria_raw_nanosleep(req, rem);
+  if (rc < 0) {
+    set_errno((int)-rc);
+    return -1;
+  }
+  return 0;
 }
 
 /* Returns the error number itself.  TIMER_ABSTIME is 1.  An absolute time
@@ -951,22 +1001,22 @@ __attribute__((visibility("default")))
 int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *req,
                     struct timespec *rem)
 {
-   long rc;
-   const int clock_error = lunaria_sleep_clock_error((int)clockid);
-   if (clock_error) return clock_error;
-   if (!req) return EFAULT;
-   if (!timespec_ok(req)) return EINVAL;
-   if ((clockid == CLOCK_REALTIME || clockid == CLOCK_MONOTONIC ||
-        clockid == CLOCK_BOOTTIME) && (flags & TIMER_ABSTIME) == 0 &&
-       req->tv_sec == 0 && req->tv_nsec == 0)
-      return 0;
-   /* Like bionic's ErrnoRestorer: a delivered signal handler may change
-    * errno while the raw wait is suspended. Restore the caller's value. */
-   int *error_slot = __errno();
-   const int saved_errno = error_slot ? *error_slot : 0;
-   rc = lunaria_raw_clock_nanosleep(clockid, flags, req, rem);
-   if (error_slot) *error_slot = saved_errno;
-   return rc < 0 ? (int)-rc : 0;
+  long rc;
+  const int clock_error = lunaria_sleep_clock_error((int)clockid);
+  if (clock_error) return clock_error;
+  if (!req) return EFAULT;
+  if (!timespec_ok(req)) return EINVAL;
+  if ((clockid == CLOCK_REALTIME || clockid == CLOCK_MONOTONIC ||
+       clockid == CLOCK_BOOTTIME) && (flags & TIMER_ABSTIME) == 0 &&
+      req->tv_sec == 0 && req->tv_nsec == 0)
+    return 0;
+  /* Like bionic's ErrnoRestorer: a delivered signal handler may change
+   * errno while the raw wait is suspended. Restore the caller's value. */
+  int *error_slot = __errno();
+  const int saved_errno = error_slot ? *error_slot : 0;
+  rc = lunaria_raw_clock_nanosleep(clockid, flags, req, rem);
+  if (error_slot) *error_slot = saved_errno;
+  return rc < 0 ? (int)-rc : 0;
 }
 
 #define COND_SHARED_MASK   0x0001u
@@ -980,8 +1030,8 @@ int clock_nanosleep(clockid_t clockid, int flags, const struct timespec *req,
 #define COND_DESTROYED             0xdeadc04du
 
 struct lunaria_cond {
-   uint32_t state;
-   uint32_t waiters;
+  uint32_t state;
+  uint32_t waiters;
 };
 
 /* futex(addr, op, val, timeout, uaddr2, val3) — the six-argument form the
@@ -1000,151 +1050,151 @@ __asm__(".text\n"
 
 static inline struct lunaria_cond *cond_of(pthread_cond_t *c)
 {
-   return (struct lunaria_cond *)(void *)c;
+  return (struct lunaria_cond *)(void *)c;
 }
 
 /* One wake generation.  The flags live in the low two bits and the step is 4,
  * so the add never disturbs them. */
 static inline void cond_bump(struct lunaria_cond *c)
 {
-   __atomic_fetch_add(&c->state, COND_COUNTER_STEP, __ATOMIC_SEQ_CST);
+  __atomic_fetch_add(&c->state, COND_COUNTER_STEP, __ATOMIC_SEQ_CST);
 }
 
 static int cond_wake(struct lunaria_cond *c, uint32_t n)
 {
-   /* Order matters: the generation moves before the count is read.  A waiter
-    * that has already sampled the state but has not yet counted itself in
-    * therefore finds the word changed and refuses to sleep. */
-   cond_bump(c);
-   if (__atomic_load_n(&c->waiters, __ATOMIC_SEQ_CST) != 0u)
-      raw_futex(&c->state, FUTEX_WAKE_PRIVATE, n);
-   return 0;
+  /* Order matters: the generation moves before the count is read.  A waiter
+   * that has already sampled the state but has not yet counted itself in
+   * therefore finds the word changed and refuses to sleep. */
+  cond_bump(c);
+  if (__atomic_load_n(&c->waiters, __ATOMIC_SEQ_CST) != 0u)
+    raw_futex(&c->state, FUTEX_WAKE_PRIVATE, n);
+  return 0;
 }
 
 static int cond_wait_common(pthread_cond_t *cv, pthread_mutex_t *m,
                             const struct timespec *abstime, int clock)
 {
-   struct lunaria_cond *c = cond_of(cv);
-   if (abstime && (abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000L))
-      return EINVAL;
-   /* Sampled under the mutex, exactly as the predicate the caller just tested
-    * was: everything the wait is racing against has to happen after this. */
-   const uint32_t seq = __atomic_load_n(&c->state, __ATOMIC_RELAXED);
-   __atomic_fetch_add(&c->waiters, 1u, __ATOMIC_SEQ_CST);
-   pthread_mutex_unlock(m);
-   const long op = FUTEX_WAIT_BITSET_PRIVATE |
-                   (clock == CLOCK_REALTIME ? FUTEX_CLOCK_REALTIME : 0);
-   const long rc = lunaria_raw_futex6(&c->state, op, seq, abstime, 0,
-                                      FUTEX_BITSET_MATCH_ANY);
-   __atomic_fetch_sub(&c->waiters, 1u, __ATOMIC_SEQ_CST);
-   /* POSIX: the call returns with the mutex held, however it ended. */
-   pthread_mutex_lock(m);
-   return rc == -ETIMEDOUT ? ETIMEDOUT : 0;
+  struct lunaria_cond *c = cond_of(cv);
+  if (abstime && (abstime->tv_nsec < 0 || abstime->tv_nsec >= 1000000000L))
+    return EINVAL;
+  /* Sampled under the mutex, exactly as the predicate the caller just tested
+   * was: everything the wait is racing against has to happen after this. */
+  const uint32_t seq = __atomic_load_n(&c->state, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&c->waiters, 1u, __ATOMIC_SEQ_CST);
+  pthread_mutex_unlock(m);
+  const long op = FUTEX_WAIT_BITSET_PRIVATE |
+                  (clock == CLOCK_REALTIME ? FUTEX_CLOCK_REALTIME : 0);
+  const long rc = lunaria_raw_futex6(&c->state, op, seq, abstime, 0,
+                                     FUTEX_BITSET_MATCH_ANY);
+  __atomic_fetch_sub(&c->waiters, 1u, __ATOMIC_SEQ_CST);
+  /* POSIX: the call returns with the mutex held, however it ended. */
+  pthread_mutex_lock(m);
+  return rc == -ETIMEDOUT ? ETIMEDOUT : 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_condattr_init(pthread_condattr_t *attr)
 {
-   if (!attr) return EINVAL;
-   *(uint32_t *)(void *)attr = 0u;
-   return 0;
+  if (!attr) return EINVAL;
+  *(uint32_t *)(void *)attr = 0u;
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_condattr_destroy(pthread_condattr_t *attr)
 {
-   if (!attr) return EINVAL;
-   *(uint32_t *)(void *)attr = COND_DESTROYED;
-   return 0;
+  if (!attr) return EINVAL;
+  *(uint32_t *)(void *)attr = COND_DESTROYED;
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock)
 {
-   if (!attr) return EINVAL;
-   if (clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME) return EINVAL;
-   uint32_t *p = (uint32_t *)(void *)attr;
-   *p = (*p & ~COND_CLOCK_MASK) |
-        (clock == CLOCK_MONOTONIC ? COND_CLOCK_MASK : 0u);
-   return 0;
+  if (!attr) return EINVAL;
+  if (clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME) return EINVAL;
+  uint32_t *p = (uint32_t *)(void *)attr;
+  *p = (*p & ~COND_CLOCK_MASK) |
+       (clock == CLOCK_MONOTONIC ? COND_CLOCK_MASK : 0u);
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_condattr_getclock(const pthread_condattr_t *attr, clockid_t *clock)
 {
-   if (!attr || !clock) return EINVAL;
-   const uint32_t v = *(const uint32_t *)(const void *)attr;
-   *clock = (v & COND_CLOCK_MASK) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
-   return 0;
+  if (!attr || !clock) return EINVAL;
+  const uint32_t v = *(const uint32_t *)(const void *)attr;
+  *clock = (v & COND_CLOCK_MASK) ? CLOCK_MONOTONIC : CLOCK_REALTIME;
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_condattr_setpshared(pthread_condattr_t *attr, int pshared)
 {
-   if (!attr) return EINVAL;
-   uint32_t *p = (uint32_t *)(void *)attr;
-   *p = (*p & ~COND_SHARED_MASK) | (pshared ? COND_SHARED_MASK : 0u);
-   return 0;
+  if (!attr) return EINVAL;
+  uint32_t *p = (uint32_t *)(void *)attr;
+  *p = (*p & ~COND_SHARED_MASK) | (pshared ? COND_SHARED_MASK : 0u);
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_condattr_getpshared(const pthread_condattr_t *attr, int *pshared)
 {
-   if (!attr || !pshared) return EINVAL;
-   *pshared = (*(const uint32_t *)(const void *)attr & COND_SHARED_MASK) ? 1 : 0;
-   return 0;
+  if (!attr || !pshared) return EINVAL;
+  *pshared = (*(const uint32_t *)(const void *)attr & COND_SHARED_MASK) ? 1 : 0;
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_init(pthread_cond_t *cv, const pthread_condattr_t *attr)
 {
-   if (!cv) return EINVAL;
-   struct lunaria_cond *c = cond_of(cv);
-   const uint32_t flags =
-       attr ? (*(const uint32_t *)(const void *)attr & COND_FLAGS_MASK) : 0u;
-   __atomic_store_n(&c->waiters, 0u, __ATOMIC_RELAXED);
-   __atomic_store_n(&c->state, flags, __ATOMIC_SEQ_CST);
-   return 0;
+  if (!cv) return EINVAL;
+  struct lunaria_cond *c = cond_of(cv);
+  const uint32_t flags =
+    attr ? (*(const uint32_t *)(const void *)attr & COND_FLAGS_MASK) : 0u;
+  __atomic_store_n(&c->waiters, 0u, __ATOMIC_RELAXED);
+  __atomic_store_n(&c->state, flags, __ATOMIC_SEQ_CST);
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_destroy(pthread_cond_t *cv)
 {
-   if (!cv) return EINVAL;
-   __atomic_store_n(&cond_of(cv)->state, COND_DESTROYED, __ATOMIC_SEQ_CST);
-   return 0;
+  if (!cv) return EINVAL;
+  __atomic_store_n(&cond_of(cv)->state, COND_DESTROYED, __ATOMIC_SEQ_CST);
+  return 0;
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_signal(pthread_cond_t *cv)
 {
-   if (!cv) return EINVAL;
-   return cond_wake(cond_of(cv), 1u);
+  if (!cv) return EINVAL;
+  return cond_wake(cond_of(cv), 1u);
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_broadcast(pthread_cond_t *cv)
 {
-   if (!cv) return EINVAL;
-   return cond_wake(cond_of(cv), 0x7fffffffu);
+  if (!cv) return EINVAL;
+  return cond_wake(cond_of(cv), 0x7fffffffu);
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_wait(pthread_cond_t *cv, pthread_mutex_t *m)
 {
-   if (!cv || !m) return EINVAL;
-   return cond_wait_common(cv, m, 0, CLOCK_MONOTONIC);
+  if (!cv || !m) return EINVAL;
+  return cond_wait_common(cv, m, 0, CLOCK_MONOTONIC);
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_timedwait(pthread_cond_t *cv, pthread_mutex_t *m,
                            const struct timespec *abstime)
 {
-   if (!cv || !m) return EINVAL;
-   const uint32_t state = __atomic_load_n(&cond_of(cv)->state, __ATOMIC_RELAXED);
-   const int clock = (state & COND_CLOCK_MASK) ? CLOCK_MONOTONIC
-                                               : CLOCK_REALTIME;
-   return cond_wait_common(cv, m, abstime, clock);
+  if (!cv || !m) return EINVAL;
+  const uint32_t state = __atomic_load_n(&cond_of(cv)->state, __ATOMIC_RELAXED);
+  const int clock = (state & COND_CLOCK_MASK) ? CLOCK_MONOTONIC
+                    : CLOCK_REALTIME;
+  return cond_wait_common(cv, m, abstime, clock);
 }
 
 /* bionic's own extensions.  A guest built against the NDK calls these
@@ -1153,32 +1203,35 @@ __attribute__((visibility("default")))
 int pthread_cond_clockwait(pthread_cond_t *cv, pthread_mutex_t *m,
                            clockid_t clock, const struct timespec *abstime)
 {
-   if (!cv || !m) return EINVAL;
-   if (clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME) return EINVAL;
-   return cond_wait_common(cv, m, abstime, clock);
+  if (!cv || !m) return EINVAL;
+  if (clock != CLOCK_MONOTONIC && clock != CLOCK_REALTIME) return EINVAL;
+  return cond_wait_common(cv, m, abstime, clock);
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_timedwait_monotonic_np(pthread_cond_t *cv, pthread_mutex_t *m,
                                         const struct timespec *abstime)
 {
-   if (!cv || !m) return EINVAL;
-   return cond_wait_common(cv, m, abstime, CLOCK_MONOTONIC);
+  if (!cv || !m) return EINVAL;
+  return cond_wait_common(cv, m, abstime, CLOCK_MONOTONIC);
 }
 
 __attribute__((visibility("default")))
 int pthread_cond_timedwait_relative_np(pthread_cond_t *cv, pthread_mutex_t *m,
                                        const struct timespec *reltime)
 {
-   if (!cv || !m) return EINVAL;
-   if (!reltime) return cond_wait_common(cv, m, 0, CLOCK_MONOTONIC);
-   struct timespec now, abs;
-   if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-      return EINVAL;
-   abs.tv_sec = now.tv_sec + reltime->tv_sec;
-   abs.tv_nsec = now.tv_nsec + reltime->tv_nsec;
-   if (abs.tv_nsec >= 1000000000L) { abs.tv_nsec -= 1000000000L; ++abs.tv_sec; }
-   return cond_wait_common(cv, m, &abs, CLOCK_MONOTONIC);
+  if (!cv || !m) return EINVAL;
+  if (!reltime) return cond_wait_common(cv, m, 0, CLOCK_MONOTONIC);
+  struct timespec now, abs;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    return EINVAL;
+  abs.tv_sec = now.tv_sec + reltime->tv_sec;
+  abs.tv_nsec = now.tv_nsec + reltime->tv_nsec;
+  if (abs.tv_nsec >= 1000000000L) {
+    abs.tv_nsec -= 1000000000L;
+    ++abs.tv_sec;
+  }
+  return cond_wait_common(cv, m, &abs, CLOCK_MONOTONIC);
 }
 
 
@@ -1219,84 +1272,84 @@ extern void lunaria_fortify_fatal(const char *what, size_t want, size_t have);
  * simply be masked off. */
 static size_t lun_strlen(const char *s)
 {
-   const char *p = s;
-   while (((uintptr_t)p & 7u) != 0u) {
-      if (*p == '\0') return (size_t)(p - s);
-      ++p;
-   }
-   for (;;) {
-      uint64_t v;
-      __builtin_memcpy(&v, p, 8);
-      const uint64_t z = (v - 0x0101010101010101ull) & ~v &
-                         0x8080808080808080ull;
-      if (z) return (size_t)(p - s) + (size_t)(__builtin_ctzll(z) >> 3);
-      p += 8;
-   }
+  const char *p = s;
+  while (((uintptr_t)p & 7u) != 0u) {
+    if (*p == '\0') return (size_t)(p - s);
+    ++p;
+  }
+  for (;;) {
+    uint64_t v;
+    __builtin_memcpy(&v, p, 8);
+    const uint64_t z = (v - 0x0101010101010101ull) & ~v &
+                       0x8080808080808080ull;
+    if (z) return (size_t)(p - s) + (size_t)(__builtin_ctzll(z) >> 3);
+    p += 8;
+  }
 }
 
 __attribute__((visibility("default")))
 size_t __strlen_chk(const char *s, size_t s_len)
 {
-   const size_t n = lun_strlen(s);
-   /* The string has to *end* inside the object, so the terminator counts. */
-   if (__builtin_expect(n + 1u > s_len, 0))
-      lunaria_fortify_fatal("strlen", n + 1u, s_len);
-   return n;
+  const size_t n = lun_strlen(s);
+  /* The string has to *end* inside the object, so the terminator counts. */
+  if (__builtin_expect(n + 1u > s_len, 0))
+    lunaria_fortify_fatal("strlen", n + 1u, s_len);
+  return n;
 }
 
 __attribute__((visibility("default")))
 void *__memcpy_chk(void *dst, const void *src, size_t n, size_t dst_len)
 {
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("memcpy", n, dst_len);
-   return memcpy(dst, src, n);
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("memcpy", n, dst_len);
+  return memcpy(dst, src, n);
 }
 
 __attribute__((visibility("default")))
 void *__memmove_chk(void *dst, const void *src, size_t n, size_t dst_len)
 {
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("memmove", n, dst_len);
-   return memmove(dst, src, n);
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("memmove", n, dst_len);
+  return memmove(dst, src, n);
 }
 
 __attribute__((visibility("default")))
 void *__memset_chk(void *dst, int c, size_t n, size_t dst_len)
 {
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("memset", n, dst_len);
-   return memset(dst, c, n);
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("memset", n, dst_len);
+  return memset(dst, c, n);
 }
 
 __attribute__((visibility("default")))
 char *__strcpy_chk(char *dst, const char *src, size_t dst_len)
 {
-   const size_t n = lun_strlen(src) + 1u;
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("strcpy", n, dst_len);
-   memcpy(dst, src, n);
-   return dst;
+  const size_t n = lun_strlen(src) + 1u;
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("strcpy", n, dst_len);
+  memcpy(dst, src, n);
+  return dst;
 }
 
 __attribute__((visibility("default")))
 char *__stpcpy_chk(char *dst, const char *src, size_t dst_len)
 {
-   const size_t n = lun_strlen(src) + 1u;
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("stpcpy", n, dst_len);
-   memcpy(dst, src, n);
-   return dst + n - 1u;
+  const size_t n = lun_strlen(src) + 1u;
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("stpcpy", n, dst_len);
+  memcpy(dst, src, n);
+  return dst + n - 1u;
 }
 
 __attribute__((visibility("default")))
 char *__strcat_chk(char *dst, const char *src, size_t dst_len)
 {
-   const size_t have = lun_strlen(dst);
-   const size_t n = have + lun_strlen(src) + 1u;
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("strcat", n, dst_len);
-   memcpy(dst + have, src, n - have);
-   return dst;
+  const size_t have = lun_strlen(dst);
+  const size_t n = have + lun_strlen(src) + 1u;
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("strcat", n, dst_len);
+  memcpy(dst + have, src, n - have);
+  return dst;
 }
 
 /* strncpy pads the destination to `n` bytes, so the operation is `n` bytes
@@ -1304,25 +1357,25 @@ char *__strcat_chk(char *dst, const char *src, size_t dst_len)
 __attribute__((visibility("default")))
 char *__strncpy_chk(char *dst, const char *src, size_t n, size_t dst_len)
 {
-   if (__builtin_expect(n > dst_len, 0))
-      lunaria_fortify_fatal("strncpy", n, dst_len);
-   size_t i = 0;
-   for (; i < n && src[i] != '\0'; ++i) dst[i] = src[i];
-   for (; i < n; ++i) dst[i] = '\0';
-   return dst;
+  if (__builtin_expect(n > dst_len, 0))
+    lunaria_fortify_fatal("strncpy", n, dst_len);
+  size_t i = 0;
+  for (; i < n && src[i] != '\0'; ++i) dst[i] = src[i];
+  for (; i < n; ++i) dst[i] = '\0';
+  return dst;
 }
 
 __attribute__((visibility("default")))
 char *__strncat_chk(char *dst, const char *src, size_t n, size_t dst_len)
 {
-   const size_t have = lun_strlen(dst);
-   size_t add = 0;
-   while (add < n && src[add] != '\0') ++add;
-   if (__builtin_expect(have + add + 1u > dst_len, 0))
-      lunaria_fortify_fatal("strncat", have + add + 1u, dst_len);
-   memcpy(dst + have, src, add);
-   dst[have + add] = '\0';
-   return dst;
+  const size_t have = lun_strlen(dst);
+  size_t add = 0;
+  while (add < n && src[add] != '\0') ++add;
+  if (__builtin_expect(have + add + 1u > dst_len, 0))
+    lunaria_fortify_fatal("strncat", have + add + 1u, dst_len);
+  memcpy(dst + have, src, add);
+  dst[have + add] = '\0';
+  return dst;
 }
 
 /* ---- gettimeofday -------------------------------------------------------
@@ -1342,31 +1395,34 @@ __attribute__((visibility("default"))) int64_t lunaria_realtime_offset_ns = 0;
 
 static long lun_syscall2(long nr, long a, long b)
 {
-   register long x0 __asm__("x0") = a;
-   register long x1 __asm__("x1") = b;
-   register long x8 __asm__("x8") = nr;
-   __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
-   return x0;
+  register long x0 __asm__("x0") = a;
+  register long x1 __asm__("x1") = b;
+  register long x8 __asm__("x8") = nr;
+  __asm__ volatile("svc #0" : "+r"(x0) : "r"(x1), "r"(x8) : "memory", "cc");
+  return x0;
 }
 
 __attribute__((visibility("default")))
 int gettimeofday(struct timeval *tv, struct timezone *tz)
 {
-   if (__builtin_expect(!lunaria_wall_counter || tz || !tv, 0)) {
-      const long r = lun_syscall2(169 /* __NR_gettimeofday */, (long)tv, (long)tz);
-      if (r < 0) { *__errno() = (int)-r; return -1; }
-      return 0;
-   }
-   uint64_t c;
-   __asm__ volatile("mrs %0, cntvct_el0" : "=r"(c));
-   /* 1e9 / 19.2e6 == 625 / 12; split so ns * freq cannot overflow. */
-   const uint64_t freq = 19200000u;
-   const int64_t ns = (int64_t)((c / freq) * 1000000000ull + (c % freq) * 625u / 12u) +
-                      lunaria_realtime_offset_ns;
-   int64_t *out = (int64_t *)tv;   /* struct timeval { time_t; suseconds_t; } on LP64 */
-   out[0] = ns / 1000000000;
-   out[1] = (ns % 1000000000) / 1000;
-   return 0;
+  if (__builtin_expect(!lunaria_wall_counter || tz || !tv, 0)) {
+    const long r = lun_syscall2(169 /* __NR_gettimeofday */, (long)tv, (long)tz);
+    if (r < 0) {
+      *__errno() = (int)-r;
+      return -1;
+    }
+    return 0;
+  }
+  uint64_t c;
+  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(c));
+  /* 1e9 / 19.2e6 == 625 / 12; split so ns * freq cannot overflow. */
+  const uint64_t freq = 19200000u;
+  const int64_t ns = (int64_t)((c / freq) * 1000000000ull + (c % freq) * 625u / 12u) +
+                     lunaria_realtime_offset_ns;
+  int64_t *out = (int64_t *)tv;   /* struct timeval { time_t; suseconds_t; } on LP64 */
+  out[0] = ns / 1000000000;
+  out[1] = (ns % 1000000000) / 1000;
+  return 0;
 }
 
 /* ---- thread-safe static initialisation ---------------------------------
@@ -1392,39 +1448,39 @@ int gettimeofday(struct timeval *tv, struct timezone *tz)
 __attribute__((visibility("default")))
 int __cxa_guard_acquire(uint64_t *guard)
 {
-   uint32_t *g = (uint32_t *)guard;
-   uint32_t v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
-   for (;;) {
-      if (v & 0xffu) return 0;
-      if (v == 0u) {
-         if (__atomic_compare_exchange_n(g, &v, GUARD_BUSY, 0,
-                                         __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE))
-            return 1;
-         continue;
-      }
-      if (v == GUARD_BUSY &&
-          !__atomic_compare_exchange_n(g, &v, GUARD_BUSY_WAIT, 0,
-                                       __ATOMIC_RELAXED, __ATOMIC_ACQUIRE))
-         continue;
-      raw_futex(g, FUTEX_WAIT_PRIVATE, GUARD_BUSY_WAIT);
-      v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
-   }
+  uint32_t *g = (uint32_t *)guard;
+  uint32_t v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+  for (;;) {
+    if (v & 0xffu) return 0;
+    if (v == 0u) {
+      if (__atomic_compare_exchange_n(g, &v, GUARD_BUSY, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE))
+        return 1;
+      continue;
+    }
+    if (v == GUARD_BUSY &&
+        !__atomic_compare_exchange_n(g, &v, GUARD_BUSY_WAIT, 0,
+                                     __ATOMIC_RELAXED, __ATOMIC_ACQUIRE))
+      continue;
+    raw_futex(g, FUTEX_WAIT_PRIVATE, GUARD_BUSY_WAIT);
+    v = __atomic_load_n(g, __ATOMIC_ACQUIRE);
+  }
 }
 
 __attribute__((visibility("default")))
 void __cxa_guard_release(uint64_t *guard)
 {
-   uint32_t *g = (uint32_t *)guard;
-   if (__atomic_exchange_n(g, 1u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
-      raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
+  uint32_t *g = (uint32_t *)guard;
+  if (__atomic_exchange_n(g, 1u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
+    raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
 }
 
 __attribute__((visibility("default")))
 void __cxa_guard_abort(uint64_t *guard)
 {
-   uint32_t *g = (uint32_t *)guard;
-   if (__atomic_exchange_n(g, 0u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
-      raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
+  uint32_t *g = (uint32_t *)guard;
+  if (__atomic_exchange_n(g, 0u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
+    raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
 }
 
 /* ---- dlopen, android_dlopen_ext -------------------------------------------
@@ -1441,33 +1497,34 @@ extern void *lunaria_host_dlopen(const char *file, int flags);
 __attribute__((noinline))
 static void *lunaria_loader_dlopen(const char *file, int flags, const void *caller)
 {
-   (void)caller;
-   return lunaria_host_dlopen(file, flags);
+  (void)caller;
+  return lunaria_host_dlopen(file, flags);
 }
 
 __attribute__((noinline))
 static void *lunaria_loader_android_dlopen_ext(const char *file, int flags,
-                                               const void *extinfo, const void *caller)
+    const void *extinfo, const void *caller)
 {
-   (void)extinfo; (void)caller;
-   return lunaria_host_dlopen(file, flags);
+  (void)extinfo;
+  (void)caller;
+  return lunaria_host_dlopen(file, flags);
 }
 
 __attribute__((visibility("default")))
 void *dlopen(const char *file, int flags)
 {
-   void *handle = lunaria_loader_dlopen(file, flags, __builtin_return_address(0));
-   __asm__ volatile("" ::: "memory");   /* a call, never a tail jump */
-   return handle;
+  void *handle = lunaria_loader_dlopen(file, flags, __builtin_return_address(0));
+  __asm__ volatile("" ::: "memory");   /* a call, never a tail jump */
+  return handle;
 }
 
 __attribute__((visibility("default")))
 void *android_dlopen_ext(const char *file, int flags, const void *extinfo)
 {
-   void *handle = lunaria_loader_android_dlopen_ext(file, flags, extinfo,
-                                                    __builtin_return_address(0));
-   __asm__ volatile("" ::: "memory");
-   return handle;
+  void *handle = lunaria_loader_android_dlopen_ext(file, flags, extinfo,
+                 __builtin_return_address(0));
+  __asm__ volatile("" ::: "memory");
+  return handle;
 }
 
 #endif /* !LUNARIA_GUEST_SHARED */

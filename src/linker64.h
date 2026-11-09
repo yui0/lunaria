@@ -5,6 +5,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
 #ifndef LUNARIA_LINKER64_H
 #define LUNARIA_LINKER64_H
 
@@ -70,8 +71,8 @@ struct ln64_module *ln64_add(const char *path, uint32_t load_bias,
 
 /* Shared parser: elf_class is ELFCLASS32 or ELFCLASS64 from the ELF header. */
 struct ln64_module *ln64_add_elf(const char *path, uint32_t load_bias,
-                                uint32_t dynamic_off, unsigned elf_class,
-                                bool is_global, bool is_main);
+                                 uint32_t dynamic_off, unsigned elf_class,
+                                 bool is_global, bool is_main);
 
 /* Resolve the DT_NEEDED names of every registered image against the images
  * registered so far, building the dependency graph the local groups are
@@ -82,12 +83,12 @@ void ln64_remove(struct ln64_module *module);
 
 /* The result of a lookup. */
 struct ln64_sym {
-   uint32_t            value;    /* backing offset of the definition */
-   uint32_t            size;
-   uint8_t             info;     /* ELF64_ST_INFO */
-   uint8_t             other;
-   const char         *name;
-   struct ln64_module *owner;
+  uint32_t            value;    /* backing offset of the definition */
+  uint32_t            size;
+  uint8_t             info;     /* ELF64_ST_INFO */
+  uint8_t             other;
+  const char         *name;
+  struct ln64_module *owner;
 };
 
 /* Resolve `name` as `ref` sees it: DF_SYMBOLIC first if set, then the global

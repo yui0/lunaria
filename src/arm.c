@@ -5,6 +5,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
+
 #include "arm.h"
 #include "lunaria_os.h"
 
@@ -49,9 +50,9 @@ static int g_spin_ok = -1;         /* spinning only helps with a core to spare *
 static inline void arm_cpu_relax(void)
 {
 #if defined(__x86_64__) || defined(__i386__)
-   __builtin_ia32_pause();
+  __builtin_ia32_pause();
 #elif defined(__aarch64__)
-   __asm__ __volatile__("yield");
+  __asm__ __volatile__("yield");
 #endif
 }
 
@@ -64,10 +65,10 @@ static _Atomic unsigned g_waiters; /* queued in acquire */
 static __thread unsigned t_depth;  /* this thread's recursion depth */
 
 struct arm_lock_waiter {
-   pthread_cond_t          cv;
-   struct arm_lock_waiter *next;
-   _Atomic bool            go;       /* the lock has been handed to me */
-   bool                    sleeping; /* parked on cv; read and written under g_m */
+  pthread_cond_t          cv;
+  struct arm_lock_waiter *next;
+  _Atomic bool            go;       /* the lock has been handed to me */
+  bool                    sleeping; /* parked on cv; read and written under g_m */
 };
 static struct arm_lock_waiter *g_head, *g_tail;
 
@@ -107,207 +108,215 @@ static __thread unsigned t_tag_saved;
 
 unsigned arm_lock_tag(unsigned tag)
 {
-   const unsigned prev = t_tag;
-   t_tag = tag < ARM_LOCK_TAG_MAX ? tag : 0u;
-   return prev;
+  const unsigned prev = t_tag;
+  t_tag = tag < ARM_LOCK_TAG_MAX ? tag : 0u;
+  return prev;
 }
 
 unsigned long long arm_lock_tag_take_ns(unsigned tag)
 {
-   if (tag >= ARM_LOCK_TAG_MAX) return 0ull;
-   return atomic_exchange_explicit(&g_tag_ns[tag], 0ull, memory_order_relaxed);
+  if (tag >= ARM_LOCK_TAG_MAX) return 0ull;
+  return atomic_exchange_explicit(&g_tag_ns[tag], 0ull, memory_order_relaxed);
 }
 
 static unsigned long long arm_now_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (unsigned long long)ts.tv_sec * 1000000000ull +
-          (unsigned long long)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long long)ts.tv_sec * 1000000000ull +
+         (unsigned long long)ts.tv_nsec;
 }
 
 unsigned long long arm_lock_held_ns(void)
 {
-   return atomic_load_explicit(&g_held_ns, memory_order_relaxed);
+  return atomic_load_explicit(&g_held_ns, memory_order_relaxed);
 }
 unsigned long long arm_lock_wait_ns(void)
 {
-   return atomic_load_explicit(&g_wait_ns, memory_order_relaxed);
+  return atomic_load_explicit(&g_wait_ns, memory_order_relaxed);
 }
 unsigned long long arm_lock_max_wait_ns(void)
 {
-   return atomic_exchange_explicit(&g_max_wait_ns, 0ull, memory_order_relaxed);
+  return atomic_exchange_explicit(&g_max_wait_ns, 0ull, memory_order_relaxed);
 }
 
 unsigned long long arm_lock_max_hold_ns(unsigned *tag_out)
 {
-   if (tag_out)
-      *tag_out = atomic_load_explicit(&g_max_hold_tag, memory_order_relaxed);
-   return atomic_exchange_explicit(&g_max_hold_ns, 0ull, memory_order_relaxed);
+  if (tag_out)
+    *tag_out = atomic_load_explicit(&g_max_hold_tag, memory_order_relaxed);
+  return atomic_exchange_explicit(&g_max_hold_ns, 0ull, memory_order_relaxed);
 }
 
 void arm_lock_acquire(void)
 {
-   if (t_depth) { ++t_depth; return; }
-   pthread_mutex_lock(&g_m);
-   if (!g_locked && !g_head) {
-      g_locked = true;
-      clock_gettime(CLOCK_MONOTONIC, &g_held_since);
-      pthread_mutex_unlock(&g_m);
-   } else {
-      /* The releaser only touches the node while holding g_m and only reaches
-       * for the condition variable of a node marked sleeping, and this thread
-       * does not queue again before it has been dequeued, so the node is free
-       * again by the time we leave. */
-      struct arm_lock_waiter *w = &t_waiter;
-      if (!t_waiter_ready) {
-         pthread_cond_init(&w->cv, NULL);
-         t_waiter_ready = true;
+  if (t_depth) {
+    ++t_depth;
+    return;
+  }
+  pthread_mutex_lock(&g_m);
+  if (!g_locked && !g_head) {
+    g_locked = true;
+    clock_gettime(CLOCK_MONOTONIC, &g_held_since);
+    pthread_mutex_unlock(&g_m);
+  } else {
+    /* The releaser only touches the node while holding g_m and only reaches
+     * for the condition variable of a node marked sleeping, and this thread
+     * does not queue again before it has been dequeued, so the node is free
+     * again by the time we leave. */
+    struct arm_lock_waiter *w = &t_waiter;
+    if (!t_waiter_ready) {
+      pthread_cond_init(&w->cv, NULL);
+      t_waiter_ready = true;
+    }
+    w->next = NULL;
+    atomic_store_explicit(&w->go, false, memory_order_relaxed);
+    w->sleeping = false;
+    if (g_tail) g_tail->next = w;
+    else g_head = w;
+    g_tail = w;
+    atomic_fetch_add_explicit(&g_waiters, 1u, memory_order_relaxed);
+    pthread_mutex_unlock(&g_m);
+    const unsigned long long t0 = arm_now_ns();
+    if (g_spin_ok < 0)
+      g_spin_ok = luna_os_cpu_count() > 2;
+    if (g_spin_ok) {
+      for (unsigned n = 0;
+           !atomic_load_explicit(&w->go, memory_order_acquire); ++n) {
+        arm_cpu_relax();
+        if ((n & 127u) == 127u && arm_now_ns() - t0 > ARM_LOCK_SPIN_NS)
+          break;
       }
-      w->next = NULL;
-      atomic_store_explicit(&w->go, false, memory_order_relaxed);
+    }
+    if (!atomic_load_explicit(&w->go, memory_order_acquire)) {
+      pthread_mutex_lock(&g_m);
+      while (!atomic_load_explicit(&w->go, memory_order_acquire)) {
+        w->sleeping = true;
+        pthread_cond_wait(&w->cv, &g_m);
+      }
       w->sleeping = false;
-      if (g_tail) g_tail->next = w; else g_head = w;
-      g_tail = w;
-      atomic_fetch_add_explicit(&g_waiters, 1u, memory_order_relaxed);
       pthread_mutex_unlock(&g_m);
-      const unsigned long long t0 = arm_now_ns();
-      if (g_spin_ok < 0)
-         g_spin_ok = luna_os_cpu_count() > 2;
-      if (g_spin_ok) {
-         for (unsigned n = 0;
-              !atomic_load_explicit(&w->go, memory_order_acquire); ++n) {
-            arm_cpu_relax();
-            if ((n & 127u) == 127u && arm_now_ns() - t0 > ARM_LOCK_SPIN_NS)
-               break;
-         }
-      }
-      if (!atomic_load_explicit(&w->go, memory_order_acquire)) {
-         pthread_mutex_lock(&g_m);
-         while (!atomic_load_explicit(&w->go, memory_order_acquire)) {
-            w->sleeping = true;
-            pthread_cond_wait(&w->cv, &g_m);
-         }
-         w->sleeping = false;
-         pthread_mutex_unlock(&g_m);
-      }
-      const unsigned long long waited = arm_now_ns() - t0;
-      atomic_fetch_add_explicit(&g_wait_ns, waited, memory_order_relaxed);
-      unsigned long long worst =
-         atomic_load_explicit(&g_max_wait_ns, memory_order_relaxed);
-      while (waited > worst &&
-             !atomic_compare_exchange_weak_explicit(
-                 &g_max_wait_ns, &worst, waited,
-                 memory_order_relaxed, memory_order_relaxed))
-         ;
-      atomic_fetch_sub_explicit(&g_waiters, 1u, memory_order_relaxed);
-      /* g_locked stayed true: the releaser handed ownership straight over. */
-   }
-   /* The label belongs to this acquisition, not to the thread.  It used to
-    * persist, so every acquire that never set one -- a scheduler pass, a guest
-    * callback, any internal helper that just takes the lock -- was charged to
-    * whichever SVC this thread happened to run last.  That is how one SVC came
-    * to "hold" a quarter of the wall clock while the timers inside it summed
-    * to a fraction of a second.  Start unlabelled and let the caller name it. */
-   t_tag = 0u;
-   t_depth = 1;
+    }
+    const unsigned long long waited = arm_now_ns() - t0;
+    atomic_fetch_add_explicit(&g_wait_ns, waited, memory_order_relaxed);
+    unsigned long long worst =
+      atomic_load_explicit(&g_max_wait_ns, memory_order_relaxed);
+    while (waited > worst &&
+           !atomic_compare_exchange_weak_explicit(
+             &g_max_wait_ns, &worst, waited,
+             memory_order_relaxed, memory_order_relaxed))
+      ;
+    atomic_fetch_sub_explicit(&g_waiters, 1u, memory_order_relaxed);
+    /* g_locked stayed true: the releaser handed ownership straight over. */
+  }
+  /* The label belongs to this acquisition, not to the thread.  It used to
+   * persist, so every acquire that never set one -- a scheduler pass, a guest
+   * callback, any internal helper that just takes the lock -- was charged to
+   * whichever SVC this thread happened to run last.  That is how one SVC came
+   * to "hold" a quarter of the wall clock while the timers inside it summed
+   * to a fraction of a second.  Start unlabelled and let the caller name it. */
+  t_tag = 0u;
+  t_depth = 1;
 }
 
 void arm_lock_release(void)
 {
-   if (!t_depth) return;      /* not ours to release */
-   if (--t_depth) return;     /* still held by an outer acquire */
-   pthread_mutex_lock(&g_m);
-   struct timespec now;
-   clock_gettime(CLOCK_MONOTONIC, &now);
-   /* tv_nsec borrows across the second boundary on roughly half of all
-    * releases (whenever now.tv_nsec < g_held_since.tv_nsec) -- computing
-    * that subtraction in unsigned before adding the whole-seconds term
-    * wrapped it to just under 2^64 ns instead of going negative, so "mine"
-    * came out around 18446744073709.5 ms on those releases. Since that beat
-    * every real hold, g_max_hold_ns latched onto the wrapped value instead
-    * of the actual longest hold almost as often as not -- the
-    * "[slice] longest single hold" line this feeds was reporting garbage,
-    * not a rare fluke. Do the subtraction in signed arithmetic, where a
-    * borrow is just a negative intermediate, and only convert to unsigned
-    * once the true (non-negative, the clock is monotonic) result is known. */
-   const long long mine_s =
-      (long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ll +
-      ((long long)now.tv_nsec - (long long)g_held_since.tv_nsec);
-   const unsigned long long mine = (unsigned long long)mine_s;
-   atomic_fetch_add_explicit(&g_held_ns, mine, memory_order_relaxed);
-   atomic_fetch_add_explicit(&g_tag_ns[t_tag], mine, memory_order_relaxed);
-   {
-      unsigned long long prev =
-         atomic_load_explicit(&g_max_hold_ns, memory_order_relaxed);
-      while (mine > prev &&
-             !atomic_compare_exchange_weak_explicit(
-                 &g_max_hold_ns, &prev, mine,
-                 memory_order_relaxed, memory_order_relaxed))
-         ;
-      if (mine >= prev)
-         atomic_store_explicit(&g_max_hold_tag, t_tag, memory_order_relaxed);
-   }
-   struct arm_lock_waiter *w = g_head;
-   if (w) {
-      g_head = w->next;
-      if (!g_head) g_tail = NULL;
-      g_held_since = now;          /* handed straight over: still held */
-      /* After the store the waiter may run on without g_m, so everything that
-       * needs the node is done before it. */
-      const bool asleep = w->sleeping;
-      atomic_store_explicit(&w->go, true, memory_order_release);
-      if (asleep)
-         pthread_cond_signal(&w->cv);
-   } else {
-      g_locked = false;
-   }
-   pthread_mutex_unlock(&g_m);
+  if (!t_depth) return;      /* not ours to release */
+  if (--t_depth) return;     /* still held by an outer acquire */
+  pthread_mutex_lock(&g_m);
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  /* tv_nsec borrows across the second boundary on roughly half of all
+   * releases (whenever now.tv_nsec < g_held_since.tv_nsec) -- computing
+   * that subtraction in unsigned before adding the whole-seconds term
+   * wrapped it to just under 2^64 ns instead of going negative, so "mine"
+   * came out around 18446744073709.5 ms on those releases. Since that beat
+   * every real hold, g_max_hold_ns latched onto the wrapped value instead
+   * of the actual longest hold almost as often as not -- the
+   * "[slice] longest single hold" line this feeds was reporting garbage,
+   * not a rare fluke. Do the subtraction in signed arithmetic, where a
+   * borrow is just a negative intermediate, and only convert to unsigned
+   * once the true (non-negative, the clock is monotonic) result is known. */
+  const long long mine_s =
+    (long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ll +
+    ((long long)now.tv_nsec - (long long)g_held_since.tv_nsec);
+  const unsigned long long mine = (unsigned long long)mine_s;
+  atomic_fetch_add_explicit(&g_held_ns, mine, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_tag_ns[t_tag], mine, memory_order_relaxed);
+  {
+    unsigned long long prev =
+      atomic_load_explicit(&g_max_hold_ns, memory_order_relaxed);
+    while (mine > prev &&
+           !atomic_compare_exchange_weak_explicit(
+             &g_max_hold_ns, &prev, mine,
+             memory_order_relaxed, memory_order_relaxed))
+      ;
+    if (mine >= prev)
+      atomic_store_explicit(&g_max_hold_tag, t_tag, memory_order_relaxed);
+  }
+  struct arm_lock_waiter *w = g_head;
+  if (w) {
+    g_head = w->next;
+    if (!g_head) g_tail = NULL;
+    g_held_since = now;          /* handed straight over: still held */
+    /* After the store the waiter may run on without g_m, so everything that
+     * needs the node is done before it. */
+    const bool asleep = w->sleeping;
+    atomic_store_explicit(&w->go, true, memory_order_release);
+    if (asleep)
+      pthread_cond_signal(&w->cv);
+  } else {
+    g_locked = false;
+  }
+  pthread_mutex_unlock(&g_m);
 }
 
 bool arm_lock_held(void)
 {
-   return t_depth != 0u;
+  return t_depth != 0u;
 }
 
 unsigned arm_lock_unlock_all(void)
 {
-   unsigned d = t_depth;
-   if (d) {
-      t_tag_saved = t_tag;   /* the same acquisition resumes in relock() */
-      t_depth = 1u;
-      arm_lock_release();
-   }
-   return d;
+  unsigned d = t_depth;
+  if (d) {
+    t_tag_saved = t_tag;   /* the same acquisition resumes in relock() */
+    t_depth = 1u;
+    arm_lock_release();
+  }
+  return d;
 }
 
 void arm_lock_relock(unsigned depth)
 {
-   if (!depth) return;
-   arm_lock_acquire();
-   t_tag   = t_tag_saved;
-   t_depth = depth;
+  if (!depth) return;
+  arm_lock_acquire();
+  t_tag   = t_tag_saved;
+  t_depth = depth;
 }
 
 void arm_lock_yield(void)
 {
-   /* A stale read only gates an optimisation: a stale zero costs one more turn
-    * of the caller's loop, a stale non-zero one pointless hand-off.  The
-    * hand-off itself needs no waiting — acquire() queues this thread behind
-    * the threads already asking. */
-   if (!atomic_load_explicit(&g_waiters, memory_order_relaxed))
-      return;
-   unsigned d = arm_lock_unlock_all();
-   if (!d)
-      return;
-   arm_lock_relock(d);
+  /* A stale read only gates an optimisation: a stale zero costs one more turn
+   * of the caller's loop, a stale non-zero one pointless hand-off.  The
+   * hand-off itself needs no waiting — acquire() queues this thread behind
+   * the threads already asking. */
+  if (!atomic_load_explicit(&g_waiters, memory_order_relaxed))
+    return;
+  unsigned d = arm_lock_unlock_all();
+  if (!d)
+    return;
+  arm_lock_relock(d);
 }
 
 unsigned arm_lock_waiters(void)
 {
-   return atomic_load_explicit(&g_waiters, memory_order_relaxed);
+  return atomic_load_explicit(&g_waiters, memory_order_relaxed);
 }
 
 static bool g_parallel;
-bool arm_parallel_engines(void) { return g_parallel; }
-void arm_set_parallel_engines(bool on) { g_parallel = on; }
+bool arm_parallel_engines(void) {
+  return g_parallel;
+}
+void arm_set_parallel_engines(bool on) {
+  g_parallel = on;
+}

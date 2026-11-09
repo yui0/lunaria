@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * lunaria_os.h on Linux.  See that header for what each entry point owes its
  * caller; this file only says how Linux provides it.
  */
@@ -60,554 +62,601 @@
 
 size_t luna_os_stack_remaining(void)
 {
-   static _Thread_local uintptr_t low, high;
-   if (!high) {
-      pthread_attr_t attr;
-      if (pthread_getattr_np(pthread_self(), &attr)) return SIZE_MAX;
-      void *base = NULL;
-      size_t size = 0;
-      int rc = pthread_attr_getstack(&attr, &base, &size);
-      pthread_attr_destroy(&attr);
-      if (rc || !size) return SIZE_MAX;
-      low = (uintptr_t)base;
-      high = low + size;
-   }
-   uintptr_t current = (uintptr_t)__builtin_frame_address(0);
-   return current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
+  static _Thread_local uintptr_t low, high;
+  if (!high) {
+    pthread_attr_t attr;
+    if (pthread_getattr_np(pthread_self(), &attr)) return SIZE_MAX;
+    void *base = NULL;
+    size_t size = 0;
+    int rc = pthread_attr_getstack(&attr, &base, &size);
+    pthread_attr_destroy(&attr);
+    if (rc || !size) return SIZE_MAX;
+    low = (uintptr_t)base;
+    high = low + size;
+  }
+  uintptr_t current = (uintptr_t)__builtin_frame_address(0);
+  return current >= low && current < high ? (size_t)(current - low) : SIZE_MAX;
 }
 
 int luna_os_setenv(const char *name, const char *value, int overwrite)
 {
-   if (!name || !*name || strchr(name, '=') || !value) { errno = EINVAL; return -1; }
-   return setenv(name, value, overwrite);
+  if (!name || !*name || strchr(name, '=') || !value) {
+    errno = EINVAL;
+    return -1;
+  }
+  return setenv(name, value, overwrite);
 }
 static unsigned netif_prefix(const struct sockaddr *mask, size_t len)
 {
-   if (!mask) return 0;
-   const uint8_t *bytes = mask->sa_family == AF_INET
-      ? (const uint8_t *)&((const struct sockaddr_in *)mask)->sin_addr
-      : (const uint8_t *)&((const struct sockaddr_in6 *)mask)->sin6_addr;
-   unsigned bits = 0;
-   for (size_t i = 0; i < len; ++i)
-      for (int b = 7; b >= 0 && (bytes[i] >> b & 1); --b) ++bits;
-   return bits;
+  if (!mask) return 0;
+  const uint8_t *bytes = mask->sa_family == AF_INET
+                         ? (const uint8_t *)&((const struct sockaddr_in *)mask)->sin_addr
+                         : (const uint8_t *)&((const struct sockaddr_in6 *)mask)->sin6_addr;
+  unsigned bits = 0;
+  for (size_t i = 0; i < len; ++i)
+    for (int b = 7; b >= 0 && (bytes[i] >> b & 1); --b) ++bits;
+  return bits;
 }
 
 int luna_os_net_list(struct luna_os_netif *out, int capacity)
 {
-   struct ifaddrs *list = NULL;
-   if (!out || capacity <= 0 || getifaddrs(&list) != 0) return 0;
-   int count = 0;
-   const int probe = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-   for (const struct ifaddrs *it = list; it; it = it->ifa_next) {
-      if (!it->ifa_name) continue;
-      int at = 0;
-      while (at < count && strcmp(out[at].name, it->ifa_name)) ++at;
-      if (at == count) {
-         if (count == capacity) continue;
-         memset(&out[count], 0, sizeof out[count]);
-         snprintf(out[count].name, sizeof out[count].name, "%s", it->ifa_name);
-         out[count].index = if_nametoindex(it->ifa_name);
-         out[count].up = (it->ifa_flags & IFF_UP) && (it->ifa_flags & IFF_RUNNING);
-         out[count].loopback = (it->ifa_flags & IFF_LOOPBACK) != 0;
-         out[count].multicast = (it->ifa_flags & IFF_MULTICAST) != 0;
-         out[count].point_to_point = (it->ifa_flags & IFF_POINTOPOINT) != 0;
-         struct ifreq request;
-         memset(&request, 0, sizeof request);
-         snprintf(request.ifr_name, sizeof request.ifr_name, "%s", it->ifa_name);
-         out[count].mtu = probe >= 0 && ioctl(probe, SIOCGIFMTU, &request) == 0
-                          ? (unsigned)request.ifr_mtu : 0;
-         ++count;
-      }
-      struct luna_os_netif *netif = &out[at];
-      const struct sockaddr *sa = it->ifa_addr;
-      if (!sa) continue;
-      if ((sa->sa_family == AF_INET || sa->sa_family == AF_INET6) && netif->naddr < LUNA_OS_NETIF_ADDRS) {
-         const bool v4 = sa->sa_family == AF_INET;
-         const size_t size = v4 ? 4 : 16;
-         netif->addr[netif->naddr].family = v4 ? 4 : 6;
-         memcpy(netif->addr[netif->naddr].bytes, v4
-                ? (const void *)&((const struct sockaddr_in *)sa)->sin_addr
-                : (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr, size);
-         netif->addr[netif->naddr].prefix = (uint8_t)netif_prefix(it->ifa_netmask, size);
-         ++netif->naddr;
-      }
-   }
-   if (probe >= 0) close(probe);
-   freeifaddrs(list);
-   return count;
+  struct ifaddrs *list = NULL;
+  if (!out || capacity <= 0 || getifaddrs(&list) != 0) return 0;
+  int count = 0;
+  const int probe = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  for (const struct ifaddrs *it = list; it; it = it->ifa_next) {
+    if (!it->ifa_name) continue;
+    int at = 0;
+    while (at < count && strcmp(out[at].name, it->ifa_name)) ++at;
+    if (at == count) {
+      if (count == capacity) continue;
+      memset(&out[count], 0, sizeof out[count]);
+      snprintf(out[count].name, sizeof out[count].name, "%s", it->ifa_name);
+      out[count].index = if_nametoindex(it->ifa_name);
+      out[count].up = (it->ifa_flags & IFF_UP) && (it->ifa_flags & IFF_RUNNING);
+      out[count].loopback = (it->ifa_flags & IFF_LOOPBACK) != 0;
+      out[count].multicast = (it->ifa_flags & IFF_MULTICAST) != 0;
+      out[count].point_to_point = (it->ifa_flags & IFF_POINTOPOINT) != 0;
+      struct ifreq request;
+      memset(&request, 0, sizeof request);
+      snprintf(request.ifr_name, sizeof request.ifr_name, "%s", it->ifa_name);
+      out[count].mtu = probe >= 0 && ioctl(probe, SIOCGIFMTU, &request) == 0
+                       ? (unsigned)request.ifr_mtu : 0;
+      ++count;
+    }
+    struct luna_os_netif *netif = &out[at];
+    const struct sockaddr *sa = it->ifa_addr;
+    if (!sa) continue;
+    if ((sa->sa_family == AF_INET || sa->sa_family == AF_INET6) && netif->naddr < LUNA_OS_NETIF_ADDRS) {
+      const bool v4 = sa->sa_family == AF_INET;
+      const size_t size = v4 ? 4 : 16;
+      netif->addr[netif->naddr].family = v4 ? 4 : 6;
+      memcpy(netif->addr[netif->naddr].bytes, v4
+             ? (const void *)&((const struct sockaddr_in *)sa)->sin_addr
+             : (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr, size);
+      netif->addr[netif->naddr].prefix = (uint8_t)netif_prefix(it->ifa_netmask, size);
+      ++netif->naddr;
+    }
+  }
+  if (probe >= 0) close(probe);
+  freeifaddrs(list);
+  return count;
 }
 
 int luna_os_random(void *buffer, size_t length)
 {
-   if (length && !buffer) { errno = EFAULT; return -1; }
-   if (length) arc4random_buf(buffer, length);
-   return 0;
+  if (length && !buffer) {
+    errno = EFAULT;
+    return -1;
+  }
+  if (length) arc4random_buf(buffer, length);
+  return 0;
 }
 
 void *luna_os_library_open(const char *path)
 {
-   return dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
+  return dlopen(path, RTLD_LAZY | RTLD_GLOBAL);
 }
 
 void *luna_os_library_open_local(const char *path)
 {
-   return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  return dlopen(path, RTLD_NOW | RTLD_LOCAL);
 }
 const char *luna_os_library_error(void)
 {
-   const char *error = dlerror();
-   return error ? error : "unknown loader error";
+  const char *error = dlerror();
+  return error ? error : "unknown loader error";
 }
 
 void *luna_os_library_symbol(void *handle, const char *name)
 {
-   return dlsym(handle ? handle : RTLD_DEFAULT, name);
+  return dlsym(handle ? handle : RTLD_DEFAULT, name);
 }
 
 void luna_os_library_close(void *handle)
 {
-   if (handle) dlclose(handle);
+  if (handle) dlclose(handle);
 }
 
 int luna_os_backtrace(void **frames, int capacity)
 {
-   return frames && capacity > 0 ? backtrace(frames, capacity) : 0;
+  return frames && capacity > 0 ? backtrace(frames, capacity) : 0;
 }
 
 void luna_os_backtrace_print(void *const *frames, int count)
 {
-   if (frames && count > 0) backtrace_symbols_fd(frames, count, 2);
+  if (frames && count > 0) backtrace_symbols_fd(frames, count, 2);
 }
 
 static int luna_prot_to_host(int prot)
 {
-   int p = 0;
-   if (prot & LUNA_PROT_READ)  p |= PROT_READ;
-   if (prot & LUNA_PROT_WRITE) p |= PROT_WRITE;
-   if (prot & LUNA_PROT_EXEC)  p |= PROT_EXEC;
-   return p ? p : PROT_NONE;
+  int p = 0;
+  if (prot & LUNA_PROT_READ)  p |= PROT_READ;
+  if (prot & LUNA_PROT_WRITE) p |= PROT_WRITE;
+  if (prot & LUNA_PROT_EXEC)  p |= PROT_EXEC;
+  return p ? p : PROT_NONE;
 }
 
 void *luna_os_reserve(void *want, size_t len, int exact)
 {
-   /* MAP_NORESERVE is the whole point of the guest heap being this large:
-    * the range exists, and a page costs memory only once it is written. */
-   int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-   if (exact) {
+  /* MAP_NORESERVE is the whole point of the guest heap being this large:
+   * the range exists, and a page costs memory only once it is written. */
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+  if (exact) {
 #ifdef MAP_FIXED_NOREPLACE
-      /* Ask for exactly this address and be told when something is already
-       * there.  MAP_FIXED would take the range by unmapping whatever it hit,
-       * which is how a guest pointer silently starts pointing at rubble. */
-      flags |= MAP_FIXED_NOREPLACE;
+    /* Ask for exactly this address and be told when something is already
+     * there.  MAP_FIXED would take the range by unmapping whatever it hit,
+     * which is how a guest pointer silently starts pointing at rubble. */
+    flags |= MAP_FIXED_NOREPLACE;
 #endif
-      if (!want) return NULL;
-   }
-   void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
-   if (p == MAP_FAILED) return NULL;
-   /* MAP_FIXED_NOREPLACE fails outright when the range is taken, but a kernel
-    * without it treats the address as a hint and answers elsewhere — so check
-    * either way, and give back what we did not ask for. */
-   if (exact && p != want) { munmap(p, len); return NULL; }
-   return p;
+    if (!want) return NULL;
+  }
+  void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+  if (p == MAP_FAILED) return NULL;
+  /* MAP_FIXED_NOREPLACE fails outright when the range is taken, but a kernel
+   * without it treats the address as a hint and answers elsewhere — so check
+   * either way, and give back what we did not ask for. */
+  if (exact && p != want) {
+    munmap(p, len);
+    return NULL;
+  }
+  return p;
 }
 
 int luna_os_release(void *addr, size_t len)
 {
-   return munmap(addr, len);
+  return munmap(addr, len);
 }
 
 void *luna_os_map_anon(void *want, size_t len, int replace)
 {
-   if (replace && !want) { errno = EINVAL; return NULL; }
-   int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-   if (replace) flags |= MAP_FIXED;
-   void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
-   return p == MAP_FAILED ? NULL : p;
+  if (replace && !want) {
+    errno = EINVAL;
+    return NULL;
+  }
+  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+  if (replace) flags |= MAP_FIXED;
+  void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
+  return p == MAP_FAILED ? NULL : p;
 }
 
 void *luna_os_map_file_flags(void *want, size_t len, int prot, int policy,
-                            int fd, uint64_t off)
+                             int fd, uint64_t off)
 {
-   int flags = (policy & LUNA_MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
-   if (policy & LUNA_MAP_FIXED) flags |= MAP_FIXED;
+  int flags = (policy & LUNA_MAP_SHARED) ? MAP_SHARED : MAP_PRIVATE;
+  if (policy & LUNA_MAP_FIXED) flags |= MAP_FIXED;
 #ifdef MAP_FIXED_NOREPLACE
-   if (policy & LUNA_MAP_NOREPLACE) flags |= MAP_FIXED_NOREPLACE;
+  if (policy & LUNA_MAP_NOREPLACE) flags |= MAP_FIXED_NOREPLACE;
 #endif
-   if ((policy & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) && !want) {
-      errno = EINVAL;
-      return NULL;
-   }
-   if (policy & LUNA_MAP_NORESERVE) flags |= MAP_NORESERVE;
+  if ((policy & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE)) && !want) {
+    errno = EINVAL;
+    return NULL;
+  }
+  if (policy & LUNA_MAP_NORESERVE) flags |= MAP_NORESERVE;
 #ifdef MAP_POPULATE
-   if (policy & LUNA_MAP_POPULATE) flags |= MAP_POPULATE;
+  if (policy & LUNA_MAP_POPULATE) flags |= MAP_POPULATE;
 #endif
 #ifdef MAP_STACK
-   if (policy & LUNA_MAP_STACK) flags |= MAP_STACK;
+  if (policy & LUNA_MAP_STACK) flags |= MAP_STACK;
 #endif
-   void *p = mmap(want, len, luna_prot_to_host(prot), flags, fd, (off_t)off);
-   return p == MAP_FAILED ? NULL : p;
+  void *p = mmap(want, len, luna_prot_to_host(prot), flags, fd, (off_t)off);
+  return p == MAP_FAILED ? NULL : p;
 }
 
 int luna_os_protect(void *addr, size_t len, int prot)
 {
-   return mprotect(addr, len, luna_prot_to_host(prot));
+  return mprotect(addr, len, luna_prot_to_host(prot));
 }
 
 void *luna_os_map_file(void *want, size_t len, int prot, int fd,
                        uint64_t off, int fixed)
 {
-   int flags = MAP_PRIVATE;
-   if (fixed) {
+  int flags = MAP_PRIVATE;
+  if (fixed) {
 #ifdef MAP_FIXED_NOREPLACE
-      flags |= MAP_FIXED_NOREPLACE;
+    flags |= MAP_FIXED_NOREPLACE;
 #else
-      flags |= MAP_FIXED;
+    flags |= MAP_FIXED;
 #endif
-      if (!want) return NULL;
-   }
-   void *p = mmap(want, len, luna_prot_to_host(prot), flags, fd, (off_t)off);
-   if (p == MAP_FAILED) return NULL;
-   if (fixed && p != want) { munmap(p, len); return NULL; }
-   return p;
+    if (!want) return NULL;
+  }
+  void *p = mmap(want, len, luna_prot_to_host(prot), flags, fd, (off_t)off);
+  if (p == MAP_FAILED) return NULL;
+  if (fixed && p != want) {
+    munmap(p, len);
+    return NULL;
+  }
+  return p;
 }
 
 void *luna_os_remap(void *addr, size_t old_len, size_t new_len)
 {
-   /* No MREMAP_MAYMOVE: the guest's VA is the host's, so a mapping that moved
-    * would take every pointer into it with it. */
-   void *p = mremap(addr, old_len, new_len, 0);
-   return p == MAP_FAILED ? NULL : p;
+  /* No MREMAP_MAYMOVE: the guest's VA is the host's, so a mapping that moved
+   * would take every pointer into it with it. */
+  void *p = mremap(addr, old_len, new_len, 0);
+  return p == MAP_FAILED ? NULL : p;
 }
 
 size_t luna_os_page_size(void)
 {
-   long v = sysconf(_SC_PAGESIZE);
-   return v > 0 ? (size_t)v : 4096u;
+  long v = sysconf(_SC_PAGESIZE);
+  return v > 0 ? (size_t)v : 4096u;
 }
 
 int luna_os_memory_advise(void *addr, size_t len, int advice)
 {
-   return madvise(addr, len, advice);
+  return madvise(addr, len, advice);
 }
 
 int luna_os_memory_sync(void *addr, size_t len, int flags)
 {
-   if ((flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
-       (flags & LUNA_MS_ASYNC && flags & LUNA_MS_SYNC)) { errno = EINVAL; return -1; }
-   int native = (flags & LUNA_MS_ASYNC ? MS_ASYNC : 0) |
-                (flags & LUNA_MS_INVALIDATE ? MS_INVALIDATE : 0) |
-                (flags & LUNA_MS_SYNC ? MS_SYNC : 0);
-   return msync(addr, len, native);
+  if ((flags & ~(LUNA_MS_ASYNC | LUNA_MS_INVALIDATE | LUNA_MS_SYNC)) ||
+      (flags & LUNA_MS_ASYNC && flags & LUNA_MS_SYNC)) {
+    errno = EINVAL;
+    return -1;
+  }
+  int native = (flags & LUNA_MS_ASYNC ? MS_ASYNC : 0) |
+               (flags & LUNA_MS_INVALIDATE ? MS_INVALIDATE : 0) |
+               (flags & LUNA_MS_SYNC ? MS_SYNC : 0);
+  return msync(addr, len, native);
 }
 
 int luna_os_memory_lock(void *addr, size_t len, int unlock)
 {
-   return unlock ? munlock(addr, len) : mlock(addr, len);
+  return unlock ? munlock(addr, len) : mlock(addr, len);
 }
 
 int luna_os_residency(void *addr, size_t len, unsigned char *vector)
 {
-   return mincore(addr, len, vector);
+  return mincore(addr, len, vector);
 }
 
 /* ---- anonymous shared memory ------------------------------------------- */
 
 int luna_os_shm_create(const char *name, size_t size)
 {
-   /* memfd is the same object ASharedMemory hands out on a device: anonymous,
-    * sized once, mappable by anyone holding the descriptor. */
-   /* Sealing is allowed because ASharedMemory_setProt exists: a guest that
-    * drops write permission on a region it shared expects that to stick. */
-   int fd = memfd_create(name && *name ? name : "lunaria-shmem",
-                         MFD_CLOEXEC | MFD_ALLOW_SEALING);
-   if (fd < 0) return -1;
-   if (size && ftruncate(fd, (off_t)size) != 0) { close(fd); return -1; }
-   return fd;
+  /* memfd is the same object ASharedMemory hands out on a device: anonymous,
+   * sized once, mappable by anyone holding the descriptor. */
+  /* Sealing is allowed because ASharedMemory_setProt exists: a guest that
+   * drops write permission on a region it shared expects that to stick. */
+  int fd = memfd_create(name && *name ? name : "lunaria-shmem",
+                        MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  if (fd < 0) return -1;
+  if (size && ftruncate(fd, (off_t)size) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
 }
 
 /* ---- descriptors -------------------------------------------------------- */
 
 int luna_os_fd_path(int fd, char *buf, size_t bufsz)
 {
-   char proc[64];
-   if (fd < 0 || !buf || bufsz < 2) return -1;
-   snprintf(proc, sizeof proc, "/proc/self/fd/%d", fd);
-   ssize_t n = readlink(proc, buf, bufsz - 1);
-   if (n <= 0) return -1;
-   buf[n] = '\0';
-   return 0;
+  char proc[64];
+  if (fd < 0 || !buf || bufsz < 2) return -1;
+  snprintf(proc, sizeof proc, "/proc/self/fd/%d", fd);
+  ssize_t n = readlink(proc, buf, bufsz - 1);
+  if (n <= 0) return -1;
+  buf[n] = '\0';
+  return 0;
 }
 
 int luna_os_executable_path(char *buf, size_t bufsz)
 {
-   if (!buf || bufsz < 2) { errno = EINVAL; return -1; }
-   ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
-   if (n < 0 || (size_t)n >= bufsz - 1) {
-      if (n >= 0) errno = ENAMETOOLONG;
-      return -1;
-   }
-   buf[n] = '\0';
-   return 0;
+  if (!buf || bufsz < 2) {
+    errno = EINVAL;
+    return -1;
+  }
+  ssize_t n = readlink("/proc/self/exe", buf, bufsz - 1);
+  if (n < 0 || (size_t)n >= bufsz - 1) {
+    if (n >= 0) errno = ENAMETOOLONG;
+    return -1;
+  }
+  buf[n] = '\0';
+  return 0;
 }
 
 int luna_os_symbol_is_function(void *address)
 {
-   Dl_info info;
-   ElfW(Sym) *sym = NULL;
-   return dladdr1(address, &info, (void **)&sym, RTLD_DL_SYMENT) != 0 &&
-          (!sym || ELF64_ST_TYPE(sym->st_info) == STT_FUNC);
+  Dl_info info;
+  ElfW(Sym) *sym = NULL;
+  return dladdr1(address, &info, (void **)&sym, RTLD_DL_SYMENT) != 0 &&
+         (!sym || ELF64_ST_TYPE(sym->st_info) == STT_FUNC);
 }
 
 int luna_os_timer_open(int clock_id, int flags)
 {
-   return timerfd_create(clock_id, flags);
+  return timerfd_create(clock_id, flags);
 }
 static void timer_spec_copy(luna_os_timer_spec *out, const struct itimerspec *in)
 {
-   out->interval_sec = in->it_interval.tv_sec;
-   out->interval_nsec = in->it_interval.tv_nsec;
-   out->value_sec = in->it_value.tv_sec;
-   out->value_nsec = in->it_value.tv_nsec;
+  out->interval_sec = in->it_interval.tv_sec;
+  out->interval_nsec = in->it_interval.tv_nsec;
+  out->value_sec = in->it_value.tv_sec;
+  out->value_nsec = in->it_value.tv_nsec;
 }
 int luna_os_timer_set(int fd, int flags, const luna_os_timer_spec *value,
                       luna_os_timer_spec *previous)
 {
-   struct itimerspec native = {
-      { value->interval_sec, value->interval_nsec },
-      { value->value_sec, value->value_nsec }
-   }, old;
-   int result = timerfd_settime(fd, flags, &native, previous ? &old : NULL);
-   if (!result && previous) timer_spec_copy(previous, &old);
-   return result;
+  struct itimerspec native = {
+    { value->interval_sec, value->interval_nsec },
+    { value->value_sec, value->value_nsec }
+  }, old;
+  int result = timerfd_settime(fd, flags, &native, previous ? &old : NULL);
+  if (!result && previous) timer_spec_copy(previous, &old);
+  return result;
 }
 int luna_os_timer_get(int fd, luna_os_timer_spec *value)
 {
-   struct itimerspec native;
-   int result = timerfd_gettime(fd, &native);
-   if (!result) timer_spec_copy(value, &native);
-   return result;
+  struct itimerspec native;
+  int result = timerfd_gettime(fd, &native);
+  if (!result) timer_spec_copy(value, &native);
+  return result;
 }
 
 int luna_os_event_open(unsigned initval, int nonblock)
 {
-   return eventfd(initval, EFD_CLOEXEC | (nonblock ? EFD_NONBLOCK : 0));
+  return eventfd(initval, EFD_CLOEXEC | (nonblock ? EFD_NONBLOCK : 0));
 }
 
 int luna_os_event_signal(int fd, uint64_t count)
 {
-   if (!count) return 0;
-   return write(fd, &count, sizeof count) == (ssize_t)sizeof count ? 0 : -1;
+  if (!count) return 0;
+  return write(fd, &count, sizeof count) == (ssize_t)sizeof count ? 0 : -1;
 }
 
 int luna_os_event_drain(int fd, uint64_t *out)
 {
-   uint64_t v = 0;
-   if (read(fd, &v, sizeof v) != (ssize_t)sizeof v) return -1;
-   if (out) *out = v;
-   return 0;
+  uint64_t v = 0;
+  if (read(fd, &v, sizeof v) != (ssize_t)sizeof v) return -1;
+  if (out) *out = v;
+  return 0;
 }
 
 int luna_os_poll_create(int cloexec)
 {
-   return epoll_create1(cloexec ? EPOLL_CLOEXEC : 0);
+  return epoll_create1(cloexec ? EPOLL_CLOEXEC : 0);
 }
 
 int luna_os_poll_ctl(int pollfd, int op, int fd,
                      const luna_os_poll_event *event)
 {
-   struct epoll_event ev;
-   struct epoll_event *p = NULL;
-   if (event) {
-      memset(&ev, 0, sizeof ev);
-      ev.events = event->events;
-      ev.data.u64 = event->data;
-      p = &ev;
-   }
-   return epoll_ctl(pollfd, op, fd, p);
+  struct epoll_event ev;
+  struct epoll_event *p = NULL;
+  if (event) {
+    memset(&ev, 0, sizeof ev);
+    ev.events = event->events;
+    ev.data.u64 = event->data;
+    p = &ev;
+  }
+  return epoll_ctl(pollfd, op, fd, p);
 }
 
 int luna_os_poll_wait(int pollfd, luna_os_poll_event *events,
                       int max_events, int timeout_ms)
 {
-   struct epoll_event host[256];
-   if (!events || max_events <= 0) { errno = EINVAL; return -1; }
-   if (max_events > 256) max_events = 256;
-   int n = epoll_wait(pollfd, host, max_events, timeout_ms);
-   for (int i = 0; i < n; ++i) {
-      events[i].events = host[i].events;
-      events[i].data = host[i].data.u64;
-   }
-   return n;
+  struct epoll_event host[256];
+  if (!events || max_events <= 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (max_events > 256) max_events = 256;
+  int n = epoll_wait(pollfd, host, max_events, timeout_ms);
+  for (int i = 0; i < n; ++i) {
+    events[i].events = host[i].events;
+    events[i].data = host[i].data.u64;
+  }
+  return n;
 }
 
 int luna_os_signal_fd(int fd, const void *mask, size_t mask_size, int flags)
 {
-   sigset_t set;
-   memset(&set, 0, sizeof set);
-   if (mask) memcpy(&set, mask, mask_size < sizeof set ? mask_size : sizeof set);
-   return signalfd(fd, &set, flags);
+  sigset_t set;
+  memset(&set, 0, sizeof set);
+  if (mask) memcpy(&set, mask, mask_size < sizeof set ? mask_size : sizeof set);
+  return signalfd(fd, &set, flags);
 }
 
 /* ---- threads and CPUs --------------------------------------------------- */
 
 int luna_os_cpu_count(void)
 {
-   /* The affinity mask, not the machine's core count: a container or a taskset
-    * gives fewer, and sizing the engine pool from cores the process may not
-    * run on is how a pool ends up oversubscribed on one CPU. */
-   cpu_set_t set;
-   CPU_ZERO(&set);
-   if (sched_getaffinity(0, sizeof set, &set) == 0) {
-      int n = CPU_COUNT(&set);
-      if (n > 0) return n;
-   }
-   long v = sysconf(_SC_NPROCESSORS_ONLN);
-   return v > 0 ? (int)v : 1;
+  /* The affinity mask, not the machine's core count: a container or a taskset
+   * gives fewer, and sizing the engine pool from cores the process may not
+   * run on is how a pool ends up oversubscribed on one CPU. */
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof set, &set) == 0) {
+    int n = CPU_COUNT(&set);
+    if (n > 0) return n;
+  }
+  long v = sysconf(_SC_NPROCESSORS_ONLN);
+  return v > 0 ? (int)v : 1;
 }
 
 void luna_os_thread_name(const char *name)
 {
-   char buf[16];  /* the kernel's limit, including the terminator */
-   if (!name) return;
-   snprintf(buf, sizeof buf, "%s", name);
-   prctl(PR_SET_NAME, buf, 0, 0, 0);
+  char buf[16];  /* the kernel's limit, including the terminator */
+  if (!name) return;
+  snprintf(buf, sizeof buf, "%s", name);
+  prctl(PR_SET_NAME, buf, 0, 0, 0);
 }
 
-uint64_t luna_os_thread_token(void) { return (uint64_t)syscall(SYS_gettid); }
+uint64_t luna_os_thread_token(void) {
+  return (uint64_t)syscall(SYS_gettid);
+}
 int luna_os_thread_priority(uint64_t token, int priority)
 {
-   if(priority<1 || priority>10) {errno=EINVAL;return -1;}
-   if(!token || token>INT32_MAX) {errno=ESRCH;return -1;}
-   return luna_os_thread_nice(token,luna_java_priority_nice(priority));
+  if(priority<1 || priority>10) {
+    errno=EINVAL;
+    return -1;
+  }
+  if(!token || token>INT32_MAX) {
+    errno=ESRCH;
+    return -1;
+  }
+  return luna_os_thread_nice(token,luna_java_priority_nice(priority));
 }
 
 int luna_os_thread_nice(uint64_t token,int niceness)
 {
-   if(niceness<-20 || niceness>19) {errno=EINVAL;return -1;}
-   if(!token || token>INT32_MAX) {errno=ESRCH;return -1;}
-   return setpriority(PRIO_PROCESS,(id_t)token,niceness);
+  if(niceness<-20 || niceness>19) {
+    errno=EINVAL;
+    return -1;
+  }
+  if(!token || token>INT32_MAX) {
+    errno=ESRCH;
+    return -1;
+  }
+  return setpriority(PRIO_PROCESS,(id_t)token,niceness);
 }
 
 void luna_os_yield(void)
 {
-   sched_yield();
+  sched_yield();
 }
 
 /* ---- time --------------------------------------------------------------- */
 
 uint64_t luna_os_monotonic_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 bool luna_os_boot_id(char *out, size_t cap)
 {
-   if (!out || cap < 37) return false;
-   FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
-   if (!f) return false;
-   bool ok = fgets(out, (int)(cap > INT_MAX ? INT_MAX : cap), f) != NULL;
-   fclose(f);
-   if (!ok) return false;
-   out[strcspn(out, "\r\n")] = 0;
-   return strlen(out) == 36;
+  if (!out || cap < 37) return false;
+  FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
+  if (!f) return false;
+  bool ok = fgets(out, (int)(cap > INT_MAX ? INT_MAX : cap), f) != NULL;
+  fclose(f);
+  if (!ok) return false;
+  out[strcspn(out, "\r\n")] = 0;
+  return strlen(out) == 36;
 }
 
 uint64_t luna_os_boottime_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_BOOTTIME, &ts);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_BOOTTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 uint64_t luna_os_uptime_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 uint64_t luna_os_realtime_ns(void)
 {
-   struct timespec ts;
-   clock_gettime(CLOCK_REALTIME, &ts);
-   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 /* ---- what the machine has ----------------------------------------------- */
 
 uint64_t luna_os_peak_rss_kb(void)
 {
-   struct rusage usage;
-   return getrusage(RUSAGE_SELF, &usage) == 0 ? (uint64_t)usage.ru_maxrss : 0;
+  struct rusage usage;
+  return getrusage(RUSAGE_SELF, &usage) == 0 ? (uint64_t)usage.ru_maxrss : 0;
 }
 
 int luna_os_mem_info(uint64_t *total_bytes, uint64_t *avail_bytes)
 {
-   /* MemAvailable, not MemFree: the guest wants to know what it could get,
-    * and on Linux most of what looks used is reclaimable page cache. */
-   FILE *f = fopen("/proc/meminfo", "re");
-   uint64_t total = 0, avail = 0;
-   char line[256];
-   if (!f) return -1;
-   while (fgets(line, sizeof line, f)) {
-      unsigned long long kb;
-      if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) total = kb * 1024ull;
-      else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) avail = kb * 1024ull;
-   }
-   fclose(f);
-   if (!total) return -1;
-   if (!avail) avail = total / 2u;
-   if (total_bytes) *total_bytes = total;
-   if (avail_bytes) *avail_bytes = avail;
-   return 0;
+  /* MemAvailable, not MemFree: the guest wants to know what it could get,
+   * and on Linux most of what looks used is reclaimable page cache. */
+  FILE *f = fopen("/proc/meminfo", "re");
+  uint64_t total = 0, avail = 0;
+  char line[256];
+  if (!f) return -1;
+  while (fgets(line, sizeof line, f)) {
+    unsigned long long kb;
+    if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) total = kb * 1024ull;
+    else if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) avail = kb * 1024ull;
+  }
+  fclose(f);
+  if (!total) return -1;
+  if (!avail) avail = total / 2u;
+  if (total_bytes) *total_bytes = total;
+  if (avail_bytes) *avail_bytes = avail;
+  return 0;
 }
 
 static void luna_fs_copy(luna_os_fs_info *out, const struct statvfs *st)
 {
-   out->f_bsize = st->f_bsize;
-   out->f_frsize = st->f_frsize;
-   out->f_blocks = st->f_blocks;
-   out->f_bfree = st->f_bfree;
-   out->f_bavail = st->f_bavail;
-   out->f_files = st->f_files;
-   out->f_ffree = st->f_ffree;
-   out->f_favail = st->f_favail;
-   out->f_fsid = st->f_fsid;
-   out->f_flag = st->f_flag;
-   out->f_namemax = st->f_namemax;
+  out->f_bsize = st->f_bsize;
+  out->f_frsize = st->f_frsize;
+  out->f_blocks = st->f_blocks;
+  out->f_bfree = st->f_bfree;
+  out->f_bavail = st->f_bavail;
+  out->f_files = st->f_files;
+  out->f_ffree = st->f_ffree;
+  out->f_favail = st->f_favail;
+  out->f_fsid = st->f_fsid;
+  out->f_flag = st->f_flag;
+  out->f_namemax = st->f_namemax;
 }
 
 int luna_os_statfs(const char *path, luna_os_fs_info *out)
 {
-   if (!path || !out) { errno = EINVAL; return -1; }
-   struct statvfs st;
-   if (statvfs(path, &st) != 0) return -1;
-   luna_fs_copy(out, &st);
-   return 0;
+  if (!path || !out) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct statvfs st;
+  if (statvfs(path, &st) != 0) return -1;
+  luna_fs_copy(out, &st);
+  return 0;
 }
 
 int luna_os_fstatfs(int fd, luna_os_fs_info *out)
 {
-   if (!out) { errno = EINVAL; return -1; }
-   struct statvfs st;
-   if (fstatvfs(fd, &st) != 0) return -1;
-   luna_fs_copy(out, &st);
-   return 0;
+  if (!out) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct statvfs st;
+  if (fstatvfs(fd, &st) != 0) return -1;
+  luna_fs_copy(out, &st);
+  return 0;
 }
 
 int luna_os_disk_info(const char *path, uint64_t *total_bytes,
                       uint64_t *free_bytes, uint64_t *block_size)
 {
-   struct statvfs st;
-   if (!path || statvfs(path, &st) != 0) return -1;
-   uint64_t frag = st.f_frsize ? st.f_frsize : st.f_bsize;
-   if (total_bytes) *total_bytes = (uint64_t)st.f_blocks * frag;
-   if (free_bytes)  *free_bytes  = (uint64_t)st.f_bavail * frag;
-   if (block_size)  *block_size  = st.f_bsize;
-   return 0;
+  struct statvfs st;
+  if (!path || statvfs(path, &st) != 0) return -1;
+  uint64_t frag = st.f_frsize ? st.f_frsize : st.f_bsize;
+  if (total_bytes) *total_bytes = (uint64_t)st.f_blocks * frag;
+  if (free_bytes)  *free_bytes  = (uint64_t)st.f_bavail * frag;
+  if (block_size)  *block_size  = st.f_bsize;
+  return 0;
 }
 
 /* ---- the window --------------------------------------------------------- */
@@ -616,10 +665,10 @@ int luna_os_disk_info(const char *path, uint64_t *total_bytes,
  * entry points dynamically so X11-only GLFW installations remain usable. */
 static int luna_wayland_backend(void)
 {
-   int (*get_platform)(void);
-   void *symbol = dlsym(RTLD_DEFAULT, "glfwGetPlatform");
-   memcpy(&get_platform, &symbol, sizeof(get_platform));
-   return get_platform && get_platform() == 0x00060003; /* GLFW_PLATFORM_WAYLAND */
+  int (*get_platform)(void);
+  void *symbol = dlsym(RTLD_DEFAULT, "glfwGetPlatform");
+  memcpy(&get_platform, &symbol, sizeof(get_platform));
+  return get_platform && get_platform() == 0x00060003; /* GLFW_PLATFORM_WAYLAND */
 }
 
 static void *g_wayland_egl_window;
@@ -627,73 +676,73 @@ static void (*g_wayland_egl_resize)(void *, int, int, int, int);
 
 void *luna_os_native_display(void)
 {
-   if (luna_wayland_backend()) {
-      void *(*get_display)(void);
-      void *symbol = dlsym(RTLD_DEFAULT, "glfwGetWaylandDisplay");
-      memcpy(&get_display, &symbol, sizeof(get_display));
-      /* eglGetDisplay's native handle is platform-specific. Mesa must not
-       * interpret a wl_display as an Xlib Display. */
-      setenv("EGL_PLATFORM", "wayland", 1);
-      return get_display ? get_display() : NULL;
-   }
-   /* Match EGL's native-handle interpretation to GLFW's selected backend,
-    * including X11 windows opened from a Wayland desktop session. */
-   setenv("EGL_PLATFORM", "x11", 1);
-   return (void *)glfwGetX11Display();
+  if (luna_wayland_backend()) {
+    void *(*get_display)(void);
+    void *symbol = dlsym(RTLD_DEFAULT, "glfwGetWaylandDisplay");
+    memcpy(&get_display, &symbol, sizeof(get_display));
+    /* eglGetDisplay's native handle is platform-specific. Mesa must not
+     * interpret a wl_display as an Xlib Display. */
+    setenv("EGL_PLATFORM", "wayland", 1);
+    return get_display ? get_display() : NULL;
+  }
+  /* Match EGL's native-handle interpretation to GLFW's selected backend,
+   * including X11 windows opened from a Wayland desktop session. */
+  setenv("EGL_PLATFORM", "x11", 1);
+  return (void *)glfwGetX11Display();
 }
 
 int luna_os_set_window_icon(void *glfw_window, int w, int h,
                             const unsigned char *rgba)
 {
-   if (!glfw_window || w <= 0 || h <= 0 || !rgba) return -1;
-   /* GLFW 3.4 has no Wayland icon support: ask the Luna compositor directly. */
+  if (!glfw_window || w <= 0 || h <= 0 || !rgba) return -1;
+  /* GLFW 3.4 has no Wayland icon support: ask the Luna compositor directly. */
 #ifdef HAVE_LUNA_WM_CLIENT
-   if (luna_wayland_backend()) {
-      static int bound;
-      if (!bound) {
-         luna_wm_client_init((GLFWwindow *)glfw_window);
-         bound = 1;
-      }
-      if (luna_wm_client_set_icon((GLFWwindow *)glfw_window, w, h, rgba)) return 0;
-   }
+  if (luna_wayland_backend()) {
+    static int bound;
+    if (!bound) {
+      luna_wm_client_init((GLFWwindow *)glfw_window);
+      bound = 1;
+    }
+    if (luna_wm_client_set_icon((GLFWwindow *)glfw_window, w, h, rgba)) return 0;
+  }
 #endif
-   GLFWimage image = { w, h, (unsigned char *)rgba };
-   glfwSetWindowIcon((GLFWwindow *)glfw_window, 1, &image);
-   return 0;
+  GLFWimage image = { w, h, (unsigned char *)rgba };
+  glfwSetWindowIcon((GLFWwindow *)glfw_window, 1, &image);
+  return 0;
 }
 
 void *luna_os_native_window(void *glfw_window)
 {
-   if (!glfw_window) return NULL;
-   if (luna_wayland_backend()) {
-      int w = 0, h = 0;
-      glfwGetFramebufferSize((GLFWwindow *)glfw_window, &w, &h);
-      if (w <= 0 || h <= 0) return g_wayland_egl_window;
-      if (!g_wayland_egl_window) {
-         void *lib = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
-         void *(*create)(void *, int, int);
-         void *(*get_surface)(GLFWwindow *);
-         void *symbol = lib ? dlsym(lib, "wl_egl_window_create") : NULL;
-         memcpy(&create, &symbol, sizeof(create));
-         symbol = dlsym(RTLD_DEFAULT, "glfwGetWaylandWindow");
-         memcpy(&get_surface, &symbol, sizeof(get_surface));
-         symbol = lib ? dlsym(lib, "wl_egl_window_resize") : NULL;
-         memcpy(&g_wayland_egl_resize, &symbol, sizeof(g_wayland_egl_resize));
-         void *surface = get_surface ? get_surface((GLFWwindow *)glfw_window) : NULL;
-         if (!create || !g_wayland_egl_resize || !surface) {
-            fprintf(stderr, "[lunaria] Wayland EGL window unavailable\n");
-            return NULL;
-         }
-         /* Lunaria owns one process-lifetime host window, like its EGL surface. */
-         g_wayland_egl_window = create(surface, w, h);
-      } else {
-         g_wayland_egl_resize(g_wayland_egl_window, w, h, 0, 0);
+  if (!glfw_window) return NULL;
+  if (luna_wayland_backend()) {
+    int w = 0, h = 0;
+    glfwGetFramebufferSize((GLFWwindow *)glfw_window, &w, &h);
+    if (w <= 0 || h <= 0) return g_wayland_egl_window;
+    if (!g_wayland_egl_window) {
+      void *lib = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
+      void *(*create)(void *, int, int);
+      void *(*get_surface)(GLFWwindow *);
+      void *symbol = lib ? dlsym(lib, "wl_egl_window_create") : NULL;
+      memcpy(&create, &symbol, sizeof(create));
+      symbol = dlsym(RTLD_DEFAULT, "glfwGetWaylandWindow");
+      memcpy(&get_surface, &symbol, sizeof(get_surface));
+      symbol = lib ? dlsym(lib, "wl_egl_window_resize") : NULL;
+      memcpy(&g_wayland_egl_resize, &symbol, sizeof(g_wayland_egl_resize));
+      void *surface = get_surface ? get_surface((GLFWwindow *)glfw_window) : NULL;
+      if (!create || !g_wayland_egl_resize || !surface) {
+        fprintf(stderr, "[lunaria] Wayland EGL window unavailable\n");
+        return NULL;
       }
-      return g_wayland_egl_window;
-   }
-   /* An X11 window id is a number, not a pointer; it is widened here so the
-    * one signature serves the platforms whose handle really is a pointer. */
-   return (void *)(uintptr_t)glfwGetX11Window((GLFWwindow *)glfw_window);
+      /* Lunaria owns one process-lifetime host window, like its EGL surface. */
+      g_wayland_egl_window = create(surface, w, h);
+    } else {
+      g_wayland_egl_resize(g_wayland_egl_window, w, h, 0, 0);
+    }
+    return g_wayland_egl_window;
+  }
+  /* An X11 window id is a number, not a pointer; it is widened here so the
+   * one signature serves the platforms whose handle really is a pointer. */
+  return (void *)(uintptr_t)glfwGetX11Window((GLFWwindow *)glfw_window);
 }
 
 /* An unmapped X11 window with the visible window's visual.  Xlib is reached
@@ -701,57 +750,57 @@ void *luna_os_native_window(void *glfw_window)
  * dependency on it.  Wayland has no unmapped-window equivalent here. */
 void *luna_os_offscreen_window(void *glfw_window, int w, int h)
 {
-   if (!glfw_window || w <= 0 || h <= 0 || luna_wayland_backend()) return NULL;
-   Display *dpy = glfwGetX11Display();
-   Window parent = glfwGetX11Window((GLFWwindow *)glfw_window);
-   if (!dpy || !parent) return NULL;
-   void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
-   if (!x11) return NULL;
-   Status (*get_attrs)(Display *, Window, XWindowAttributes *);
-   Colormap (*create_cmap)(Display *, Window, Visual *, int);
-   Window (*create_win)(Display *, Window, int, int, unsigned, unsigned,
-                        unsigned, int, unsigned, Visual *, unsigned long,
-                        XSetWindowAttributes *);
-   int (*flush)(Display *);
-   void *sym = dlsym(x11, "XGetWindowAttributes");
-   memcpy(&get_attrs, &sym, sizeof get_attrs);
-   sym = dlsym(x11, "XCreateColormap");
-   memcpy(&create_cmap, &sym, sizeof create_cmap);
-   sym = dlsym(x11, "XCreateWindow");
-   memcpy(&create_win, &sym, sizeof create_win);
-   sym = dlsym(x11, "XFlush");
-   memcpy(&flush, &sym, sizeof flush);
-   if (!get_attrs || !create_cmap || !create_win || !flush) return NULL;
-   XWindowAttributes wa;
-   if (!get_attrs(dpy, parent, &wa)) return NULL;
-   XSetWindowAttributes sa;
-   memset(&sa, 0, sizeof sa);
-   sa.colormap = create_cmap(dpy, wa.root, wa.visual, AllocNone);
-   /* A child of the root, never mapped: it has back buffers of its own and
-    * is never part of what the X server shows. */
-   Window win = create_win(dpy, wa.root, 0, 0, (unsigned)w, (unsigned)h, 0,
-                           wa.depth, InputOutput, wa.visual, CWColormap, &sa);
-   flush(dpy);
-   return (void *)(uintptr_t)win;
+  if (!glfw_window || w <= 0 || h <= 0 || luna_wayland_backend()) return NULL;
+  Display *dpy = glfwGetX11Display();
+  Window parent = glfwGetX11Window((GLFWwindow *)glfw_window);
+  if (!dpy || !parent) return NULL;
+  void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+  if (!x11) return NULL;
+  Status (*get_attrs)(Display *, Window, XWindowAttributes *);
+  Colormap (*create_cmap)(Display *, Window, Visual *, int);
+  Window (*create_win)(Display *, Window, int, int, unsigned, unsigned,
+                       unsigned, int, unsigned, Visual *, unsigned long,
+                       XSetWindowAttributes *);
+  int (*flush)(Display *);
+  void *sym = dlsym(x11, "XGetWindowAttributes");
+  memcpy(&get_attrs, &sym, sizeof get_attrs);
+  sym = dlsym(x11, "XCreateColormap");
+  memcpy(&create_cmap, &sym, sizeof create_cmap);
+  sym = dlsym(x11, "XCreateWindow");
+  memcpy(&create_win, &sym, sizeof create_win);
+  sym = dlsym(x11, "XFlush");
+  memcpy(&flush, &sym, sizeof flush);
+  if (!get_attrs || !create_cmap || !create_win || !flush) return NULL;
+  XWindowAttributes wa;
+  if (!get_attrs(dpy, parent, &wa)) return NULL;
+  XSetWindowAttributes sa;
+  memset(&sa, 0, sizeof sa);
+  sa.colormap = create_cmap(dpy, wa.root, wa.visual, AllocNone);
+  /* A child of the root, never mapped: it has back buffers of its own and
+   * is never part of what the X server shows. */
+  Window win = create_win(dpy, wa.root, 0, 0, (unsigned)w, (unsigned)h, 0,
+                          wa.depth, InputOutput, wa.visual, CWColormap, &sa);
+  flush(dpy);
+  return (void *)(uintptr_t)win;
 }
 
 void luna_os_offscreen_resize(void *native_window, int w, int h)
 {
-   if (!native_window || w <= 0 || h <= 0 || luna_wayland_backend()) return;
-   Display *dpy = glfwGetX11Display();
-   void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
-   if (!dpy || !x11) return;
-   int (*resize)(Display *, Window, unsigned, unsigned);
-   int (*sync)(Display *, Bool);
-   void *sym = dlsym(x11, "XResizeWindow");
-   memcpy(&resize, &sym, sizeof resize);
-   sym = dlsym(x11, "XSync");
-   memcpy(&sync, &sym, sizeof sync);
-   if (resize && sync) {
-      resize(dpy, (Window)(uintptr_t)native_window, (unsigned)w, (unsigned)h);
-      sync(dpy, False);
-   }
-   dlclose(x11);
+  if (!native_window || w <= 0 || h <= 0 || luna_wayland_backend()) return;
+  Display *dpy = glfwGetX11Display();
+  void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+  if (!dpy || !x11) return;
+  int (*resize)(Display *, Window, unsigned, unsigned);
+  int (*sync)(Display *, Bool);
+  void *sym = dlsym(x11, "XResizeWindow");
+  memcpy(&resize, &sym, sizeof resize);
+  sym = dlsym(x11, "XSync");
+  memcpy(&sync, &sym, sizeof sync);
+  if (resize && sync) {
+    resize(dpy, (Window)(uintptr_t)native_window, (unsigned)w, (unsigned)h);
+    sync(dpy, False);
+  }
+  dlclose(x11);
 }
 
 /* ---- audio out ----------------------------------------------------------
@@ -793,9 +842,9 @@ static char              g_audio_dev_now[128] = "default";
 
 static unsigned luna_audio_used(void)
 {
-   const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_acquire);
-   const unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_acquire);
-   return (h - t) % LUNA_AUDIO_RING_FRAMES;
+  const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_acquire);
+  const unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_acquire);
+  return (h - t) % LUNA_AUDIO_RING_FRAMES;
 }
 
 /* A sink can accept PCM immediately (ALSA null/file plugins). Accepted
@@ -804,21 +853,21 @@ static unsigned luna_audio_used(void)
  * already waited need no additional delay. */
 static void audio_wait_frames(struct timespec *deadline, unsigned frames, unsigned rate)
 {
-   struct timespec now;
-   uint64_t ns = (uint64_t)frames * 1000000000ull / rate;
-   deadline->tv_sec += (time_t)(ns / 1000000000ull);
-   deadline->tv_nsec += (long)(ns % 1000000000ull);
-   if (deadline->tv_nsec >= 1000000000L) {
-      ++deadline->tv_sec;
-      deadline->tv_nsec -= 1000000000L;
-   }
-   clock_gettime(CLOCK_MONOTONIC, &now);
-   if (now.tv_sec > deadline->tv_sec ||
-       (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
-      *deadline = now;
-      return;
-   }
-   while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) == EINTR) {}
+  struct timespec now;
+  uint64_t ns = (uint64_t)frames * 1000000000ull / rate;
+  deadline->tv_sec += (time_t)(ns / 1000000000ull);
+  deadline->tv_nsec += (long)(ns % 1000000000ull);
+  if (deadline->tv_nsec >= 1000000000L) {
+    ++deadline->tv_sec;
+    deadline->tv_nsec -= 1000000000L;
+  }
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (now.tv_sec > deadline->tv_sec ||
+      (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec)) {
+    *deadline = now;
+    return;
+  }
+  while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, deadline, NULL) == EINTR) {}
 }
 
 /* Published after the output thread starts; volatile does not synchronize
@@ -826,301 +875,307 @@ static void audio_wait_frames(struct timespec *deadline, unsigned frames, unsign
 static _Atomic(void (*)(void)) g_audio_pull;
 void luna_os_audio_set_pull(void (*pull)(void))
 {
-   atomic_store_explicit(&g_audio_pull, pull, memory_order_release);
+  atomic_store_explicit(&g_audio_pull, pull, memory_order_release);
 }
 static atomic_int g_audio_fallback;          /* playing into the null sink because no card opened */
 
 static void *luna_audio_thread(void *arg)
 {
-   (void)arg;
-   luna_os_thread_name("luna-audio");
-   /* Hand the card whole periods.  Writing whatever happens to be in the ring
-    * makes snd_pcm_writei return short and the stream stutter; waiting for a
-    * period's worth is what keeps it continuous. */
-   unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
-   int16_t *chunk = (int16_t *)malloc((size_t)period * g_audio_ch * sizeof *chunk);
-   if (!chunk) return NULL;
-   struct timespec deadline;
-   clock_gettime(CLOCK_MONOTONIC, &deadline);
-   uint64_t submitted = 0;
-   unsigned long starved_periods = 0, starved_frames = 0;
-   uint64_t off_start_ns = 0, off_retired = 0;
-   while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
-      /* Hand the card a whole period every period, always.  A mixer does not
-       * stop when the application is late; it plays what it has and silence
-       * for the rest, and the stream stays continuous.  Waiting for a full
-       * period before writing anything let the card run out instead — every
-       * dry spell is an -EPIPE, a restart of the stream, and an audible click
-       * — which is what a producer that cannot keep up sounds like here.
-       * Hardware writes normally pace the loop; the monotonic deadline
-       * below also paces sinks that accept frames without waiting. */
-      /* This thread is the output's clock: ask the mixer for what the next period
-       * needs before looking at what is in the ring. */
-      {
-         void (*pull)(void) = atomic_load_explicit(&g_audio_pull, memory_order_acquire);
-         if (pull) pull();
-      }
-      unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_relaxed);
-      unsigned have = luna_audio_used();
-      if (have > period) have = period;
-      for (unsigned i = 0; i < have; ++i) {
-         const unsigned src = ((t + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
-         for (unsigned c = 0; c < g_audio_ch; ++c)
-            chunk[i * g_audio_ch + c] = g_audio_ring[src + c];
-      }
-      if (have < period && g_audio.handle) {
-         memset(chunk + (size_t)have * g_audio_ch, 0,
-                (size_t)(period - have) * g_audio_ch * sizeof *chunk);
-         /* Say so: silence covers the gap, it does not fill it.  A run that
-          * reports these is one whose guest mixer is not being asked for
-          * audio often enough, and that is a bug upstream of the card. */
-         ++starved_periods;
-         starved_frames += period - have;
-         if (starved_periods == 1 || (starved_periods % 500) == 0)
-            fprintf(stderr, "[audio] sink starved: %lu periods short so far "
-                    "(%lu frames of silence, %.0f ms)\n", starved_periods,
-                    starved_frames,
-                    1000.0 * (double)starved_frames / (double)g_audio.freq);
-      }
-      /* The menu's volume and mute, applied on the way to the card so the
-       * guest's own mix and its clock are untouched. */
-      const int gain = atomic_load_explicit(&g_audio_muted, memory_order_relaxed)
-         ? 0 : atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed);
-      if (gain != 32768) {
-         const size_t n = (size_t)period * g_audio_ch;
-         for (size_t i = 0; i < n; ++i)
-            chunk[i] = (int16_t)(((int32_t)chunk[i] * gain) >> 15);
-      }
-      if (atomic_exchange_explicit(&g_audio_dev_switch, 0, memory_order_acq_rel)) {
-         char want[128];
-         pthread_mutex_lock(&g_audio_dev_lock);
-         snprintf(want, sizeof want, "%s", g_audio_dev_want[0] ? g_audio_dev_want : "default");
-         pthread_mutex_unlock(&g_audio_dev_lock);
-         if (!strcmp(want, "off")) {
-            /* Close the PCM.  While it stays open, even muted, dmix cannot
-             * hand the card to another program. */
-            if (g_audio.handle) AUDIO_close(&g_audio);
-            pthread_mutex_lock(&g_audio_dev_lock);
-            snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "off");
-            pthread_mutex_unlock(&g_audio_dev_lock);
-            fprintf(stderr, "[audio] output released\n");
-         } else {
-         AUDIO next;
-         memset(&next, 0, sizeof next);
-         int opened = !strcmp(want, g_audio_dev_now) ? 2 :
-            AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch,
-                       (int)g_audio.req_frames, 1, SND_PCM_FORMAT_S16_LE);
-         if (opened == 1) {
-            /* Two ALSA names may address one exclusive card.  Release the
-             * old PCM, retry, then restore it if the requested PCM fails. */
-            AUDIO_release(&g_audio);
-            opened = AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch,
-                                (int)g_audio.req_frames, 1, SND_PCM_FORMAT_S16_LE);
-            if (opened != 0 && AUDIO_reopen(&g_audio) != 0)
-               fprintf(stderr, "[audio] cannot reopen previous output '%s'\n",
-                       g_audio_dev_now);
-         }
-         if (opened == 0) {
-            const unsigned np = (unsigned)next.frames ? (unsigned)next.frames : 256u;
-            /* Keep the old output usable if the new period cannot be buffered.
-             * The current chunk still has the old period's samples; its write
-             * below uses that size, and the following iteration uses np. */
-            if (np > period) {
-               int16_t *grown = (int16_t *)realloc(chunk, (size_t)np * g_audio_ch * sizeof *chunk);
-               if (!grown) {
-                  AUDIO_close(&next);
-                  if (!g_audio.handle) (void)AUDIO_reopen(&g_audio);
-                  fprintf(stderr, "[audio] cannot buffer ALSA '%s'; keeping '%s'\n",
-                          want, g_audio_dev_now);
-                  continue;
-               }
-               chunk = grown;
-            }
-            AUDIO_close(&g_audio);
-            g_audio = next;
-            pthread_mutex_lock(&g_audio_dev_lock);
-            snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", want);
-            pthread_mutex_unlock(&g_audio_dev_lock);
-            fprintf(stderr, "[audio] output switched to '%s'\n", want);
-         } else if (opened == 1) {
-            if (next.handle) AUDIO_close(&next);
-            fprintf(stderr, "[audio] cannot switch output to '%s'; keeping '%s'\n",
-                    want, g_audio_dev_now);
-         }
-         }
-      }
-      if (!g_audio.handle) {
-         /* No PCM is open.  "None" closed it on purpose.  The guest mixer
-          * still retires buffers from g_audio_played, so advance that clock
-          * for one period and leave the card free. */
-         unsigned freq = g_audio.freq ? g_audio.freq : 48000u;
-         audio_wait_frames(&deadline, period, freq);
-         /* The clock is the wall clock, not a count of wake-ups: a thread that
-          * wakes late (the host is busy) has to retire what the time since its
-          * last wake-up is worth, or the stream falls behind a little every
-          * period and plays at two thirds speed under load. */
-         struct timespec wall;
-         clock_gettime(CLOCK_MONOTONIC, &wall);
-         const uint64_t wall_ns = (uint64_t)wall.tv_sec * 1000000000ull + (uint64_t)wall.tv_nsec;
-         if (!off_start_ns) { off_start_ns = wall_ns; off_retired = 0; }
-         /* The card that was busy may be free now: ask for it again every few
-          * seconds (the switch above does the opening and keeps the null sink
-          * if it still will not). */
-         if (atomic_load(&g_audio_fallback)) {
-            static uint64_t next_try;
-            if (wall_ns >= next_try) {
-               next_try = wall_ns + 3000000000ull;
-               if (next_try > 3000000000ull && off_retired) {
-                  pthread_mutex_lock(&g_audio_dev_lock);
-                  snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "default");
-                  pthread_mutex_unlock(&g_audio_dev_lock);
-                  atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
-               }
-            }
-         }
-         const uint64_t due = (wall_ns - off_start_ns) * freq / 1000000000ull;
-         unsigned retire = due > off_retired ? (unsigned)(due - off_retired) : 0u;
-         if (!retire) continue;
-         const unsigned used = luna_audio_used();
-         const unsigned drop = used < retire ? used : retire;
-         if (drop)
-            atomic_store_explicit(&g_audio_tail,
-                                  (t + drop) % LUNA_AUDIO_RING_FRAMES,
-                                  memory_order_release);
-         atomic_fetch_add_explicit(&g_audio_played, retire, memory_order_release);
-         submitted += retire;
-         off_retired += retire;
-         if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
-            static uint64_t ticks, dropped, retired_sum, last;
-            ++ticks; dropped += drop; retired_sum += retire;
-            if (wall_ns - last >= 1000000000ull) {
-               if (last) fprintf(stderr, "[audio-thread] %llu ticks, retired %llu, dropped from ring %llu frames/s (ring used %u)\n",
-                  (unsigned long long)ticks, (unsigned long long)retired_sum, (unsigned long long)dropped, used);
-               last = wall_ns; ticks = dropped = retired_sum = 0;
-            }
-         }
-         continue;
-      }
-      off_start_ns = 0;   /* a card is open again: its own clock counts */
-      const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
-      /* Count silence as well as source PCM: the mixer clock continues when
-       * the guest producer is late.  Device delay is subtracted below so
-       * buffer completion follows playback rather than submission. */
-      unsigned taken = 0u;
-      if (wrote >= 0) taken = (unsigned)wrote < period ? (unsigned)wrote : period;
-      const unsigned next_period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
-      /* Give back only what the card took.  A short write leaves the tail of
-       * the chunk unplayed, and advancing the ring past it would drop those
-       * frames on the floor — a gap in the middle of the sound rather than at
-       * its edge, which is the one artefact a listener cannot miss. */
-      unsigned consumed = have < taken ? have : taken;
-      if (consumed)
-         atomic_store_explicit(&g_audio_tail,
-                               (t + consumed) % LUNA_AUDIO_RING_FRAMES,
-                               memory_order_release);
-      submitted += taken;
-      snd_pcm_sframes_t pending = 0;
-      const int delay_rc = snd_pcm_delay(g_audio.handle, &pending);
-      uint64_t played;
-      if (delay_rc == 0 && pending > 0) {
-         /* Fill the device queue; blocking writes then pace this consumer.
-          * Sleeping after each accepted period kept the queue nearly empty
-          * and made normal scheduling jitter cause an underrun.  Accepted
-          * samples still queued at the device have not been played. */
-         played = (uint64_t)pending < submitted
-            ? submitted - (uint64_t)pending : 0;
-         clock_gettime(CLOCK_MONOTONIC, &deadline);
+  (void)arg;
+  luna_os_thread_name("luna-audio");
+  /* Hand the card whole periods.  Writing whatever happens to be in the ring
+   * makes snd_pcm_writei return short and the stream stutter; waiting for a
+   * period's worth is what keeps it continuous. */
+  unsigned period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
+  int16_t *chunk = (int16_t *)malloc((size_t)period * g_audio_ch * sizeof *chunk);
+  if (!chunk) return NULL;
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  uint64_t submitted = 0;
+  unsigned long starved_periods = 0, starved_frames = 0;
+  uint64_t off_start_ns = 0, off_retired = 0;
+  while (!atomic_load_explicit(&g_audio_stop, memory_order_acquire)) {
+    /* Hand the card a whole period every period, always.  A mixer does not
+     * stop when the application is late; it plays what it has and silence
+     * for the rest, and the stream stays continuous.  Waiting for a full
+     * period before writing anything let the card run out instead — every
+     * dry spell is an -EPIPE, a restart of the stream, and an audible click
+     * — which is what a producer that cannot keep up sounds like here.
+     * Hardware writes normally pace the loop; the monotonic deadline
+     * below also paces sinks that accept frames without waiting. */
+    /* This thread is the output's clock: ask the mixer for what the next period
+     * needs before looking at what is in the ring. */
+    {
+      void (*pull)(void) = atomic_load_explicit(&g_audio_pull, memory_order_acquire);
+      if (pull) pull();
+    }
+    unsigned t = atomic_load_explicit(&g_audio_tail, memory_order_relaxed);
+    unsigned have = luna_audio_used();
+    if (have > period) have = period;
+    for (unsigned i = 0; i < have; ++i) {
+      const unsigned src = ((t + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
+      for (unsigned c = 0; c < g_audio_ch; ++c)
+        chunk[i * g_audio_ch + c] = g_audio_ring[src + c];
+    }
+    if (have < period && g_audio.handle) {
+      memset(chunk + (size_t)have * g_audio_ch, 0,
+             (size_t)(period - have) * g_audio_ch * sizeof *chunk);
+      /* Say so: silence covers the gap, it does not fill it.  A run that
+       * reports these is one whose guest mixer is not being asked for
+       * audio often enough, and that is a bug upstream of the card. */
+      ++starved_periods;
+      starved_frames += period - have;
+      if (starved_periods == 1 || (starved_periods % 500) == 0)
+        fprintf(stderr, "[audio] sink starved: %lu periods short so far "
+                        "(%lu frames of silence, %.0f ms)\n", starved_periods,
+                starved_frames,
+                1000.0 * (double)starved_frames / (double)g_audio.freq);
+    }
+    /* The menu's volume and mute, applied on the way to the card so the
+     * guest's own mix and its clock are untouched. */
+    const int gain = atomic_load_explicit(&g_audio_muted, memory_order_relaxed)
+                     ? 0 : atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed);
+    if (gain != 32768) {
+      const size_t n = (size_t)period * g_audio_ch;
+      for (size_t i = 0; i < n; ++i)
+        chunk[i] = (int16_t)(((int32_t)chunk[i] * gain) >> 15);
+    }
+    if (atomic_exchange_explicit(&g_audio_dev_switch, 0, memory_order_acq_rel)) {
+      char want[128];
+      pthread_mutex_lock(&g_audio_dev_lock);
+      snprintf(want, sizeof want, "%s", g_audio_dev_want[0] ? g_audio_dev_want : "default");
+      pthread_mutex_unlock(&g_audio_dev_lock);
+      if (!strcmp(want, "off")) {
+        /* Close the PCM.  While it stays open, even muted, dmix cannot
+         * hand the card to another program. */
+        if (g_audio.handle) AUDIO_close(&g_audio);
+        pthread_mutex_lock(&g_audio_dev_lock);
+        snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "off");
+        pthread_mutex_unlock(&g_audio_dev_lock);
+        fprintf(stderr, "[audio] output released\n");
       } else {
-         /* Null/file sinks consume immediately and need a real-time clock. */
-         audio_wait_frames(&deadline, taken ? taken : period,
-                           g_audio.freq ? g_audio.freq : 48000u);
-         played = submitted;
+        AUDIO next;
+        memset(&next, 0, sizeof next);
+        int opened = !strcmp(want, g_audio_dev_now) ? 2 :
+                     AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch,
+                                (int)g_audio.req_frames, 1, SND_PCM_FORMAT_S16_LE);
+        if (opened == 1) {
+          /* Two ALSA names may address one exclusive card.  Release the
+           * old PCM, retry, then restore it if the requested PCM fails. */
+          AUDIO_release(&g_audio);
+          opened = AUDIO_init(&next, want, g_audio.freq, (int)g_audio_ch,
+                              (int)g_audio.req_frames, 1, SND_PCM_FORMAT_S16_LE);
+          if (opened != 0 && AUDIO_reopen(&g_audio) != 0)
+            fprintf(stderr, "[audio] cannot reopen previous output '%s'\n",
+                    g_audio_dev_now);
+        }
+        if (opened == 0) {
+          const unsigned np = (unsigned)next.frames ? (unsigned)next.frames : 256u;
+          /* Keep the old output usable if the new period cannot be buffered.
+           * The current chunk still has the old period's samples; its write
+           * below uses that size, and the following iteration uses np. */
+          if (np > period) {
+            int16_t *grown = (int16_t *)realloc(chunk, (size_t)np * g_audio_ch * sizeof *chunk);
+            if (!grown) {
+              AUDIO_close(&next);
+              if (!g_audio.handle) (void)AUDIO_reopen(&g_audio);
+              fprintf(stderr, "[audio] cannot buffer ALSA '%s'; keeping '%s'\n",
+                      want, g_audio_dev_now);
+              continue;
+            }
+            chunk = grown;
+          }
+          AUDIO_close(&g_audio);
+          g_audio = next;
+          pthread_mutex_lock(&g_audio_dev_lock);
+          snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", want);
+          pthread_mutex_unlock(&g_audio_dev_lock);
+          fprintf(stderr, "[audio] output switched to '%s'\n", want);
+        } else if (opened == 1) {
+          if (next.handle) AUDIO_close(&next);
+          fprintf(stderr, "[audio] cannot switch output to '%s'; keeping '%s'\n",
+                  want, g_audio_dev_now);
+        }
       }
-      const uint64_t previous = atomic_load_explicit(&g_audio_played,
-                                                     memory_order_relaxed);
-      if (played > previous)
-         atomic_store_explicit(&g_audio_played, played, memory_order_release);
-      period = next_period;
-   }
-   free(chunk);
-   return NULL;
+    }
+    if (!g_audio.handle) {
+      /* No PCM is open.  "None" closed it on purpose.  The guest mixer
+       * still retires buffers from g_audio_played, so advance that clock
+       * for one period and leave the card free. */
+      unsigned freq = g_audio.freq ? g_audio.freq : 48000u;
+      audio_wait_frames(&deadline, period, freq);
+      /* The clock is the wall clock, not a count of wake-ups: a thread that
+       * wakes late (the host is busy) has to retire what the time since its
+       * last wake-up is worth, or the stream falls behind a little every
+       * period and plays at two thirds speed under load. */
+      struct timespec wall;
+      clock_gettime(CLOCK_MONOTONIC, &wall);
+      const uint64_t wall_ns = (uint64_t)wall.tv_sec * 1000000000ull + (uint64_t)wall.tv_nsec;
+      if (!off_start_ns) {
+        off_start_ns = wall_ns;
+        off_retired = 0;
+      }
+      /* The card that was busy may be free now: ask for it again every few
+       * seconds (the switch above does the opening and keeps the null sink
+       * if it still will not). */
+      if (atomic_load(&g_audio_fallback)) {
+        static uint64_t next_try;
+        if (wall_ns >= next_try) {
+          next_try = wall_ns + 3000000000ull;
+          if (next_try > 3000000000ull && off_retired) {
+            pthread_mutex_lock(&g_audio_dev_lock);
+            snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "default");
+            pthread_mutex_unlock(&g_audio_dev_lock);
+            atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
+          }
+        }
+      }
+      const uint64_t due = (wall_ns - off_start_ns) * freq / 1000000000ull;
+      unsigned retire = due > off_retired ? (unsigned)(due - off_retired) : 0u;
+      if (!retire) continue;
+      const unsigned used = luna_audio_used();
+      const unsigned drop = used < retire ? used : retire;
+      if (drop)
+        atomic_store_explicit(&g_audio_tail,
+                              (t + drop) % LUNA_AUDIO_RING_FRAMES,
+                              memory_order_release);
+      atomic_fetch_add_explicit(&g_audio_played, retire, memory_order_release);
+      submitted += retire;
+      off_retired += retire;
+      if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
+        static uint64_t ticks, dropped, retired_sum, last;
+        ++ticks;
+        dropped += drop;
+        retired_sum += retire;
+        if (wall_ns - last >= 1000000000ull) {
+          if (last) fprintf(stderr, "[audio-thread] %llu ticks, retired %llu, dropped from ring %llu frames/s (ring used %u)\n",
+                              (unsigned long long)ticks, (unsigned long long)retired_sum, (unsigned long long)dropped, used);
+          last = wall_ns;
+          ticks = dropped = retired_sum = 0;
+        }
+      }
+      continue;
+    }
+    off_start_ns = 0;   /* a card is open again: its own clock counts */
+    const int wrote = AUDIO_play(&g_audio, (char *)chunk, (int)period);
+    /* Count silence as well as source PCM: the mixer clock continues when
+     * the guest producer is late.  Device delay is subtracted below so
+     * buffer completion follows playback rather than submission. */
+    unsigned taken = 0u;
+    if (wrote >= 0) taken = (unsigned)wrote < period ? (unsigned)wrote : period;
+    const unsigned next_period = (unsigned)g_audio.frames ? (unsigned)g_audio.frames : 256u;
+    /* Give back only what the card took.  A short write leaves the tail of
+     * the chunk unplayed, and advancing the ring past it would drop those
+     * frames on the floor — a gap in the middle of the sound rather than at
+     * its edge, which is the one artefact a listener cannot miss. */
+    unsigned consumed = have < taken ? have : taken;
+    if (consumed)
+      atomic_store_explicit(&g_audio_tail,
+                            (t + consumed) % LUNA_AUDIO_RING_FRAMES,
+                            memory_order_release);
+    submitted += taken;
+    snd_pcm_sframes_t pending = 0;
+    const int delay_rc = snd_pcm_delay(g_audio.handle, &pending);
+    uint64_t played;
+    if (delay_rc == 0 && pending > 0) {
+      /* Fill the device queue; blocking writes then pace this consumer.
+       * Sleeping after each accepted period kept the queue nearly empty
+       * and made normal scheduling jitter cause an underrun.  Accepted
+       * samples still queued at the device have not been played. */
+      played = (uint64_t)pending < submitted
+               ? submitted - (uint64_t)pending : 0;
+      clock_gettime(CLOCK_MONOTONIC, &deadline);
+    } else {
+      /* Null/file sinks consume immediately and need a real-time clock. */
+      audio_wait_frames(&deadline, taken ? taken : period,
+                        g_audio.freq ? g_audio.freq : 48000u);
+      played = submitted;
+    }
+    const uint64_t previous = atomic_load_explicit(&g_audio_played,
+                              memory_order_relaxed);
+    if (played > previous)
+      atomic_store_explicit(&g_audio_played, played, memory_order_release);
+    period = next_period;
+  }
+  free(chunk);
+  return NULL;
 }
 
 /* Volume and mute are remembered in lunaria.conf.  Applied once, before the
  * first playback and before the menu reads them back. */
 static void audio_saved_prefs(void)
 {
-   static int done;
-   const char *v, *m;
-   if (done) return;
-   done = 1;
-   v = getenv("LUNARIA_AUDIO_VOLUME");
-   if (v && *v) {
-      float g = (float)atof(v);
-      if (g < 0.0f) g = 0.0f;
-      if (g > 1.0f) g = 1.0f;
-      atomic_store_explicit(&g_audio_gain_q15, (int)(g * 32768.0f + 0.5f),
-                            memory_order_relaxed);
-   }
-   m = getenv("LUNARIA_AUDIO_MUTE");
-   if (m && *m && strcmp(m, "0") != 0)
-      atomic_store_explicit(&g_audio_muted, 1, memory_order_relaxed);
+  static int done;
+  const char *v, *m;
+  if (done) return;
+  done = 1;
+  v = getenv("LUNARIA_AUDIO_VOLUME");
+  if (v && *v) {
+    float g = (float)atof(v);
+    if (g < 0.0f) g = 0.0f;
+    if (g > 1.0f) g = 1.0f;
+    atomic_store_explicit(&g_audio_gain_q15, (int)(g * 32768.0f + 0.5f),
+                          memory_order_relaxed);
+  }
+  m = getenv("LUNARIA_AUDIO_MUTE");
+  if (m && *m && strcmp(m, "0") != 0)
+    atomic_store_explicit(&g_audio_muted, 1, memory_order_relaxed);
 }
 
 int luna_os_audio_open(unsigned rate, unsigned channels)
 {
-   audio_saved_prefs();
-   if (g_audio_open) return 0;
-   if (!rate) rate = 48000u;
-   if (channels < 1u || channels > 8u) channels = 2u;
-   const char *dev = getenv("LUNARIA_ALSA_DEVICE");
-   /* "default" is the plug layer: it converts rate and channel count when the
-    * card cannot do what the guest asked for, which a hw: device would simply
-    * refuse.  A caller who names a bare "hw:" device is asking for that
-    * device specifically — LUNARIA_ALSA_DEVICE is not rewritten — but a rate
-    * mismatch on a hw: device is then real (see the [audio] log line this
-    * function prints: compare its Hz against the [opensles] CreateAudioPlayer
-    * line) and the fix is to name "plughw:" instead, not for this function to
-    * silently substitute one for the other. */
-   char devbuf[128];
-   snprintf(devbuf, sizeof devbuf, "%s", (dev && *dev) ? dev : "default");
-   int start_off = !strcmp(devbuf, "off") || !strcmp(devbuf, "none");
-   /* A period of about 10 ms: small enough that the guest's own buffer queue
-    * keeps its timing, large enough not to wake the thread constantly. */
-   unsigned period = rate / 100u;
-   if (period < 64u) period = 64u;
-   if (start_off) {
-      memset(&g_audio, 0, sizeof g_audio);
-      g_audio.freq = rate;
-      g_audio.ch = (int)channels;
-      g_audio.frames = period;
-      g_audio.req_frames = (int)period;
-      g_audio.flag = 1;
-      g_audio.format = SND_PCM_FORMAT_S16_LE;
-      snprintf(devbuf, sizeof devbuf, "off");
-   } else if (AUDIO_init(&g_audio, devbuf, rate, (int)channels, (int)period, 1,
-                  SND_PCM_FORMAT_S16_LE) != 0) {
-      /* "default" on this host is whatever asound.conf names, and that is
-       * often card 0 even when the only card is not 0.  An implicit request
-       * then walks the cards and opens the first one that plays.  An explicit
-       * LUNARIA_ALSA_DEVICE is left alone: the caller named that device. */
-      int opened = -1;
-      if (!(dev && *dev)) {
-         int c = -1;
-         while (snd_card_next(&c) >= 0 && c >= 0) {
-            char alt[32];
-            snprintf(alt, sizeof alt, "plughw:%d,0", c);
-            if (AUDIO_init(&g_audio, alt, rate, (int)channels, (int)period, 1,
-                           SND_PCM_FORMAT_S16_LE) == 0) {
-               snprintf(devbuf, sizeof devbuf, "%s", alt);
-               opened = 0;
-               fprintf(stderr, "[audio] ALSA 'default' did not open; using '%s'\n",
-                       alt);
-               break;
-            }
-         }
+  audio_saved_prefs();
+  if (g_audio_open) return 0;
+  if (!rate) rate = 48000u;
+  if (channels < 1u || channels > 8u) channels = 2u;
+  const char *dev = getenv("LUNARIA_ALSA_DEVICE");
+  /* "default" is the plug layer: it converts rate and channel count when the
+   * card cannot do what the guest asked for, which a hw: device would simply
+   * refuse.  A caller who names a bare "hw:" device is asking for that
+   * device specifically — LUNARIA_ALSA_DEVICE is not rewritten — but a rate
+   * mismatch on a hw: device is then real (see the [audio] log line this
+   * function prints: compare its Hz against the [opensles] CreateAudioPlayer
+   * line) and the fix is to name "plughw:" instead, not for this function to
+   * silently substitute one for the other. */
+  char devbuf[128];
+  snprintf(devbuf, sizeof devbuf, "%s", (dev && *dev) ? dev : "default");
+  int start_off = !strcmp(devbuf, "off") || !strcmp(devbuf, "none");
+  /* A period of about 10 ms: small enough that the guest's own buffer queue
+   * keeps its timing, large enough not to wake the thread constantly. */
+  unsigned period = rate / 100u;
+  if (period < 64u) period = 64u;
+  if (start_off) {
+    memset(&g_audio, 0, sizeof g_audio);
+    g_audio.freq = rate;
+    g_audio.ch = (int)channels;
+    g_audio.frames = period;
+    g_audio.req_frames = (int)period;
+    g_audio.flag = 1;
+    g_audio.format = SND_PCM_FORMAT_S16_LE;
+    snprintf(devbuf, sizeof devbuf, "off");
+  } else if (AUDIO_init(&g_audio, devbuf, rate, (int)channels, (int)period, 1,
+                        SND_PCM_FORMAT_S16_LE) != 0) {
+    /* "default" on this host is whatever asound.conf names, and that is
+     * often card 0 even when the only card is not 0.  An implicit request
+     * then walks the cards and opens the first one that plays.  An explicit
+     * LUNARIA_ALSA_DEVICE is left alone: the caller named that device. */
+    int opened = -1;
+    if (!(dev && *dev)) {
+      int c = -1;
+      while (snd_card_next(&c) >= 0 && c >= 0) {
+        char alt[32];
+        snprintf(alt, sizeof alt, "plughw:%d,0", c);
+        if (AUDIO_init(&g_audio, alt, rate, (int)channels, (int)period, 1,
+                       SND_PCM_FORMAT_S16_LE) == 0) {
+          snprintf(devbuf, sizeof devbuf, "%s", alt);
+          opened = 0;
+          fprintf(stderr, "[audio] ALSA 'default' did not open; using '%s'\n",
+                  alt);
+          break;
+        }
       }
-      if (opened != 0) {
+    }
+    if (opened != 0) {
       /* The usual reason on a desktop is that something else holds the card
        * exclusively (a player on hw:N,0 keeps even dmix from opening it).
        * Say so, and name the way out, rather than reporting "no audio". */
@@ -1128,9 +1183,9 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
        * seconds for a whole session buries everything else. */
       static unsigned complained;
       if (complained++ % 10u == 0u)
-         fprintf(stderr, "[audio] cannot open ALSA '%s' — is another program "
-                 "using the card?  LUNARIA_ALSA_DEVICE names a different one, "
-                 "LUNARIA_AUDIO=0 turns playback off\n", devbuf);
+        fprintf(stderr, "[audio] cannot open ALSA '%s' — is another program "
+                        "using the card?  LUNARIA_ALSA_DEVICE names a different one, "
+                        "LUNARIA_AUDIO=0 turns playback off\n", devbuf);
       /* Play on into a sink that is not there instead of failing the stream.  The
        * player's clock is the audio clock: with no sink consuming samples at the
        * rate they are played, a video ran at two thirds speed and dropped frames
@@ -1146,56 +1201,59 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
       g_audio.flag = 1;
       g_audio.format = SND_PCM_FORMAT_S16_LE;
       snprintf(devbuf, sizeof devbuf, "off");
-      }
-   }
-   g_audio_ring = (int16_t *)calloc((size_t)LUNA_AUDIO_RING_FRAMES * channels,
-                                    sizeof *g_audio_ring);
-   if (!g_audio_ring) { AUDIO_close(&g_audio); return -1; }
-   g_audio_ch = channels;
-   atomic_store_explicit(&g_audio_head, 0u, memory_order_relaxed);
-   atomic_store_explicit(&g_audio_tail, 0u, memory_order_relaxed);
-   atomic_store_explicit(&g_audio_played, 0u, memory_order_relaxed);
-   atomic_store_explicit(&g_audio_stop, 0, memory_order_relaxed);
-   g_audio_open = 1;
-   if (pthread_create(&g_audio_thread, NULL, luna_audio_thread, NULL) != 0) {
-      g_audio_open = 0;
-      free(g_audio_ring);
-      g_audio_ring = NULL;
-      AUDIO_close(&g_audio);
-      return -1;
-   }
-   snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", devbuf);
-   if (start_off)
-      fprintf(stderr, "[audio] output off (%u Hz %u ch); no ALSA device is held\n",
-              g_audio.freq, channels);
-   else
-      fprintf(stderr, "[audio] ALSA '%s' %u Hz %u ch, %lu-frame periods\n",
-              devbuf, g_audio.freq, channels, (unsigned long)g_audio.frames);
-   return 0;
+    }
+  }
+  g_audio_ring = (int16_t *)calloc((size_t)LUNA_AUDIO_RING_FRAMES * channels,
+                                   sizeof *g_audio_ring);
+  if (!g_audio_ring) {
+    AUDIO_close(&g_audio);
+    return -1;
+  }
+  g_audio_ch = channels;
+  atomic_store_explicit(&g_audio_head, 0u, memory_order_relaxed);
+  atomic_store_explicit(&g_audio_tail, 0u, memory_order_relaxed);
+  atomic_store_explicit(&g_audio_played, 0u, memory_order_relaxed);
+  atomic_store_explicit(&g_audio_stop, 0, memory_order_relaxed);
+  g_audio_open = 1;
+  if (pthread_create(&g_audio_thread, NULL, luna_audio_thread, NULL) != 0) {
+    g_audio_open = 0;
+    free(g_audio_ring);
+    g_audio_ring = NULL;
+    AUDIO_close(&g_audio);
+    return -1;
+  }
+  snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", devbuf);
+  if (start_off)
+    fprintf(stderr, "[audio] output off (%u Hz %u ch); no ALSA device is held\n",
+            g_audio.freq, channels);
+  else
+    fprintf(stderr, "[audio] ALSA '%s' %u Hz %u ch, %lu-frame periods\n",
+            devbuf, g_audio.freq, channels, (unsigned long)g_audio.frames);
+  return 0;
 }
 
 void luna_os_audio_set_volume(float gain)
 {
-   if (gain < 0.0f) gain = 0.0f;
-   if (gain > 1.0f) gain = 1.0f;
-   atomic_store_explicit(&g_audio_gain_q15, (int)(gain * 32768.0f + 0.5f), memory_order_relaxed);
+  if (gain < 0.0f) gain = 0.0f;
+  if (gain > 1.0f) gain = 1.0f;
+  atomic_store_explicit(&g_audio_gain_q15, (int)(gain * 32768.0f + 0.5f), memory_order_relaxed);
 }
 
 float luna_os_audio_volume(void)
 {
-   audio_saved_prefs();
-   return (float)atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed) / 32768.0f;
+  audio_saved_prefs();
+  return (float)atomic_load_explicit(&g_audio_gain_q15, memory_order_relaxed) / 32768.0f;
 }
 
 void luna_os_audio_set_muted(int muted)
 {
-   atomic_store_explicit(&g_audio_muted, muted ? 1 : 0, memory_order_relaxed);
+  atomic_store_explicit(&g_audio_muted, muted ? 1 : 0, memory_order_relaxed);
 }
 
 int luna_os_audio_muted(void)
 {
-   audio_saved_prefs();
-   return atomic_load_explicit(&g_audio_muted, memory_order_relaxed);
+  audio_saved_prefs();
+  return atomic_load_explicit(&g_audio_muted, memory_order_relaxed);
 }
 
 /* ALSA's playback PCMs, as the system configuration names them: default,
@@ -1204,188 +1262,210 @@ int luna_os_audio_muted(void)
  * again and are left out. */
 int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
 {
-   void **hints = NULL;
-   int n = 0;
-   if (snd_device_name_hint(-1, "pcm", &hints) < 0 || !hints) return 0;
-   for (void **h = hints; *h && n < max; ++h) {
-      char *name = snd_device_name_get_hint(*h, "NAME");
-      char *desc = snd_device_name_get_hint(*h, "DESC");
-      char *io = snd_device_name_get_hint(*h, "IOID");
-      const int playback = !io || strcmp(io, "Output") == 0;
-      const int wanted = name && playback &&
-         (!strcmp(name, "default") || !strcmp(name, "pipewire") || !strcmp(name, "pulse") ||
-          !strcmp(name, "jack") || !strncmp(name, "sysdefault:", 11) || !strncmp(name, "hdmi:", 5) ||
-          !strncmp(name, "hw:", 3) || !strncmp(name, "plughw:", 7));
-      if (wanted) {
-         snprintf(names[n], 128, "%s", name);
-         /* The description's first line is the card, the second the port. */
-         char d[256];
-         snprintf(d, sizeof d, "%s", desc ? desc : name);
-         for (char *c = d; *c; ++c) if (*c == '\n') *c = ' ';
-         snprintf(descs[n], 128, "%s", d);
-         ++n;
-      }
-      free(name); free(desc); free(io);
-   }
-   snd_device_name_free_hint(hints);
-   return n;
+  void **hints = NULL;
+  int n = 0;
+  if (snd_device_name_hint(-1, "pcm", &hints) < 0 || !hints) return 0;
+  for (void **h = hints; *h && n < max; ++h) {
+    char *name = snd_device_name_get_hint(*h, "NAME");
+    char *desc = snd_device_name_get_hint(*h, "DESC");
+    char *io = snd_device_name_get_hint(*h, "IOID");
+    const int playback = !io || strcmp(io, "Output") == 0;
+    const int wanted = name && playback &&
+                       (!strcmp(name, "default") || !strcmp(name, "pipewire") || !strcmp(name, "pulse") ||
+                        !strcmp(name, "jack") || !strncmp(name, "sysdefault:", 11) || !strncmp(name, "hdmi:", 5) ||
+                        !strncmp(name, "hw:", 3) || !strncmp(name, "plughw:", 7));
+    if (wanted) {
+      snprintf(names[n], 128, "%s", name);
+      /* The description's first line is the card, the second the port. */
+      char d[256];
+      snprintf(d, sizeof d, "%s", desc ? desc : name);
+      for (char *c = d; *c; ++c) if (*c == '\n') *c = ' ';
+      snprintf(descs[n], 128, "%s", d);
+      ++n;
+    }
+    free(name);
+    free(desc);
+    free(io);
+  }
+  snd_device_name_free_hint(hints);
+  return n;
 }
 
 int luna_os_audio_select_device(const char *name)
 {
-   const char *use = name && *name ? name : "default";
-   if (!strcmp(use, "none")) use = "off";
-   pthread_mutex_lock(&g_audio_dev_lock);
-   snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "%s", use);
-   pthread_mutex_unlock(&g_audio_dev_lock);
-   /* Not open yet: the choice is where the stream will open. */
-   if (!g_audio_open) {
-      setenv("LUNARIA_ALSA_DEVICE", g_audio_dev_want, 1);
-      pthread_mutex_lock(&g_audio_dev_lock);
-      snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", g_audio_dev_want);
-      pthread_mutex_unlock(&g_audio_dev_lock);
-      return 0;
-   }
-   atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
-   return 0;
+  const char *use = name && *name ? name : "default";
+  if (!strcmp(use, "none")) use = "off";
+  pthread_mutex_lock(&g_audio_dev_lock);
+  snprintf(g_audio_dev_want, sizeof g_audio_dev_want, "%s", use);
+  pthread_mutex_unlock(&g_audio_dev_lock);
+  /* Not open yet: the choice is where the stream will open. */
+  if (!g_audio_open) {
+    setenv("LUNARIA_ALSA_DEVICE", g_audio_dev_want, 1);
+    pthread_mutex_lock(&g_audio_dev_lock);
+    snprintf(g_audio_dev_now, sizeof g_audio_dev_now, "%s", g_audio_dev_want);
+    pthread_mutex_unlock(&g_audio_dev_lock);
+    return 0;
+  }
+  atomic_store_explicit(&g_audio_dev_switch, 1, memory_order_release);
+  return 0;
 }
 
 const char *luna_os_audio_device(void)
 {
-   static _Thread_local char name[128];
-   pthread_mutex_lock(&g_audio_dev_lock);
-   snprintf(name, sizeof name, "%s", g_audio_dev_now);
-   pthread_mutex_unlock(&g_audio_dev_lock);
-   return name;
+  static _Thread_local char name[128];
+  pthread_mutex_lock(&g_audio_dev_lock);
+  snprintf(name, sizeof name, "%s", g_audio_dev_now);
+  pthread_mutex_unlock(&g_audio_dev_lock);
+  return name;
 }
 
 int luna_os_audio_write(const void *pcm16, unsigned frames)
 {
-   if (!g_audio_open || !pcm16 || !frames) return 0;
-   const int16_t *src = (const int16_t *)pcm16;
-   const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_relaxed);
-   const unsigned free_frames = LUNA_AUDIO_RING_FRAMES - 1u - luna_audio_used();
-   if (frames > free_frames) {
-      /* The caller retains frames the nonblocking sink cannot accept. */
-      static unsigned complained;
-      if (complained++ % 200u == 0u)
-         fprintf(stderr, "[audio] ring full: accepting %u of %u frames "
-                 "(used=%u/%u)\n", free_frames, frames,
-                 luna_audio_used(), LUNA_AUDIO_RING_FRAMES);
-      frames = free_frames;
-   }
-   for (unsigned i = 0; i < frames; ++i) {
-      const unsigned dst = ((h + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
-      for (unsigned c = 0; c < g_audio_ch; ++c)
-         g_audio_ring[dst + c] = src[i * g_audio_ch + c];
-   }
-   atomic_store_explicit(&g_audio_head, (h + frames) % LUNA_AUDIO_RING_FRAMES,
-                         memory_order_release);
-   return (int)frames;
+  if (!g_audio_open || !pcm16 || !frames) return 0;
+  const int16_t *src = (const int16_t *)pcm16;
+  const unsigned h = atomic_load_explicit(&g_audio_head, memory_order_relaxed);
+  const unsigned free_frames = LUNA_AUDIO_RING_FRAMES - 1u - luna_audio_used();
+  if (frames > free_frames) {
+    /* The caller retains frames the nonblocking sink cannot accept. */
+    static unsigned complained;
+    if (complained++ % 200u == 0u)
+      fprintf(stderr, "[audio] ring full: accepting %u of %u frames "
+                      "(used=%u/%u)\n", free_frames, frames,
+              luna_audio_used(), LUNA_AUDIO_RING_FRAMES);
+    frames = free_frames;
+  }
+  for (unsigned i = 0; i < frames; ++i) {
+    const unsigned dst = ((h + i) % LUNA_AUDIO_RING_FRAMES) * g_audio_ch;
+    for (unsigned c = 0; c < g_audio_ch; ++c)
+      g_audio_ring[dst + c] = src[i * g_audio_ch + c];
+  }
+  atomic_store_explicit(&g_audio_head, (h + frames) % LUNA_AUDIO_RING_FRAMES,
+                        memory_order_release);
+  return (int)frames;
 }
 
 unsigned luna_os_audio_queued_frames(void)
 {
-   return g_audio_open ? luna_audio_used() : 0u;
+  return g_audio_open ? luna_audio_used() : 0u;
 }
 
 uint64_t luna_os_audio_played_frames(void)
 {
-   return g_audio_open
-      ? atomic_load_explicit(&g_audio_played, memory_order_acquire) : 0u;
+  return g_audio_open
+         ? atomic_load_explicit(&g_audio_played, memory_order_acquire) : 0u;
 }
 
 void luna_os_audio_close(void)
 {
-   if (!g_audio_open) return;
-   atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
-   pthread_join(g_audio_thread, NULL);
-   AUDIO_close(&g_audio);
-   free(g_audio_ring);
-   g_audio_ring = NULL;
-   g_audio_open = 0;
+  if (!g_audio_open) return;
+  atomic_store_explicit(&g_audio_stop, 1, memory_order_release);
+  pthread_join(g_audio_thread, NULL);
+  AUDIO_close(&g_audio);
+  free(g_audio_ring);
+  g_audio_ring = NULL;
+  g_audio_open = 0;
 }
 
-uint32_t luna_os_lrand48(void) { return (uint32_t)lrand48(); }
-void luna_os_srand48(int32_t seed) { srand48((long)seed); }
+uint32_t luna_os_lrand48(void) {
+  return (uint32_t)lrand48();
+}
+void luna_os_srand48(int32_t seed) {
+  srand48((long)seed);
+}
 
 int luna_os_pipe_open(int fds[2], int nonblocking, int close_on_exec)
-{ return pipe2(fds, (nonblocking ? O_NONBLOCK : 0) | (close_on_exec ? O_CLOEXEC : 0)); }
+{
+  return pipe2(fds, (nonblocking ? O_NONBLOCK : 0) | (close_on_exec ? O_CLOEXEC : 0));
+}
 
 luna_os_locale luna_os_locale_new(void)
 {
-   locale_t locale = newlocale(LC_ALL_MASK, "C.UTF-8", (locale_t)0);
-   if (!locale) locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
-   return (luna_os_locale)locale;
+  locale_t locale = newlocale(LC_ALL_MASK, "C.UTF-8", (locale_t)0);
+  if (!locale) locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+  return (luna_os_locale)locale;
 }
 luna_os_locale luna_os_locale_clone(luna_os_locale locale)
 {
-   if (!locale) { errno = EINVAL; return NULL; }
-   return (luna_os_locale)duplocale((locale_t)locale);
+  if (!locale) {
+    errno = EINVAL;
+    return NULL;
+  }
+  return (luna_os_locale)duplocale((locale_t)locale);
 }
 void luna_os_locale_free(luna_os_locale locale)
-{ if (locale) freelocale((locale_t)locale); }
+{
+  if (locale) freelocale((locale_t)locale);
+}
 int luna_os_locale_use(luna_os_locale locale)
-{ return uselocale(locale ? (locale_t)locale : LC_GLOBAL_LOCALE) ? 0 : -1; }
+{
+  return uselocale(locale ? (locale_t)locale : LC_GLOBAL_LOCALE) ? 0 : -1;
+}
 
 int luna_os_time_break(int64_t seconds, int local, struct tm *result, int64_t *offset)
 {
-   time_t value = (time_t)seconds;
-   if ((int64_t)value != seconds) { errno = EOVERFLOW; return -1; }
-   if (!(local ? localtime_r(&value, result) : gmtime_r(&value, result))) return -1;
-   *offset = (int64_t)result->tm_gmtoff;
-   return 0;
+  time_t value = (time_t)seconds;
+  if ((int64_t)value != seconds) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  if (!(local ? localtime_r(&value, result) : gmtime_r(&value, result))) return -1;
+  *offset = (int64_t)result->tm_gmtoff;
+  return 0;
 }
 char *luna_os_strptime(const char *input, const char *format, struct tm *value, long *gmtoff)
 {
-   value->tm_gmtoff = *gmtoff;
-   char *end = strptime(input, format, value);
-   *gmtoff = value->tm_gmtoff;
-   return end;
+  value->tm_gmtoff = *gmtoff;
+  char *end = strptime(input, format, value);
+  *gmtoff = value->tm_gmtoff;
+  return end;
 }
 
 int luna_os_time_make(struct tm *value, int64_t *seconds, int64_t *offset)
 {
-   int saved = errno;
-   errno = 0;
-   time_t result = mktime(value);
-   if (result == (time_t)-1 && errno) return -1;
-   *seconds = (int64_t)result;
-   *offset = (int64_t)value->tm_gmtoff;
-   errno = saved;
-   return 0;
+  int saved = errno;
+  errno = 0;
+  time_t result = mktime(value);
+  if (result == (time_t)-1 && errno) return -1;
+  *seconds = (int64_t)result;
+  *offset = (int64_t)value->tm_gmtoff;
+  errno = saved;
+  return 0;
 }
 
 int luna_os_time_make_utc(struct tm *value, int64_t *seconds)
 {
-   int saved = errno;
-   errno = 0;
-   value->tm_isdst = 0;
-   time_t result = timegm(value);
-   if (result == (time_t)-1 && errno) return -1;
-   *seconds = (int64_t)result;
-   errno = saved;
-   return 0;
+  int saved = errno;
+  errno = 0;
+  value->tm_isdst = 0;
+  time_t result = timegm(value);
+  if (result == (time_t)-1 && errno) return -1;
+  *seconds = (int64_t)result;
+  errno = saved;
+  return 0;
 }
 
 
-int luna_os_unsetenv(const char *name) { return unsetenv(name); }
+int luna_os_unsetenv(const char *name) {
+  return unsetenv(name);
+}
 intptr_t luna_os_command_pipe_open(const char *path)
 {
-   if (mkfifo(path, 0600) && errno != EEXIST) return -1;
-   return open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+  if (mkfifo(path, 0600) && errno != EEXIST) return -1;
+  return open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 }
 ptrdiff_t luna_os_command_pipe_read(intptr_t pipe, void *buffer, size_t capacity)
 {
-   return read((int)pipe, buffer, capacity);
+  return read((int)pipe, buffer, capacity);
 }
-void luna_os_command_pipe_close(intptr_t pipe) { close((int)pipe); }
+void luna_os_command_pipe_close(intptr_t pipe) {
+  close((int)pipe);
+}
 
 void *luna_os_library_loaded_symbol(const char *module, const char *name)
 {
-   void *handle = dlopen(module, RTLD_LAZY | RTLD_NOLOAD);
-   if (!handle) return NULL;
-   void *symbol = dlsym(handle, name);
-   dlclose(handle);
-   return symbol;
+  void *handle = dlopen(module, RTLD_LAZY | RTLD_NOLOAD);
+  if (!handle) return NULL;
+  void *symbol = dlsym(handle, name);
+  dlclose(handle);
+  return symbol;
 }

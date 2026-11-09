@@ -1,3 +1,10 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 
 /*
  * libmediandk.c — Android libmediandk stub for Lunaria
@@ -28,72 +35,88 @@ typedef int32_t media_status_t;
 AMediaFormat *
 AMediaFormat_new(void)
 {
-    return calloc(1, sizeof(void *));
+  return calloc(1, sizeof(void *));
 }
 
 void
 AMediaFormat_delete(AMediaFormat *fmt)
 {
-    free(fmt);
+  free(fmt);
 }
 
 int32_t
 AMediaFormat_getInt32(AMediaFormat *fmt, const char *name, int32_t *out)
 {
-    (void)fmt; (void)name; (void)out;
-    return 0;
+  (void)fmt;
+  (void)name;
+  (void)out;
+  return 0;
 }
 
 int32_t
 AMediaFormat_getInt64(AMediaFormat *fmt, const char *name, int64_t *out)
 {
-    (void)fmt; (void)name; (void)out;
-    return 0;
+  (void)fmt;
+  (void)name;
+  (void)out;
+  return 0;
 }
 
 int32_t
 AMediaFormat_getFloat(AMediaFormat *fmt, const char *name, float *out)
 {
-    (void)fmt; (void)name; (void)out;
-    return 0;
+  (void)fmt;
+  (void)name;
+  (void)out;
+  return 0;
 }
 
 int32_t
 AMediaFormat_getString(AMediaFormat *fmt, const char *name, const char **out)
 {
-    (void)fmt; (void)name; (void)out;
-    return 0;
+  (void)fmt;
+  (void)name;
+  (void)out;
+  return 0;
 }
 
 void
 AMediaFormat_setInt32(AMediaFormat *fmt, const char *name, int32_t value)
 {
-    (void)fmt; (void)name; (void)value;
+  (void)fmt;
+  (void)name;
+  (void)value;
 }
 
 void
 AMediaFormat_setInt64(AMediaFormat *fmt, const char *name, int64_t value)
 {
-    (void)fmt; (void)name; (void)value;
+  (void)fmt;
+  (void)name;
+  (void)value;
 }
 
 void
 AMediaFormat_setFloat(AMediaFormat *fmt, const char *name, float value)
 {
-    (void)fmt; (void)name; (void)value;
+  (void)fmt;
+  (void)name;
+  (void)value;
 }
 
 void
 AMediaFormat_setString(AMediaFormat *fmt, const char *name, const char *value)
 {
-    (void)fmt; (void)name; (void)value;
+  (void)fmt;
+  (void)name;
+  (void)value;
 }
 
 const char *
 AMediaFormat_toString(AMediaFormat *fmt)
 {
-    (void)fmt;
-    return "{}";
+  (void)fmt;
+  return "{}";
 }
 
 /* ---- AMediaCodec ---- */
@@ -101,72 +124,80 @@ AMediaFormat_toString(AMediaFormat *fmt)
 AMediaCodec *
 AMediaCodec_createDecoderByType(const char *mime_type)
 {
-    (void)mime_type;
-    return NULL;
+  (void)mime_type;
+  return NULL;
 }
 
 AMediaCodec *
 AMediaCodec_createEncoderByType(const char *mime_type)
 {
-    (void)mime_type;
-    return NULL;
+  (void)mime_type;
+  return NULL;
 }
 
 AMediaCodec *
 AMediaCodec_createCodecByName(const char *name)
 {
-    (void)name;
-    return NULL;
+  (void)name;
+  return NULL;
 }
 
 media_status_t
 AMediaCodec_delete(AMediaCodec *codec)
 {
-    free(codec);
-    return AMEDIA_OK;
+  free(codec);
+  return AMEDIA_OK;
 }
 
 media_status_t
 AMediaCodec_configure(AMediaCodec *codec, const AMediaFormat *fmt,
                       void *surface, AMediaCrypto *crypto, uint32_t flags)
 {
-    (void)codec; (void)fmt; (void)surface; (void)crypto; (void)flags;
-    return AMEDIA_ERROR_UNKNOWN;
+  (void)codec;
+  (void)fmt;
+  (void)surface;
+  (void)crypto;
+  (void)flags;
+  return AMEDIA_ERROR_UNKNOWN;
 }
 
 media_status_t
 AMediaCodec_start(AMediaCodec *codec)
 {
-    (void)codec;
-    return AMEDIA_ERROR_UNKNOWN;
+  (void)codec;
+  return AMEDIA_ERROR_UNKNOWN;
 }
 
 media_status_t
 AMediaCodec_stop(AMediaCodec *codec)
 {
-    (void)codec;
-    return AMEDIA_OK;
+  (void)codec;
+  return AMEDIA_OK;
 }
 
 media_status_t
 AMediaCodec_flush(AMediaCodec *codec)
 {
-    (void)codec;
-    return AMEDIA_OK;
+  (void)codec;
+  return AMEDIA_OK;
 }
 
 uint8_t *
 AMediaCodec_getInputBuffer(AMediaCodec *codec, size_t idx, size_t *out_size)
 {
-    (void)codec; (void)idx; (void)out_size;
-    return NULL;
+  (void)codec;
+  (void)idx;
+  (void)out_size;
+  return NULL;
 }
 
 uint8_t *
 AMediaCodec_getOutputBuffer(AMediaCodec *codec, size_t idx, size_t *out_size)
 {
-    (void)codec; (void)idx; (void)out_size;
-    return NULL;
+  (void)codec;
+  (void)idx;
+  (void)out_size;
+  return NULL;
 }
 
 /* ---- AMediaExtractor ---- */
@@ -174,61 +205,66 @@ AMediaCodec_getOutputBuffer(AMediaCodec *codec, size_t idx, size_t *out_size)
 AMediaExtractor *
 AMediaExtractor_new(void)
 {
-    return calloc(1, sizeof(void *));
+  return calloc(1, sizeof(void *));
 }
 
 media_status_t
 AMediaExtractor_delete(AMediaExtractor *ex)
 {
-    free(ex);
-    return AMEDIA_OK;
+  free(ex);
+  return AMEDIA_OK;
 }
 
 media_status_t
 AMediaExtractor_setDataSource(AMediaExtractor *ex, const char *location)
 {
-    (void)ex; (void)location;
-    return AMEDIA_ERROR_UNKNOWN;
+  (void)ex;
+  (void)location;
+  return AMEDIA_ERROR_UNKNOWN;
 }
 
 size_t
 AMediaExtractor_getTrackCount(AMediaExtractor *ex)
 {
-    (void)ex;
-    return 0;
+  (void)ex;
+  return 0;
 }
 
 AMediaFormat *
 AMediaExtractor_getTrackFormat(AMediaExtractor *ex, size_t idx)
 {
-    (void)ex; (void)idx;
-    return NULL;
+  (void)ex;
+  (void)idx;
+  return NULL;
 }
 
 media_status_t
 AMediaExtractor_selectTrack(AMediaExtractor *ex, size_t idx)
 {
-    (void)ex; (void)idx;
-    return AMEDIA_ERROR_UNKNOWN;
+  (void)ex;
+  (void)idx;
+  return AMEDIA_ERROR_UNKNOWN;
 }
 
 int64_t
 AMediaExtractor_getSampleTime(AMediaExtractor *ex)
 {
-    (void)ex;
-    return -1;
+  (void)ex;
+  return -1;
 }
 
 int
 AMediaExtractor_readSampleData(AMediaExtractor *ex, uint8_t *buf, size_t capacity)
 {
-    (void)ex; (void)buf; (void)capacity;
-    return -1;
+  (void)ex;
+  (void)buf;
+  (void)capacity;
+  return -1;
 }
 
 int32_t
 AMediaExtractor_advance(AMediaExtractor *ex)
 {
-    (void)ex;
-    return 0;
+  (void)ex;
+  return 0;
 }

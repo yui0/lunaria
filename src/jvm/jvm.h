@@ -19,30 +19,46 @@
  * orientations without an actual sensor select the normal orientation. */
 static inline int lunaria_orientation_rotation(long orientation)
 {
-   switch (orientation) {
-   case 0: case 6: case 11: return 1; /* landscape */
-   case 8: return 3;                  /* reverse landscape */
-   case 9: return 2;                  /* reverse portrait */
-   default: return 0;
-   }
+  switch (orientation) {
+  case 0:
+  case 6:
+  case 11:
+    return 1; /* landscape */
+  case 8:
+    return 3;                  /* reverse landscape */
+  case 9:
+    return 2;                  /* reverse portrait */
+  default:
+    return 0;
+  }
 }
 
 /* Shared primitive descriptor names for JNI and dex callers. */
 static inline const char *luna_java_primitive_name(const char *desc)
 {
-   if (!desc || !desc[0] || desc[1]) return NULL;
-   switch (desc[0]) {
-   case 'Z': return "boolean";
-   case 'B': return "byte";
-   case 'C': return "char";
-   case 'S': return "short";
-   case 'I': return "int";
-   case 'J': return "long";
-   case 'F': return "float";
-   case 'D': return "double";
-   case 'V': return "void";
-   default: return NULL;
-   }
+  if (!desc || !desc[0] || desc[1]) return NULL;
+  switch (desc[0]) {
+  case 'Z':
+    return "boolean";
+  case 'B':
+    return "byte";
+  case 'C':
+    return "char";
+  case 'S':
+    return "short";
+  case 'I':
+    return "int";
+  case 'J':
+    return "long";
+  case 'F':
+    return "float";
+  case 'D':
+    return "double";
+  case 'V':
+    return "void";
+  default:
+    return NULL;
+  }
 }
 
 /* Host stubs take `va_list` and treat a null/empty list as "no arguments".
@@ -52,9 +68,9 @@ static inline const char *luna_java_primitive_name(const char *desc)
 #if defined(__aarch64__) && !defined(__APPLE__)
 static inline int jvm_va_has_args(va_list ap)
 {
-   va_list empty;
-   memset(&empty, 0, sizeof empty);
-   return memcmp(&ap, &empty, sizeof(va_list)) != 0;
+  va_list empty;
+  memset(&empty, 0, sizeof empty);
+  return memcmp(&ap, &empty, sizeof(va_list)) != 0;
 }
 #define JVM_VA_HAS_ARGS(ap) jvm_va_has_args(ap)
 #else
@@ -66,10 +82,10 @@ static inline int jvm_va_has_args(va_list ap)
  * JNI では ANDROID_APK_FILE を優先する。 */
 static inline const char *lunaria_apk_mount_path(void)
 {
-   const char *apk = getenv("ANDROID_APK_FILE");
-   if (apk && *apk)
-      return apk;
-   return getenv("ANDROID_PACKAGE_CODE_PATH");
+  const char *apk = getenv("ANDROID_APK_FILE");
+  if (apk && *apk)
+    return apk;
+  return getenv("ANDROID_PACKAGE_CODE_PATH");
 }
 
 /* The Android platform version this emulator presents.
@@ -110,35 +126,35 @@ const char *lunaria_android_release(void);
  * build id, DISPLAY and the fingerprint are assembled from whatever the
  * profile finally says, so an override cannot make them disagree. */
 struct lunaria_device {
-   const char *key;             /* LUNARIA_DEVICE selector */
-   const char *manufacturer;    /* ro.product.manufacturer / Build.MANUFACTURER */
-   const char *brand;           /* ro.product.brand */
-   const char *model;           /* ro.product.model */
-   const char *name;            /* ro.product.name */
-   const char *device;          /* ro.product.device */
-   const char *board;           /* ro.product.board */
-   const char *platform;        /* ro.board.platform */
-   const char *hardware;        /* ro.hardware */
-   const char *build_id;        /* ro.build.id */
-   const char *incremental;     /* ro.build.version.incremental */
-   const char *security_patch;  /* ro.build.version.security_patch */
-   const char *sensor_vendor;   /* the IMU's maker, for ASensor_getVendor */
-   const char *accel_name;
-   const char *gyro_name;
-   int         sdk;             /* the level this build actually shipped with */
-   /* The panel this machine was built with, in its natural (portrait)
-    * orientation, and the density the build declares for it
-    * (ro.sf.lcd_density).  A device's screen is a property of the device, so
-    * it belongs in the same row as the board and the build id: a profile that
-    * claims to be a Pixel 6 while reporting some other display describes a
-    * machine nobody shipped, and an app that reads both notices.
-    *
-    * The emulator does not have to open a window that large — see
-    * LUNARIA_SCALE in arm_exec.cpp, which shrinks the panel and its density
-    * together, the way `wm size` / `wm density` do on a device. */
-   int         screen_w;        /* px, short side  */
-   int         screen_h;        /* px, long side   */
-   int         density;         /* dpi             */
+  const char *key;             /* LUNARIA_DEVICE selector */
+  const char *manufacturer;    /* ro.product.manufacturer / Build.MANUFACTURER */
+  const char *brand;           /* ro.product.brand */
+  const char *model;           /* ro.product.model */
+  const char *name;            /* ro.product.name */
+  const char *device;          /* ro.product.device */
+  const char *board;           /* ro.product.board */
+  const char *platform;        /* ro.board.platform */
+  const char *hardware;        /* ro.hardware */
+  const char *build_id;        /* ro.build.id */
+  const char *incremental;     /* ro.build.version.incremental */
+  const char *security_patch;  /* ro.build.version.security_patch */
+  const char *sensor_vendor;   /* the IMU's maker, for ASensor_getVendor */
+  const char *accel_name;
+  const char *gyro_name;
+  int         sdk;             /* the level this build actually shipped with */
+  /* The panel this machine was built with, in its natural (portrait)
+   * orientation, and the density the build declares for it
+   * (ro.sf.lcd_density).  A device's screen is a property of the device, so
+   * it belongs in the same row as the board and the build id: a profile that
+   * claims to be a Pixel 6 while reporting some other display describes a
+   * machine nobody shipped, and an app that reads both notices.
+   *
+   * The emulator does not have to open a window that large — see
+   * LUNARIA_SCALE in arm_exec.cpp, which shrinks the panel and its density
+   * together, the way `wm size` / `wm density` do on a device. */
+  int         screen_w;        /* px, short side  */
+  int         screen_h;        /* px, long side   */
+  int         density;         /* dpi             */
 };
 
 /* The emulated display, after LUNARIA_SCALE / LUNARIA_WIDTH / LUNARIA_HEIGHT /
@@ -146,10 +162,10 @@ struct lunaria_device {
  * answer for the whole process: AConfiguration, DisplayMetrics, the EGL
  * surface and the window are all views of this. */
 struct lunaria_screen {
-   int width;      /* px, as oriented */
-   int height;     /* px, as oriented */
-   int density;    /* dpi             */
-   int rotation;   /* Surface.ROTATION_* relative to the natural panel */
+  int width;      /* px, as oriented */
+  int height;     /* px, as oriented */
+  int density;    /* dpi             */
+  int rotation;   /* Surface.ROTATION_* relative to the natural panel */
 };
 const struct lunaria_screen *lunaria_screen(void);
 
@@ -193,29 +209,29 @@ const char *lunaria_android_data_path(void);       /* /data/data/<pkg> */
  * installation, so it is configured in lunaria.conf (LUNARIA_PACKAGES,
  * LUNARIA_PACKAGES_EXTRA) rather than derived from the running app. */
 enum {
-   /* `flags` below is ApplicationInfo.flags exactly as the guest is handed
-    * it, so the bits are the framework's.  FLAG_SYSTEM is the one the
-    * emulator itself tests (`pm list packages -s|-3`). */
-   LUNARIA_APP_FLAG_SYSTEM = 1u
+  /* `flags` below is ApplicationInfo.flags exactly as the guest is handed
+   * it, so the bits are the framework's.  FLAG_SYSTEM is the one the
+   * emulator itself tests (`pm list packages -s|-3`). */
+  LUNARIA_APP_FLAG_SYSTEM = 1u
 };
 
 struct lunaria_android_package {
-   const char *name;
-   const char *source_dir;
-   const char *data_dir;
-   /* Never empty on a device: a platform package's native libraries live in
-    * /system/lib64 and an installed app's in its own lib directory.  An empty
-    * one is visible to any caller that builds a path out of it -- NMSS opens
-    * nativeLibraryDir + "/libnmsssa.so" and greps `pm list packages -f` for
-    * the same string. */
-   const char *lib_dir;
-   int uid;
-   int flags;
-   int target_sdk;
-   /* PackageInfo.versionName/versionCode of a ledger package.  NULL for the
-    * running app, whose version comes from its own manifest. */
-   const char *version_name;
-   int version_code;
+  const char *name;
+  const char *source_dir;
+  const char *data_dir;
+  /* Never empty on a device: a platform package's native libraries live in
+   * /system/lib64 and an installed app's in its own lib directory.  An empty
+   * one is visible to any caller that builds a path out of it -- NMSS opens
+   * nativeLibraryDir + "/libnmsssa.so" and greps `pm list packages -f` for
+   * the same string. */
+  const char *lib_dir;
+  int uid;
+  int flags;
+  int target_sdk;
+  /* PackageInfo.versionName/versionCode of a ledger package.  NULL for the
+   * running app, whose version comes from its own manifest. */
+  const char *version_name;
+  int version_code;
 };
 
 /* Device-owned unknown-source trust, separate from app-owned preferences.
@@ -234,7 +250,7 @@ int lunaria_android_package_find(const char *name,
 int lunaria_android_package_install(const char *name, uint32_t uid, const char *host_apk);
 /* Immutable manifest metadata read by the package registry when installing an APK. */
 int luna_apk_package_version(const char *apk, const char *package, int *code,
-                              char *name, size_t cap, int *target_sdk);
+                             char *name, size_t cap, int *target_sdk);
 
 /* Package visibility, as Android 11 defines it for PackageManager queries.
  *
@@ -247,153 +263,153 @@ int luna_apk_package_version(const char *apk, const char *package, int *code,
 int lunaria_android_package_visible(const struct lunaria_android_package *record);
 
 struct jvm_string {
-   const char *data;
-   size_t size;
-   bool heap; // if on heap, then `data` should be freed
+  const char *data;
+  size_t size;
+  bool heap; // if on heap, then `data` should be freed
 };
 
 struct jvm_array {
-   void *data;
-   size_t element_sz, size; // `size` == in elements, `size * element_sz` for bytes
-   bool reference_elements;
+  void *data;
+  size_t element_sz, size; // `size` == in elements, `size * element_sz` for bytes
+  bool reference_elements;
 };
 
 struct jvm_class {
-   struct jvm_string name;
+  struct jvm_string name;
 };
 
 struct jvm_method {
-   jclass klass;
-   struct jvm_string name, signature;
+  jclass klass;
+  struct jvm_string name, signature;
 };
 
 struct jvm_object {
-   jclass this_klass;
+  jclass this_klass;
 
-   union {
-      struct jvm_array array;
-      struct jvm_method method;
-      struct jvm_class klass;
-      struct jvm_string string;
-      luna_touch_event motion;
-   };
+  union {
+    struct jvm_array array;
+    struct jvm_method method;
+    struct jvm_class klass;
+    struct jvm_string string;
+    luna_touch_event motion;
+  };
 
-   enum jvm_object_type {
-      JVM_OBJECT_NONE,
-      JVM_OBJECT_OPAQUE,
-      JVM_OBJECT_ARRAY,
-      JVM_OBJECT_METHOD,
-      JVM_OBJECT_CLASS,
-      JVM_OBJECT_STRING,
-      JVM_OBJECT_MOTION,
-      JVM_OBJECT_LAST,
-   } type;
+  enum jvm_object_type {
+    JVM_OBJECT_NONE,
+    JVM_OBJECT_OPAQUE,
+    JVM_OBJECT_ARRAY,
+    JVM_OBJECT_METHOD,
+    JVM_OBJECT_CLASS,
+    JVM_OBJECT_STRING,
+    JVM_OBJECT_MOTION,
+    JVM_OBJECT_LAST,
+  } type;
 
-   /* Outstanding references; creation counts as one.  DeleteLocalRef and
-    * DeleteGlobalRef were no-ops, so every handle an app made leaked until
-    * the table filled and the process aborted.  Only the two types an app
-    * allocates without bound — arrays and strings — release their slot when
-    * this reaches zero (see jvm_deref_object()).  Classes and methods are
-    * interned and must keep their identity for the process lifetime, and
-    * opaque objects back the singleton stubs in jni_stubs.c, which cache the
-    * jobject in a `static` and would dangle if the slot were recycled.  The
-    * DVM-to-native bridge explicitly releases the opaque locals it created
-    * once that native call returns (jvm_release_bridge_local). */
-   int refs;
-   int array_refs; /* Strong array edges, excluded from JNI-local ownership. */
-   int global_refs; /* JNI global ownership, included in refs. */
-   bool bridge_owned; /* Opaque bridge instances are reclaimable at zero refs. */
-   int bridge_pending; /* Bridge-held local refs not yet released or deleted by native code. */
+  /* Outstanding references; creation counts as one.  DeleteLocalRef and
+   * DeleteGlobalRef were no-ops, so every handle an app made leaked until
+   * the table filled and the process aborted.  Only the two types an app
+   * allocates without bound — arrays and strings — release their slot when
+   * this reaches zero (see jvm_deref_object()).  Classes and methods are
+   * interned and must keep their identity for the process lifetime, and
+   * opaque objects back the singleton stubs in jni_stubs.c, which cache the
+   * jobject in a `static` and would dangle if the slot were recycled.  The
+   * DVM-to-native bridge explicitly releases the opaque locals it created
+   * once that native call returns (jvm_release_bridge_local). */
+  int refs;
+  int array_refs; /* Strong array edges, excluded from JNI-local ownership. */
+  int global_refs; /* JNI global ownership, included in refs. */
+  bool bridge_owned; /* Opaque bridge instances are reclaimable at zero refs. */
+  int bridge_pending; /* Bridge-held local refs not yet released or deleted by native code. */
 
-   /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
-    * monitor mutex; the small owner token avoids depending on pthread_t's
-    * representation in this public C structure. */
-   uint64_t monitor_owner;
-   uint32_t monitor_depth;
+  /* JNI MonitorEnter/Exit state.  Access is serialized by the bridge's
+   * monitor mutex; the small owner token avoids depending on pthread_t's
+   * representation in this public C structure. */
+  uint64_t monitor_owner;
+  uint32_t monitor_depth;
 };
 
 struct jvm_native_method {
-   struct jvm_method method;
-   void *function;
+  struct jvm_method method;
+  void *function;
 };
 
 struct jvm_local_state;
 struct jvm {
-   struct jvm_cached_ref *cached_refs;
-   struct jvm_local_state *local_states;
-   // [0] object is created on `jvm_init` and it's a class object for defining the class of a class
-   // every class object's `this_class` member points back to [0], causing recursion.
-   // Every other object or class definition is created lazily as needed, only [0] is special.
-   // `jobject`'s we return through JNI are actually (index+1) to this array, not pointers.
-   struct jvm_object objects[65536];
-   /* Weak handles occupy a disjoint, guest-pointer-width-safe namespace.
-    * A generation prevents a recycled object slot from reviving a weak ref. */
-   uint64_t object_generation[65536];
-   struct jvm_weak_ref {
-      jobject target;
-      uint64_t generation;
-      bool used;
-   } *weak_refs;
-   size_t weak_capacity, next_weak;
+  struct jvm_cached_ref *cached_refs;
+  struct jvm_local_state *local_states;
+  // [0] object is created on `jvm_init` and it's a class object for defining the class of a class
+  // every class object's `this_class` member points back to [0], causing recursion.
+  // Every other object or class definition is created lazily as needed, only [0] is special.
+  // `jobject`'s we return through JNI are actually (index+1) to this array, not pointers.
+  struct jvm_object objects[65536];
+  /* Weak handles occupy a disjoint, guest-pointer-width-safe namespace.
+   * A generation prevents a recycled object slot from reviving a weak ref. */
+  uint64_t object_generation[65536];
+  struct jvm_weak_ref {
+    jobject target;
+    uint64_t generation;
+    bool used;
+  } *weak_refs;
+  size_t weak_capacity, next_weak;
 
-   // Rotating free-slot hint for jvm_add_object(): allocation resumes here
-   // instead of rescanning the whole table from index 0 on every call.
-   size_t next_object;
+  // Rotating free-slot hint for jvm_add_object(): allocation resumes here
+  // instead of rescanning the whole table from index 0 on every call.
+  size_t next_object;
 
-   // Native methods registered by the application.
-   // Nothing special, but there's no need to access this array either really.
-   // You can use `jvm_get_native_method` instead.
-   struct jvm_native_method methods[255];
+  // Native methods registered by the application.
+  // Nothing special, but there's no need to access this array either really.
+  // You can use `jvm_get_native_method` instead.
+  struct jvm_native_method methods[255];
 
-   // These hold the function pointers for our JNI implementation.
-   struct JNINativeInterface native;
-   struct JNIInvokeInterface invoke;
+  // These hold the function pointers for our JNI implementation.
+  struct JNINativeInterface native;
+  struct JNIInvokeInterface invoke;
 
-   // JNI's api is weird.. pointer to a reference of a struct, OK!
-   // Developers have to dereference these pointers to call methods from an ... reference.
-   // NOTE: These are pointers, and JNI interface passes pointers to these pointers!
-   JNIEnv env; // points to native
-   JavaVM vm; // points to invoke
+  // JNI's api is weird.. pointer to a reference of a struct, OK!
+  // Developers have to dereference these pointers to call methods from an ... reference.
+  // NOTE: These are pointers, and JNI interface passes pointers to these pointers!
+  JNIEnv env; // points to native
+  JavaVM vm; // points to invoke
 
-   /* The pending JNI exception.  A JNI caller finds out that a call failed by
-    * asking ExceptionCheck()/ExceptionOccurred(), not by the return value —
-    * ClassLoader.loadClass() answering "null, and no exception" tells the
-    * caller the class loaded and *is* null, which is not a thing that can
-    * happen on a device.  libswappy reads exactly this to decide whether to
-    * fall back to its own embedded dex. */
-   jthrowable pending_exception;
-   char pending_exception_class[128];
-   char pending_exception_msg[256];
-   /* jvm_wrap_method() resolves a method to its hand-written stub by forming a
-    * symbol name and asking dlsym(RTLD_DEFAULT) for it, walking up the class
-    * hierarchy when the derived class has no stub of its own.  That is up to
-    * eighteen dlsym misses — each one a search of every loaded object — plus a
-    * dvm_jni_super_name() per hop, which takes the interpreter lock and walks
-    * the dex.  It used to do all of that on *every* JNI call: this UE title
-    * polls MediaPlayer.getCurrentPosition two thousand times a second, and
-    * each call spent about 42 us here before the method body even started.
-    *
-    * The answer depends only on the method object and the class hierarchy,
-    * both fixed once the dexes are in, so resolve it once per method id.  NULL
-    * is a real answer — "no stub, hand it to the dvm" — so the resolved flag
-    * is separate, and the whole table is dropped when a dex arrives.
-    *
-    * Deliberately last in the struct.  Putting it between objects[] and
-    * next_object made the emulator fault at the first bytecode call, which
-    * means something writes past the end of objects[] and has been landing on
-    * the fields that follow it.  That is worth finding, but it is not this
-    * change's to fix; appending leaves every existing offset relationship
-    * exactly as it was. */
-   void    *wrap_cache[65536];
-   bool     wrap_cached[65536];
-   unsigned wrap_epoch;
+  /* The pending JNI exception.  A JNI caller finds out that a call failed by
+   * asking ExceptionCheck()/ExceptionOccurred(), not by the return value —
+   * ClassLoader.loadClass() answering "null, and no exception" tells the
+   * caller the class loaded and *is* null, which is not a thing that can
+   * happen on a device.  libswappy reads exactly this to decide whether to
+   * fall back to its own embedded dex. */
+  jthrowable pending_exception;
+  char pending_exception_class[128];
+  char pending_exception_msg[256];
+  /* jvm_wrap_method() resolves a method to its hand-written stub by forming a
+   * symbol name and asking dlsym(RTLD_DEFAULT) for it, walking up the class
+   * hierarchy when the derived class has no stub of its own.  That is up to
+   * eighteen dlsym misses — each one a search of every loaded object — plus a
+   * dvm_jni_super_name() per hop, which takes the interpreter lock and walks
+   * the dex.  It used to do all of that on *every* JNI call: this UE title
+   * polls MediaPlayer.getCurrentPosition two thousand times a second, and
+   * each call spent about 42 us here before the method body even started.
+   *
+   * The answer depends only on the method object and the class hierarchy,
+   * both fixed once the dexes are in, so resolve it once per method id.  NULL
+   * is a real answer — "no stub, hand it to the dvm" — so the resolved flag
+   * is separate, and the whole table is dropped when a dex arrives.
+   *
+   * Deliberately last in the struct.  Putting it between objects[] and
+   * next_object made the emulator fault at the first bytecode call, which
+   * means something writes past the end of objects[] and has been landing on
+   * the fields that follow it.  That is worth finding, but it is not this
+   * change's to fix; appending leaves every existing offset relationship
+   * exactly as it was. */
+  void    *wrap_cache[65536];
+  bool     wrap_cached[65536];
+  unsigned wrap_epoch;
 
-   /* Hash index over the interned object types (see jvm_find_object): chains
-    * of slot numbers + 1, 0 ending a chain.  Appended last for the same
-    * reason as wrap_cache above. */
-   uint32_t intern_head[1u << 17];
-   uint32_t intern_next[65536];
-   uint32_t intern_hash[65536];
+  /* Hash index over the interned object types (see jvm_find_object): chains
+   * of slot numbers + 1, 0 ending a chain.  Appended last for the same
+   * reason as wrap_cache above. */
+  uint32_t intern_head[1u << 17];
+  uint32_t intern_next[65536];
+  uint32_t intern_hash[65536];
 };
 
 /* Raise a JNI exception of `class_name` ("java/lang/ClassNotFoundException")
@@ -483,7 +499,7 @@ void jni_set_current_activity(JNIEnv *env, jobject activity);
  * fresh local. Slots are cleared when this JVM is released. */
 jobject jvm_cached_object(JNIEnv *env, jobject *slot, const char *class_name);
 jobject jvm_cached_object_init(JNIEnv *env, jobject *slot, const char *class_name,
-                              void (*initialize)(JNIEnv *, jobject, void *), void *data);
+                               void (*initialize)(JNIEnv *, jobject, void *), void *data);
 bool jvm_cache_reference(JNIEnv *env, jobject *slot, jobject value);
 jobject jni_get_current_activity(void);
 void jni_file_bind_ctor(JNIEnv *env, jobject file, jmethodID ctor, va_list ap);
@@ -508,19 +524,19 @@ void lunaria_logbuf_clear(void);
 
 /* Process Application bootstrap: constructor, attachment, providers, onCreate. */
 int luna_application_start(struct jvm *jvm,const char *manifest_class,
-      bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
-      jobject *base_out,jobject *application_out);
+                           bool (*in_dex)(const char *),int (*providers)(struct jvm *,jobject),
+                           jobject *base_out,jobject *application_out);
 
 /* Manifest provider installation plan, shared by loader and PackageManager. */
 struct luna_provider {
-   char *name, *authority, *metadata, *process;
-   int enabled, init_order, grant_uri, multiprocess;
-   size_t ordinal;
+  char *name, *authority, *metadata, *process;
+  int enabled, init_order, grant_uri, multiprocess;
+  size_t ordinal;
 };
 struct luna_providers {
-   char *storage;
-   struct luna_provider *items;
-   size_t count;
+  char *storage;
+  struct luna_provider *items;
+  size_t count;
 };
 void luna_providers_close(struct luna_providers *);
 int luna_providers_open(struct luna_providers *,const char *text,const char *package);

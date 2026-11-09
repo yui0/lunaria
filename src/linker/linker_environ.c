@@ -47,64 +47,64 @@ static char** apkenv__envp;
 static int
 apkenv__is_valid_definition(const char*  str)
 {
-    int   pos = 0;
-    int   first_equal_pos = -1;
+  int   pos = 0;
+  int   first_equal_pos = -1;
 
-    /* According to its sources, the kernel uses 32*PAGE_SIZE by default
-     * as the maximum size for an env. variable definition.
-     */
-    const int MAX_ENV_LEN = 32*4096;
+  /* According to its sources, the kernel uses 32*PAGE_SIZE by default
+   * as the maximum size for an env. variable definition.
+   */
+  const int MAX_ENV_LEN = 32*4096;
 
-    if (str == NULL)
-        return 0;
+  if (str == NULL)
+    return 0;
 
-    /* Parse the string, looking for the first '=' there, and its size */
-    do {
-        if (str[pos] == '\0')
-            break;
-        if (str[pos] == '=' && first_equal_pos < 0)
-            first_equal_pos = pos;
-        pos++;
-    } while (pos < MAX_ENV_LEN);
+  /* Parse the string, looking for the first '=' there, and its size */
+  do {
+    if (str[pos] == '\0')
+      break;
+    if (str[pos] == '=' && first_equal_pos < 0)
+      first_equal_pos = pos;
+    pos++;
+  } while (pos < MAX_ENV_LEN);
 
-    if (pos >= MAX_ENV_LEN)  /* Too large */
-        return 0;
+  if (pos >= MAX_ENV_LEN)  /* Too large */
+    return 0;
 
-    if (first_equal_pos < 1)  /* No equal sign, or it is the first character */
-        return 0;
+  if (first_equal_pos < 1)  /* No equal sign, or it is the first character */
+    return 0;
 
-    return 1;
+  return 1;
 }
 
 uintptr_t*
 apkenv_linker_env_init(uintptr_t* vecs)
 {
-    /* Store environment pointer - can't be NULL */
-    apkenv__envp = (char**) vecs;
+  /* Store environment pointer - can't be NULL */
+  apkenv__envp = (char**) vecs;
 
-    /* Skip over all definitions */
-    while (vecs[0] != 0)
-        vecs++;
-    /* The end of the environment block is marked by two NULL pointers */
+  /* Skip over all definitions */
+  while (vecs[0] != 0)
     vecs++;
+  /* The end of the environment block is marked by two NULL pointers */
+  vecs++;
 
-    /* As a sanity check, we're going to remove all invalid variable
-     * definitions from the environment array.
-     */
-    {
-        char** readp  = apkenv__envp;
-        char** writep = apkenv__envp;
-        for ( ; readp[0] != NULL; readp++ ) {
-            if (!apkenv__is_valid_definition(readp[0]))
-                continue;
-            writep[0] = readp[0];
-            writep++;
-        }
-        writep[0] = NULL;
+  /* As a sanity check, we're going to remove all invalid variable
+   * definitions from the environment array.
+   */
+  {
+    char** readp  = apkenv__envp;
+    char** writep = apkenv__envp;
+    for ( ; readp[0] != NULL; readp++ ) {
+      if (!apkenv__is_valid_definition(readp[0]))
+        continue;
+      writep[0] = readp[0];
+      writep++;
     }
+    writep[0] = NULL;
+  }
 
-    /* Return the address of the aux vectors table */
-    return vecs;
+  /* Return the address of the aux vectors table */
+  return vecs;
 }
 
 /* Check if the environment variable definition at 'envstr'
@@ -114,15 +114,15 @@ apkenv_linker_env_init(uintptr_t* vecs)
 static char*
 apkenv_env_match(char* envstr, const char* name)
 {
-    size_t  cnt = 0;
+  size_t  cnt = 0;
 
-    while (envstr[cnt] == name[cnt] && name[cnt] != '\0')
-        cnt++;
+  while (envstr[cnt] == name[cnt] && name[cnt] != '\0')
+    cnt++;
 
-    if (name[cnt] == '\0' && envstr[cnt] == '=')
-        return envstr + cnt + 1;
+  if (name[cnt] == '\0' && envstr[cnt] == '=')
+    return envstr + cnt + 1;
 
-    return NULL;
+  return NULL;
 }
 
 #define MAX_ENV_LEN  (16*4096)
@@ -130,43 +130,42 @@ apkenv_env_match(char* envstr, const char* name)
 const char*
 apkenv_linker_env_get(const char* name)
 {
-    char** readp = apkenv__envp;
+  char** readp = apkenv__envp;
 
-    if (name == NULL || name[0] == '\0')
-        return NULL;
-
-    for ( ; readp[0] != NULL; readp++ ) {
-        char* val = apkenv_env_match(readp[0], name);
-        if (val != NULL) {
-            /* Return NULL for empty strings, or if it is too large */
-            if (val[0] == '\0')
-                val = NULL;
-            return val;
-        }
-    }
+  if (name == NULL || name[0] == '\0')
     return NULL;
+
+  for ( ; readp[0] != NULL; readp++ ) {
+    char* val = apkenv_env_match(readp[0], name);
+    if (val != NULL) {
+      /* Return NULL for empty strings, or if it is too large */
+      if (val[0] == '\0')
+        val = NULL;
+      return val;
+    }
+  }
+  return NULL;
 }
 
 
 void
 apkenv_linker_env_unset(const char* name)
 {
-    char**  readp = apkenv__envp;
-    char**  writep = readp;
+  char**  readp = apkenv__envp;
+  char**  writep = readp;
 
-    if (name == NULL || name[0] == '\0')
-        return;
+  if (name == NULL || name[0] == '\0')
+    return;
 
-    for ( ; readp[0] != NULL; readp++ ) {
-        if (apkenv_env_match(readp[0], name))
-            continue;
-        writep[0] = readp[0];
-        writep++;
-    }
-    /* end list with a NULL */
-    writep[0] = NULL;
+  for ( ; readp[0] != NULL; readp++ ) {
+    if (apkenv_env_match(readp[0], name))
+      continue;
+    writep[0] = readp[0];
+    writep++;
+  }
+  /* end list with a NULL */
+  writep[0] = NULL;
 }
-
 
 
 /* Remove unsafe environment variables. This should be used when
@@ -174,47 +173,47 @@ apkenv_linker_env_unset(const char* name)
 void
 apkenv_linker_env_secure(void)
 {
-    /* The same list than GLibc at this point */
-    static const char* const unsec_vars[] = {
-        "GCONV_PATH",
-        "GETCONF_DIR",
-        "HOSTALIASES",
-        "LD_AUDIT",
-        "LD_DEBUG",
-        "LD_DEBUG_OUTPUT",
-        "LD_DYNAMIC_WEAK",
-        "LD_LIBRARY_PATH",
-        "LD_ORIGIN_PATH",
-        "LD_PRELOAD",
-        "LD_PROFILE",
-        "LD_SHOW_AUXV",
-        "LD_USE_LOAD_BIAS",
-        "LOCALDOMAIN",
-        "LOCPATH",
-        "MALLOC_TRACE",
-        "MALLOC_CHECK_",
-        "NIS_PATH",
-        "NLSPATH",
-        "RESOLV_HOST_CONF",
-        "RES_OPTIONS",
-        "TMPDIR",
-        "TZDIR",
-        "LD_AOUT_LIBRARY_PATH",
-        "LD_AOUT_PRELOAD",
-    };
+  /* The same list than GLibc at this point */
+  static const char* const unsec_vars[] = {
+    "GCONV_PATH",
+    "GETCONF_DIR",
+    "HOSTALIASES",
+    "LD_AUDIT",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_SHOW_AUXV",
+    "LD_USE_LOAD_BIAS",
+    "LOCALDOMAIN",
+    "LOCPATH",
+    "MALLOC_TRACE",
+    "MALLOC_CHECK_",
+    "NIS_PATH",
+    "NLSPATH",
+    "RESOLV_HOST_CONF",
+    "RES_OPTIONS",
+    "TMPDIR",
+    "TZDIR",
+    "LD_AOUT_LIBRARY_PATH",
+    "LD_AOUT_PRELOAD",
+  };
 
-    const char* const* cp   = unsec_vars;
-    const char* const* endp = cp + sizeof(unsec_vars)/sizeof(unsec_vars[0]);
+  const char* const* cp   = unsec_vars;
+  const char* const* endp = cp + sizeof(unsec_vars)/sizeof(unsec_vars[0]);
 
-    while (cp < endp) {
-        apkenv_linker_env_unset(*cp);
-        cp++;
-    }
+  while (cp < endp) {
+    apkenv_linker_env_unset(*cp);
+    cp++;
+  }
 }
 
 /* ---- apkenv_strlcpy (OpenBSD) ---- */
 #include <string.h>
-/*	$OpenBSD: strlcpy.c,v 1.11 2006/05/05 15:27:38 millert Exp $	*/
+/*  $OpenBSD: strlcpy.c,v 1.11 2006/05/05 15:27:38 millert Exp $  */
 
 /*
  * Copyright (c) 1998 Todd C. Miller <Todd.Miller@courtesan.com>
@@ -241,25 +240,25 @@ apkenv_linker_env_secure(void)
 size_t
 apkenv_strlcpy(char *dst, const char *src, size_t siz)
 {
-	char *d = dst;
-	const char *s = src;
-	size_t n = siz;
+  char *d = dst;
+  const char *s = src;
+  size_t n = siz;
 
-	/* Copy as many bytes as will fit */
-	if (n != 0) {
-		while (--n != 0) {
-			if ((*d++ = *s++) == '\0')
-				break;
-		}
-	}
+  /* Copy as many bytes as will fit */
+  if (n != 0) {
+    while (--n != 0) {
+      if ((*d++ = *s++) == '\0')
+        break;
+    }
+  }
 
-	/* Not enough room in dst, add NUL and traverse rest of src */
-	if (n == 0) {
-		if (siz != 0)
-			*d = '\0';		/* NUL-terminate dst */
-		while (*s++)
-			;
-	}
+  /* Not enough room in dst, add NUL and traverse rest of src */
+  if (n == 0) {
+    if (siz != 0)
+      *d = '\0';    /* NUL-terminate dst */
+    while (*s++)
+      ;
+  }
 
-	return(s - src - 1);	/* count does not include NUL */
+  return(s - src - 1);  /* count does not include NUL */
 }

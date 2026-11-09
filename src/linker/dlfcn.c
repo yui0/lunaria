@@ -36,10 +36,10 @@
 #define RTLD_DEFAULT ((void *)0)
 #define RTLD_NEXT ((void *)-1)
 typedef struct {
-    const char *dli_fname;
-    void *dli_fbase;
-    const char *dli_sname;
-    void *dli_saddr;
+  const char *dli_fname;
+  void *dli_fbase;
+  const char *dli_sname;
+  void *dli_saddr;
 } Dl_info;
 #endif
 
@@ -64,11 +64,11 @@ static char dl_err_buf[1024];
 static const char *dl_err_str;
 
 static const char *dl_errors[] = {
-    [DL_ERR_CANNOT_LOAD_LIBRARY] = "Cannot load library",
-    [DL_ERR_INVALID_LIBRARY_HANDLE] = "Invalid library handle",
-    [DL_ERR_BAD_SYMBOL_NAME] = "Invalid symbol name",
-    [DL_ERR_SYMBOL_NOT_FOUND] = "Symbol not found",
-    [DL_ERR_SYMBOL_NOT_GLOBAL] = "Symbol is not global",
+  [DL_ERR_CANNOT_LOAD_LIBRARY] = "Cannot load library",
+  [DL_ERR_INVALID_LIBRARY_HANDLE] = "Invalid library handle",
+  [DL_ERR_BAD_SYMBOL_NAME] = "Invalid symbol name",
+  [DL_ERR_SYMBOL_NOT_FOUND] = "Symbol not found",
+  [DL_ERR_SYMBOL_NOT_GLOBAL] = "Symbol is not global",
 };
 
 #define likely(expr)   __builtin_expect (expr, 1)
@@ -78,165 +78,165 @@ static pthread_mutex_t apkenv_dl_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void set_dlerror(int err)
 {
-    format_buffer(dl_err_buf, sizeof(dl_err_buf), "%s: %s", dl_errors[err],
-             apkenv_linker_get_error());
-    dl_err_str = (const char *)&dl_err_buf[0];
+  format_buffer(dl_err_buf, sizeof(dl_err_buf), "%s: %s", dl_errors[err],
+                apkenv_linker_get_error());
+  dl_err_str = (const char *)&dl_err_buf[0];
 }
 
 void *bionic_dlopen(const char *filename, int flag)
 {
-    verbose("%s (%d)", filename, flag);
-    soinfo *ret;
-    pthread_mutex_lock(&apkenv_dl_lock);
-    ret = apkenv_find_library(filename, false);
+  verbose("%s (%d)", filename, flag);
+  soinfo *ret;
+  pthread_mutex_lock(&apkenv_dl_lock);
+  ret = apkenv_find_library(filename, false);
 
-    if (unlikely(ret == NULL)) {
-        if (!(flag & (RTLD_LAZY | RTLD_NOW)))
-          flag |= RTLD_NOW;
+  if (unlikely(ret == NULL)) {
+    if (!(flag & (RTLD_LAZY | RTLD_NOW)))
+      flag |= RTLD_NOW;
 
-        char path[4096];
-        snprintf(path, sizeof(path), RUNTIMEPATH "/%s", filename);
+    char path[4096];
+    snprintf(path, sizeof(path), RUNTIMEPATH "/%s", filename);
 #ifdef _WIN32
-        ret = (soinfo *)luna_os_library_open(filename);
-        if (!ret) ret = (soinfo *)luna_os_library_open(path);
+    ret = (soinfo *)luna_os_library_open(filename);
+    if (!ret) ret = (soinfo *)luna_os_library_open(path);
 #else
-        ret = (soinfo *)dlopen(filename, flag);
-        if (!ret) ret = (soinfo *)dlopen(path, flag);
+    ret = (soinfo *)dlopen(filename, flag);
+    if (!ret) ret = (soinfo *)dlopen(path, flag);
 #endif
-        if (!ret)
-            set_dlerror(DL_ERR_CANNOT_LOAD_LIBRARY);
-    } else {
-        apkenv_call_constructors_recursive(ret);
-        ret->refcount++;
-    }
-    pthread_mutex_unlock(&apkenv_dl_lock);
-    return ret;
+    if (!ret)
+      set_dlerror(DL_ERR_CANNOT_LOAD_LIBRARY);
+  } else {
+    apkenv_call_constructors_recursive(ret);
+    ret->refcount++;
+  }
+  pthread_mutex_unlock(&apkenv_dl_lock);
+  return ret;
 }
 
 const char *bionic_dlerror(void)
 {
-    const char *tmp = dl_err_str;
-    dl_err_str = NULL;
-    return (const char *)tmp;
+  const char *tmp = dl_err_str;
+  dl_err_str = NULL;
+  return (const char *)tmp;
 }
 
 enum {
-    WRAPPER_DYNHOOK,
+  WRAPPER_DYNHOOK,
 };
 
 #define MIN(a,b) (((a)<(b))?(a):(b))
 
 void *bionic_dlsym(void *handle, const char *symbol)
 {
-    verbose("%p, %s", handle, symbol);
+  verbose("%p, %s", handle, symbol);
 
-    soinfo *found;
-    AElf(Sym) *sym;
-    unsigned bind;
+  soinfo *found;
+  AElf(Sym) *sym;
+  unsigned bind;
 
-    pthread_mutex_lock(&apkenv_dl_lock);
+  pthread_mutex_lock(&apkenv_dl_lock);
 
-    if(unlikely(symbol == 0)) {
-        set_dlerror(DL_ERR_BAD_SYMBOL_NAME);
-        goto err;
+  if(unlikely(symbol == 0)) {
+    set_dlerror(DL_ERR_BAD_SYMBOL_NAME);
+    goto err;
+  }
+
+  {
+    char wrap_sym_name[1024] = { 'b', 'i', 'o', 'n', 'i', 'c', '_' };
+    memcpy(wrap_sym_name + 7, symbol, MIN(sizeof(wrap_sym_name) - 7, strlen(symbol)));
+    if ((sym = luna_os_library_symbol(NULL, wrap_sym_name))) {
+      pthread_mutex_unlock(&apkenv_dl_lock);
+      verbose("found bionic_ version");
+      return wrapper_create(symbol, sym);
+    } else if ((sym = luna_os_library_symbol(NULL, symbol))) {
+      pthread_mutex_unlock(&apkenv_dl_lock);
+      verbose("found system version");
+      return wrapper_create(symbol, sym);
+    }
+  }
+
+  if(unlikely(handle == 0)) {
+    set_dlerror(DL_ERR_INVALID_LIBRARY_HANDLE);
+    goto err;
+  }
+
+  if(handle == RTLD_DEFAULT) {
+    sym = apkenv_lookup(symbol, &found, NULL);
+  } else if(handle == RTLD_NEXT) {
+    void *ret_addr = __builtin_return_address(0);
+    soinfo *si = apkenv_find_containing_library(ret_addr);
+
+    sym = NULL;
+    if(si && si->next) {
+      sym = apkenv_lookup(symbol, &found, si->next);
+    }
+  } else {
+    found = (soinfo*)handle;
+    sym = apkenv_lookup_in_library(found, symbol);
+  }
+
+  if(likely(sym != 0)) {
+    bind = AELF(ST_BIND)(sym->st_info);
+
+    if(likely((bind == STB_GLOBAL) && (sym->st_shndx != 0))) {
+      uintptr_t ret = sym->st_value + found->base;
+      pthread_mutex_unlock(&apkenv_dl_lock);
+      return wrapper_create((char*)symbol, (void*)ret);
     }
 
-    {
-        char wrap_sym_name[1024] = { 'b', 'i', 'o', 'n', 'i', 'c', '_' };
-        memcpy(wrap_sym_name + 7, symbol, MIN(sizeof(wrap_sym_name) - 7, strlen(symbol)));
-        if ((sym = luna_os_library_symbol(NULL, wrap_sym_name))) {
-            pthread_mutex_unlock(&apkenv_dl_lock);
-            verbose("found bionic_ version");
-            return wrapper_create(symbol, sym);
-        } else if ((sym = luna_os_library_symbol(NULL, symbol))) {
-            pthread_mutex_unlock(&apkenv_dl_lock);
-            verbose("found system version");
-            return wrapper_create(symbol, sym);
-        }
-    }
-
-    if(unlikely(handle == 0)) {
-        set_dlerror(DL_ERR_INVALID_LIBRARY_HANDLE);
-        goto err;
-    }
-
-    if(handle == RTLD_DEFAULT) {
-        sym = apkenv_lookup(symbol, &found, NULL);
-    } else if(handle == RTLD_NEXT) {
-        void *ret_addr = __builtin_return_address(0);
-        soinfo *si = apkenv_find_containing_library(ret_addr);
-
-        sym = NULL;
-        if(si && si->next) {
-            sym = apkenv_lookup(symbol, &found, si->next);
-        }
-    } else {
-        found = (soinfo*)handle;
-        sym = apkenv_lookup_in_library(found, symbol);
-    }
-
-    if(likely(sym != 0)) {
-        bind = AELF(ST_BIND)(sym->st_info);
-
-        if(likely((bind == STB_GLOBAL) && (sym->st_shndx != 0))) {
-            uintptr_t ret = sym->st_value + found->base;
-            pthread_mutex_unlock(&apkenv_dl_lock);
-            return wrapper_create((char*)symbol, (void*)ret);
-        }
-
-        set_dlerror(DL_ERR_SYMBOL_NOT_GLOBAL);
-    }
-    else
-        set_dlerror(DL_ERR_SYMBOL_NOT_FOUND);
+    set_dlerror(DL_ERR_SYMBOL_NOT_GLOBAL);
+  }
+  else
+    set_dlerror(DL_ERR_SYMBOL_NOT_FOUND);
 
 err:
-    LINKER_DEBUG_PRINTF("symbol %s has not been hooked\n",symbol);
-    pthread_mutex_unlock(&apkenv_dl_lock);
-    return 0;
+  LINKER_DEBUG_PRINTF("symbol %s has not been hooked\n",symbol);
+  pthread_mutex_unlock(&apkenv_dl_lock);
+  return 0;
 }
 
 int bionic_dladdr(const void *addr, Dl_info *info)
 {
-    int ret = 0;
+  int ret = 0;
 
-    pthread_mutex_lock(&apkenv_dl_lock);
+  pthread_mutex_lock(&apkenv_dl_lock);
 
-    /* Determine if this address can be found in any library currently mapped */
-    soinfo *si = apkenv_find_containing_library(addr);
+  /* Determine if this address can be found in any library currently mapped */
+  soinfo *si = apkenv_find_containing_library(addr);
 
-    if(si) {
-        memset(info, 0, sizeof(*info));
+  if(si) {
+    memset(info, 0, sizeof(*info));
 
-        info->dli_fname = si->name;
-        info->dli_fbase = (void*)(uintptr_t)si->base;
+    info->dli_fname = si->name;
+    info->dli_fbase = (void*)(uintptr_t)si->base;
 
-        /* Determine if any symbol in the library contains the specified address */
-        AElf(Sym) *sym = apkenv_find_containing_symbol(addr, si);
+    /* Determine if any symbol in the library contains the specified address */
+    AElf(Sym) *sym = apkenv_find_containing_symbol(addr, si);
 
-        if(sym != NULL) {
-            info->dli_sname = si->strtab + sym->st_name;
-            info->dli_saddr = (void*)(uintptr_t)(si->base + sym->st_value);
-        }
-
-        ret = 1;
+    if(sym != NULL) {
+      info->dli_sname = si->strtab + sym->st_name;
+      info->dli_saddr = (void*)(uintptr_t)(si->base + sym->st_value);
     }
 
-    pthread_mutex_unlock(&apkenv_dl_lock);
+    ret = 1;
+  }
 
-    return ret;
+  pthread_mutex_unlock(&apkenv_dl_lock);
+
+  return ret;
 }
 
 int bionic_dlclose(void *handle)
 {
 #if 0
-    if (is_builtin_lib_handle(handle))
-        return 0;
+  if (is_builtin_lib_handle(handle))
+    return 0;
 #endif
 
-    pthread_mutex_lock(&apkenv_dl_lock);
-    (void)apkenv_unload_library((soinfo*)handle);
-    pthread_mutex_unlock(&apkenv_dl_lock);
-    return 0;
+  pthread_mutex_lock(&apkenv_dl_lock);
+  (void)apkenv_unload_library((soinfo*)handle);
+  pthread_mutex_unlock(&apkenv_dl_lock);
+  return 0;
 }
 
 

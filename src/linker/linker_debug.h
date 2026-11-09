@@ -71,6 +71,9 @@
 /* Only use printf() during debugging.  We have seen occasional memory
  * corruption when the linker uses printf().
  */
+/* apkenv: LINKER_DEBUG=0 builds still call format_buffer; always have it. */
+#define format_buffer snprintf
+
 #if LINKER_DEBUG
 #include <stdarg.h>
 #include <stddef.h>
@@ -82,7 +85,6 @@
 
 // apkenv: we can just use snprintf
 //int format_buffer(char *buffer, size_t bufsize, const char *format, ...);
-#define format_buffer snprintf
 
 extern int apkenv_debug_verbosity;
 #if LINKER_DEBUG_TO_LOG
@@ -133,7 +135,7 @@ extern int apkenv_format_log(int, const char *, const char *, ...);
 #define NUM_RELOC_STATS       4
 
 struct _link_stats {
-    int reloc[NUM_RELOC_STATS];
+  int reloc[NUM_RELOC_STATS];
 };
 extern struct _link_stats apkenv_linker_stats;
 

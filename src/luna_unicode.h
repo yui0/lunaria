@@ -1,4 +1,14 @@
-/* MPL-2.0. Portable Unicode operations; data license: LICENSE.unicode. */
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * Portable Unicode operations; data license: LICENSE.unicode.
+ */
 #ifndef LUNARIA_UNICODE_H
 #define LUNARIA_UNICODE_H
 #include <stddef.h>

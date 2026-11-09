@@ -1,6 +1,15 @@
-/* Copyright © 2026 Yuichiro Nakada / Project Lunaria
- * SPDX-License-Identifier: MPL-2.0
- * Host presentation, input, boot card and launcher interfaces. */
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * * SPDX-License-Identifier: MPL-2.0
+ * * Host presentation, input, boot card and launcher interfaces.
+ */
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
@@ -49,12 +58,12 @@ int luna_launcher_choose(const char *package, const char *const *profiles, const
  * edited by the person, read back).  `folder` adds a Browse button that picks
  * a directory. */
 typedef struct luna_launcher_setting {
-   const char *key, *label, *hint;
-   int folder;
-   int compact;      /* shares a row with the neighbouring compact settings */
-   const char *const *choices; /* NULL-terminated values, or NULL for text */
-   const char *const *choice_labels; /* optional display names for choices */
-   char value[1024];
+  const char *key, *label, *hint;
+  int folder;
+  int compact;      /* shares a row with the neighbouring compact settings */
+  const char *const *choices; /* NULL-terminated values, or NULL for text */
+  const char *const *choice_labels; /* optional display names for choices */
+  char value[1024];
 } luna_launcher_setting;
 
 /* Started with no application: asks which to open and how this installation
@@ -70,7 +79,9 @@ void *luna_launcher_take_window(void);
 
 /* APKPure discovery and streaming downloads, using the host HTTP client. */
 #define APKPURE_RESULTS 8
-struct apkpure_result { char package[256], title[256]; };
+struct apkpure_result {
+  char package[256], title[256];
+};
 /* Return nonzero from progress to cancel. Called on the worker, never the UI. */
 typedef int (*apkpure_progress)(void *, uint64_t, uint64_t);
 int apkpure_package_valid(const char *name);
@@ -106,18 +117,21 @@ int luna_apk_service_manifest(const char *apk, char **services, char **providers
 
 /* Touch input, keymaps and recording */
 #define LUNA_TOUCH_MAX 10
-typedef struct luna_touch_point { int id; float x, y; } luna_touch_point;
+typedef struct luna_touch_point {
+  int id;
+  float x, y;
+} luna_touch_point;
 typedef struct luna_touch_event {
-    int action;
-    float x, y; /* pointer zero, also used by legacy single-pointer producers */
-    long long event_ms, down_ms;
-    int pointer_count;
-    luna_touch_point pointers[LUNA_TOUCH_MAX];
+  int action;
+  float x, y; /* pointer zero, also used by legacy single-pointer producers */
+  long long event_ms, down_ms;
+  int pointer_count;
+  luna_touch_point pointers[LUNA_TOUCH_MAX];
 } luna_touch_event;
 typedef struct luna_touch_state {
-    int count;
-    long long down_ms;
-    luna_touch_point points[LUNA_TOUCH_MAX];
+  int count;
+  long long down_ms;
+  luna_touch_point points[LUNA_TOUCH_MAX];
 } luna_touch_state;
 /* action: DOWN=0, UP=1, MOVE=2, CANCEL=3; id identifies a stable contact.
  * Returns a complete immutable Android event, including the lifting pointer
@@ -138,34 +152,38 @@ float luna_event_y(const luna_touch_event *, int index);
  *   points are tapped again every MS milliseconds while the key is held, each
  *   tap lasting hold= milliseconds.  x/y mirror the first point. */
 typedef struct luna_key_binding {
-    int key, held;
-    float x, y;
-    int npoints, id, repeat_ms, hold_ms, phase;
-    float px[LUNA_KEY_POINTS], py[LUNA_KEY_POINTS];
-    long long cycle_ms;
+  int key, held;
+  float x, y;
+  int npoints, id, repeat_ms, hold_ms, phase;
+  float px[LUNA_KEY_POINTS], py[LUNA_KEY_POINTS];
+  long long cycle_ms;
 } luna_key_binding;
 /* macro KEY step... [loop]
  *   A step is "x,y[|x,y...][/hold_ms]" (taps those points together) or
  *   "@ms" (waits).  The sequence runs once per press; "loop" keeps running it
  *   while the key is held. */
 typedef struct luna_macro_step {
-    int npoints, hold_ms, wait_ms;
-    float x[LUNA_KEY_POINTS], y[LUNA_KEY_POINTS];
+  int npoints, hold_ms, wait_ms;
+  float x[LUNA_KEY_POINTS], y[LUNA_KEY_POINTS];
 } luna_macro_step;
 typedef struct luna_macro {
-    int key, held, loop, nsteps, id, pending;
-    unsigned down;                 /* contacts currently pressed, by offset */
-    luna_macro_step steps[LUNA_MACRO_STEPS];
+  int key, held, loop, nsteps, id, pending;
+  unsigned down;                 /* contacts currently pressed, by offset */
+  luna_macro_step steps[LUNA_MACRO_STEPS];
 } luna_macro;
-typedef struct luna_timed { long long at_ms; int id, action, macro; float x, y; } luna_timed;
+typedef struct luna_timed {
+  long long at_ms;
+  int id, action, macro;
+  float x, y;
+} luna_timed;
 typedef struct luna_keymap {
-    int enabled, direction[4], stick_down, count, nmacros, nqueue;
-    float stick_x, stick_y, radius;
-    int walk_key, walk_held;
-    float walk_radius;
-    luna_key_binding buttons[LUNA_KEYMAP_BUTTONS];
-    luna_macro macros[LUNA_KEYMAP_MACROS];
-    luna_timed queue[LUNA_TIMED_MAX];
+  int enabled, direction[4], stick_down, count, nmacros, nqueue;
+  float stick_x, stick_y, radius;
+  int walk_key, walk_held;
+  float walk_radius;
+  luna_key_binding buttons[LUNA_KEYMAP_BUTTONS];
+  luna_macro macros[LUNA_KEYMAP_MACROS];
+  luna_timed queue[LUNA_TIMED_MAX];
 } luna_keymap;
 typedef void (*luna_keymap_emit)(void *, int id, int action, float x, float y);
 /* Selection can come from the menu thread. The input pump takes a validated
@@ -316,7 +334,7 @@ void luna_overlay_set_scroll_handler(luna_overlay_scroll_fn fn);
  * element. x/y are local image pixels; the receiver queues them for the
  * Android main looper. */
 typedef void (*luna_overlay_web_pointer_fn)(const char *id,
-                                            int x, int y, int action, long long event_ms);
+    int x, int y, int action, long long event_ms);
 void luna_overlay_set_web_pointer_handler(luna_overlay_web_pointer_fn fn);
 typedef void (*luna_overlay_web_char_fn)(const char *id, uint32_t codepoint);
 typedef void (*luna_overlay_web_key_fn)(const char *id, int key, int action, int mods);
@@ -364,7 +382,7 @@ void luna_overlay_prepare_platform(void);
  * decoder luna-ui already links; NULL when it cannot.  Free the result with
  * luna_overlay_image_free(). */
 unsigned char *luna_overlay_image_decode(const void *data, size_t len,
-                                         int *w, int *h);
+    int *w, int *h);
 void luna_overlay_image_free(unsigned char *pixels);
 /* Copies one ARGB Bitmap generation. Pending updates of the same key coalesce
  * and are uploaded by the presenting thread; no image file or codec. */
@@ -390,22 +408,22 @@ void luna_overlay_poll_image_sources(int64_t present_ns);
  * with the overlay's render. */
 /* CPU text runs shared by Android measurement and Bitmap Canvas drawing. */
 struct luna_text_glyph {
- const void *font,*font_data;
- uint32_t glyph,cluster;
- float x,y,advance;
+  const void *font,*font_data;
+  uint32_t glyph,cluster;
+  float x,y,advance;
 };
 struct luna_text_run {
- struct luna_text_glyph *glyphs;
- size_t count;
- float width;
- /* Unrounded baseline metrics of the faces actually used for this run. */
- float ascent,descent;
- bool missing;
+  struct luna_text_glyph *glyphs;
+  size_t count;
+  float width;
+  /* Unrounded baseline metrics of the faces actually used for this run. */
+  float ascent,descent;
+  bool missing;
 };
 struct luna_text_bitmap {
- unsigned char *coverage;
- int width,height,left,top;
- void *cache; /* owner entry while the coverage is shared; release with luna_overlay_free_glyph */
+  unsigned char *coverage;
+  int width,height,left,top;
+  void *cache; /* owner entry while the coverage is shared; release with luna_overlay_free_glyph */
 };
 /* Immutable copied font data, cached until host shutdown. Zero is the system
  * face. Handles remain valid across platform-font reloads and glyph runs. */
@@ -425,20 +443,20 @@ bool luna_overlay_text_breaks(const uint16_t *text,size_t length,const char *loc
 float luna_overlay_text_width(const char *text, float px, bool bold);
 float luna_overlay_line_height(float px);
 struct luna_overlay_font_metrics {
-   float top, ascent, descent, bottom, leading;
+  float top, ascent, descent, bottom, leading;
 };
 /* Face metrics in Android's baseline coordinate system, without GL work. */
 bool luna_overlay_font_metrics(uint32_t font,float px,bool bold,
                                struct luna_overlay_font_metrics *metrics);
 bool luna_overlay_get_font_metrics(float px, bool bold,
-                                  struct luna_overlay_font_metrics *metrics);
+                                   struct luna_overlay_font_metrics *metrics);
 
 /* Input method */
 /* What luna_ime_pump() reports, as a bitmask. */
 enum {
-   LUNA_IME_EV_TEXT   = 1 << 0,   /* the buffer changed */
-   LUNA_IME_EV_ACCEPT = 1 << 1,   /* the editor action fired (Enter / OK) */
-   LUNA_IME_EV_CANCEL = 1 << 2,   /* dismissed without accepting (Esc) */
+  LUNA_IME_EV_TEXT   = 1 << 0,   /* the buffer changed */
+  LUNA_IME_EV_ACCEPT = 1 << 1,   /* the editor action fired (Enter / OK) */
+  LUNA_IME_EV_CANCEL = 1 << 2,   /* dismissed without accepting (Esc) */
 };
 
 /* Raises the input method over `initial`, with the Android input type the
@@ -486,6 +504,15 @@ bool luna_comp_start(void *egl_display, void *egl_config, void *native_window);
 
 /* True once started and running. */
 bool luna_comp_active(void);
+
+/* Saves the next frame the compositor puts on screen to `path` (a .png): the
+ * window as the user sees it, emulator UI included.  Any thread; the file is
+ * written on the compositor's next present.  False when not running. */
+bool luna_comp_shot(const char *path);
+
+/* An 8-bit RGB PNG from `w` x `h` RGBA pixels; `bottom_up` for glReadPixels
+ * order.  False on any failure. */
+bool luna_png_write_rgba(const char *path, int w, int h, const uint8_t *rgba, bool bottom_up);
 
 /* Guest side, on the thread and context that just finished the frame, with
  * the frame in the default framebuffer of the current draw surface (w x h).

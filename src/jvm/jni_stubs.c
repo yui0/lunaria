@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * JNI native method stubs for Android/Java/Unity APIs (merged from libjvm-*.c).
  */
 
@@ -39,91 +41,101 @@ static jobject g_current_activity;
 void
 jni_set_current_activity(JNIEnv *env, jobject activity)
 {
-   if (!jvm_cache_reference(env, &g_current_activity, activity)) return;
-   /* IronSource (and many other Unity plugins) read the public static field
-    * UnityPlayer.currentActivity via sget, not the currentActivity() accessor
-    * stub.  Mirror the process Activity into that field whenever it is set,
-    * the same way UnityPlayer itself does after attach. */
-   if (env && activity)
-      dvm_jni_bind_unity_activity(env, activity);
+  if (!jvm_cache_reference(env, &g_current_activity, activity)) return;
+  /* IronSource (and many other Unity plugins) read the public static field
+   * UnityPlayer.currentActivity via sget, not the currentActivity() accessor
+   * stub.  Mirror the process Activity into that field whenever it is set,
+   * the same way UnityPlayer itself does after attach. */
+  if (env && activity)
+    dvm_jni_bind_unity_activity(env, activity);
 }
 
 jobject
 jni_get_current_activity(void)
 {
-   return g_current_activity;
+  return g_current_activity;
 }
 
 void
 jni_file_set_path(jobject file, const char *path)
 {
-   if (!file)
-      return;
-   uintptr_t idx = (uintptr_t)file;
-   if (idx >= JNI_FILE_PATHS_MAX)
-      return;
-   char *copy=path ? luna_java_file_normalize(path) : NULL;
-   if(path && !copy)return;
-   free(g_file_paths[idx]);g_file_paths[idx]=copy;
+  if (!file)
+    return;
+  uintptr_t idx = (uintptr_t)file;
+  if (idx >= JNI_FILE_PATHS_MAX)
+    return;
+  char *copy=path ? luna_java_file_normalize(path) : NULL;
+  if(path && !copy)return;
+  free(g_file_paths[idx]);
+  g_file_paths[idx]=copy;
 }
 
 const char *
 jni_file_get_path(jobject file)
 {
-   if (!file)
-      return NULL;
-   uintptr_t idx = (uintptr_t)file;
-   return (idx < JNI_FILE_PATHS_MAX) ? g_file_paths[idx] : NULL;
+  if (!file)
+    return NULL;
+  uintptr_t idx = (uintptr_t)file;
+  return (idx < JNI_FILE_PATHS_MAX) ? g_file_paths[idx] : NULL;
 }
 
 static jstring
 jni_file_path_string(JNIEnv *env,jobject object)
 {
-   const char *path=jni_file_get_path(object);
-   return (*env)->NewStringUTF(env,path ? path : "");
+  const char *path=jni_file_get_path(object);
+  return (*env)->NewStringUTF(env,path ? path : "");
 }
 
 void
 jni_file_bind_ctor_a(JNIEnv *env,jobject file,jmethodID ctor,const jvalue *args)
 {
-   struct jvm *jvm=jnienv_get_jvm(env);
-   if(!jvm || !file || !ctor || !args)return;
-   struct jvm_object *method=&jvm->objects[(uintptr_t)ctor-1];
-   if(method->type!=JVM_OBJECT_METHOD || !method->method.signature.data)return;
-   const char *sig=method->method.signature.data;
-   bool single=!strcmp(sig,"(Ljava/lang/String;)V");
-   bool parent_file=!strcmp(sig,"(Ljava/io/File;Ljava/lang/String;)V");
-   if(!single && !parent_file && strcmp(sig,"(Ljava/lang/String;Ljava/lang/String;)V"))return;
-   jstring child=(jstring)args[single ? 0 : 1].l;
-   if(!child){
-      jclass exception=(*env)->FindClass(env,"java/lang/NullPointerException");
-      (*env)->ThrowNew(env,exception,"pathname");return;
-   }
-   const char *tail=(*env)->GetStringUTFChars(env,child,NULL);
-   jstring parent_string=!single && !parent_file ? (jstring)args[0].l : NULL;
-   const char *parent=single ? NULL : parent_file ? jni_file_get_path((jobject)args[0].l) :
-      parent_string ? (*env)->GetStringUTFChars(env,parent_string,NULL) : NULL;
-   char *path=single ? luna_java_file_normalize(tail) : luna_java_file_resolve(!parent_file && parent && !*parent ? NULL : parent,tail);
-   if(path){jni_file_set_path(file,path);free(path);}
-   else {jclass exception=(*env)->FindClass(env,"java/lang/OutOfMemoryError");(*env)->ThrowNew(env,exception,"pathname");}
-   if(parent_string && parent)(*env)->ReleaseStringUTFChars(env,parent_string,parent);
-   if(tail)(*env)->ReleaseStringUTFChars(env,child,tail);
+  struct jvm *jvm=jnienv_get_jvm(env);
+  if(!jvm || !file || !ctor || !args)return;
+  struct jvm_object *method=&jvm->objects[(uintptr_t)ctor-1];
+  if(method->type!=JVM_OBJECT_METHOD || !method->method.signature.data)return;
+  const char *sig=method->method.signature.data;
+  bool single=!strcmp(sig,"(Ljava/lang/String;)V");
+  bool parent_file=!strcmp(sig,"(Ljava/io/File;Ljava/lang/String;)V");
+  if(!single && !parent_file && strcmp(sig,"(Ljava/lang/String;Ljava/lang/String;)V"))return;
+  jstring child=(jstring)args[single ? 0 : 1].l;
+  if(!child) {
+    jclass exception=(*env)->FindClass(env,"java/lang/NullPointerException");
+    (*env)->ThrowNew(env,exception,"pathname");
+    return;
+  }
+  const char *tail=(*env)->GetStringUTFChars(env,child,NULL);
+  jstring parent_string=!single && !parent_file ? (jstring)args[0].l : NULL;
+  const char *parent=single ? NULL : parent_file ? jni_file_get_path((jobject)args[0].l) :
+                     parent_string ? (*env)->GetStringUTFChars(env,parent_string,NULL) : NULL;
+  char *path=single ? luna_java_file_normalize(tail) : luna_java_file_resolve(!parent_file && parent && !*parent ? NULL : parent,tail);
+  if(path) {
+    jni_file_set_path(file,path);
+    free(path);
+  }
+  else {
+    jclass exception=(*env)->FindClass(env,"java/lang/OutOfMemoryError");
+    (*env)->ThrowNew(env,exception,"pathname");
+  }
+  if(parent_string && parent)(*env)->ReleaseStringUTFChars(env,parent_string,parent);
+  if(tail)(*env)->ReleaseStringUTFChars(env,child,tail);
 }
 
 void
 jni_file_bind_ctor(JNIEnv *env,jobject file,jmethodID ctor,va_list ap)
 {
-   struct jvm *jvm=jnienv_get_jvm(env);
-   if(!jvm || !file || !ctor)return;
-   struct jvm_object *method=&jvm->objects[(uintptr_t)ctor-1];
-   if(method->type!=JVM_OBJECT_METHOD || !method->method.signature.data)return;
-   const char *sig=method->method.signature.data;jvalue values[2]={{0}};
-   if(!strcmp(sig,"(Ljava/lang/String;)V"))values[0].l=va_arg(ap,jobject);
-   else if(!strcmp(sig,"(Ljava/io/File;Ljava/lang/String;)V") ||
-           !strcmp(sig,"(Ljava/lang/String;Ljava/lang/String;)V")){
-      values[0].l=va_arg(ap,jobject);values[1].l=va_arg(ap,jobject);
-   }else return;
-   jni_file_bind_ctor_a(env,file,ctor,values);
+  struct jvm *jvm=jnienv_get_jvm(env);
+  if(!jvm || !file || !ctor)return;
+  struct jvm_object *method=&jvm->objects[(uintptr_t)ctor-1];
+  if(method->type!=JVM_OBJECT_METHOD || !method->method.signature.data)return;
+  const char *sig=method->method.signature.data;
+  jvalue values[2]= {{0}};
+  if(!strcmp(sig,"(Ljava/lang/String;)V"))values[0].l=va_arg(ap,jobject);
+  else if(!strcmp(sig,"(Ljava/io/File;Ljava/lang/String;)V") ||
+          !strcmp(sig,"(Ljava/lang/String;Ljava/lang/String;)V")) {
+    values[0].l=va_arg(ap,jobject);
+    values[1].l=va_arg(ap,jobject);
+  } else return;
+  jni_file_bind_ctor_a(env,file,ctor,values);
 }
 
 /* Forward declaration — implemented in arm_exec.cpp */
@@ -131,96 +143,99 @@ jni_file_bind_ctor(JNIEnv *env,jobject file,jmethodID ctor,va_list ap)
 void
 java_lang_System_load(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return;
-   jstring jlib = va_arg(args, jstring);
-   const char *lib = (*env)->GetStringUTFChars(env, jlib, NULL);
-   if (!lib) return;
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return;
+  jstring jlib = va_arg(args, jstring);
+  const char *lib = (*env)->GetStringUTFChars(env, jlib, NULL);
+  if (!lib) return;
 
-   /* Absolute path into the guest ELF loader.  Host/apkenv dlopen rejects
-    * aarch64 APS2 objects the arm64 loader already unpacks. */
-   if (arm_exec_system_load(lib) < 0)
-      fprintf(stderr, "java/lang/System/load: failed to load `%s`\n", lib);
+  /* Absolute path into the guest ELF loader.  Host/apkenv dlopen rejects
+   * aarch64 APS2 objects the arm64 loader already unpacks. */
+  if (arm_exec_system_load(lib) < 0)
+    fprintf(stderr, "java/lang/System/load: failed to load `%s`\n", lib);
 
-   (*env)->ReleaseStringUTFChars(env, jlib, lib);
+  (*env)->ReleaseStringUTFChars(env, jlib, lib);
 }
 
 jobject
 java_lang_ClassLoader_findLibrary(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   const char *libname = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
-   const char *libdir = arm_exec_get_main_lib_dir();
-   char lib[4096];
-   lib[0] = '\0';
-   if (!libname || !*libname)
-      return NULL;
-   /* Full path: as-is, then +.so (mono probes without the suffix first). */
-   if (strchr(libname, '/')) {
-      if (access(libname, F_OK) == 0)
-         snprintf(lib, sizeof(lib), "%s", libname);
-      else {
-         size_t n = strlen(libname);
-         if (n + 4 < sizeof(lib) && (n < 3 || strcmp(libname + n - 3, ".so") != 0)) {
-            snprintf(lib, sizeof(lib), "%s.so", libname);
-            if (access(lib, F_OK) != 0) lib[0] = '\0';
-         }
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  const char *libname = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+  const char *libdir = arm_exec_get_main_lib_dir();
+  char lib[4096];
+  lib[0] = '\0';
+  if (!libname || !*libname)
+    return NULL;
+  /* Full path: as-is, then +.so (mono probes without the suffix first). */
+  if (strchr(libname, '/')) {
+    if (access(libname, F_OK) == 0)
+      snprintf(lib, sizeof(lib), "%s", libname);
+    else {
+      size_t n = strlen(libname);
+      if (n + 4 < sizeof(lib) && (n < 3 || strcmp(libname + n - 3, ".so") != 0)) {
+        snprintf(lib, sizeof(lib), "%s.so", libname);
+        if (access(lib, F_OK) != 0) lib[0] = '\0';
       }
-   } else {
-      /* Bare name: try Android spellings under the APK lib dir. */
-      size_t nl = strlen(libname);
-      int has_so = nl > 3 && !strcmp(libname + nl - 3, ".so");
-      int has_lib = nl > 3 && !strncmp(libname, "lib", 3);
-      char cand[4096];
-      int i, ntry = 0;
-      const char *cands[4];
-      if (libdir && *libdir) {
-         if (has_so) {
-            snprintf(cand, sizeof(cand), "%s/%s", libdir, libname);
-            cands[ntry++] = cand;
-         } else if (has_lib) {
-            static char a[4096], b[4096];
-            snprintf(a, sizeof(a), "%s/%s.so", libdir, libname);
-            snprintf(b, sizeof(b), "%s/%s", libdir, libname);
-            cands[ntry++] = a; cands[ntry++] = b;
-         } else {
-            static char a[4096], b[4096], c[4096], d[4096];
-            snprintf(a, sizeof(a), "%s/lib%s.so", libdir, libname);
-            snprintf(b, sizeof(b), "%s/%s.so", libdir, libname);
-            snprintf(c, sizeof(c), "%s/lib%s", libdir, libname);
-            snprintf(d, sizeof(d), "%s/%s", libdir, libname);
-            cands[ntry++] = a; cands[ntry++] = b;
-            cands[ntry++] = c; cands[ntry++] = d;
-         }
-      } else if (has_so) {
-         cands[ntry++] = libname;
+    }
+  } else {
+    /* Bare name: try Android spellings under the APK lib dir. */
+    size_t nl = strlen(libname);
+    int has_so = nl > 3 && !strcmp(libname + nl - 3, ".so");
+    int has_lib = nl > 3 && !strncmp(libname, "lib", 3);
+    char cand[4096];
+    int i, ntry = 0;
+    const char *cands[4];
+    if (libdir && *libdir) {
+      if (has_so) {
+        snprintf(cand, sizeof(cand), "%s/%s", libdir, libname);
+        cands[ntry++] = cand;
       } else if (has_lib) {
-         snprintf(cand, sizeof(cand), "%s.so", libname);
-         cands[ntry++] = cand;
+        static char a[4096], b[4096];
+        snprintf(a, sizeof(a), "%s/%s.so", libdir, libname);
+        snprintf(b, sizeof(b), "%s/%s", libdir, libname);
+        cands[ntry++] = a;
+        cands[ntry++] = b;
       } else {
-         snprintf(cand, sizeof(cand), "lib%s.so", libname);
-         cands[ntry++] = cand;
+        static char a[4096], b[4096], c[4096], d[4096];
+        snprintf(a, sizeof(a), "%s/lib%s.so", libdir, libname);
+        snprintf(b, sizeof(b), "%s/%s.so", libdir, libname);
+        snprintf(c, sizeof(c), "%s/lib%s", libdir, libname);
+        snprintf(d, sizeof(d), "%s/%s", libdir, libname);
+        cands[ntry++] = a;
+        cands[ntry++] = b;
+        cands[ntry++] = c;
+        cands[ntry++] = d;
       }
-      for (i = 0; i < ntry; ++i) {
-         if (access(cands[i], F_OK) == 0) {
-            snprintf(lib, sizeof(lib), "%s", cands[i]);
-            break;
-         }
+    } else if (has_so) {
+      cands[ntry++] = libname;
+    } else if (has_lib) {
+      snprintf(cand, sizeof(cand), "%s.so", libname);
+      cands[ntry++] = cand;
+    } else {
+      snprintf(cand, sizeof(cand), "lib%s.so", libname);
+      cands[ntry++] = cand;
+    }
+    for (i = 0; i < ntry; ++i) {
+      if (access(cands[i], F_OK) == 0) {
+        snprintf(lib, sizeof(lib), "%s", cands[i]);
+        break;
       }
-   }
-   if (!lib[0]) return NULL;
-   return (*env)->NewStringUTF(env, lib);
+    }
+  }
+  if (!lib[0]) return NULL;
+  return (*env)->NewStringUTF(env, lib);
 }
 
 jobject
 java_lang_ClassLoader_findClass(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring str = va_arg(args, jstring);
-   const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
-   return (*env)->FindClass(env, utf);
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring str = va_arg(args, jstring);
+  const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
+  return (*env)->FindClass(env, utf);
 }
 
 /* ClassLoader.loadClass(name) — same as findClass for our stub JVM.
@@ -229,119 +244,120 @@ java_lang_ClassLoader_findClass(JNIEnv *env, jobject object, va_list args)
 jobject
 java_lang_ClassLoader_loadClass(JNIEnv *env, jobject object, va_list args)
 {
-   return java_lang_ClassLoader_findClass(env, object, args);
+  return java_lang_ClassLoader_findClass(env, object, args);
 }
 
 jobject
 dalvik_system_DexClassLoader_loadClass(JNIEnv *env, jobject object, va_list args)
 {
-   return java_lang_ClassLoader_findClass(env, object, args);
+  return java_lang_ClassLoader_findClass(env, object, args);
 }
 
 jobject
 dalvik_system_BaseDexClassLoader_loadClass(JNIEnv *env, jobject object, va_list args)
 {
-   return java_lang_ClassLoader_findClass(env, object, args);
+  return java_lang_ClassLoader_findClass(env, object, args);
 }
 
 jobject
 java_lang_Class_getClassLoader(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return dvm_jni_get_class_loader(env, object);
+  assert(env && object);
+  return dvm_jni_get_class_loader(env, object);
 }
 
 jclass
 java_lang_Class_forName(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring str = va_arg(args, jstring);
-   const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
-   return (*env)->FindClass(env, utf);
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring str = va_arg(args, jstring);
+  const char *utf = (*env)->GetStringUTFChars(env, str, NULL);
+  return (*env)->FindClass(env, utf);
 }
 
 jstring
 java_lang_Class_getName(JNIEnv *env, jobject object)
 {
-   assert(env && object);
+  assert(env && object);
 
-   {
-      struct {
-         union {
-            void *ptr;
-            struct jvm* (*fun)(JNIEnv*);
-         } jnienv_get_jvm;
+  {
+    struct {
+      union {
+        void *ptr;
+        struct jvm* (*fun)(JNIEnv*);
+      } jnienv_get_jvm;
 
-         union {
-            void *ptr;
-            const char* (*fun)(const struct jvm*, jobject);
-         } jvm_get_class_name;
-      } jvm;
+      union {
+        void *ptr;
+        const char* (*fun)(const struct jvm*, jobject);
+      } jvm_get_class_name;
+    } jvm;
 
-      if ((jvm.jnienv_get_jvm.ptr = luna_os_library_symbol(NULL, "jnienv_get_jvm")) && (jvm.jvm_get_class_name.ptr = luna_os_library_symbol(NULL, "jvm_get_class_name"))) {
-         struct jvm *jvm_ = jvm.jnienv_get_jvm.fun(env);
-         const char *name = jvm.jvm_get_class_name.fun(jvm_, object);
-         const char *primitive = luna_java_primitive_name(name);
-         return (*env)->NewStringUTF(env, primitive ? primitive : name);
-      }
-   }
+    if ((jvm.jnienv_get_jvm.ptr = luna_os_library_symbol(NULL, "jnienv_get_jvm")) && (jvm.jvm_get_class_name.ptr = luna_os_library_symbol(NULL, "jvm_get_class_name"))) {
+      struct jvm *jvm_ = jvm.jnienv_get_jvm.fun(env);
+      const char *name = jvm.jvm_get_class_name.fun(jvm_, object);
+      const char *primitive = luna_java_primitive_name(name);
+      return (*env)->NewStringUTF(env, primitive ? primitive : name);
+    }
+  }
 
-   fprintf(stderr, "%s: returning NULL, as running in unknown JVM and don't know how to get class name\n", __func__);
-   return NULL;
+  fprintf(stderr, "%s: returning NULL, as running in unknown JVM and don't know how to get class name\n", __func__);
+  return NULL;
 }
 
 jclass
 java_lang_Object_getClass(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->GetObjectClass(env, object);
+  assert(env && object);
+  return (*env)->GetObjectClass(env, object);
 }
 
 jstring
 java_io_File_getPath(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   return jni_file_path_string(env, object);
+  assert(env && object);
+  (void)args;
+  return jni_file_path_string(env, object);
 }
 
 jstring
 java_io_File_getParent(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   const char *p=jni_file_get_path(object);
-   const char *slash=p ? strrchr(p,'/') : NULL;
-   if(!slash || !strcmp(p,"/"))return NULL;
-   char *parent=luna_strndup(p,slash==p ? 1 : (size_t)(slash-p));
-   jstring result=parent ? (*env)->NewStringUTF(env,parent) : NULL;
-   free(parent);return result;
+  assert(env && object);
+  (void)args;
+  const char *p=jni_file_get_path(object);
+  const char *slash=p ? strrchr(p,'/') : NULL;
+  if(!slash || !strcmp(p,"/"))return NULL;
+  char *parent=luna_strndup(p,slash==p ? 1 : (size_t)(slash-p));
+  jstring result=parent ? (*env)->NewStringUTF(env,parent) : NULL;
+  free(parent);
+  return result;
 }
 
 jboolean
 java_lang_String_equals(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return false;
-   jstring str = va_arg(args, jstring);
-   const char *utf1 = (*env)->GetStringUTFChars(env, object, NULL);
-   const char *utf2 = (*env)->GetStringUTFChars(env, str, NULL);
-   const jboolean equal = (utf1 == utf2 || (utf1 && utf2 && !strcmp(utf1, utf2)));
-   (*env)->ReleaseStringUTFChars(env, object, utf1);
-   (*env)->ReleaseStringUTFChars(env, str, utf2);
-   return equal;
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return false;
+  jstring str = va_arg(args, jstring);
+  const char *utf1 = (*env)->GetStringUTFChars(env, object, NULL);
+  const char *utf2 = (*env)->GetStringUTFChars(env, str, NULL);
+  const jboolean equal = (utf1 == utf2 || (utf1 && utf2 && !strcmp(utf1, utf2)));
+  (*env)->ReleaseStringUTFChars(env, object, utf1);
+  (*env)->ReleaseStringUTFChars(env, str, utf2);
+  return equal;
 }
 
 /* Locale methods use the VM implementation so Java and JNI observe the
  * same default, explicit Locale instances and Locale.setDefault changes. */
 static jobject runtime_default_locale(JNIEnv *env)
 {
-   jclass cls=(*env)->FindClass(env,"java/util/Locale");
-   jmethodID method=cls ? (*env)->GetStaticMethodID(env,cls,"getDefault","()Ljava/util/Locale;") : NULL;
-   jobject result=method ? (*env)->CallStaticObjectMethod(env,cls,method) : NULL;
-   if (cls) (*env)->DeleteLocalRef(env,cls);
-   return result;
+  jclass cls=(*env)->FindClass(env,"java/util/Locale");
+  jmethodID method=cls ? (*env)->GetStaticMethodID(env,cls,"getDefault","()Ljava/util/Locale;") : NULL;
+  jobject result=method ? (*env)->CallStaticObjectMethod(env,cls,method) : NULL;
+  if (cls) (*env)->DeleteLocalRef(env,cls);
+  return result;
 }
 
 /* Choreographer.getInstance() → singleton stub.  UnityChoreographer's init
@@ -351,9 +367,9 @@ static jobject runtime_default_locale(JNIEnv *env)
 jobject
 android_view_Choreographer_getInstance(JNIEnv *env, jclass clazz)
 {
-   assert(env);
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/view/Choreographer");
+  assert(env);
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/view/Choreographer");
 }
 
 /* Long.longValue() — unboxes the frameTimeNanos argument that doFrame(J)
@@ -361,47 +377,47 @@ android_view_Choreographer_getInstance(JNIEnv *env, jclass clazz)
 jlong
 java_lang_Long_longValue(JNIEnv *env, jobject object)
 {
-   assert(env);
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (jlong)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+  assert(env);
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (jlong)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
 /* Return empty array so Unity's STE construction loop runs 0 iterations */
 jobjectArray
 java_lang_Thread_getStackTrace(JNIEnv *env, jobject thread)
 {
-   assert(env);
-   return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/StackTraceElement"), NULL);
+  assert(env);
+  return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/StackTraceElement"), NULL);
 }
 
 jobjectArray
 java_lang_Throwable_getStackTrace(JNIEnv *env, jobject throwable)
 {
-   assert(env);
-   return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/StackTraceElement"), NULL);
+  assert(env);
+  return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/StackTraceElement"), NULL);
 }
 
 /* no-op: suppress stack-trace capture on exception construction */
 jobject
 java_lang_Throwable_fillInStackTrace(JNIEnv *env, jobject throwable)
 {
-   assert(env && throwable);
-   return throwable;
+  assert(env && throwable);
+  return throwable;
 }
 
 void
 java_lang_Throwable_printStackTrace(JNIEnv *env, jobject throwable)
 {
-   assert(env && throwable);
-   (void)throwable;
+  assert(env && throwable);
+  (void)throwable;
 }
 
 jstring
 java_lang_Throwable_getMessage(JNIEnv *env, jobject throwable)
 {
-   assert(env && throwable);
-   return NULL;
+  assert(env && throwable);
+  return NULL;
 }
 
 /* Scanner.useDelimiter(pattern) → the Scanner itself (fluent API).  Unity reads
@@ -412,8 +428,9 @@ java_lang_Throwable_getMessage(JNIEnv *env, jobject throwable)
 jobject
 java_util_Scanner_useDelimiter(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object); (void)args;
-   return object;
+  assert(env && object);
+  (void)args;
+  return object;
 }
 
 /* Scanner.hasNext() / Scanner.hasNextLine() → false: the scanner stub has no
@@ -421,15 +438,15 @@ java_util_Scanner_useDelimiter(JNIEnv *env, jobject object, va_list args)
 jboolean
 java_util_Scanner_hasNext(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return 0;
+  assert(env && object);
+  return 0;
 }
 
 jboolean
 java_util_Scanner_hasNextLine(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return 0;
+  assert(env && object);
+  return 0;
 }
 
 /* Scanner.next() / Scanner.nextLine(): Unity calls this after
@@ -439,22 +456,23 @@ java_util_Scanner_hasNextLine(JNIEnv *env, jobject object)
 jstring
 java_util_Scanner_next(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, "");
+  assert(env && object);
+  return (*env)->NewStringUTF(env, "");
 }
 
 jstring
 java_util_Scanner_nextLine(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, "");
+  assert(env && object);
+  return (*env)->NewStringUTF(env, "");
 }
 
 /* Scanner.close() — no-op: the stub has no resources to release. */
 void
 java_util_Scanner_close(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
+  (void)env;
+  (void)object;
 }
 
 /* Object.toString and subclass overrides are owned by the VM. A native
@@ -467,8 +485,11 @@ java_util_Scanner_close(JNIEnv *env, jobject object)
  * Unity actually reads after nativeInjectEvent. */
 static void motion_trace(const char *m)
 {
-   static int n;
-   if (n < 60) { fprintf(stderr, "[motion] %s\n", m); ++n; }
+  static int n;
+  if (n < 60) {
+    fprintf(stderr, "[motion] %s\n", m);
+    ++n;
+  }
 }
 
 /* ------------------------------------------------------------------------ *
@@ -485,58 +506,77 @@ static void motion_trace(const char *m)
 static jint
 android_log_write(JNIEnv *env, char level, va_list args)
 {
-   if (!JVM_VA_HAS_ARGS(args)) return 0;
-   const char *tag = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
-   /* Log.w(String, Throwable) has no message argument; GetStringUTFChars
-    * answers NULL for a non-string handle rather than misreading it. */
-   const char *msg = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
-   fprintf(stderr, "[java %c/%s] %s\n", level, tag ? tag : "?", msg ? msg : "");
-   lunaria_logbuf_write(level, tag, msg);
-   return (jint)((tag ? strlen(tag) : 0) + (msg ? strlen(msg) : 0) + 2);
+  if (!JVM_VA_HAS_ARGS(args)) return 0;
+  const char *tag = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+  /* Log.w(String, Throwable) has no message argument; GetStringUTFChars
+   * answers NULL for a non-string handle rather than misreading it. */
+  const char *msg = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+  fprintf(stderr, "[java %c/%s] %s\n", level, tag ? tag : "?", msg ? msg : "");
+  lunaria_logbuf_write(level, tag, msg);
+  return (jint)((tag ? strlen(tag) : 0) + (msg ? strlen(msg) : 0) + 2);
 }
 
 jint android_util_Log_v(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_log_write(env, 'V', a); }
+{
+  (void)o;
+  return android_log_write(env, 'V', a);
+}
 jint android_util_Log_d(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_log_write(env, 'D', a); }
+{
+  (void)o;
+  return android_log_write(env, 'D', a);
+}
 jint android_util_Log_i(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_log_write(env, 'I', a); }
+{
+  (void)o;
+  return android_log_write(env, 'I', a);
+}
 jint android_util_Log_w(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_log_write(env, 'W', a); }
+{
+  (void)o;
+  return android_log_write(env, 'W', a);
+}
 jint android_util_Log_e(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_log_write(env, 'E', a); }
+{
+  (void)o;
+  return android_log_write(env, 'E', a);
+}
 jint android_util_Log_wtf(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_log_write(env, 'F', a); }
+{
+  (void)o;
+  return android_log_write(env, 'F', a);
+}
 
 /* println(int priority, String tag, String msg): the priority comes first. */
 jint
 android_util_Log_println(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object;
-   if (!JVM_VA_HAS_ARGS(args)) return 0;
-   int prio = va_arg(args, jint);
-   static const char lv[] = "??VDIWEF";
-   return android_log_write(env, lv[(prio >= 2 && prio <= 7) ? prio : 0], args);
+  (void)object;
+  if (!JVM_VA_HAS_ARGS(args)) return 0;
+  int prio = va_arg(args, jint);
+  static const char lv[] = "??VDIWEF";
+  return android_log_write(env, lv[(prio >= 2 && prio <= 7) ? prio : 0], args);
 }
 
 /* isLoggable is an application-side guard, with Android's INFO default. */
 jboolean
 android_util_Log_isLoggable(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object;
-   jstring string=va_arg(args,jstring);
-   int priority=va_arg(args,jint);
-   const char *tag=string ? (*env)->GetStringUTFChars(env,string,NULL) : NULL;
-   bool result=lunaria_log_is_loggable(tag,priority,lunaria_android_property);
-   if(tag) (*env)->ReleaseStringUTFChars(env,string,tag);
-   return result ? JNI_TRUE : JNI_FALSE;
+  (void)object;
+  jstring string=va_arg(args,jstring);
+  int priority=va_arg(args,jint);
+  const char *tag=string ? (*env)->GetStringUTFChars(env,string,NULL) : NULL;
+  bool result=lunaria_log_is_loggable(tag,priority,lunaria_android_property);
+  if(tag) (*env)->ReleaseStringUTFChars(env,string,tag);
+  return result ? JNI_TRUE : JNI_FALSE;
 }
 
 jstring
 android_util_Log_getStackTraceString(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object; (void)args;
-   return (*env)->NewStringUTF(env, "");
+  (void)object;
+  (void)args;
+  return (*env)->NewStringUTF(env, "");
 }
 
 /* ------------------------------------------------------------------------ *
@@ -553,22 +593,37 @@ android_util_Log_getStackTraceString(JNIEnv *env, jobject object, va_list args)
 static jstring
 android_gl_get_string(JNIEnv *env, va_list args)
 {
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   unsigned name = (unsigned)va_arg(args, jint);
-   const char *s = arm_exec_gl_string(name);
-   return s ? (*env)->NewStringUTF(env, s) : NULL;
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  unsigned name = (unsigned)va_arg(args, jint);
+  const char *s = arm_exec_gl_string(name);
+  return s ? (*env)->NewStringUTF(env, s) : NULL;
 }
 
 jstring android_opengl_GLES10_glGetString(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_gl_get_string(env, a); }
+{
+  (void)o;
+  return android_gl_get_string(env, a);
+}
 jstring android_opengl_GLES20_glGetString(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_gl_get_string(env, a); }
+{
+  (void)o;
+  return android_gl_get_string(env, a);
+}
 jstring android_opengl_GLES30_glGetString(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_gl_get_string(env, a); }
+{
+  (void)o;
+  return android_gl_get_string(env, a);
+}
 jstring android_opengl_GLES31_glGetString(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_gl_get_string(env, a); }
+{
+  (void)o;
+  return android_gl_get_string(env, a);
+}
 jstring android_opengl_GLES32_glGetString(JNIEnv *env, jobject o, va_list a)
-{ (void)o; return android_gl_get_string(env, a); }
+{
+  (void)o;
+  return android_gl_get_string(env, a);
+}
 
 
 /* ---------------------------------------------------------------------------
@@ -582,126 +637,135 @@ jstring android_opengl_GLES32_glGetString(JNIEnv *env, jobject o, va_list a)
  * each row describes something that was built.
  * ------------------------------------------------------------------------ */
 static const struct lunaria_device k_devices[] = {
-   {  "pixel6", "Google", "google", "Pixel 6", "oriole", "oriole", "oriole",
-      "gs101", "oriole", "SQ3A.220705.003.A1", "8672226", "2022-07-05",
-      "Bosch", "LSM6DSO Accelerometer", "LSM6DSO Gyroscope", 31,
-      1080, 2400, 420 },
-   {  "pixel7", "Google", "google", "Pixel 7", "panther", "panther", "panther",
-      "gs201", "panther", "TQ3A.230805.001", "10316531", "2023-08-05",
-      "Bosch", "BMI323 Accelerometer", "BMI323 Gyroscope", 33,
-      1080, 2400, 420 },
-   {  "galaxys21", "samsung", "samsung", "SM-G991B", "o1sxxx", "o1s", "exynos2100",
-      "exynos2100", "exynos2100", "SP1A.210812.016", "G991BXXU4CVF2",
-      "2022-06-01", "STMicroelectronics", "LSM6DSO Accelerometer",
-      "LSM6DSO Gyroscope", 31,
-      1080, 2400, 420 },
-   /* The emulator's own former identity.  Kept so the previous behaviour is
-    * still reachable, and because it is the honest answer when the point is
-    * to say "this is Lunaria" rather than to imitate a phone.  It names no
-    * device that exists, which is exactly why it is not the default. */
-   {  "lunaria", "Lunaria", "Lunaria", "Lunaria", "lunaria", "lunaria",
-      "lunaria", "lunaria", "lunaria", NULL, "1", "2026-09-05",
-      "Lunaria", "Lunaria Accelerometer", "Lunaria Gyroscope", 31,
-      720, 1280, 320 },
-   /* Moto G6 Play: a 720x1440 phone that shipped in volume and is squarely
-    * inside every mobile title's supported set.  Kept as the real-device
-    * low-resolution answer for a run that has to look like a phone. */
-   {  "motog6play", "motorola", "motorola", "moto g(6) play", "aljeter",
-      "aljeter", "msm8937", "msm8937", "qcom", "OPP28.85-13", "13",
-      "2018-08-01", "STMicroelectronics", "LSM6DSM Accelerometer",
-      "LSM6DSM Gyroscope", 27,
-      720, 1440, 320 },
-   /* The default.  A Pixel 6 in every respect an engine can match on --
-    * make, brand, model, device, board, platform, hardware -- with a
-    * 1024x576 landscape panel, which is the surface this emulator actually
-    * presents on a desktop.
-    *
-    * The identity has to be a real device, and it has to be *this* one.
-    * Android engines pick their per-device settings by matching those
-    * fields: UE4's [AndroidDeviceProfileMatchingRules] compares DeviceMake,
-    * DeviceModel and GpuFamily, and a name no rule mentions falls through to
-    * the bare [Android DeviceProfile], where sg.ResolutionQuality is unset.
-    * Cross Worlds then clamps to UE's 10% floor and draws its world into a
-    * 103x58 buffer stretched over the window -- measured with
-    * LUNARIA_DRAW_CENSUS on 2026-09-19 against efed3fe, which reported a
-    * Pixel 6 and got a full-size 1024x576 scene.  Pixel 6 specifically
-    * because guest_gl_identity_string() already answers ARM / Mali-G78, and
-    * that is the Pixel 6's GPU: a process may not be one device to
-    * glGetString and another to Build.
-    *
-    * The panel is the one field that is *not* the Pixel 6's, and that is the
-    * honest way round.  lunaria_screen() hands the guest this panel at 1:1,
-    * so DisplayMetrics, Display.getRealSize() and AConfiguration all report
-    * the surface the app is really given -- which is what an app is entitled
-    * to assume, and what a scaled-down window used to break. */
-   {  "desktop", "Google", "google", "Pixel 6", "oriole", "oriole", "oriole",
-      "gs101", "oriole", "SQ3A.220705.003.A1", "8672226", "2022-07-05",
-      "Bosch", "LSM6DSO Accelerometer", "LSM6DSO Gyroscope", 31,
-      576, 1024, 320 },
+  { "pixel6", "Google", "google", "Pixel 6", "oriole", "oriole", "oriole",
+    "gs101", "oriole", "SQ3A.220705.003.A1", "8672226", "2022-07-05",
+    "Bosch", "LSM6DSO Accelerometer", "LSM6DSO Gyroscope", 31,
+    1080, 2400, 420
+  },
+  { "pixel7", "Google", "google", "Pixel 7", "panther", "panther", "panther",
+    "gs201", "panther", "TQ3A.230805.001", "10316531", "2023-08-05",
+    "Bosch", "BMI323 Accelerometer", "BMI323 Gyroscope", 33,
+    1080, 2400, 420
+  },
+  { "galaxys21", "samsung", "samsung", "SM-G991B", "o1sxxx", "o1s", "exynos2100",
+    "exynos2100", "exynos2100", "SP1A.210812.016", "G991BXXU4CVF2",
+    "2022-06-01", "STMicroelectronics", "LSM6DSO Accelerometer",
+    "LSM6DSO Gyroscope", 31,
+    1080, 2400, 420
+  },
+  /* The emulator's own former identity.  Kept so the previous behaviour is
+   * still reachable, and because it is the honest answer when the point is
+   * to say "this is Lunaria" rather than to imitate a phone.  It names no
+   * device that exists, which is exactly why it is not the default. */
+  { "lunaria", "Lunaria", "Lunaria", "Lunaria", "lunaria", "lunaria",
+    "lunaria", "lunaria", "lunaria", NULL, "1", "2026-09-05",
+    "Lunaria", "Lunaria Accelerometer", "Lunaria Gyroscope", 31,
+    720, 1280, 320
+  },
+  /* Moto G6 Play: a 720x1440 phone that shipped in volume and is squarely
+   * inside every mobile title's supported set.  Kept as the real-device
+   * low-resolution answer for a run that has to look like a phone. */
+  { "motog6play", "motorola", "motorola", "moto g(6) play", "aljeter",
+    "aljeter", "msm8937", "msm8937", "qcom", "OPP28.85-13", "13",
+    "2018-08-01", "STMicroelectronics", "LSM6DSM Accelerometer",
+    "LSM6DSM Gyroscope", 27,
+    720, 1440, 320
+  },
+  /* The default.  A Pixel 6 in every respect an engine can match on --
+   * make, brand, model, device, board, platform, hardware -- with a
+   * 1024x576 landscape panel, which is the surface this emulator actually
+   * presents on a desktop.
+   *
+   * The identity has to be a real device, and it has to be *this* one.
+   * Android engines pick their per-device settings by matching those
+   * fields: UE4's [AndroidDeviceProfileMatchingRules] compares DeviceMake,
+   * DeviceModel and GpuFamily, and a name no rule mentions falls through to
+   * the bare [Android DeviceProfile], where sg.ResolutionQuality is unset.
+   * Cross Worlds then clamps to UE's 10% floor and draws its world into a
+   * 103x58 buffer stretched over the window -- measured with
+   * LUNARIA_DRAW_CENSUS on 2026-09-19 against efed3fe, which reported a
+   * Pixel 6 and got a full-size 1024x576 scene.  Pixel 6 specifically
+   * because guest_gl_identity_string() already answers ARM / Mali-G78, and
+   * that is the Pixel 6's GPU: a process may not be one device to
+   * glGetString and another to Build.
+   *
+   * The panel is the one field that is *not* the Pixel 6's, and that is the
+   * honest way round.  lunaria_screen() hands the guest this panel at 1:1,
+   * so DisplayMetrics, Display.getRealSize() and AConfiguration all report
+   * the surface the app is really given -- which is what an app is entitled
+   * to assume, and what a scaled-down window used to break. */
+  { "desktop", "Google", "google", "Pixel 6", "oriole", "oriole", "oriole",
+    "gs101", "oriole", "SQ3A.220705.003.A1", "8672226", "2022-07-05",
+    "Bosch", "LSM6DSO Accelerometer", "LSM6DSO Gyroscope", 31,
+    576, 1024, 320
+  },
 };
 
 static const struct lunaria_device *const k_device_list[] = {
-   &k_devices[0], &k_devices[1], &k_devices[2], &k_devices[3], &k_devices[4],
-   &k_devices[5], NULL
+  &k_devices[0], &k_devices[1], &k_devices[2], &k_devices[3], &k_devices[4],
+  &k_devices[5], NULL
 };
 
 const struct lunaria_device *const *
 lunaria_device_list(void)
 {
-   return k_device_list;
+  return k_device_list;
 }
 
 static const char *
 device_env(const char *suffix, const char *fallback)
 {
-   char var[64];
-   snprintf(var, sizeof var, "LUNARIA_DEVICE_%s", suffix);
-   const char *v = getenv(var);
-   return (v && *v) ? v : fallback;
+  char var[64];
+  snprintf(var, sizeof var, "LUNARIA_DEVICE_%s", suffix);
+  const char *v = getenv(var);
+  return (v && *v) ? v : fallback;
 }
 
 const struct lunaria_device *
 lunaria_device(void)
 {
-   static struct lunaria_device active;
-   static int resolved;
-   if (resolved) return &active;
-   resolved = 1;
+  static struct lunaria_device active;
+  static int resolved;
+  if (resolved) return &active;
+  resolved = 1;
 
-   /* The "desktop" profile, for the reason given at its table entry. */
-   const struct lunaria_device *base = &k_devices[5];
-   const char *want = getenv("LUNARIA_DEVICE");
-   if (want && *want) {
-      const struct lunaria_device *hit = NULL;
-      for (size_t i = 0; i < sizeof k_devices / sizeof k_devices[0]; ++i)
-         if (!strcasecmp(want, k_devices[i].key)) { hit = &k_devices[i]; break; }
-      if (hit) {
-         base = hit;
-      } else {
-         fprintf(stderr, "[jvm] LUNARIA_DEVICE=%s is not a known profile; "
-                         "using %s.  Known:", want, base->key);
-         for (size_t i = 0; i < sizeof k_devices / sizeof k_devices[0]; ++i)
-            fprintf(stderr, " %s", k_devices[i].key);
-         fputc('\n', stderr);
+  /* The "desktop" profile, for the reason given at its table entry. */
+  const struct lunaria_device *base = &k_devices[5];
+  const char *want = getenv("LUNARIA_DEVICE");
+  if (want && *want) {
+    const struct lunaria_device *hit = NULL;
+    for (size_t i = 0; i < sizeof k_devices / sizeof k_devices[0]; ++i)
+      if (!strcasecmp(want, k_devices[i].key)) {
+        hit = &k_devices[i];
+        break;
       }
-   }
-   active = *base;
-   active.manufacturer   = device_env("MANUFACTURER", base->manufacturer);
-   active.brand          = device_env("BRAND", base->brand);
-   active.model          = device_env("MODEL", base->model);
-   active.name           = device_env("NAME", base->name);
-   active.device         = device_env("DEVICE", base->device);
-   active.board          = device_env("BOARD", base->board);
-   active.platform       = device_env("PLATFORM", base->platform);
-   active.hardware       = device_env("HARDWARE", base->hardware);
-   active.build_id       = device_env("BUILD_ID", base->build_id);
-   active.incremental    = device_env("INCREMENTAL", base->incremental);
-   active.security_patch = device_env("SECURITY_PATCH", base->security_patch);
-   if (want && *want)
-      fprintf(stderr, "[jvm] device: %s %s (%s, %s, API %d)\n",
-              active.manufacturer, active.model, active.device,
-              active.platform, active.sdk);
-   return &active;
+    if (hit) {
+      base = hit;
+    } else {
+      fprintf(stderr, "[jvm] LUNARIA_DEVICE=%s is not a known profile; "
+                      "using %s.  Known:", want, base->key);
+      for (size_t i = 0; i < sizeof k_devices / sizeof k_devices[0]; ++i)
+        fprintf(stderr, " %s", k_devices[i].key);
+      fputc('\n', stderr);
+    }
+  }
+  active = *base;
+  active.manufacturer   = device_env("MANUFACTURER", base->manufacturer);
+  active.brand          = device_env("BRAND", base->brand);
+  active.model          = device_env("MODEL", base->model);
+  active.name           = device_env("NAME", base->name);
+  active.device         = device_env("DEVICE", base->device);
+  active.board          = device_env("BOARD", base->board);
+  active.platform       = device_env("PLATFORM", base->platform);
+  active.hardware       = device_env("HARDWARE", base->hardware);
+  active.build_id       = device_env("BUILD_ID", base->build_id);
+  active.incremental    = device_env("INCREMENTAL", base->incremental);
+  active.security_patch = device_env("SECURITY_PATCH", base->security_patch);
+  if (want && *want)
+    fprintf(stderr, "[jvm] device: %s %s (%s, %s, API %d)\n",
+            active.manufacturer, active.model, active.device,
+            active.platform, active.sdk);
+  return &active;
 }
 
 /* ---------------------------------------------------------------------------
@@ -729,11 +793,11 @@ lunaria_device(void)
 static long
 screen_env_long(const char *name, long fallback)
 {
-   const char *v = getenv(name);
-   if (!v || !*v) return fallback;
-   char *end = NULL;
-   long n = strtol(v, &end, 10);
-   return (end && end != v) ? n : fallback;
+  const char *v = getenv(name);
+  if (!v || !*v) return fallback;
+  char *end = NULL;
+  long n = strtol(v, &end, 10);
+  return (end && end != v) ? n : fallback;
 }
 
 /* android:screenOrientation, as the launcher read it out of the manifest.
@@ -743,100 +807,108 @@ screen_env_long(const char *name, long fallback)
 static int
 screen_is_landscape(void)
 {
-   const char *o = getenv("ANDROID_SCREEN_ORIENTATION");
-   if (!o || !*o) return 0;
-   int rotation = lunaria_orientation_rotation(strtol(o, NULL, 10));
-   return rotation == 1 || rotation == 3;
+  const char *o = getenv("ANDROID_SCREEN_ORIENTATION");
+  if (!o || !*o) return 0;
+  int rotation = lunaria_orientation_rotation(strtol(o, NULL, 10));
+  return rotation == 1 || rotation == 3;
 }
 
 const struct lunaria_screen *
 lunaria_screen(void)
 {
-   static struct lunaria_screen s;
-   static int resolved;
-   if (resolved) return &s;
-   resolved = 1;
+  static struct lunaria_screen s;
+  static int resolved;
+  if (resolved) return &s;
+  resolved = 1;
 
-   const struct lunaria_device *d = lunaria_device();
-   const char *orientation = getenv("ANDROID_SCREEN_ORIENTATION");
-   long requested = orientation && *orientation ? strtol(orientation, NULL, 10) : -1;
-   s.rotation = lunaria_orientation_rotation(requested);
-   const int operator_chose_panel =
-      (getenv("LUNARIA_DEVICE_SCREEN_WIDTH")   && *getenv("LUNARIA_DEVICE_SCREEN_WIDTH")) ||
-      (getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")  && *getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")) ||
-      (getenv("LUNARIA_DEVICE_SCREEN_DENSITY") && *getenv("LUNARIA_DEVICE_SCREEN_DENSITY")) ||
-      (getenv("LUNARIA_SCALE")                 && *getenv("LUNARIA_SCALE"));
-   int w   = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_WIDTH",   d->screen_w);
-   int h   = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_HEIGHT",  d->screen_h);
-   int dpi = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_DENSITY", d->density);
-   if (w < 64 || w > 8192) w = 1080;
-   if (h < 64 || h > 8192) h = 2400;
-   if (dpi < 40 || dpi > 1200) dpi = 420;
-   if (w > h) { int t = w; w = h; h = t; }   /* the table is portrait-natural */
-   if (screen_is_landscape()) { int t = w; w = h; h = t; }
+  const struct lunaria_device *d = lunaria_device();
+  const char *orientation = getenv("ANDROID_SCREEN_ORIENTATION");
+  long requested = orientation && *orientation ? strtol(orientation, NULL, 10) : -1;
+  s.rotation = lunaria_orientation_rotation(requested);
+  const int operator_chose_panel =
+    (getenv("LUNARIA_DEVICE_SCREEN_WIDTH")   && *getenv("LUNARIA_DEVICE_SCREEN_WIDTH")) ||
+    (getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")  && *getenv("LUNARIA_DEVICE_SCREEN_HEIGHT")) ||
+    (getenv("LUNARIA_DEVICE_SCREEN_DENSITY") && *getenv("LUNARIA_DEVICE_SCREEN_DENSITY")) ||
+    (getenv("LUNARIA_SCALE")                 && *getenv("LUNARIA_SCALE"));
+  int w   = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_WIDTH",   d->screen_w);
+  int h   = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_HEIGHT",  d->screen_h);
+  int dpi = (int)screen_env_long("LUNARIA_DEVICE_SCREEN_DENSITY", d->density);
+  if (w < 64 || w > 8192) w = 1080;
+  if (h < 64 || h > 8192) h = 2400;
+  if (dpi < 40 || dpi > 1200) dpi = 420;
+  if (w > h) {
+    int t = w;  /* the table is portrait-natural */
+    w = h;
+    h = t;
+  }
+  if (screen_is_landscape()) {
+    int t = w;
+    w = h;
+    h = t;
+  }
 
-   double scale = LUNARIA_SCALE_DEFAULT;
-   const char *sc = getenv("LUNARIA_SCALE");
-   if (sc && *sc) {
-      char *end = NULL;
-      double v = strtod(sc, &end);
-      if (end != sc && v >= 0.1 && v <= 4.0) scale = v;
-      else fprintf(stderr, "[jvm] LUNARIA_SCALE=%s is not a factor between "
+  double scale = LUNARIA_SCALE_DEFAULT;
+  const char *sc = getenv("LUNARIA_SCALE");
+  if (sc && *sc) {
+    char *end = NULL;
+    double v = strtod(sc, &end);
+    if (end != sc && v >= 0.1 && v <= 4.0) scale = v;
+    else fprintf(stderr, "[jvm] LUNARIA_SCALE=%s is not a factor between "
                            "0.1 and 4.0; using %.2f\n", sc, scale);
-   }
+  }
 
-   /* Even dimensions: a chroma-subsampled encoder and a half-resolution
-    * render target both want the surface to halve without a remainder. */
-   s.width   = ((int)(w * scale + 0.5) + 1) & ~1;
-   s.height  = ((int)(h * scale + 0.5) + 1) & ~1;
-   s.density = (int)(dpi * scale + 0.5);
+  /* Even dimensions: a chroma-subsampled encoder and a half-resolution
+   * render target both want the surface to halve without a remainder. */
+  s.width   = ((int)(w * scale + 0.5) + 1) & ~1;
+  s.height  = ((int)(h * scale + 0.5) + 1) & ~1;
+  s.density = (int)(dpi * scale + 0.5);
 
-   /* The panel, at 1:1.  The surface the emulator presents, DisplayMetrics,
-    * Display.getRealSize() and AConfiguration all have to describe one
-    * display, and the app is entitled to assume the pixels it is given are
-    * the pixels it was told about.  A scaled-down desktop-friendly window
-    * broke that: UE was told one height and handed another, and
-    * UGameUserSettings::UpdateResolutionQuality() -- which computes
-    *     MinResolutionScale = max(MinYFor3DView / ScreenHeight * 100, 10)
-    * and then raises its saved ResolutionQuality (0) to it -- landed on the
-    * 10% floor, so Cross Worlds drew its world into a 103x58 buffer and
-    * stretched it over the window (measured with LUNARIA_DRAW_CENSUS,
-    * 2026-09-18: exactly 10% of the surface at both 1024x576 and 1280x720).
-    *
-    * Which panel that is, is the device profile's business, not this
-    * function's: the default profile is a real low-resolution phone for
-    * exactly the reason a smaller frame is wanted (see k_devices).
-    * LUNARIA_SCALE, LUNARIA_WIDTH/HEIGHT and LUNARIA_DEVICE_SCREEN_* still
-    * name something else for an operator who wants it -- and an operator who
-    * does gets the mismatch back, knowingly. */
-   if (!operator_chose_panel) {
-      const int landscape = screen_is_landscape();
-      s.width   = landscape ? (d->screen_h) : (d->screen_w);
-      s.height  = landscape ? (d->screen_w) : (d->screen_h);
-      s.density = d->density;
-   }
+  /* The panel, at 1:1.  The surface the emulator presents, DisplayMetrics,
+   * Display.getRealSize() and AConfiguration all have to describe one
+   * display, and the app is entitled to assume the pixels it is given are
+   * the pixels it was told about.  A scaled-down desktop-friendly window
+   * broke that: UE was told one height and handed another, and
+   * UGameUserSettings::UpdateResolutionQuality() -- which computes
+   *     MinResolutionScale = max(MinYFor3DView / ScreenHeight * 100, 10)
+   * and then raises its saved ResolutionQuality (0) to it -- landed on the
+   * 10% floor, so Cross Worlds drew its world into a 103x58 buffer and
+   * stretched it over the window (measured with LUNARIA_DRAW_CENSUS,
+   * 2026-09-18: exactly 10% of the surface at both 1024x576 and 1280x720).
+   *
+   * Which panel that is, is the device profile's business, not this
+   * function's: the default profile is a real low-resolution phone for
+   * exactly the reason a smaller frame is wanted (see k_devices).
+   * LUNARIA_SCALE, LUNARIA_WIDTH/HEIGHT and LUNARIA_DEVICE_SCREEN_* still
+   * name something else for an operator who wants it -- and an operator who
+   * does gets the mismatch back, knowingly. */
+  if (!operator_chose_panel) {
+    const int landscape = screen_is_landscape();
+    s.width   = landscape ? (d->screen_h) : (d->screen_w);
+    s.height  = landscape ? (d->screen_w) : (d->screen_h);
+    s.density = d->density;
+  }
 
-   /* Exact sizes, for an operator who wants one particular surface rather
-    * than a fraction of the device's.  These name pixels only; the density
-    * has its own setting, so that asking for a window size does not silently
-    * restate what kind of screen this is. */
-   long ew = screen_env_long("LUNARIA_WIDTH", 0);
-   long eh = screen_env_long("LUNARIA_HEIGHT", 0);
-   if (ew >= 64 && ew <= 8192) s.width  = (int)ew;
-   if (eh >= 64 && eh <= 8192) s.height = (int)eh;
-   long ed = screen_env_long("LUNARIA_DPI", 0);
-   if (ed >= 40 && ed <= 1200) s.density = (int)ed;
-   if (s.density < 40) s.density = 40;
+  /* Exact sizes, for an operator who wants one particular surface rather
+   * than a fraction of the device's.  These name pixels only; the density
+   * has its own setting, so that asking for a window size does not silently
+   * restate what kind of screen this is. */
+  long ew = screen_env_long("LUNARIA_WIDTH", 0);
+  long eh = screen_env_long("LUNARIA_HEIGHT", 0);
+  if (ew >= 64 && ew <= 8192) s.width  = (int)ew;
+  if (eh >= 64 && eh <= 8192) s.height = (int)eh;
+  long ed = screen_env_long("LUNARIA_DPI", 0);
+  if (ed >= 40 && ed <= 1200) s.density = (int)ed;
+  if (s.density < 40) s.density = 40;
 
-   fprintf(stderr, "[jvm] screen: %dx%d @ %d dpi (%s %s panel %dx%d @ %d dpi, "
-                   "%s, LUNARIA_SCALE=%s)\n",
-           s.width, s.height, s.density, d->manufacturer, d->model,
-           d->screen_w, d->screen_h, d->density,
-           screen_is_landscape() ? "landscape" : "portrait",
-           operator_chose_panel
-              ? (sc && *sc ? sc : "default-on-override")
-              : "unset→panel 1:1");
-   return &s;
+  fprintf(stderr, "[jvm] screen: %dx%d @ %d dpi (%s %s panel %dx%d @ %d dpi, "
+                  "%s, LUNARIA_SCALE=%s)\n",
+          s.width, s.height, s.density, d->manufacturer, d->model,
+          d->screen_w, d->screen_h, d->density,
+          screen_is_landscape() ? "landscape" : "portrait",
+          operator_chose_panel
+          ? (sc && *sc ? sc : "default-on-override")
+          : "unset→panel 1:1");
+  return &s;
 }
 
 /* The single answer to "which Android is this?".  See jvm.h for why there is
@@ -844,44 +916,44 @@ lunaria_screen(void)
 int
 lunaria_sdk_int(void)
 {
-   static int cached;
-   if (!cached) {
-      const char *e = getenv("LUNARIA_SDK_INT");
-      long v = (e && *e) ? strtol(e, NULL, 10) : 0;
-      /* Unset, the level is the one the chosen device actually shipped with,
-       * so the build id and the fingerprint cannot describe a release that
-       * device never ran. */
-      if (v < 1 || v > 99) v = lunaria_device()->sdk;
-      if (v < 1 || v > 99) v = LUNARIA_SDK_INT_DEFAULT;
-      cached = (int)v;
-      if (cached != LUNARIA_SDK_INT_DEFAULT)
-         fprintf(stderr, "[jvm] Android API level %d (LUNARIA_SDK_INT)%s\n",
-                 cached,
-                 cached < LUNARIA_SDK_INT_FLOOR
-                    ? " — below the supported floor (API 31 / Android 12)" : "");
-   }
-   return cached;
+  static int cached;
+  if (!cached) {
+    const char *e = getenv("LUNARIA_SDK_INT");
+    long v = (e && *e) ? strtol(e, NULL, 10) : 0;
+    /* Unset, the level is the one the chosen device actually shipped with,
+     * so the build id and the fingerprint cannot describe a release that
+     * device never ran. */
+    if (v < 1 || v > 99) v = lunaria_device()->sdk;
+    if (v < 1 || v > 99) v = LUNARIA_SDK_INT_DEFAULT;
+    cached = (int)v;
+    if (cached != LUNARIA_SDK_INT_DEFAULT)
+      fprintf(stderr, "[jvm] Android API level %d (LUNARIA_SDK_INT)%s\n",
+              cached,
+              cached < LUNARIA_SDK_INT_FLOOR
+              ? " — below the supported floor (API 31 / Android 12)" : "");
+  }
+  return cached;
 }
 
 static int
 manifest_sdk(const char *name, int fallback)
 {
-   const char *s = getenv(name);
-   char *end = NULL;
-   long value = (s && *s) ? strtol(s, &end, 10) : 0;
-   return value > 0 && value <= 99 && end && !*end ? (int)value : fallback;
+  const char *s = getenv(name);
+  char *end = NULL;
+  long value = (s && *s) ? strtol(s, &end, 10) : 0;
+  return value > 0 && value <= 99 && end && !*end ? (int)value : fallback;
 }
 
 int lunaria_app_min_sdk(void)
 {
-   return manifest_sdk("ANDROID_MIN_SDK", 1);
+  return manifest_sdk("ANDROID_MIN_SDK", 1);
 }
 
 int lunaria_app_target_sdk(void)
 {
-   /* PackageParser defaults an omitted target to the manifest's minimum,
-    * which itself defaults to API 1. The device API is independent. */
-   return manifest_sdk("ANDROID_TARGET_SDK", lunaria_app_min_sdk());
+  /* PackageParser defaults an omitted target to the manifest's minimum,
+   * which itself defaults to API 1. The device API is independent. */
+  return manifest_sdk("ANDROID_TARGET_SDK", lunaria_app_min_sdk());
 }
 
 /* See jvm.h: the device spelling of this install.  The installer segment
@@ -889,53 +961,55 @@ int lunaria_app_target_sdk(void)
 static void android_install_token(const char *label, const char *pkg,
                                   char out[12])
 {
-   static const char alphabet[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-   uint64_t h = UINT64_C(1469598103934665603);
-   /* The install is named by its package and version, not by where this process
-    * happens to keep a copy of the APK: every process of the package -- the
-    * launched one and each component host -- sees one install directory, and
-    * it stays the same from run to run, as PackageManager's does. */
-   int32_t version_code = 0;
-   const char *version_name = NULL;
-   arm_exec_apk_version(&version_code, &version_name);
-   char version[32];
-   snprintf(version, sizeof version, "%d", (int)version_code);
-   const char *parts[3] = { label, pkg, version };
-   for (unsigned p = 0; p < 3; ++p)
-      for (const unsigned char *s =
-              (const unsigned char *)(parts[p] ? parts[p] : ""); *s; ++s) {
-         h ^= *s;
-         h *= UINT64_C(1099511628211);
-      }
-   for (unsigned i = 0; i < 11; ++i) {
-      h ^= h >> 12; h ^= h << 25; h ^= h >> 27;
-      h *= UINT64_C(2685821657736338717);
-      out[i] = alphabet[h & 63u];
-   }
-   out[11] = '\0';
+  static const char alphabet[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  uint64_t h = UINT64_C(1469598103934665603);
+  /* The install is named by its package and version, not by where this process
+   * happens to keep a copy of the APK: every process of the package -- the
+   * launched one and each component host -- sees one install directory, and
+   * it stays the same from run to run, as PackageManager's does. */
+  int32_t version_code = 0;
+  const char *version_name = NULL;
+  arm_exec_apk_version(&version_code, &version_name);
+  char version[32];
+  snprintf(version, sizeof version, "%d", (int)version_code);
+  const char *parts[3] = { label, pkg, version };
+  for (unsigned p = 0; p < 3; ++p)
+    for (const unsigned char *s =
+           (const unsigned char *)(parts[p] ? parts[p] : ""); *s; ++s) {
+      h ^= *s;
+      h *= UINT64_C(1099511628211);
+    }
+  for (unsigned i = 0; i < 11; ++i) {
+    h ^= h >> 12;
+    h ^= h << 25;
+    h ^= h >> 27;
+    h *= UINT64_C(2685821657736338717);
+    out[i] = alphabet[h & 63u];
+  }
+  out[11] = '\0';
 }
 
 const char *lunaria_android_apk_dir(void)
 {
-   static char dir[PATH_MAX];
-   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   if (!dir[0]) {
-      char installer[12], instance[12];
-      pkg = (pkg && *pkg) ? pkg : "com.lunaria.app";
-      android_install_token("installer", pkg, installer);
-      android_install_token("instance", pkg, instance);
-      snprintf(dir, sizeof dir, "/data/app/~~%s==/%s-%s==",
-               installer, pkg, instance);
-   }
-   return dir;
+  static char dir[PATH_MAX];
+  const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+  if (!dir[0]) {
+    char installer[12], instance[12];
+    pkg = (pkg && *pkg) ? pkg : "com.lunaria.app";
+    android_install_token("installer", pkg, installer);
+    android_install_token("instance", pkg, instance);
+    snprintf(dir, sizeof dir, "/data/app/~~%s==/%s-%s==",
+             installer, pkg, instance);
+  }
+  return dir;
 }
 
 const char *lunaria_android_apk_path(void)
 {
-   static char path[PATH_MAX];
-   if (!path[0]) snprintf(path, sizeof path, "%s/base.apk", lunaria_android_apk_dir());
-   return path;
+  static char path[PATH_MAX];
+  if (!path[0]) snprintf(path, sizeof path, "%s/base.apk", lunaria_android_apk_dir());
+  return path;
 }
 
 /* The directory an installed package's libraries are copied to is named for the
@@ -945,25 +1019,25 @@ const char *lunaria_android_apk_path(void)
  * it finds with the process it runs in. */
 static const char *native_lib_abi_dir(void)
 {
-   return arm_exec_guest_is_64bit() ? "arm64" : "arm";
+  return arm_exec_guest_is_64bit() ? "arm64" : "arm";
 }
 
 const char *lunaria_android_native_lib_path(void)
 {
-   static char path[PATH_MAX];
-   if (!path[0])
-      snprintf(path, sizeof path, "%s/lib/%s", lunaria_android_apk_dir(), native_lib_abi_dir());
-   return path;
+  static char path[PATH_MAX];
+  if (!path[0])
+    snprintf(path, sizeof path, "%s/lib/%s", lunaria_android_apk_dir(), native_lib_abi_dir());
+  return path;
 }
 
 const char *lunaria_android_data_path(void)
 {
-   static char path[PATH_MAX];
-   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-   if (!path[0])
-      snprintf(path, sizeof path, "/data/data/%s",
-               (pkg && *pkg) ? pkg : "com.lunaria.app");
-   return path;
+  static char path[PATH_MAX];
+  const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+  if (!path[0])
+    snprintf(path, sizeof path, "/data/data/%s",
+             (pkg && *pkg) ? pkg : "com.lunaria.app");
+  return path;
 }
 
 /* The installed-package ledger -- lunaria_android_package_count/at/find and
@@ -978,22 +1052,25 @@ const char *lunaria_android_data_path(void)
 const char *
 lunaria_android_release(void)
 {
-   static const char *cached;
-   if (cached) return cached;
-   const char *e = getenv("LUNARIA_ANDROID_RELEASE");
-   if (e && *e) return (cached = e);
-   static const struct { int sdk; const char *release; } map[] = {
-      { 27, "8.1" }, { 28, "9" },  { 29, "10" }, { 30, "11" }, { 31, "12" },
-      { 32, "12" },  { 33, "13" }, { 34, "14" }, { 35, "15" }, { 36, "16" },
-   };
-   const int sdk = lunaria_sdk_int();
-   for (size_t i = 0; i < sizeof map / sizeof map[0]; ++i)
-      if (map[i].sdk == sdk) return (cached = map[i].release);
-   /* Outside the table: report the level itself rather than a version that
-    * contradicts it. */
-   static char buf[16];
-   snprintf(buf, sizeof buf, "%d", sdk);
-   return (cached = buf);
+  static const char *cached;
+  if (cached) return cached;
+  const char *e = getenv("LUNARIA_ANDROID_RELEASE");
+  if (e && *e) return (cached = e);
+  static const struct {
+    int sdk;
+    const char *release;
+  } map[] = {
+    { 27, "8.1" }, { 28, "9" },  { 29, "10" }, { 30, "11" }, { 31, "12" },
+    { 32, "12" },  { 33, "13" }, { 34, "14" }, { 35, "15" }, { 36, "16" },
+  };
+  const int sdk = lunaria_sdk_int();
+  for (size_t i = 0; i < sizeof map / sizeof map[0]; ++i)
+    if (map[i].sdk == sdk) return (cached = map[i].release);
+  /* Outside the table: report the level itself rather than a version that
+   * contradicts it. */
+  static char buf[16];
+  snprintf(buf, sizeof buf, "%d", sdk);
+  return (cached = buf);
 }
 
 /* The device's build properties — one table, because Android has one.
@@ -1021,92 +1098,94 @@ lunaria_android_release(void)
 static const char *
 android_property_entry(const char *name, size_t index)
 {
-   const struct lunaria_device *dev = lunaria_device();
-   static char sdk[8], fingerprint[192], display[96], build_id[48], density[16];
-   if (!sdk[0]) {
-      snprintf(sdk, sizeof sdk, "%d", lunaria_sdk_int());
-      snprintf(density, sizeof density, "%d", dev->density);
-      /* A retail build id is the platform's own release tag; DISPLAY is that
-       * id again, and the fingerprint is assembled from the same parts in the
-       * order the platform documents.  Every one of them therefore follows
-       * whatever the active device profile (and any override) finally says. */
-      if (dev->build_id && *dev->build_id)
-         snprintf(build_id, sizeof build_id, "%s", dev->build_id);
-      else
-         snprintf(build_id, sizeof build_id, "%s.%s.001",
-                  dev->device, lunaria_android_release());
-      snprintf(display, sizeof display, "%s", build_id);
-      snprintf(fingerprint, sizeof fingerprint,
-               "%s/%s/%s:%s/%s/%s:user/release-keys",
-               dev->brand, dev->name, dev->device,
-               lunaria_android_release(), build_id, dev->incremental);
-   }
+  const struct lunaria_device *dev = lunaria_device();
+  static char sdk[8], fingerprint[192], display[96], build_id[48], density[16];
+  if (!sdk[0]) {
+    snprintf(sdk, sizeof sdk, "%d", lunaria_sdk_int());
+    snprintf(density, sizeof density, "%d", dev->density);
+    /* A retail build id is the platform's own release tag; DISPLAY is that
+     * id again, and the fingerprint is assembled from the same parts in the
+     * order the platform documents.  Every one of them therefore follows
+     * whatever the active device profile (and any override) finally says. */
+    if (dev->build_id && *dev->build_id)
+      snprintf(build_id, sizeof build_id, "%s", dev->build_id);
+    else
+      snprintf(build_id, sizeof build_id, "%s.%s.001",
+               dev->device, lunaria_android_release());
+    snprintf(display, sizeof display, "%s", build_id);
+    snprintf(fingerprint, sizeof fingerprint,
+             "%s/%s/%s:%s/%s/%s:user/release-keys",
+             dev->brand, dev->name, dev->device,
+             lunaria_android_release(), build_id, dev->incremental);
+  }
 
-   const struct { const char *name, *value; } fixed[] = {
-      { "ro.sf.lcd_density", density },
-      /* identity */
-      { "ro.product.manufacturer",  dev->manufacturer },
-      { "ro.product.brand",         dev->brand },
-      { "ro.product.model",         dev->model },
-      { "ro.product.name",          dev->name },
-      { "ro.product.device",        dev->device },
-      { "ro.product.board",         dev->board },
-      { "ro.board.platform",        dev->platform },
-      { "ro.hardware",              dev->hardware },
-      /* OpenGL ES 3.2, encoded as the framework reads it: major<<16 | minor. */
-      { "ro.opengles.version",      "196610" },
-      /* Both execution engines are installed. These device-wide properties
-       * are identical in 32-bit applications and 64-bit system services. */
-      { "ro.product.cpu.abi",       "arm64-v8a" },
-      { "ro.product.cpu.abi2",      "" },
-      { "ro.product.cpu.abilist",   "arm64-v8a,armeabi-v7a" },
-      { "ro.product.cpu.abilist64", "arm64-v8a" },
-      { "ro.product.cpu.abilist32", "armeabi-v7a" },
-      /* build */
-      { "ro.build.type",            "user" },
-      { "ro.build.tags",            "release-keys" },
-      { "ro.build.user",            "android-build" },
-      { "ro.build.host",            "abfarm" },
-      { "ro.build.characteristics", "default" },
-      { "ro.build.version.incremental", dev->incremental },
-      { "ro.build.version.codename",    "REL" },
-      { "ro.build.version.security_patch", dev->security_patch },
-      /* A retail device boots a locked, verified, non-debuggable image.  The
-       * emulator is not an engineering build, so these are 1/0/1, not "". */
-      { "ro.secure",                "1" },
-      { "ro.debuggable",            "0" },
-      { "ro.adb.secure",            "1" },
-      { "ro.boot.verifiedbootstate", "green" },
-      { "ro.boot.flash.locked",     "1" },
-      { "ro.bootloader",            "unknown" },
-      /* Since Android 8 the serial is not readable by ordinary apps, and the
-       * platform answers Build.UNKNOWN rather than a number. */
-      { "ro.serialno",              "unknown" },
-      { "gsm.version.baseband",     "unknown" },
-      { "ro.build.version.sdk", sdk },
-      { "ro.build.version.release", lunaria_android_release() },
-      { "ro.build.id", build_id },
-      { "ro.build.display.id", display },
-      { "ro.build.fingerprint", fingerprint },
-      { "ro.bootimage.build.fingerprint", fingerprint },
-      { "ro.system.build.fingerprint", fingerprint },
-      { "ro.vendor.build.fingerprint", fingerprint },
-   };
+  const struct {
+    const char *name, *value;
+  } fixed[] = {
+    { "ro.sf.lcd_density", density },
+    /* identity */
+    { "ro.product.manufacturer",  dev->manufacturer },
+    { "ro.product.brand",         dev->brand },
+    { "ro.product.model",         dev->model },
+    { "ro.product.name",          dev->name },
+    { "ro.product.device",        dev->device },
+    { "ro.product.board",         dev->board },
+    { "ro.board.platform",        dev->platform },
+    { "ro.hardware",              dev->hardware },
+    /* OpenGL ES 3.2, encoded as the framework reads it: major<<16 | minor. */
+    { "ro.opengles.version",      "196610" },
+    /* Both execution engines are installed. These device-wide properties
+     * are identical in 32-bit applications and 64-bit system services. */
+    { "ro.product.cpu.abi",       "arm64-v8a" },
+    { "ro.product.cpu.abi2",      "" },
+    { "ro.product.cpu.abilist",   "arm64-v8a,armeabi-v7a" },
+    { "ro.product.cpu.abilist64", "arm64-v8a" },
+    { "ro.product.cpu.abilist32", "armeabi-v7a" },
+    /* build */
+    { "ro.build.type",            "user" },
+    { "ro.build.tags",            "release-keys" },
+    { "ro.build.user",            "android-build" },
+    { "ro.build.host",            "abfarm" },
+    { "ro.build.characteristics", "default" },
+    { "ro.build.version.incremental", dev->incremental },
+    { "ro.build.version.codename",    "REL" },
+    { "ro.build.version.security_patch", dev->security_patch },
+    /* A retail device boots a locked, verified, non-debuggable image.  The
+     * emulator is not an engineering build, so these are 1/0/1, not "". */
+    { "ro.secure",                "1" },
+    { "ro.debuggable",            "0" },
+    { "ro.adb.secure",            "1" },
+    { "ro.boot.verifiedbootstate", "green" },
+    { "ro.boot.flash.locked",     "1" },
+    { "ro.bootloader",            "unknown" },
+    /* Since Android 8 the serial is not readable by ordinary apps, and the
+     * platform answers Build.UNKNOWN rather than a number. */
+    { "ro.serialno",              "unknown" },
+    { "gsm.version.baseband",     "unknown" },
+    { "ro.build.version.sdk", sdk },
+    { "ro.build.version.release", lunaria_android_release() },
+    { "ro.build.id", build_id },
+    { "ro.build.display.id", display },
+    { "ro.build.fingerprint", fingerprint },
+    { "ro.bootimage.build.fingerprint", fingerprint },
+    { "ro.system.build.fingerprint", fingerprint },
+    { "ro.vendor.build.fingerprint", fingerprint },
+  };
 
-   if (!name) return index < sizeof fixed / sizeof fixed[0] ? fixed[index].name : NULL;
-   for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; ++i)
-      if (!strcmp(name, fixed[i].name)) return fixed[i].value;
-   return "";
+  if (!name) return index < sizeof fixed / sizeof fixed[0] ? fixed[index].name : NULL;
+  for (size_t i = 0; i < sizeof fixed / sizeof fixed[0]; ++i)
+    if (!strcmp(name, fixed[i].name)) return fixed[i].value;
+  return "";
 }
 
 const char *lunaria_android_property(const char *name)
 {
-   return name && *name ? android_property_entry(name, 0) : "";
+  return name && *name ? android_property_entry(name, 0) : "";
 }
 
 const char *lunaria_android_property_name(size_t index)
 {
-   return android_property_entry(NULL, index);
+  return android_property_entry(NULL, index);
 }
 
 /* Every android.os.Build string field is the property of the same name.
@@ -1135,8 +1214,8 @@ LUNARIA_BUILD_FIELD(RADIO,        "gsm.version.baseband")
 LUNARIA_BUILD_FIELD(UNKNOWN,      "ro.serialno")   /* Build.UNKNOWN == "unknown" */
 jstring android_os_Build_CPU_ABI(JNIEnv *env, jobject object)
 {
-   (void)object;
-   return (*env)->NewStringUTF(env, arm_exec_guest_is_64bit() ? "arm64-v8a" : "armeabi-v7a");
+  (void)object;
+  return (*env)->NewStringUTF(env, arm_exec_guest_is_64bit() ? "arm64-v8a" : "armeabi-v7a");
 }
 LUNARIA_BUILD_FIELD(CPU_ABI2,     "ro.product.cpu.abi2")
 LUNARIA_BUILD_FIELD(VERSION_SECURITY_PATCH, "ro.build.version.security_patch")
@@ -1162,115 +1241,116 @@ LUNARIA_BUILD_FIELD_ALIAS(CPU_ABI2)
 jstring
 android_os_Build_VERSION_RELEASE(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, lunaria_android_release());
+  assert(env && object);
+  return (*env)->NewStringUTF(env, lunaria_android_release());
 }
 
 jint
 android_os_Build_VERSION_SDK_INT(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return lunaria_sdk_int();
+  assert(env && object);
+  return lunaria_sdk_int();
 }
 
 jstring
 android_os_Build_VERSION_INCREMENTAL(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env,
-                               lunaria_android_property("ro.build.version.incremental"));
+  assert(env && object);
+  return (*env)->NewStringUTF(env,
+                              lunaria_android_property("ro.build.version.incremental"));
 }
 
 jstring
 android_content_Context_getPackageName(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, getenv("ANDROID_PACKAGE_NAME"));
+  assert(env && object);
+  return (*env)->NewStringUTF(env, getenv("ANDROID_PACKAGE_NAME"));
 }
 
 jstring
 android_content_Context_getPackageCodePath(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, lunaria_android_apk_path());
+  assert(env && object);
+  return (*env)->NewStringUTF(env, lunaria_android_apk_path());
 }
 
 jstring
 android_content_Context_getPackageResourcePath(JNIEnv *env, jobject object, va_list args)
 {
-   /* ContextImpl returns LoadedApk's resource APK. This installation uses the
-    * same base APK for code and resources, as does ApplicationInfo.publicSourceDir.
-    * JNI framework calls need this entry too: external framework classes do
-    * not execute through the dex method lookup. */
-   assert(env && object);
-   (void)args;
-   return (*env)->NewStringUTF(env, lunaria_android_apk_path());
+  /* ContextImpl returns LoadedApk's resource APK. This installation uses the
+   * same base APK for code and resources, as does ApplicationInfo.publicSourceDir.
+   * JNI framework calls need this entry too: external framework classes do
+   * not execute through the dex method lookup. */
+  assert(env && object);
+  (void)args;
+  return (*env)->NewStringUTF(env, lunaria_android_apk_path());
 }
 
 jstring
 android_content_pm_PackageInfo_versionName(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   /* The installed package's own version, not a literal: native code and
-    * bytecode compare what they read here against the manifest. */
-   const char *name = NULL;
-   arm_exec_apk_version(NULL, &name);
-   return (*env)->NewStringUTF(env, name ? name : "1.0");
+  assert(env && object);
+  /* The installed package's own version, not a literal: native code and
+   * bytecode compare what they read here against the manifest. */
+  const char *name = NULL;
+  arm_exec_apk_version(NULL, &name);
+  return (*env)->NewStringUTF(env, name ? name : "1.0");
 }
 
 struct cached_file_spec {
-   const char *environment, *fallback_environment, *fallback;
-   bool make_directory;
+  const char *environment, *fallback_environment, *fallback;
+  bool make_directory;
 };
 
 static void cached_file_initialize(JNIEnv *env, jobject file, void *data)
 {
-   (void)env;
-   const struct cached_file_spec *spec = data;
-   const char *path = getenv(spec->environment);
-   if ((!path || !*path) && spec->fallback_environment)
-      path = getenv(spec->fallback_environment);
-   if (!path || !*path) path = spec->fallback;
-   char guest[PATH_MAX];const char *published=arm_exec_unmap_host_path(path,guest,sizeof guest);
-   if(published)jni_file_set_path(file,published);
-   if (spec->make_directory) luna_file_mkdir(path, 0755);
+  (void)env;
+  const struct cached_file_spec *spec = data;
+  const char *path = getenv(spec->environment);
+  if ((!path || !*path) && spec->fallback_environment)
+    path = getenv(spec->fallback_environment);
+  if (!path || !*path) path = spec->fallback;
+  char guest[PATH_MAX];
+  const char *published=arm_exec_unmap_host_path(path,guest,sizeof guest);
+  if(published)jni_file_set_path(file,published);
+  if (spec->make_directory) luna_file_mkdir(path, 0755);
 }
 
 jobject
 android_content_Context_getExternalFilesDir(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   static jobject sv;
-   static struct cached_file_spec spec = {"ANDROID_EXTERNAL_FILES_DIR", NULL, "/tmp", false};
-   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  static struct cached_file_spec spec = {"ANDROID_EXTERNAL_FILES_DIR", NULL, "/tmp", false};
+  return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 jobject
 android_content_Context_getFilesDir(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   static jobject sv;
-   static struct cached_file_spec spec = {"ANDROID_FILES_DIR", "ANDROID_EXTERNAL_FILES_DIR", "/tmp", false};
-   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  static struct cached_file_spec spec = {"ANDROID_FILES_DIR", "ANDROID_EXTERNAL_FILES_DIR", "/tmp", false};
+  return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 static jobject
 lunaria_application_info(JNIEnv *env)
 {
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/content/pm/ApplicationInfo");
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/content/pm/ApplicationInfo");
 }
 
 jobject
 android_content_Context_getApplicationInfo(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   /* Context and PackageManager describe the same installed application.
-    * Keep one object identity, as Android's cached LoadedApk normally does. */
-   return lunaria_application_info(env);
+  assert(env && object);
+  (void)args;
+  /* Context and PackageManager describe the same installed application.
+   * Keep one object identity, as Android's cached LoadedApk normally does. */
+  return lunaria_application_info(env);
 }
 
 /* PackageItemInfo.packageName is inherited by ApplicationInfo.  Android
@@ -1282,9 +1362,9 @@ android_content_Context_getApplicationInfo(JNIEnv *env, jobject object, va_list 
 jstring
 android_content_pm_ApplicationInfo_packageName(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   const char *name = getenv("ANDROID_PACKAGE_NAME");
-   return (*env)->NewStringUTF(env, (name && *name) ? name : "");
+  assert(env && object);
+  const char *name = getenv("ANDROID_PACKAGE_NAME");
+  return (*env)->NewStringUTF(env, (name && *name) ? name : "");
 }
 
 /* packageName is declared by PackageItemInfo and inherited by
@@ -1292,7 +1372,7 @@ android_content_pm_ApplicationInfo_packageName(JNIEnv *env, jobject object)
 jstring
 android_content_pm_PackageItemInfo_packageName(JNIEnv *env, jobject object)
 {
-   return android_content_pm_ApplicationInfo_packageName(env, object);
+  return android_content_pm_ApplicationInfo_packageName(env, object);
 }
 
 /* ApplicationInfo split arrays.  ANDROID_SPLIT_APKS is the installed split
@@ -1301,104 +1381,107 @@ android_content_pm_PackageItemInfo_packageName(JNIEnv *env, jobject object)
  * returning NULL here describes a monolithic install and makes native SDKs
  * omit split APKs from their package identity and integrity inputs. */
 struct lunaria_split_name {
-   const char *name;
-   size_t length;
+  const char *name;
+  size_t length;
 };
 
 static int lunaria_split_name_compare(const void *left, const void *right)
 {
-   const struct lunaria_split_name *a = left, *b = right;
-   size_t common = a->length < b->length ? a->length : b->length;
-   int order = memcmp(a->name, b->name, common);
-   if (order) return order;
-   return a->length < b->length ? -1 : a->length > b->length ? 1 : 0;
+  const struct lunaria_split_name *a = left, *b = right;
+  size_t common = a->length < b->length ? a->length : b->length;
+  int order = memcmp(a->name, b->name, common);
+  if (order) return order;
+  return a->length < b->length ? -1 : a->length > b->length ? 1 : 0;
 }
 
 static jobjectArray
 lunaria_application_info_splits(JNIEnv *env, int names)
 {
-   const char *table = getenv("ANDROID_SPLIT_APKS");
-   size_t capacity = 0, count = 0;
-   for (const char *p = table; p && *p; ) {
-      const char *end = strchr(p, ';');
-      if (!end) end = p + strlen(p);
-      if (memchr(p, '|', (size_t)(end - p))) ++capacity;
-      p = *end ? end + 1 : end;
-   }
-   struct lunaria_split_name *entries =
-      capacity ? calloc(capacity, sizeof *entries) : NULL;
-   if (capacity && !entries) return NULL;
-   for (const char *p = table; p && *p; ) {
-      const char *end = strchr(p, ';');
-      if (!end) end = p + strlen(p);
-      const char *bar = memchr(p, '|', (size_t)(end - p));
-      if (bar && bar != p) {
-         entries[count].name = p;
-         entries[count].length = (size_t)(bar - p);
-         ++count;
-      }
-      p = *end ? end + 1 : end;
-   }
-   qsort(entries, count, sizeof *entries, lunaria_split_name_compare);
-   jclass string_class = (*env)->FindClass(env, "java/lang/String");
-   jobjectArray out = (*env)->NewObjectArray(env, (jsize)count,
-                                             string_class, NULL);
-   if (!out) { free(entries); return NULL; }
-   for (size_t i = 0; i < count; ++i) {
-      size_t length = entries[i].length;
-      const char *base = lunaria_android_apk_dir();
-      size_t base_len = strlen(base);
-      size_t needed = base_len + sizeof "/split_.apk" + length;
-      char *value = malloc(needed);
-      if (!value) break;
-      if (names) {
-         memcpy(value, entries[i].name, length);
-         value[length] = '\0';
-      } else {
-         snprintf(value, needed, "%s/split_%.*s.apk", base,
-                  (int)length, entries[i].name);
-      }
-      jstring s = (*env)->NewStringUTF(env, value);
-      if (s) (*env)->SetObjectArrayElement(env, out, (jsize)i, s);
-      free(value);
-   }
-   free(entries);
-   return out;
+  const char *table = getenv("ANDROID_SPLIT_APKS");
+  size_t capacity = 0, count = 0;
+  for (const char *p = table; p && *p; ) {
+    const char *end = strchr(p, ';');
+    if (!end) end = p + strlen(p);
+    if (memchr(p, '|', (size_t)(end - p))) ++capacity;
+    p = *end ? end + 1 : end;
+  }
+  struct lunaria_split_name *entries =
+    capacity ? calloc(capacity, sizeof *entries) : NULL;
+  if (capacity && !entries) return NULL;
+  for (const char *p = table; p && *p; ) {
+    const char *end = strchr(p, ';');
+    if (!end) end = p + strlen(p);
+    const char *bar = memchr(p, '|', (size_t)(end - p));
+    if (bar && bar != p) {
+      entries[count].name = p;
+      entries[count].length = (size_t)(bar - p);
+      ++count;
+    }
+    p = *end ? end + 1 : end;
+  }
+  qsort(entries, count, sizeof *entries, lunaria_split_name_compare);
+  jclass string_class = (*env)->FindClass(env, "java/lang/String");
+  jobjectArray out = (*env)->NewObjectArray(env, (jsize)count,
+                     string_class, NULL);
+  if (!out) {
+    free(entries);
+    return NULL;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    size_t length = entries[i].length;
+    const char *base = lunaria_android_apk_dir();
+    size_t base_len = strlen(base);
+    size_t needed = base_len + sizeof "/split_.apk" + length;
+    char *value = malloc(needed);
+    if (!value) break;
+    if (names) {
+      memcpy(value, entries[i].name, length);
+      value[length] = '\0';
+    } else {
+      snprintf(value, needed, "%s/split_%.*s.apk", base,
+               (int)length, entries[i].name);
+    }
+    jstring s = (*env)->NewStringUTF(env, value);
+    if (s) (*env)->SetObjectArrayElement(env, out, (jsize)i, s);
+    free(value);
+  }
+  free(entries);
+  return out;
 }
 
 jobjectArray
 android_content_pm_ApplicationInfo_splitNames(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return lunaria_application_info_splits(env, 1);
+  assert(env && object);
+  return lunaria_application_info_splits(env, 1);
 }
 
 jobjectArray
 android_content_pm_ApplicationInfo_splitSourceDirs(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return lunaria_application_info_splits(env, 0);
+  assert(env && object);
+  return lunaria_application_info_splits(env, 0);
 }
 
 jobjectArray
 android_content_pm_ApplicationInfo_splitPublicSourceDirs(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return lunaria_application_info_splits(env, 0);
+  assert(env && object);
+  return lunaria_application_info_splits(env, 0);
 }
 
 /* ApplicationInfo.sourceDir — the base APK path. */
 jstring
 android_content_pm_ApplicationInfo_sourceDir(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, lunaria_android_apk_path());
+  assert(env && object);
+  return (*env)->NewStringUTF(env, lunaria_android_apk_path());
 }
 
 jstring
 android_content_pm_ApplicationInfo_publicSourceDir(JNIEnv *env, jobject object)
 {
-   return android_content_pm_ApplicationInfo_sourceDir(env, object);
+  return android_content_pm_ApplicationInfo_sourceDir(env, object);
 }
 
 /* ApplicationInfo.dataDir is the package's private data root (the parent of
@@ -1406,47 +1489,47 @@ android_content_pm_ApplicationInfo_publicSourceDir(JNIEnv *env, jobject object)
 jstring
 android_content_pm_ApplicationInfo_dataDir(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, lunaria_android_data_path());
+  assert(env && object);
+  return (*env)->NewStringUTF(env, lunaria_android_data_path());
 }
 
 jobject
 android_content_pm_ApplicationInfo_storageUuid(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   jclass cls = (*env)->FindClass(env, "android/os/storage/StorageManager");
-   if (!cls) return NULL;
-   jfieldID field = (*env)->GetStaticFieldID(env, cls, "UUID_DEFAULT", "Ljava/util/UUID;");
-   jobject uuid = field ? (*env)->GetStaticObjectField(env, cls, field) : NULL;
-   (*env)->DeleteLocalRef(env, cls);
-   return uuid;
+  assert(env && object);
+  jclass cls = (*env)->FindClass(env, "android/os/storage/StorageManager");
+  if (!cls) return NULL;
+  jfieldID field = (*env)->GetStaticFieldID(env, cls, "UUID_DEFAULT", "Ljava/util/UUID;");
+  jobject uuid = field ? (*env)->GetStaticObjectField(env, cls, field) : NULL;
+  (*env)->DeleteLocalRef(env, cls);
+  return uuid;
 }
 
 jstring
 android_content_pm_ApplicationInfo_nativeLibraryDir(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return (*env)->NewStringUTF(env, lunaria_android_native_lib_path());
+  assert(env && object);
+  return (*env)->NewStringUTF(env, lunaria_android_native_lib_path());
 }
 
 jobject
 android_content_Context_getCacheDir(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   static jobject sv;
-   static struct cached_file_spec spec = {"ANDROID_CACHE_DIR", NULL, "/tmp/lunaria-cache", true};
-   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  static struct cached_file_spec spec = {"ANDROID_CACHE_DIR", NULL, "/tmp/lunaria-cache", true};
+  return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 jobject
 android_content_Context_getExternalCacheDir(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   static jobject sv;
-   static struct cached_file_spec spec = {"ANDROID_EXTERNAL_CACHE_DIR", NULL, "/tmp/lunaria-ext-cache", true};
-   return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  static struct cached_file_spec spec = {"ANDROID_EXTERNAL_CACHE_DIR", NULL, "/tmp/lunaria-ext-cache", true};
+  return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
 /* Context.getDir(name, mode) → File for app_<name> under the files dir.
@@ -1457,68 +1540,68 @@ android_content_Context_getExternalCacheDir(JNIEnv *env, jobject object, va_list
 jobject
 android_content_Context_getDir(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   char namebuf[256];
-   snprintf(namebuf, sizeof namebuf, "%s", "dir");
-   jstring js = NULL;
-   if (JVM_VA_HAS_ARGS(args)) {
-      js = va_arg(args, jstring);
-      (void)va_arg(args, jint); /* mode */
-      if (js) {
-         const char *utf = (*env)->GetStringUTFChars(env, js, NULL);
-         if (utf && *utf)
-            snprintf(namebuf, sizeof namebuf, "%s", utf);
-         if (utf)
-            (*env)->ReleaseStringUTFChars(env, js, utf);
-      }
-   }
-   const char *base = getenv("ANDROID_FILES_DIR");
-   if (!base || !*base)
-      base = "/tmp/lunaria-files";
-   luna_file_mkdir(base, 0755);
-   char path[PATH_MAX];
-   snprintf(path, sizeof path, "%s/app_%s", base, namebuf);
-   luna_file_mkdir(path, 0755);
-   jobject file = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
-   jni_file_set_path(file, path);
-   return file;
+  assert(env && object);
+  char namebuf[256];
+  snprintf(namebuf, sizeof namebuf, "%s", "dir");
+  jstring js = NULL;
+  if (JVM_VA_HAS_ARGS(args)) {
+    js = va_arg(args, jstring);
+    (void)va_arg(args, jint); /* mode */
+    if (js) {
+      const char *utf = (*env)->GetStringUTFChars(env, js, NULL);
+      if (utf && *utf)
+        snprintf(namebuf, sizeof namebuf, "%s", utf);
+      if (utf)
+        (*env)->ReleaseStringUTFChars(env, js, utf);
+    }
+  }
+  const char *base = getenv("ANDROID_FILES_DIR");
+  if (!base || !*base)
+    base = "/tmp/lunaria-files";
+  luna_file_mkdir(base, 0755);
+  char path[PATH_MAX];
+  snprintf(path, sizeof path, "%s/app_%s", base, namebuf);
+  luna_file_mkdir(path, 0755);
+  jobject file = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
+  jni_file_set_path(file, path);
+  return file;
 }
 
 jstring
 android_net_Uri_decode(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring str = va_arg(args, jstring);
-   (*env)->GetStringUTFChars(env, str, NULL);
-   return str;
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring str = va_arg(args, jstring);
+  (*env)->GetStringUTFChars(env, str, NULL);
+  return str;
 }
 
 jstring
 android_net_Uri_encode(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring str = va_arg(args, jstring);
-   (*env)->GetStringUTFChars(env, str, NULL);
-   return str;
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring str = va_arg(args, jstring);
+  (*env)->GetStringUTFChars(env, str, NULL);
+  return str;
 }
 
 jstring
 android_os_Bundle_getString(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring str1 = va_arg(args, jstring);
-   (*env)->GetStringUTFChars(env, str1, NULL);
-   return NULL;
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring str1 = va_arg(args, jstring);
+  (*env)->GetStringUTFChars(env, str1, NULL);
+  return NULL;
 }
 
 jintArray
 android_view_InputDevice_getDeviceIds(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return (*env)->NewIntArray(env, 1);
+  assert(env && object);
+  return (*env)->NewIntArray(env, 1);
 }
 
 /* InputDevice.getDevice(int id) — static.  Unity probes the source device of
@@ -1527,39 +1610,39 @@ android_view_InputDevice_getDeviceIds(JNIEnv *env, jobject object, va_list args)
 jobject
 android_view_InputDevice_getDevice(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/view/InputDevice");
+  assert(env && object);
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/view/InputDevice");
 }
 
 jint
 android_view_InputDevice_getSources(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return 0x00001002; // SOURCE_TOUCHSCREEN
+  assert(env && object);
+  return 0x00001002; // SOURCE_TOUCHSCREEN
 }
 
 jint
 android_view_InputDevice_getSource(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return 0x00001002; // SOURCE_TOUCHSCREEN
+  assert(env && object);
+  return 0x00001002; // SOURCE_TOUCHSCREEN
 }
 
 jint
 android_view_InputDevice_getId(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getId");
-   return 0;
+  assert(env && object);
+  motion_trace("getId");
+  return 0;
 }
 
 jstring
 android_view_InputDevice_getName(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getName");
-   return (*env)->NewStringUTF(env, "lunaria-touchscreen");
+  assert(env && object);
+  motion_trace("getName");
+  return (*env)->NewStringUTF(env, "lunaria-touchscreen");
 }
 
 /* KeyCharacterMap.load(int deviceId) — static; Unity loads it for key events.
@@ -1567,25 +1650,25 @@ android_view_InputDevice_getName(JNIEnv *env, jobject object, va_list args)
 jobject
 android_view_KeyCharacterMap_load(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("load");
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/view/KeyCharacterMap");
+  assert(env && object);
+  motion_trace("load");
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/view/KeyCharacterMap");
 }
 
 jint
 android_view_InputEvent_getSource(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return 0x00001002; // SOURCE_TOUCHSCREEN
+  assert(env && object);
+  return 0x00001002; // SOURCE_TOUCHSCREEN
 }
 
 jint
 android_view_InputEvent_getDeviceId(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getDeviceId");
-   return 0;
+  assert(env && object);
+  motion_trace("getDeviceId");
+  return 0;
 }
 
 /* Unity 2023 resolves the InputEvent getters against the MotionEvent class
@@ -1595,9 +1678,9 @@ android_view_InputEvent_getDeviceId(JNIEnv *env, jobject object, va_list args)
 jint
 android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getSource");
-   return 0x00001002; // SOURCE_TOUCHSCREEN
+  assert(env && object);
+  motion_trace("getSource");
+  return 0x00001002; // SOURCE_TOUCHSCREEN
 }
 
 /* MotionEvent is a value object: each sample is its own JVM_OBJECT_MOTION with
@@ -1608,173 +1691,173 @@ android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
 static const lunaria_touch_event *
 motion_payload(JNIEnv *env, jobject object)
 {
-   static _Thread_local lunaria_touch_event scratch;
-   struct jvm *jvm = jnienv_get_jvm(env);
-   return jvm && jvm_motion_event_read(jvm, object, &scratch) ? &scratch : NULL;
+  static _Thread_local lunaria_touch_event scratch;
+  struct jvm *jvm = jnienv_get_jvm(env);
+  return jvm && jvm_motion_event_read(jvm, object, &scratch) ? &scratch : NULL;
 }
 
 jobject
 android_view_MotionEvent_obtain(JNIEnv *env, jclass clazz, va_list args)
 {
-   assert(env && clazz);
-   motion_trace("obtain");
-   struct jvm *jvm = jnienv_get_jvm(env);
-   jobject src = va_arg(args, jobject);
-   lunaria_touch_event ev = {0};
-   bool valid = jvm && jvm_motion_event_read(jvm, src, &ev);
-   if (getenv("LUNARIA_TOUCH_DIAG"))
-      fprintf(stderr, "[motion] obtain source=%p valid=%d action=%d x=%.0f y=%.0f\n",
-              src, valid, ev.action, ev.x, ev.y);
-   if (!valid)
-      return NULL;
-   return jvm_new_motion_event(jvm, &ev);
+  assert(env && clazz);
+  motion_trace("obtain");
+  struct jvm *jvm = jnienv_get_jvm(env);
+  jobject src = va_arg(args, jobject);
+  lunaria_touch_event ev = {0};
+  bool valid = jvm && jvm_motion_event_read(jvm, src, &ev);
+  if (getenv("LUNARIA_TOUCH_DIAG"))
+    fprintf(stderr, "[motion] obtain source=%p valid=%d action=%d x=%.0f y=%.0f\n",
+            src, valid, ev.action, ev.x, ev.y);
+  if (!valid)
+    return NULL;
+  return jvm_new_motion_event(jvm, &ev);
 }
 
 void
 android_view_MotionEvent_recycle(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("recycle");
-   (void)args;
+  assert(env && object);
+  motion_trace("recycle");
+  (void)args;
 }
 
 
 jint
 android_view_MotionEvent_getAction(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getAction");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? ev->action : 0;
+  assert(env && object);
+  motion_trace("getAction");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? ev->action : 0;
 }
 
 jint
 android_view_MotionEvent_getActionMasked(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getActionMasked");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? (ev->action & 0xff) : 0;
+  assert(env && object);
+  motion_trace("getActionMasked");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? (ev->action & 0xff) : 0;
 }
 
 jint
 android_view_MotionEvent_getActionIndex(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getActionIndex");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? ((ev->action >> 8) & 0xff) : 0;
+  assert(env && object);
+  motion_trace("getActionIndex");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? ((ev->action >> 8) & 0xff) : 0;
 }
 
 jfloat
 android_view_MotionEvent_getX(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getX");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? ev->x : 0.f;
+  assert(env && object);
+  motion_trace("getX");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? ev->x : 0.f;
 }
 
 jfloat
 android_view_MotionEvent_getY(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getY");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? ev->y : 0.f;
+  assert(env && object);
+  motion_trace("getY");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? ev->y : 0.f;
 }
 
 jfloat
 android_view_MotionEvent_getRawX(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getRawX");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? ev->x : 0.f;
+  assert(env && object);
+  motion_trace("getRawX");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? ev->x : 0.f;
 }
 
 jfloat
 android_view_MotionEvent_getRawY(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getRawY");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? ev->y : 0.f;
+  assert(env && object);
+  motion_trace("getRawY");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? ev->y : 0.f;
 }
 
 jint
 android_view_MotionEvent_getPointerCount(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getPointerCount");
-   return luna_event_count(motion_payload(env, object));
+  assert(env && object);
+  motion_trace("getPointerCount");
+  return luna_event_count(motion_payload(env, object));
 }
 
 jint
 android_view_MotionEvent_getPointerId(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getPointerId");
-   return luna_event_id(motion_payload(env, object), va_arg(args, int));
+  assert(env && object);
+  motion_trace("getPointerId");
+  return luna_event_id(motion_payload(env, object), va_arg(args, int));
 }
 
 jlong
 android_view_MotionEvent_getEventTime(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getEventTime");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? (jlong)ev->event_ms : 0;
+  assert(env && object);
+  motion_trace("getEventTime");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? (jlong)ev->event_ms : 0;
 }
 
 jlong
 android_view_MotionEvent_getDownTime(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getDownTime");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return ev ? (jlong)ev->down_ms : 0;
+  assert(env && object);
+  motion_trace("getDownTime");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return ev ? (jlong)ev->down_ms : 0;
 }
 
 jint
 android_view_MotionEvent_getMetaState(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getMetaState");
-   return 0;
+  assert(env && object);
+  motion_trace("getMetaState");
+  return 0;
 }
 
 jint
 android_view_MotionEvent_getDeviceId(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getDeviceId");
-   return 0;
+  assert(env && object);
+  motion_trace("getDeviceId");
+  return 0;
 }
 
 jfloat
 android_view_MotionEvent_getPressure(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getPressure");
-   const lunaria_touch_event *ev = motion_payload(env, object);
-   return (ev && ev->action != 1) ? 1.0f : 0.0f;
+  assert(env && object);
+  motion_trace("getPressure");
+  const lunaria_touch_event *ev = motion_payload(env, object);
+  return (ev && ev->action != 1) ? 1.0f : 0.0f;
 }
 
 jint
 android_view_MotionEvent_getToolType(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getToolType");
-   return 1; /* TOOL_TYPE_FINGER */
+  assert(env && object);
+  motion_trace("getToolType");
+  return 1; /* TOOL_TYPE_FINGER */
 }
 
 jint
 android_view_MotionEvent_getHistorySize(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   motion_trace("getHistorySize");
-   return 0; /* mouse-injected events carry no historical samples */
+  assert(env && object);
+  motion_trace("getHistorySize");
+  return 0; /* mouse-injected events carry no historical samples */
 }
 
 /* DisplayMetrics fields — Unity reads these to transform touch coordinates
@@ -1783,15 +1866,15 @@ android_view_MotionEvent_getHistorySize(JNIEnv *env, jobject object, va_list arg
 jint
 android_util_DisplayMetrics_widthPixels(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return arm_exec_fb_width();
+  assert(env && object);
+  return arm_exec_fb_width();
 }
 
 jint
 android_util_DisplayMetrics_heightPixels(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   return arm_exec_fb_height();
+  assert(env && object);
+  return arm_exec_fb_height();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1810,9 +1893,9 @@ android_util_DisplayMetrics_heightPixels(JNIEnv *env, jobject object)
 jobject
 android_app_Activity_getIntent(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/content/Intent");
+  assert(env && object);
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/content/Intent");
 }
 
 /* Intent.getExtras() → null: this launch carries no extras, so the caller
@@ -1820,17 +1903,17 @@ android_app_Activity_getIntent(JNIEnv *env, jobject object, va_list args)
 jobject
 android_content_Intent_getExtras(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return NULL;
+  assert(env && object);
+  return NULL;
 }
 
 /* Context.getObbDir() → a File stub (no OBB, but a valid object). */
 jobject
 android_content_Context_getObbDir(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "java/io/File");
+  assert(env && object);
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "java/io/File");
 }
 
 /* Context.getObbDirs() → an empty File[] (this is a mono APK, no expansion
@@ -1838,17 +1921,17 @@ android_content_Context_getObbDir(JNIEnv *env, jobject object, va_list args)
 jobjectArray
 android_content_Context_getObbDirs(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/io/File"), NULL);
+  assert(env && object);
+  return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/io/File"), NULL);
 }
 
 /* File.getAbsolutePath() → stored path for this File object. */
 jstring
 java_io_File_getAbsolutePath(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   return jni_file_path_string(env, object);
+  assert(env && object);
+  (void)args;
+  return jni_file_path_string(env, object);
 }
 
 /* Context.getSystemService(name).
@@ -1861,73 +1944,73 @@ java_io_File_getAbsolutePath(JNIEnv *env, jobject object, va_list args)
 jobject
 android_content_Context_getSystemService(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args))
-      return NULL;
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args))
+    return NULL;
 
-   /* Share the context-owned service and virtual wrapper dispatch with Java.
-    * The legacy table below is only needed when the DVM is disabled. */
-   if (dvm_jni_mode() != DVM_JNI_OFF) {
-      jclass cls = (*env)->GetObjectClass(env, object);
-      const char *name = cls ? jvm_get_class_name(jnienv_get_jvm(env), cls) : NULL;
-      jvalue out = { 0 };
-      va_list copy;
-      va_copy(copy, args);
-      bool handled = name && dvm_jni_invoke(env, name, "getSystemService",
-         "(Ljava/lang/String;)Ljava/lang/Object;", object, false, &copy, NULL, &out);
-      va_end(copy);
-      if (cls) (*env)->DeleteLocalRef(env, cls);
-      if (handled) return out.l;
-   }
+  /* Share the context-owned service and virtual wrapper dispatch with Java.
+   * The legacy table below is only needed when the DVM is disabled. */
+  if (dvm_jni_mode() != DVM_JNI_OFF) {
+    jclass cls = (*env)->GetObjectClass(env, object);
+    const char *name = cls ? jvm_get_class_name(jnienv_get_jvm(env), cls) : NULL;
+    jvalue out = { 0 };
+    va_list copy;
+    va_copy(copy, args);
+    bool handled = name && dvm_jni_invoke(env, name, "getSystemService",
+                                          "(Ljava/lang/String;)Ljava/lang/Object;", object, false, &copy, NULL, &out);
+    va_end(copy);
+    if (cls) (*env)->DeleteLocalRef(env, cls);
+    if (handled) return out.l;
+  }
 
-   jstring service = va_arg(args, jstring);
-   const char *name = service ? (*env)->GetStringUTFChars(env, service, NULL) : NULL;
-   if (!name)
-      return NULL;
+  jstring service = va_arg(args, jstring);
+  const char *name = service ? (*env)->GetStringUTFChars(env, service, NULL) : NULL;
+  if (!name)
+    return NULL;
 
-   struct service_entry {
-      const char *name;
-      const char *class_name;
-      jobject instance;
-   };
-   static struct service_entry services[] = {
-      { "window",       "android/view/WindowManager", NULL },
-      { "input",        "android/hardware/input/InputManager", NULL },
-      { "sensor",       "android/hardware/SensorManager", NULL },
-      { "connectivity", "android/net/ConnectivityManager", NULL },
-      { "activity",     "android/app/ActivityManager", NULL },
-      { "audio",        "android/media/AudioManager", NULL },
-      { "wifi",         "android/net/wifi/WifiManager", NULL },
-      { "notification", "android/app/NotificationManager", NULL },
-      { "display",      "android/hardware/display/DisplayManager", NULL },
-      { "power",        "android/os/PowerManager", NULL },
-      { "vibrator",     "android/os/Vibrator", NULL },
-      { "vibrator_manager", "android/os/VibratorManager", NULL },
-      { "input_method", "android/view/inputmethod/InputMethodManager", NULL },
-      { "clipboard",    "android/content/ClipboardManager", NULL },
-      { "user",         "android/os/UserManager", NULL },
-      { "jobscheduler", "android/app/job/JobScheduler", NULL },
-   };
+  struct service_entry {
+    const char *name;
+    const char *class_name;
+    jobject instance;
+  };
+  static struct service_entry services[] = {
+    { "window",       "android/view/WindowManager", NULL },
+    { "input",        "android/hardware/input/InputManager", NULL },
+    { "sensor",       "android/hardware/SensorManager", NULL },
+    { "connectivity", "android/net/ConnectivityManager", NULL },
+    { "activity",     "android/app/ActivityManager", NULL },
+    { "audio",        "android/media/AudioManager", NULL },
+    { "wifi",         "android/net/wifi/WifiManager", NULL },
+    { "notification", "android/app/NotificationManager", NULL },
+    { "display",      "android/hardware/display/DisplayManager", NULL },
+    { "power",        "android/os/PowerManager", NULL },
+    { "vibrator",     "android/os/Vibrator", NULL },
+    { "vibrator_manager", "android/os/VibratorManager", NULL },
+    { "input_method", "android/view/inputmethod/InputMethodManager", NULL },
+    { "clipboard",    "android/content/ClipboardManager", NULL },
+    { "user",         "android/os/UserManager", NULL },
+    { "jobscheduler", "android/app/job/JobScheduler", NULL },
+  };
 
-   jobject result = NULL;
-   for (size_t i = 0; i < sizeof services / sizeof services[0]; ++i) {
-      if (strcmp(name, services[i].name))
-         continue;
-      result = jvm_cached_object(env, &services[i].instance,
-                                  services[i].class_name);
-      break;
-   }
-   (*env)->ReleaseStringUTFChars(env, service, name);
-   return result;
+  jobject result = NULL;
+  for (size_t i = 0; i < sizeof services / sizeof services[0]; ++i) {
+    if (strcmp(name, services[i].name))
+      continue;
+    result = jvm_cached_object(env, &services[i].instance,
+                               services[i].class_name);
+    break;
+  }
+  (*env)->ReleaseStringUTFChars(env, service, name);
+  return result;
 }
 
 /* Context.getPackageManager() → a PackageManager stub. */
 jobject
 android_content_Context_getPackageManager(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/content/pm/PackageManager");
+  assert(env && object);
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/content/pm/PackageManager");
 }
 
 /* PackageManager.getPackageInfo(name, flags).  The bytecode VM owns the
@@ -1936,35 +2019,35 @@ android_content_Context_getPackageManager(JNIEnv *env, jobject object, va_list a
 jobject
 android_content_pm_PackageManager_getPackageInfo(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring name = va_arg(args, jstring);
-   jint flags = va_arg(args, jint);
-   return dvm_jni_package_info(env, name, flags);
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring name = va_arg(args, jstring);
+  jint flags = va_arg(args, jint);
+  return dvm_jni_package_info(env, name, flags);
 }
 
 /* Native and bytecode callers share package visibility, metadata, and the
  * pending NameNotFoundException for a package absent from the device. */
 jobject
 android_content_pm_PackageManager_getApplicationInfo(JNIEnv *env,
-                                                       jobject object,
-                                                       va_list args)
+    jobject object,
+    va_list args)
 {
-   assert(env && object);
-   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-   jstring name = va_arg(args, jstring);
-   jint flags = va_arg(args, jint);
-   return dvm_jni_application_info(env, name, flags);
+  assert(env && object);
+  if (!JVM_VA_HAS_ARGS(args)) return NULL;
+  jstring name = va_arg(args, jstring);
+  jint flags = va_arg(args, jint);
+  return dvm_jni_application_info(env, name, flags);
 }
 
 /* PackageInfo.versionCode — read as an int field. */
 jint
 android_content_pm_PackageInfo_versionCode(JNIEnv *env, jobject object)
 {
-   assert(env && object);
-   int32_t code = 1;
-   arm_exec_apk_version(&code, NULL);
-   return code;
+  assert(env && object);
+  int32_t code = 1;
+  arm_exec_apk_version(&code, NULL);
+  return code;
 }
 
 /* android.os.Process.setThreadPriority(int tid, int priority) or (int priority).
@@ -1972,7 +2055,9 @@ android_content_pm_PackageInfo_versionCode(JNIEnv *env, jobject object)
 void
 android_os_Process_setThreadPriority(JNIEnv *env, jclass cls, va_list args)
 {
-   (void)env; (void)cls; (void)args;
+  (void)env;
+  (void)cls;
+  (void)args;
 }
 
 /* android.os.Environment.getExternalStorageState() → "mounted".
@@ -1980,16 +2065,17 @@ android_os_Process_setThreadPriority(JNIEnv *env, jclass cls, va_list args)
 jstring
 android_os_Environment_getExternalStorageState(JNIEnv *env, jclass cls, va_list args)
 {
-   (void)cls; (void)args;
-   return (*env)->NewStringUTF(env, "mounted");
+  (void)cls;
+  (void)args;
+  return (*env)->NewStringUTF(env, "mounted");
 }
 
 /* android.os.Environment.MEDIA_MOUNTED — static String field "mounted". */
 jstring
 android_os_Environment_MEDIA_MOUNTED(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "mounted");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "mounted");
 }
 
 /* ApplicationErrorReport.getErrorReportReceiver(Context, String, ApplicationErrorReport)
@@ -2005,8 +2091,9 @@ android_os_Environment_MEDIA_MOUNTED(JNIEnv *env, jobject obj)
 jobject
 android_app_ApplicationErrorReport_getErrorReportReceiver(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
-   return NULL;
+  (void)env;
+  (void)object;
+  return NULL;
 }
 
 /* Activity.executeMainThreadJobs() — Unity calls this from its render thread to
@@ -2015,7 +2102,9 @@ android_app_ApplicationErrorReport_getErrorReportReceiver(JNIEnv *env, jobject o
 void
 android_app_Activity_executeMainThreadJobs(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
+  (void)env;
+  (void)object;
+  (void)args;
 }
 
 /* Activity.executeGLThreadJobs() — Unity 4 stores this method ID during initJni
@@ -2025,8 +2114,10 @@ android_app_Activity_executeMainThreadJobs(JNIEnv *env, jobject object, va_list 
 void
 android_app_Activity_executeGLThreadJobs(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
-   arm_exec_drain_gl_thread_jobs();
+  (void)env;
+  (void)object;
+  (void)args;
+  arm_exec_drain_gl_thread_jobs();
 }
 
 /* Activity.kill() — Unity calls this to terminate a background service or process.
@@ -2034,7 +2125,9 @@ android_app_Activity_executeGLThreadJobs(JNIEnv *env, jobject object, va_list ar
 void
 android_app_Activity_kill(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
+  (void)env;
+  (void)object;
+  (void)args;
 }
 
 /* Looper.getMainLooper() — static call; returns a stub so new Handler(looper)
@@ -2042,9 +2135,9 @@ android_app_Activity_kill(JNIEnv *env, jobject object, va_list args)
 jobject
 android_os_Looper_getMainLooper(JNIEnv *env, jobject object, va_list args)
 {
-   (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/os/Looper");
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/os/Looper");
 }
 
 /* Context.getResources() → Resources → Configuration.
@@ -2057,34 +2150,37 @@ android_os_Looper_getMainLooper(JNIEnv *env, jobject object, va_list args)
 jobject
 android_content_res_Resources_getConfiguration(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object; (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/content/res/Configuration");
+  (void)object;
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/content/res/Configuration");
 }
 
 void android_view_Display_fillMetrics(JNIEnv *e, jobject out); /* defined below */
 static void cached_metrics_initialize(JNIEnv *env, jobject metrics, void *data)
 {
-   (void)data;
-   android_view_Display_fillMetrics(env, metrics);
+  (void)data;
+  android_view_Display_fillMetrics(env, metrics);
 }
 
 
 jobject
 android_content_res_Resources_getDisplayMetrics(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object; (void)args;
-   static jobject sv;
-   return jvm_cached_object_init(env, &sv, "android/util/DisplayMetrics",
-                                 cached_metrics_initialize, NULL);
+  (void)object;
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object_init(env, &sv, "android/util/DisplayMetrics",
+                                cached_metrics_initialize, NULL);
 }
 
 jobject
 android_content_Context_getResources(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object; (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/content/res/Resources");
+  (void)object;
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/content/res/Resources");
 }
 
 /* Context.getAssets().
@@ -2098,9 +2194,10 @@ android_content_Context_getResources(JNIEnv *env, jobject object, va_list args)
 jobject
 android_content_Context_getAssets(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object; (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/content/res/AssetManager");
+  (void)object;
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/content/res/AssetManager");
 }
 
 /* Configuration fields.  These are read through GetObjectField/GetIntField,
@@ -2109,51 +2206,97 @@ android_content_Context_getAssets(JNIEnv *env, jobject object, va_list args)
 jobject
 android_content_res_Configuration_locale(JNIEnv *env, jobject object)
 {
-   (void)object;
-   return runtime_default_locale(env);
+  (void)object;
+  return runtime_default_locale(env);
 }
 
 /* Configuration.ORIENTATION_PORTRAIT == 1, ORIENTATION_LANDSCAPE == 2. */
 jint
 android_content_res_Configuration_orientation(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
-   return arm_exec_fb_width() >= arm_exec_fb_height() ? 2 : 1;
+  (void)env;
+  (void)object;
+  return arm_exec_fb_width() >= arm_exec_fb_height() ? 2 : 1;
 }
 
 /* SCREENLAYOUT_SIZE_NORMAL | SCREENLAYOUT_LONG_NO | SCREENLAYOUT_LAYOUTDIR_LTR */
 jint android_content_res_Configuration_screenLayout(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 0x02 | 0x10 | 0x40; }
+{
+  (void)env;
+  (void)o;
+  return 0x02 | 0x10 | 0x40;
+}
 /* dp = px x 160 / densityDpi, as fillMetrics() reports. */
 jint android_content_res_Configuration_screenWidthDp(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return (jint)((long)arm_exec_fb_width() * 160 / lunaria_screen()->density); }
+{
+  (void)env;
+  (void)o;
+  return (jint)((long)arm_exec_fb_width() * 160 / lunaria_screen()->density);
+}
 jint android_content_res_Configuration_screenHeightDp(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return (jint)((long)arm_exec_fb_height() * 160 / lunaria_screen()->density); }
+{
+  (void)env;
+  (void)o;
+  return (jint)((long)arm_exec_fb_height() * 160 / lunaria_screen()->density);
+}
 jint android_content_res_Configuration_smallestScreenWidthDp(JNIEnv *env, jobject o)
 {
-   (void)env; (void)o;
-   const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-   return (jint)((long)(w < h ? w : h) * 160 / lunaria_screen()->density);
+  (void)env;
+  (void)o;
+  const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+  return (jint)((long)(w < h ? w : h) * 160 / lunaria_screen()->density);
 }
 jint android_content_res_Configuration_densityDpi(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return lunaria_screen()->density; }
+{
+  (void)env;
+  (void)o;
+  return lunaria_screen()->density;
+}
 jfloat android_content_res_Configuration_fontScale(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 1.0f; }
+{
+  (void)env;
+  (void)o;
+  return 1.0f;
+}
 /* UI_MODE_TYPE_NORMAL | UI_MODE_NIGHT_NO */
 jint android_content_res_Configuration_uiMode(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 0x01 | 0x10; }
+{
+  (void)env;
+  (void)o;
+  return 0x01 | 0x10;
+}
 /* No SIM: mcc/mnc are 0 on a device without a mobile network. */
 jint android_content_res_Configuration_mcc(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 0; }
+{
+  (void)env;
+  (void)o;
+  return 0;
+}
 jint android_content_res_Configuration_mnc(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 0; }
+{
+  (void)env;
+  (void)o;
+  return 0;
+}
 /* KEYBOARD_NOKEYS / TOUCHSCREEN_FINGER / NAVIGATION_NONAV */
 jint android_content_res_Configuration_keyboard(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 1; }
+{
+  (void)env;
+  (void)o;
+  return 1;
+}
 jint android_content_res_Configuration_touchscreen(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 3; }
+{
+  (void)env;
+  (void)o;
+  return 3;
+}
 jint android_content_res_Configuration_navigation(JNIEnv *env, jobject o)
-{ (void)env; (void)o; return 1; }
+{
+  (void)env;
+  (void)o;
+  return 1;
+}
 
 /* Context.MODE_PRIVATE — static int constant (0).  Read via GetStaticIntField;
  * the default (0) is already correct, but provide it explicitly so the symbol
@@ -2161,8 +2304,9 @@ jint android_content_res_Configuration_navigation(JNIEnv *env, jobject o)
 jint
 android_content_Context_MODE_PRIVATE(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
-   return 0;
+  (void)env;
+  (void)object;
+  return 0;
 }
 
 /* ApplicationInfo.minSdkVersion / targetSdkVersion — int fields read by Unity's
@@ -2172,17 +2316,19 @@ android_content_Context_MODE_PRIVATE(JNIEnv *env, jobject object)
 jint
 android_content_pm_ApplicationInfo_minSdkVersion(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
-   /* Unity 2023's floor, but never above what the platform reports: an app
-    * whose minSdk exceeds the device's SDK_INT could not have been installed. */
-   return lunaria_app_min_sdk();
+  (void)env;
+  (void)object;
+  /* Unity 2023's floor, but never above what the platform reports: an app
+   * whose minSdk exceeds the device's SDK_INT could not have been installed. */
+  return lunaria_app_min_sdk();
 }
 
 jint
 android_content_pm_ApplicationInfo_targetSdkVersion(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
-   return lunaria_app_target_sdk();
+  (void)env;
+  (void)object;
+  return lunaria_app_target_sdk();
 }
 
 /* AlertDialog.Builder fluent setters — each returns the builder itself so the
@@ -2190,26 +2336,55 @@ android_content_pm_ApplicationInfo_targetSdkVersion(JNIEnv *env, jobject object)
  * chain keeps a valid handle instead of a NULL that the guest would then
  * dereference (wild jump).  create() yields an AlertDialog stub; show() is a
  * no-op in headless emulation. */
-jobject android_app_AlertDialog_Builder_setTitle(JNIEnv *env, jobject object, va_list args)          { (void)env; (void)args; return object; }
-jobject android_app_AlertDialog_Builder_setMessage(JNIEnv *env, jobject object, va_list args)        { (void)env; (void)args; return object; }
-jobject android_app_AlertDialog_Builder_setPositiveButton(JNIEnv *env, jobject object, va_list args) { (void)env; (void)args; return object; }
-jobject android_app_AlertDialog_Builder_setNegativeButton(JNIEnv *env, jobject object, va_list args) { (void)env; (void)args; return object; }
-jobject android_app_AlertDialog_Builder_setNeutralButton(JNIEnv *env, jobject object, va_list args)  { (void)env; (void)args; return object; }
-jobject android_app_AlertDialog_Builder_setCancelable(JNIEnv *env, jobject object, va_list args)     { (void)env; (void)args; return object; }
-jobject android_app_AlertDialog_Builder_setIcon(JNIEnv *env, jobject object, va_list args)           { (void)env; (void)args; return object; }
+jobject android_app_AlertDialog_Builder_setTitle(JNIEnv *env, jobject object, va_list args)          {
+  (void)env;
+  (void)args;
+  return object;
+}
+jobject android_app_AlertDialog_Builder_setMessage(JNIEnv *env, jobject object, va_list args)        {
+  (void)env;
+  (void)args;
+  return object;
+}
+jobject android_app_AlertDialog_Builder_setPositiveButton(JNIEnv *env, jobject object, va_list args) {
+  (void)env;
+  (void)args;
+  return object;
+}
+jobject android_app_AlertDialog_Builder_setNegativeButton(JNIEnv *env, jobject object, va_list args) {
+  (void)env;
+  (void)args;
+  return object;
+}
+jobject android_app_AlertDialog_Builder_setNeutralButton(JNIEnv *env, jobject object, va_list args)  {
+  (void)env;
+  (void)args;
+  return object;
+}
+jobject android_app_AlertDialog_Builder_setCancelable(JNIEnv *env, jobject object, va_list args)     {
+  (void)env;
+  (void)args;
+  return object;
+}
+jobject android_app_AlertDialog_Builder_setIcon(JNIEnv *env, jobject object, va_list args)           {
+  (void)env;
+  (void)args;
+  return object;
+}
 
 jobject
 android_app_AlertDialog_Builder_create(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object); (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/app/AlertDialog");
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/app/AlertDialog");
 }
 
 jobject
 android_app_AlertDialog_Builder_show(JNIEnv *env, jobject object, va_list args)
 {
-   return android_app_AlertDialog_Builder_create(env, object, args);
+  return android_app_AlertDialog_Builder_create(env, object, args);
 }
 
 /* ---- android.content.Context static String fields ----
@@ -2218,71 +2393,71 @@ android_app_AlertDialog_Builder_show(JNIEnv *env, jobject object, va_list args)
 jstring
 android_content_Context_POWER_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "power");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "power");
 }
 
 jstring
 android_content_Context_WINDOW_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "window");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "window");
 }
 
 jstring
 android_content_Context_AUDIO_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "audio");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "audio");
 }
 
 jstring
 android_content_Context_SENSOR_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "sensor");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "sensor");
 }
 
 jstring
 android_content_Context_INPUT_METHOD_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "input_method");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "input_method");
 }
 
 jstring
 android_content_Context_VIBRATOR_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "vibrator");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "vibrator");
 }
 
 jstring
 android_content_Context_CONNECTIVITY_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "connectivity");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "connectivity");
 }
 
 jstring
 android_content_Context_WIFI_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "wifi");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "wifi");
 }
 
 jstring
 android_content_Context_ACTIVITY_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "activity");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "activity");
 }
 
 jstring
 android_content_Context_CLIPBOARD_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "clipboard");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "clipboard");
 }
 
 /* ---- android.content.Context static String fields (service name keys) ----
@@ -2292,113 +2467,113 @@ android_content_Context_CLIPBOARD_SERVICE(JNIEnv *env, jobject obj)
 jstring
 android_content_Context_LOCATION_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "location");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "location");
 }
 
 jstring
 android_content_Context_ALARM_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "alarm");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "alarm");
 }
 
 jstring
 android_content_Context_NOTIFICATION_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "notification");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "notification");
 }
 
 jstring
 android_content_Context_TELEPHONY_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "phone");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "phone");
 }
 
 jstring
 android_content_Context_DISPLAY_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "display");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "display");
 }
 
 jstring
 android_content_Context_INPUT_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "input");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "input");
 }
 
 jstring
 android_content_Context_NFC_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "nfc");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "nfc");
 }
 
 jstring
 android_content_Context_BLUETOOTH_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "bluetooth");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "bluetooth");
 }
 
 jstring
 android_content_Context_STORAGE_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "storage");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "storage");
 }
 
 jstring
 android_content_Context_STORAGE_STATS_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "storagestats");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "storagestats");
 }
 
 jstring
 android_content_Context_CAMERA_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "camera");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "camera");
 }
 
 jstring
 android_content_Context_ACCESSIBILITY_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "accessibility");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "accessibility");
 }
 
 jstring
 android_content_Context_KEYGUARD_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "keyguard");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "keyguard");
 }
 
 jstring
 android_content_Context_SEARCH_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "search");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "search");
 }
 
 jstring
 android_content_Context_DOWNLOAD_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "download");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "download");
 }
 
 jstring
 android_content_Context_UI_MODE_SERVICE(JNIEnv *env, jobject obj)
 {
-   (void)obj;
-   return (*env)->NewStringUTF(env, "uimode");
+  (void)obj;
+  return (*env)->NewStringUTF(env, "uimode");
 }
 
 /* ---- android.os.PowerManager static int constants ---- */
@@ -2407,40 +2582,45 @@ android_content_Context_UI_MODE_SERVICE(JNIEnv *env, jobject obj)
 jint
 android_os_PowerManager_FULL_WAKE_LOCK(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return 26; /* PowerManager.FULL_WAKE_LOCK */
+  (void)env;
+  (void)obj;
+  return 26; /* PowerManager.FULL_WAKE_LOCK */
 }
 
 /* PowerManager.PARTIAL_WAKE_LOCK = 1: keep CPU on but allow screen to dim. */
 jint
 android_os_PowerManager_PARTIAL_WAKE_LOCK(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return 1;
+  (void)env;
+  (void)obj;
+  return 1;
 }
 
 /* PowerManager.SCREEN_DIM_WAKE_LOCK = 6 (deprecated). */
 jint
 android_os_PowerManager_SCREEN_DIM_WAKE_LOCK(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return 6;
+  (void)env;
+  (void)obj;
+  return 6;
 }
 
 /* PowerManager.SCREEN_BRIGHT_WAKE_LOCK = 10 (deprecated). */
 jint
 android_os_PowerManager_SCREEN_BRIGHT_WAKE_LOCK(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return 10;
+  (void)env;
+  (void)obj;
+  return 10;
 }
 
 /* PowerManager.ON_AFTER_RELEASE = 0x20000000: flag to keep screen on briefly. */
 jint
 android_os_PowerManager_ON_AFTER_RELEASE(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return 0x20000000;
+  (void)env;
+  (void)obj;
+  return 0x20000000;
 }
 
 /* PowerManager.newWakeLock(int levelAndFlags, String tag) → WakeLock stub.
@@ -2450,20 +2630,37 @@ android_os_PowerManager_ON_AFTER_RELEASE(JNIEnv *env, jobject obj)
 jobject
 android_os_PowerManager_newWakeLock(JNIEnv *env, jobject object, va_list args)
 {
-   (void)object;
-   if (JVM_VA_HAS_ARGS(args)) {
-      (void)va_arg(args, jint);    /* levelAndFlags */
-      (void)va_arg(args, jstring); /* tag */
-   }
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/os/PowerManager$WakeLock");
+  (void)object;
+  if (JVM_VA_HAS_ARGS(args)) {
+    (void)va_arg(args, jint);    /* levelAndFlags */
+    (void)va_arg(args, jstring); /* tag */
+  }
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/os/PowerManager$WakeLock");
 }
 
 /* ---- android.os.PowerManager$WakeLock methods ---- */
-void android_os_PowerManager_WakeLock_acquire(JNIEnv *env, jobject obj, va_list args)          { (void)env; (void)obj; (void)args; }
-void android_os_PowerManager_WakeLock_release(JNIEnv *env, jobject obj, va_list args)          { (void)env; (void)obj; (void)args; }
-void android_os_PowerManager_WakeLock_setReferenceCounted(JNIEnv *env, jobject obj, va_list a) { (void)env; (void)obj; (void)a; }
-jboolean android_os_PowerManager_WakeLock_isHeld(JNIEnv *env, jobject obj, va_list args)       { (void)env; (void)obj; (void)args; return 0; }
+void android_os_PowerManager_WakeLock_acquire(JNIEnv *env, jobject obj, va_list args)          {
+  (void)env;
+  (void)obj;
+  (void)args;
+}
+void android_os_PowerManager_WakeLock_release(JNIEnv *env, jobject obj, va_list args)          {
+  (void)env;
+  (void)obj;
+  (void)args;
+}
+void android_os_PowerManager_WakeLock_setReferenceCounted(JNIEnv *env, jobject obj, va_list a) {
+  (void)env;
+  (void)obj;
+  (void)a;
+}
+jboolean android_os_PowerManager_WakeLock_isHeld(JNIEnv *env, jobject obj, va_list args)       {
+  (void)env;
+  (void)obj;
+  (void)args;
+  return 0;
+}
 
 /* ---- android.content.pm.PackageManager static int constants ---- */
 
@@ -2471,16 +2668,18 @@ jboolean android_os_PowerManager_WakeLock_isHeld(JNIEnv *env, jobject obj, va_li
 jint
 android_content_pm_PackageManager_PERMISSION_GRANTED(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return 0;
+  (void)env;
+  (void)obj;
+  return 0;
 }
 
 /* PackageManager.PERMISSION_DENIED = -1 */
 jint
 android_content_pm_PackageManager_PERMISSION_DENIED(JNIEnv *env, jobject obj)
 {
-   (void)env; (void)obj;
-   return -1;
+  (void)env;
+  (void)obj;
+  return -1;
 }
 
 /* Context.checkCallingOrSelfPermission(String permission) → PERMISSION_GRANTED.
@@ -2489,22 +2688,28 @@ android_content_pm_PackageManager_PERMISSION_DENIED(JNIEnv *env, jobject obj)
 jint
 android_content_Context_checkCallingOrSelfPermission(JNIEnv *env, jobject obj, va_list args)
 {
-   (void)env; (void)obj; (void)args;
-   return 0; /* PERMISSION_GRANTED */
+  (void)env;
+  (void)obj;
+  (void)args;
+  return 0; /* PERMISSION_GRANTED */
 }
 
 jint
 android_content_Context_checkPermission(JNIEnv *env, jobject obj, va_list args)
 {
-   (void)env; (void)obj; (void)args;
-   return 0; /* PERMISSION_GRANTED */
+  (void)env;
+  (void)obj;
+  (void)args;
+  return 0; /* PERMISSION_GRANTED */
 }
 
 jint
 android_content_Context_checkSelfPermission(JNIEnv *env, jobject obj, va_list args)
 {
-   (void)env; (void)obj; (void)args;
-   return 0; /* PERMISSION_GRANTED */
+  (void)env;
+  (void)obj;
+  (void)args;
+  return 0; /* PERMISSION_GRANTED */
 }
 
 /* ---- android.app.Activity / java.lang.Object / java.lang.Class aliases ----
@@ -2515,37 +2720,61 @@ android_content_Context_checkSelfPermission(JNIEnv *env, jobject obj, va_list ar
  * to the canonical android_content_Context_* implementation. */
 
 jstring android_app_Activity_getPackageName(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getPackageName(env, obj, args); }
+{
+  return android_content_Context_getPackageName(env, obj, args);
+}
 jstring java_lang_Object_getPackageName(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getPackageName(env, obj, args); }
+{
+  return android_content_Context_getPackageName(env, obj, args);
+}
 jstring java_lang_Class_getPackageName(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getPackageName(env, obj, args); }
+{
+  return android_content_Context_getPackageName(env, obj, args);
+}
 
 jobject android_app_Activity_getSystemService(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getSystemService(env, obj, args); }
+{
+  return android_content_Context_getSystemService(env, obj, args);
+}
 jobject java_lang_Object_getSystemService(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getSystemService(env, obj, args); }
+{
+  return android_content_Context_getSystemService(env, obj, args);
+}
 jobject java_lang_Class_getSystemService(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getSystemService(env, obj, args); }
+{
+  return android_content_Context_getSystemService(env, obj, args);
+}
 
 /* getResources() is inherited the same way.  Without these aliases the dex
  * bytecode's `Landroid/app/Activity;->getResources()` resolved to nothing and
  * handed back null, so GameActivity.AndroidThunkJava_GetDeviceOrientation threw
  * an NPE on Resources.getConfiguration and the engine lost its orientation. */
 jobject android_app_Activity_getResources(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getResources(env, obj, args); }
+{
+  return android_content_Context_getResources(env, obj, args);
+}
 jobject java_lang_Object_getResources(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getResources(env, obj, args); }
+{
+  return android_content_Context_getResources(env, obj, args);
+}
 jobject java_lang_Class_getResources(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getResources(env, obj, args); }
+{
+  return android_content_Context_getResources(env, obj, args);
+}
 
 /* …and so is getAssets(): the call site names Activity or NativeActivity. */
 jobject android_app_Activity_getAssets(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getAssets(env, obj, args); }
+{
+  return android_content_Context_getAssets(env, obj, args);
+}
 jobject java_lang_Object_getAssets(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getAssets(env, obj, args); }
+{
+  return android_content_Context_getAssets(env, obj, args);
+}
 jobject java_lang_Class_getAssets(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getAssets(env, obj, args); }
+{
+  return android_content_Context_getAssets(env, obj, args);
+}
 
 /* Context.registerReceiver(BroadcastReceiver, IntentFilter[, …]) → null.
  * UE's Volume/Battery/HeadsetReceiver.startReceiver calls this; without a
@@ -2556,44 +2785,79 @@ jobject java_lang_Class_getAssets(JNIEnv *env, jobject obj, va_list args)
 jobject
 android_content_Context_registerReceiver(JNIEnv *env, jobject object, va_list args)
 {
-   (void)args;
-   if (!env || !object) return NULL;
-   return NULL;
+  (void)args;
+  if (!env || !object) return NULL;
+  return NULL;
 }
 jobject android_app_Activity_registerReceiver(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_registerReceiver(env, obj, args); }
+{
+  return android_content_Context_registerReceiver(env, obj, args);
+}
 jobject java_lang_Object_registerReceiver(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_registerReceiver(env, obj, args); }
+{
+  return android_content_Context_registerReceiver(env, obj, args);
+}
 jobject java_lang_Class_registerReceiver(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_registerReceiver(env, obj, args); }
+{
+  return android_content_Context_registerReceiver(env, obj, args);
+}
 
 jobject android_content_Context_getDir(JNIEnv *env, jobject obj, va_list args);
 jobject android_app_Activity_getDir(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getDir(env, obj, args); }
+{
+  return android_content_Context_getDir(env, obj, args);
+}
 jobject com_unity3d_player_UnityPlayer_getDir(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getDir(env, obj, args); }
+{
+  return android_content_Context_getDir(env, obj, args);
+}
 jobject java_lang_Object_getDir(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getDir(env, obj, args); }
+{
+  return android_content_Context_getDir(env, obj, args);
+}
 jobject java_lang_Class_getDir(JNIEnv *env, jobject obj, va_list args)
-{ return android_content_Context_getDir(env, obj, args); }
+{
+  return android_content_Context_getDir(env, obj, args);
+}
 
 jobject java_lang_Class_getClassLoader(JNIEnv *env, jobject object);
 jobject android_content_Context_getClassLoader(JNIEnv *env, jobject obj, va_list args)
-{ (void)args; return java_lang_Class_getClassLoader(env, obj); }
+{
+  (void)args;
+  return java_lang_Class_getClassLoader(env, obj);
+}
 jobject android_app_Activity_getClassLoader(JNIEnv *env, jobject obj, va_list args)
-{ (void)args; return java_lang_Class_getClassLoader(env, obj); }
+{
+  (void)args;
+  return java_lang_Class_getClassLoader(env, obj);
+}
 jobject com_unity3d_player_UnityPlayer_getClassLoader(JNIEnv *env, jobject obj, va_list args)
-{ (void)args; return java_lang_Class_getClassLoader(env, obj); }
+{
+  (void)args;
+  return java_lang_Class_getClassLoader(env, obj);
+}
 
 /* ActivityManager.MemoryInfo.lowMemory — public boolean field read by Unity to
  * decide whether to trigger aggressive GC.  In headless emulation report false
  * so the engine takes its normal (non-low-memory) code path. */
 jboolean android_app_ActivityManager_MemoryInfo_lowMemory(JNIEnv *env, jobject obj)
-{ (void)env; (void)obj; return 0; }
+{
+  (void)env;
+  (void)obj;
+  return 0;
+}
 jboolean java_lang_Object_lowMemory(JNIEnv *env, jobject obj)
-{ (void)env; (void)obj; return 0; }
+{
+  (void)env;
+  (void)obj;
+  return 0;
+}
 jboolean java_lang_Class_lowMemory(JNIEnv *env, jobject obj)
-{ (void)env; (void)obj; return 0; }
+{
+  (void)env;
+  (void)obj;
+  return 0;
+}
 
 /* ActivityManager.getMemoryInfo(ActivityManager.MemoryInfo outInfo) — void method.
  * Unity queries this to size Dynamic Heap / trim caches.  Profile comes from
@@ -2604,47 +2868,47 @@ jboolean java_lang_Class_lowMemory(JNIEnv *env, jobject obj)
 void
 android_app_ActivityManager_getMemoryInfo(JNIEnv *env, jobject obj, va_list args)
 {
-   (void)obj;
+  (void)obj;
 
-   jobject out_info = NULL;
-   if (JVM_VA_HAS_ARGS(args))
-      out_info = va_arg(args, jobject);
-   if (!out_info)
-      return;
+  jobject out_info = NULL;
+  if (JVM_VA_HAS_ARGS(args))
+    out_info = va_arg(args, jobject);
+  if (!out_info)
+    return;
 
-   jlong total_bytes = (jlong)lunaria_mem_total_bytes();
-   jlong avail_bytes = (jlong)lunaria_mem_avail_bytes();
-   jlong threshold   = (jlong)lunaria_mem_threshold_bytes();
-   jboolean low = (avail_bytes < threshold) ? JNI_TRUE : JNI_FALSE;
+  jlong total_bytes = (jlong)lunaria_mem_total_bytes();
+  jlong avail_bytes = (jlong)lunaria_mem_avail_bytes();
+  jlong threshold   = (jlong)lunaria_mem_threshold_bytes();
+  jboolean low = (avail_bytes < threshold) ? JNI_TRUE : JNI_FALSE;
 
-   static jfieldID fid_avail   = NULL;
-   static jfieldID fid_total   = NULL;
-   static jfieldID fid_low     = NULL;
-   static jfieldID fid_thresh  = NULL;
-   static int logged = 0;
+  static jfieldID fid_avail   = NULL;
+  static jfieldID fid_total   = NULL;
+  static jfieldID fid_low     = NULL;
+  static jfieldID fid_thresh  = NULL;
+  static int logged = 0;
 
-   if (!fid_avail) {
-      jclass cls = (*env)->FindClass(env, "android/app/ActivityManager$MemoryInfo");
-      if (!cls) return;
-      fid_avail  = (*env)->GetFieldID(env, cls, "availMem",  "J");
-      fid_total  = (*env)->GetFieldID(env, cls, "totalMem",  "J");
-      fid_low    = (*env)->GetFieldID(env, cls, "lowMemory", "Z");
-      fid_thresh = (*env)->GetFieldID(env, cls, "threshold", "J");
-      if (!fid_avail || !fid_total || !fid_low || !fid_thresh) return;
-   }
+  if (!fid_avail) {
+    jclass cls = (*env)->FindClass(env, "android/app/ActivityManager$MemoryInfo");
+    if (!cls) return;
+    fid_avail  = (*env)->GetFieldID(env, cls, "availMem",  "J");
+    fid_total  = (*env)->GetFieldID(env, cls, "totalMem",  "J");
+    fid_low    = (*env)->GetFieldID(env, cls, "lowMemory", "Z");
+    fid_thresh = (*env)->GetFieldID(env, cls, "threshold", "J");
+    if (!fid_avail || !fid_total || !fid_low || !fid_thresh) return;
+  }
 
-   if (!logged) {
-      logged = 1;
-      fprintf(stderr, "[mem] getMemoryInfo total=%ldMB avail=%ldMB threshold=%ldMB "
-              "(LUNARIA_MEM_TOTAL_MB / LUNARIA_MEM_AVAIL_MB)\n",
-              (long)(total_bytes >> 20), (long)(avail_bytes >> 20),
-              (long)(threshold >> 20));
-   }
+  if (!logged) {
+    logged = 1;
+    fprintf(stderr, "[mem] getMemoryInfo total=%ldMB avail=%ldMB threshold=%ldMB "
+                    "(LUNARIA_MEM_TOTAL_MB / LUNARIA_MEM_AVAIL_MB)\n",
+            (long)(total_bytes >> 20), (long)(avail_bytes >> 20),
+            (long)(threshold >> 20));
+  }
 
-   (*env)->SetLongField   (env, out_info, fid_avail,  avail_bytes);
-   (*env)->SetLongField   (env, out_info, fid_total,  total_bytes);
-   (*env)->SetBooleanField(env, out_info, fid_low,    low);
-   (*env)->SetLongField   (env, out_info, fid_thresh, threshold);
+  (*env)->SetLongField   (env, out_info, fid_avail,  avail_bytes);
+  (*env)->SetLongField   (env, out_info, fid_total,  total_bytes);
+  (*env)->SetBooleanField(env, out_info, fid_low,    low);
+  (*env)->SetLongField   (env, out_info, fid_thresh, threshold);
 }
 
 /* Bridge alias: the JVM bridge resolves by prepending the runtime class name.
@@ -2652,9 +2916,13 @@ android_app_ActivityManager_getMemoryInfo(JNIEnv *env, jobject obj, va_list args
  * bridge looks up java_lang_Object_getMemoryInfo / java_lang_Class_getMemoryInfo
  * before the concrete android_app_ActivityManager_* name. */
 void java_lang_Object_getMemoryInfo(JNIEnv *env, jobject obj, va_list args)
-{ android_app_ActivityManager_getMemoryInfo(env, obj, args); }
+{
+  android_app_ActivityManager_getMemoryInfo(env, obj, args);
+}
 void java_lang_Class_getMemoryInfo(JNIEnv *env, jobject obj, va_list args)
-{ android_app_ActivityManager_getMemoryInfo(env, obj, args); }
+{
+  android_app_ActivityManager_getMemoryInfo(env, obj, args);
+}
 
 /* java.lang.StringBuilder is implemented in libjvm.so (jvm.c) so that
  * luna_os_library_symbol(NULL, …) always resolves within the same DSO. */
@@ -2698,122 +2966,177 @@ static bool g_activity_orientation_initialized;
 static jint
 activity_manifest_orientation(void)
 {
-   const char *value = getenv("ANDROID_SCREEN_ORIENTATION");
-   if (value && *value)
-      return (jint)strtol(value, NULL, 10);
-   return arm_exec_fb_width() >= arm_exec_fb_height()
-      ? 0 /* SCREEN_ORIENTATION_LANDSCAPE */
-      : 1 /* SCREEN_ORIENTATION_PORTRAIT */;
+  const char *value = getenv("ANDROID_SCREEN_ORIENTATION");
+  if (value && *value)
+    return (jint)strtol(value, NULL, 10);
+  return arm_exec_fb_width() >= arm_exec_fb_height()
+         ? 0 /* SCREEN_ORIENTATION_LANDSCAPE */
+         : 1 /* SCREEN_ORIENTATION_PORTRAIT */;
 }
 
 static void
 activity_orientation_init(void)
 {
-   if (g_activity_orientation_initialized)
-      return;
-   for (size_t i = 0; i < JNI_ACTIVITY_MAX; ++i)
-      g_activity_orientation[i] = INT16_MIN;
-   g_activity_orientation_initialized = true;
+  if (g_activity_orientation_initialized)
+    return;
+  for (size_t i = 0; i < JNI_ACTIVITY_MAX; ++i)
+    g_activity_orientation[i] = INT16_MIN;
+  g_activity_orientation_initialized = true;
 }
 
 static void
 activity_set_requested_orientation(jobject activity, jint orientation)
 {
-   activity_orientation_init();
-   const uintptr_t index = (uintptr_t)activity;
-   if (index < JNI_ACTIVITY_MAX)
-      g_activity_orientation[index] = (int16_t)orientation;
+  activity_orientation_init();
+  const uintptr_t index = (uintptr_t)activity;
+  if (index < JNI_ACTIVITY_MAX)
+    g_activity_orientation[index] = (int16_t)orientation;
 }
 
 static jint
 activity_get_requested_orientation(jobject activity)
 {
-   activity_orientation_init();
-   const uintptr_t index = (uintptr_t)activity;
-   jint orientation = activity_manifest_orientation();
-   if (index < JNI_ACTIVITY_MAX && g_activity_orientation[index] != INT16_MIN)
-      orientation = g_activity_orientation[index];
-   return orientation;
+  activity_orientation_init();
+  const uintptr_t index = (uintptr_t)activity;
+  jint orientation = activity_manifest_orientation();
+  if (index < JNI_ACTIVITY_MAX && g_activity_orientation[index] != INT16_MIN)
+    orientation = g_activity_orientation[index];
+  return orientation;
 }
 
 void android_app_Activity_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; activity_set_requested_orientation(o, va_arg(a, jint)); }
+{
+  (void)e;
+  activity_set_requested_orientation(o, va_arg(a, jint));
+}
 void java_lang_Object_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ android_app_Activity_setRequestedOrientation(e, o, a); }
+{
+  android_app_Activity_setRequestedOrientation(e, o, a);
+}
 void java_lang_Class_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ android_app_Activity_setRequestedOrientation(e, o, a); }
+{
+  android_app_Activity_setRequestedOrientation(e, o, a);
+}
 
 jint android_app_Activity_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)a; return activity_get_requested_orientation(o); }
+{
+  (void)e;
+  (void)a;
+  return activity_get_requested_orientation(o);
+}
 jint java_lang_Object_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ return android_app_Activity_getRequestedOrientation(e, o, a); }
+{
+  return android_app_Activity_getRequestedOrientation(e, o, a);
+}
 jint java_lang_Class_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
-{ return android_app_Activity_getRequestedOrientation(e, o, a); }
+{
+  return android_app_Activity_getRequestedOrientation(e, o, a);
+}
 
 /* ---- android.os.Build string fields ---- */
 jstring android_os_Build_DEVICE(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.product.device")); }
+{
+  (void)o;
+  return (*e)->NewStringUTF(e, lunaria_android_property("ro.product.device"));
+}
 jstring java_lang_Object_DEVICE(JNIEnv *e, jobject o)
-{ return android_os_Build_DEVICE(e, o); }
+{
+  return android_os_Build_DEVICE(e, o);
+}
 jstring java_lang_Class_DEVICE(JNIEnv *e, jobject o)
-{ return android_os_Build_DEVICE(e, o); }
+{
+  return android_os_Build_DEVICE(e, o);
+}
 
 jstring android_os_Build_DISPLAY(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.build.display.id")); }
+{
+  (void)o;
+  return (*e)->NewStringUTF(e, lunaria_android_property("ro.build.display.id"));
+}
 jstring java_lang_Object_DISPLAY(JNIEnv *e, jobject o)
-{ return android_os_Build_DISPLAY(e, o); }
+{
+  return android_os_Build_DISPLAY(e, o);
+}
 jstring java_lang_Class_DISPLAY(JNIEnv *e, jobject o)
-{ return android_os_Build_DISPLAY(e, o); }
+{
+  return android_os_Build_DISPLAY(e, o);
+}
 
 jstring android_os_Build_HARDWARE(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.hardware")); }
+{
+  (void)o;
+  return (*e)->NewStringUTF(e, lunaria_android_property("ro.hardware"));
+}
 jstring java_lang_Object_HARDWARE(JNIEnv *e, jobject o)
-{ return android_os_Build_HARDWARE(e, o); }
+{
+  return android_os_Build_HARDWARE(e, o);
+}
 jstring java_lang_Class_HARDWARE(JNIEnv *e, jobject o)
-{ return android_os_Build_HARDWARE(e, o); }
+{
+  return android_os_Build_HARDWARE(e, o);
+}
 
 jstring android_os_Build_SERIAL(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, lunaria_android_property("ro.serialno")); }
+{
+  (void)o;
+  return (*e)->NewStringUTF(e, lunaria_android_property("ro.serialno"));
+}
 jstring java_lang_Object_SERIAL(JNIEnv *e, jobject o)
-{ return android_os_Build_SERIAL(e, o); }
+{
+  return android_os_Build_SERIAL(e, o);
+}
 jstring java_lang_Class_SERIAL(JNIEnv *e, jobject o)
-{ return android_os_Build_SERIAL(e, o); }
+{
+  return android_os_Build_SERIAL(e, o);
+}
 
 /* ---- android.provider.Settings.Secure ---- */
 /* ANDROID_ID: the constant string key "android_id", not the value itself */
 jstring android_provider_Settings_Secure_ANDROID_ID(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, "android_id"); }
+{
+  (void)o;
+  return (*e)->NewStringUTF(e, "android_id");
+}
 jstring java_lang_Object_ANDROID_ID(JNIEnv *e, jobject o)
-{ return android_provider_Settings_Secure_ANDROID_ID(e, o); }
+{
+  return android_provider_Settings_Secure_ANDROID_ID(e, o);
+}
 jstring java_lang_Class_ANDROID_ID(JNIEnv *e, jobject o)
-{ return android_provider_Settings_Secure_ANDROID_ID(e, o); }
+{
+  return android_provider_Settings_Secure_ANDROID_ID(e, o);
+}
 
 /* Settings.Secure.getString(ContentResolver cr, String name). */
 jstring
 android_provider_Settings_Secure_getString(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o;
-   if (!JVM_VA_HAS_ARGS(a)) return NULL;
-   (void)va_arg(a, jobject);
-   jstring key = va_arg(a, jstring);
-   if (!key) return NULL;
-   const char *name = (*e)->GetStringUTFChars(e, key, NULL);
-   const char *value = lunaria_android_setting("secure", name);
-   if (name) (*e)->ReleaseStringUTFChars(e, key, name);
-   return value ? (*e)->NewStringUTF(e, value) : NULL;
+  (void)o;
+  if (!JVM_VA_HAS_ARGS(a)) return NULL;
+  (void)va_arg(a, jobject);
+  jstring key = va_arg(a, jstring);
+  if (!key) return NULL;
+  const char *name = (*e)->GetStringUTFChars(e, key, NULL);
+  const char *value = lunaria_android_setting("secure", name);
+  if (name) (*e)->ReleaseStringUTFChars(e, key, name);
+  return value ? (*e)->NewStringUTF(e, value) : NULL;
 }
 
 /* ---- android.telephony.TelephonyManager ---- */
 jstring
 android_telephony_TelephonyManager_getDeviceId(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o; (void)a;
-   return (*e)->NewStringUTF(e, "000000000000000");
+  (void)o;
+  (void)a;
+  return (*e)->NewStringUTF(e, "000000000000000");
 }
 jstring java_lang_Object_getDeviceId(JNIEnv *e, jobject o, va_list a)
-{ return android_telephony_TelephonyManager_getDeviceId(e, o, a); }
+{
+  return android_telephony_TelephonyManager_getDeviceId(e, o, a);
+}
 jstring java_lang_Class_getDeviceId(JNIEnv *e, jobject o, va_list a)
-{ return android_telephony_TelephonyManager_getDeviceId(e, o, a); }
+{
+  return android_telephony_TelephonyManager_getDeviceId(e, o, a);
+}
 
 /* Context.getAttributionTag() — API 30+.  Play services reflects for it and
  * calls straight through when the platform level says it exists, so an
@@ -2821,39 +3144,58 @@ jstring java_lang_Class_getDeviceId(JNIEnv *e, jobject o, va_list a)
  * attribution tag returns, which is every context unless the app sets one. */
 jstring
 android_content_Context_getAttributionTag(JNIEnv *env, jobject object, va_list args)
-{ (void)env; (void)object; (void)args; return NULL; }
+{
+  (void)env;
+  (void)object;
+  (void)args;
+  return NULL;
+}
 jstring java_lang_Object_getAttributionTag(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getAttributionTag(e, o, a); }
+{
+  return android_content_Context_getAttributionTag(e, o, a);
+}
 jstring java_lang_Class_getAttributionTag(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getAttributionTag(e, o, a); }
+{
+  return android_content_Context_getAttributionTag(e, o, a);
+}
 jstring android_app_Activity_getAttributionTag(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getAttributionTag(e, o, a); }
+{
+  return android_content_Context_getAttributionTag(e, o, a);
+}
 
 /* ---- android.content.Context.getContentResolver() → stub ---- */
 jobject
 android_content_Context_getContentResolver(JNIEnv *e, jobject o, va_list a)
 {
-   (void)a;
-   static jobject sv;
-   return jvm_cached_object(e, &sv, "android/content/ContentResolver");
+  (void)a;
+  static jobject sv;
+  return jvm_cached_object(e, &sv, "android/content/ContentResolver");
 }
 jobject java_lang_Object_getContentResolver(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getContentResolver(e, o, a); }
+{
+  return android_content_Context_getContentResolver(e, o, a);
+}
 jobject java_lang_Class_getContentResolver(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getContentResolver(e, o, a); }
+{
+  return android_content_Context_getContentResolver(e, o, a);
+}
 
 /* ---- android.hardware.display.DisplayManager.getDisplay(int) → stub ---- */
 jobject
 android_hardware_display_DisplayManager_getDisplay(JNIEnv *e, jobject o, va_list a)
 {
-   (void)a;
-   static jobject sv;
-   return jvm_cached_object(e, &sv, "android/view/Display");
+  (void)a;
+  static jobject sv;
+  return jvm_cached_object(e, &sv, "android/view/Display");
 }
 jobject java_lang_Object_getDisplay(JNIEnv *e, jobject o, va_list a)
-{ return android_hardware_display_DisplayManager_getDisplay(e, o, a); }
+{
+  return android_hardware_display_DisplayManager_getDisplay(e, o, a);
+}
 jobject java_lang_Class_getDisplay(JNIEnv *e, jobject o, va_list a)
-{ return android_hardware_display_DisplayManager_getDisplay(e, o, a); }
+{
+  return android_hardware_display_DisplayManager_getDisplay(e, o, a);
+}
 
 /* Activity.getWindowManager() → WindowManager stub.
  * UE's AndroidThunkJava_GetDeviceOrientation does:
@@ -2862,17 +3204,23 @@ jobject java_lang_Class_getDisplay(JNIEnv *e, jobject o, va_list a)
 jobject
 android_app_Activity_getWindowManager(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/view/WindowManager");
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/view/WindowManager");
 }
 jobject java_lang_Object_getWindowManager(JNIEnv *env, jobject obj, va_list args)
-{ return android_app_Activity_getWindowManager(env, obj, args); }
+{
+  return android_app_Activity_getWindowManager(env, obj, args);
+}
 jobject java_lang_Class_getWindowManager(JNIEnv *env, jobject obj, va_list args)
-{ return android_app_Activity_getWindowManager(env, obj, args); }
+{
+  return android_app_Activity_getWindowManager(env, obj, args);
+}
 jobject com_epicgames_ue4_GameActivity_getWindowManager(JNIEnv *env, jobject obj, va_list args)
-{ return android_app_Activity_getWindowManager(env, obj, args); }
+{
+  return android_app_Activity_getWindowManager(env, obj, args);
+}
 
 /* Activity.getWindow() → Window stub.
  * AndroidThunkJava_KeepScreenOn does runOnUiThread(() -> getWindow().addFlags/
@@ -2881,17 +3229,23 @@ jobject com_epicgames_ue4_GameActivity_getWindowManager(JNIEnv *env, jobject obj
 jobject
 android_app_Activity_getWindow(JNIEnv *env, jobject object, va_list args)
 {
-   assert(env && object);
-   (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "android/view/Window");
+  assert(env && object);
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/view/Window");
 }
 jobject java_lang_Object_getWindow(JNIEnv *env, jobject obj, va_list args)
-{ return android_app_Activity_getWindow(env, obj, args); }
+{
+  return android_app_Activity_getWindow(env, obj, args);
+}
 jobject java_lang_Class_getWindow(JNIEnv *env, jobject obj, va_list args)
-{ return android_app_Activity_getWindow(env, obj, args); }
+{
+  return android_app_Activity_getWindow(env, obj, args);
+}
 jobject com_epicgames_ue4_GameActivity_getWindow(JNIEnv *env, jobject obj, va_list args)
-{ return android_app_Activity_getWindow(env, obj, args); }
+{
+  return android_app_Activity_getWindow(env, obj, args);
+}
 
 /* Window.addFlags / clearFlags — KeepScreenOn only; no host window attrs. */
 #define DEF_WINDOW_FLAGS(name) \
@@ -2913,50 +3267,89 @@ DEF_WINDOW_FLAGS(clearFlags)
 jobject
 android_view_WindowManager_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o; (void)a;
-   return android_hardware_display_DisplayManager_getDisplay(e, o, a);
+  (void)o;
+  (void)a;
+  return android_hardware_display_DisplayManager_getDisplay(e, o, a);
 }
 jobject java_lang_Object_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
-{ return android_view_WindowManager_getDefaultDisplay(e, o, a); }
+{
+  return android_view_WindowManager_getDefaultDisplay(e, o, a);
+}
 jobject java_lang_Class_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
-{ return android_view_WindowManager_getDefaultDisplay(e, o, a); }
+{
+  return android_view_WindowManager_getDefaultDisplay(e, o, a);
+}
 jobject android_view_WindowManagerImpl_getDefaultDisplay(JNIEnv *e, jobject o, va_list a)
-{ return android_view_WindowManager_getDefaultDisplay(e, o, a); }
+{
+  return android_view_WindowManager_getDefaultDisplay(e, o, a);
+}
 
 /* ---- android.Manifest.permission.READ_PHONE_STATE ---- */
 jstring android_Manifest_permission_READ_PHONE_STATE(JNIEnv *e, jobject o)
-{ (void)o; return (*e)->NewStringUTF(e, "android.permission.READ_PHONE_STATE"); }
+{
+  (void)o;
+  return (*e)->NewStringUTF(e, "android.permission.READ_PHONE_STATE");
+}
 jstring java_lang_Object_READ_PHONE_STATE(JNIEnv *e, jobject o)
-{ return android_Manifest_permission_READ_PHONE_STATE(e, o); }
+{
+  return android_Manifest_permission_READ_PHONE_STATE(e, o);
+}
 jstring java_lang_Class_READ_PHONE_STATE(JNIEnv *e, jobject o)
-{ return android_Manifest_permission_READ_PHONE_STATE(e, o); }
+{
+  return android_Manifest_permission_READ_PHONE_STATE(e, o);
+}
 
 /* Activity.isFinishing() — Netmarble cancelNotification / checkActivity.
  * Without a host stub the DVM reports a miss and treats the call as falsey
  * only by accident; return JNI_FALSE so the activity looks alive. */
 jboolean android_app_Activity_isFinishing(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return JNI_FALSE;
+}
 jboolean com_epicgames_ue4_GameActivity_isFinishing(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return JNI_FALSE;
+}
 jboolean java_lang_Object_isFinishing(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return JNI_FALSE;
+}
 
 /* The process Application has its own identity and lifetime. Returning the
  * Activity breaks plugins that cast the application context to Application
  * to register lifecycle callbacks (including DFU's pointer capture helper). */
 static jobject lunaria_application_context(JNIEnv *e)
 {
-   static jobject application;
-   return jvm_cached_object(e, &application, "android/app/Application");
+  static jobject application;
+  return jvm_cached_object(e, &application, "android/app/Application");
 }
 jobject android_content_Context_getApplicationContext(JNIEnv *e, jobject o, va_list a)
-{ (void)o; (void)a; return lunaria_application_context(e); }
+{
+  (void)o;
+  (void)a;
+  return lunaria_application_context(e);
+}
 jobject android_app_Activity_getApplicationContext(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getApplicationContext(e, o, a); }
+{
+  return android_content_Context_getApplicationContext(e, o, a);
+}
 jobject com_epicgames_ue4_GameActivity_getApplicationContext(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getApplicationContext(e, o, a); }
+{
+  return android_content_Context_getApplicationContext(e, o, a);
+}
 jobject java_lang_Object_getApplicationContext(JNIEnv *e, jobject o, va_list a)
-{ return android_content_Context_getApplicationContext(e, o, a); }
+{
+  return android_content_Context_getApplicationContext(e, o, a);
+}
 
 /* GameActivity.AndroidThunkJava_GetAndroidId() — UE FAndroidMisc::GetDeviceId.
  * Blade & Soul CDN URL (CBCdnConfigManager::SetConfingURL) appends this; without
@@ -2965,11 +3358,14 @@ jobject java_lang_Object_getApplicationContext(JNIEnv *e, jobject o, va_list a)
 jstring
 com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o; (void)a;
-   return (*e)->NewStringUTF(e, lunaria_android_setting("secure", "android_id"));
+  (void)o;
+  (void)a;
+  return (*e)->NewStringUTF(e, lunaria_android_setting("secure", "android_id"));
 }
 jstring java_lang_Object_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_list a)
-{ return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(e, o, a); }
+{
+  return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetAndroidId(e, o, a);
+}
 
 /* GameActivity.AndroidThunkJava_GetNetworkConnectionType() — UE ENetworkConnectionType.
  * WiFi=3 (None=0, Airplane=1, Cell=2, WiFi=3).  Dex bytecode walks
@@ -2977,51 +3373,102 @@ jstring java_lang_Object_AndroidThunkJava_GetAndroidId(JNIEnv *e, jobject o, va_
 jint
 com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(JNIEnv *e, jobject o, va_list a)
 {
-   (void)e; (void)o; (void)a;
-   return arm_exec_network_enabled() ? 3 : 0;
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_network_enabled() ? 3 : 0;
 }
 jint java_lang_Object_AndroidThunkJava_GetNetworkConnectionType(JNIEnv *e, jobject o, va_list a)
-{ return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(e, o, a); }
+{
+  return com_epicgames_ue4_GameActivity_AndroidThunkJava_GetNetworkConnectionType(e, o, a);
+}
 
 /* ConnectivityManager / NetworkInfo — used if dex GetNetworkConnectionType runs. */
 jobject
 android_net_ConnectivityManager_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o; (void)a;
-   if (!arm_exec_network_enabled()) return NULL;
-   static jobject sv;
-   return jvm_cached_object(e, &sv, "android/net/NetworkInfo");
+  (void)o;
+  (void)a;
+  if (!arm_exec_network_enabled()) return NULL;
+  static jobject sv;
+  return jvm_cached_object(e, &sv, "android/net/NetworkInfo");
 }
 jobject java_lang_Object_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
-{ return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a); }
+{
+  return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a);
+}
 jobject java_lang_Class_getActiveNetworkInfo(JNIEnv *e, jobject o, va_list a)
-{ return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a); }
+{
+  return android_net_ConnectivityManager_getActiveNetworkInfo(e, o, a);
+}
 
 jboolean android_net_NetworkInfo_isConnected(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_network_enabled() ? JNI_TRUE : JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_network_enabled() ? JNI_TRUE : JNI_FALSE;
+}
 
 jboolean android_net_NetworkInfo_isAvailable(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_network_enabled() ? JNI_TRUE : JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_network_enabled() ? JNI_TRUE : JNI_FALSE;
+}
 
 /* android.net.ConnectivityManager.TYPE_WIFI == 1 */
 jint android_net_NetworkInfo_getType(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 1; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 1;
+}
 
 /* ---- Activity.getSplashMode() → 0 (no splash) ---- */
 jint android_app_Activity_getSplashMode(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 jint java_lang_Object_getSplashMode(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 jint java_lang_Class_getSplashMode(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 
 /* ---- Activity.triggerResizeCall() → no-op ---- */
 void android_app_Activity_triggerResizeCall(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+}
 void java_lang_Object_triggerResizeCall(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+}
 void java_lang_Class_triggerResizeCall(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+}
 
 /* ---- Activity UI stubs ---- */
 #define DEF_VOID3(name) \
@@ -3038,39 +3485,90 @@ DEF_VOID3(stopActivityIndicator)
 
 /* ---- android.view.Display ---- */
 jint android_view_Display_getDisplayId(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 jint java_lang_Object_getDisplayId(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 jint java_lang_Class_getDisplayId(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 
 jint android_view_Display_getWidth(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_fb_width(); }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_fb_width();
+}
 jint java_lang_Object_getWidth(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_fb_width(); }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_fb_width();
+}
 jint java_lang_Class_getWidth(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_fb_width(); }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_fb_width();
+}
 
 jint android_view_Display_getHeight(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_fb_height();
+}
 jint java_lang_Object_getHeight(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_fb_height();
+}
 jint java_lang_Class_getHeight(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return arm_exec_fb_height();
+}
 
 jint android_view_Display_getRotation(JNIEnv *e, jobject o, va_list a)
 {
-   (void)e; (void)o; (void)a;
-   /* The emulated device's natural orientation is portrait.  Rotation and
-    * DisplayMetrics must describe the same current display: UE polls this
-    * every frame and swaps its render dimensions when they disagree. */
-   return arm_exec_fb_width() > arm_exec_fb_height()
-      ? 1 /* ROTATION_90 */ : 0 /* ROTATION_0 */;
+  (void)e;
+  (void)o;
+  (void)a;
+  /* The emulated device's natural orientation is portrait.  Rotation and
+   * DisplayMetrics must describe the same current display: UE polls this
+   * every frame and swaps its render dimensions when they disagree. */
+  return arm_exec_fb_width() > arm_exec_fb_height()
+         ? 1 /* ROTATION_90 */ : 0 /* ROTATION_0 */;
 }
 jint java_lang_Object_getRotation(JNIEnv *e, jobject o, va_list a)
-{ return android_view_Display_getRotation(e, o, a); }
+{
+  return android_view_Display_getRotation(e, o, a);
+}
 jint java_lang_Class_getRotation(JNIEnv *e, jobject o, va_list a)
-{ return android_view_Display_getRotation(e, o, a); }
+{
+  return android_view_Display_getRotation(e, o, a);
+}
 
 /* Display refresh timing.  Frame pacers (Google's Swappy, which UE links as
  * libswappy.so) derive the vsync period as 1e9 / getRefreshRate(); with the
@@ -3082,29 +3580,74 @@ jint java_lang_Class_getRotation(JNIEnv *e, jobject o, va_list a)
 #define LUNA_REFRESH_NS 16666667LL
 
 jfloat android_view_Display_getRefreshRate(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return LUNA_REFRESH_HZ; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return LUNA_REFRESH_HZ;
+}
 jfloat java_lang_Object_getRefreshRate(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return LUNA_REFRESH_HZ; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return LUNA_REFRESH_HZ;
+}
 jfloat java_lang_Class_getRefreshRate(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return LUNA_REFRESH_HZ; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return LUNA_REFRESH_HZ;
+}
 
 /* Time from vsync to when the app's buffer is sampled; 0 is a valid answer and
  * is what devices without a measured offset report. */
 jlong android_view_Display_getAppVsyncOffsetNanos(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 jlong java_lang_Object_getAppVsyncOffsetNanos(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 jlong java_lang_Class_getAppVsyncOffsetNanos(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0;
+}
 
 /* Latest a buffer may be queued and still make the next vsync: one frame minus
  * the compositor's slack. */
 jlong android_view_Display_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return LUNA_REFRESH_NS + 1000000LL; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return LUNA_REFRESH_NS + 1000000LL;
+}
 jlong java_lang_Object_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return LUNA_REFRESH_NS + 1000000LL; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return LUNA_REFRESH_NS + 1000000LL;
+}
 jlong java_lang_Class_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return LUNA_REFRESH_NS + 1000000LL; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return LUNA_REFRESH_NS + 1000000LL;
+}
 
 /* Display.getRealMetrics(DisplayMetrics outMetrics) — populate w/h/density.
  * Unity reads widthPixels/heightPixels/xdpi/ydpi/density from the outMetrics
@@ -3114,52 +3657,60 @@ jlong java_lang_Class_getPresentationDeadlineNanos(JNIEnv *e, jobject o, va_list
 void
 android_view_Display_fillMetrics(JNIEnv *e, jobject out)
 {
-   if (!e || !out) return;
-   jclass cls = (*e)->FindClass(e, "android/util/DisplayMetrics");
-   if (!cls) return;
-   int w = arm_exec_fb_width(), h = arm_exec_fb_height();
-   /* The density the screen is presented with, the one AConfiguration and the
-    * bytecode VM's DisplayMetrics report too: dp = density x px. */
-   float dpi = (float)lunaria_screen()->density;
-   float density = dpi / 160.0f;
-   jfieldID fw = (*e)->GetFieldID(e, cls, "widthPixels",   "I");
-   jfieldID fh = (*e)->GetFieldID(e, cls, "heightPixels",  "I");
-   jfieldID fd = (*e)->GetFieldID(e, cls, "density",       "F");
-   jfieldID fs = (*e)->GetFieldID(e, cls, "scaledDensity", "F");
-   jfieldID fx = (*e)->GetFieldID(e, cls, "xdpi",          "F");
-   jfieldID fy = (*e)->GetFieldID(e, cls, "ydpi",          "F");
-   jfieldID fi = (*e)->GetFieldID(e, cls, "densityDpi",    "I");
-   if (fw) (*e)->SetIntField(e, out, fw, w);
-   if (fh) (*e)->SetIntField(e, out, fh, h);
-   if (fd) (*e)->SetFloatField(e, out, fd, density);
-   if (fs) (*e)->SetFloatField(e, out, fs, density);
-   if (fx) (*e)->SetFloatField(e, out, fx, dpi);
-   if (fy) (*e)->SetFloatField(e, out, fy, dpi);
-   if (fi) (*e)->SetIntField(e, out, fi, (jint)(dpi + 0.5f));
-   fprintf(stderr, "[arm_jni] DisplayMetrics filled %dx%d density=%.1f\n",
-           w, h, density);
+  if (!e || !out) return;
+  jclass cls = (*e)->FindClass(e, "android/util/DisplayMetrics");
+  if (!cls) return;
+  int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+  /* The density the screen is presented with, the one AConfiguration and the
+   * bytecode VM's DisplayMetrics report too: dp = density x px. */
+  float dpi = (float)lunaria_screen()->density;
+  float density = dpi / 160.0f;
+  jfieldID fw = (*e)->GetFieldID(e, cls, "widthPixels",   "I");
+  jfieldID fh = (*e)->GetFieldID(e, cls, "heightPixels",  "I");
+  jfieldID fd = (*e)->GetFieldID(e, cls, "density",       "F");
+  jfieldID fs = (*e)->GetFieldID(e, cls, "scaledDensity", "F");
+  jfieldID fx = (*e)->GetFieldID(e, cls, "xdpi",          "F");
+  jfieldID fy = (*e)->GetFieldID(e, cls, "ydpi",          "F");
+  jfieldID fi = (*e)->GetFieldID(e, cls, "densityDpi",    "I");
+  if (fw) (*e)->SetIntField(e, out, fw, w);
+  if (fh) (*e)->SetIntField(e, out, fh, h);
+  if (fd) (*e)->SetFloatField(e, out, fd, density);
+  if (fs) (*e)->SetFloatField(e, out, fs, density);
+  if (fx) (*e)->SetFloatField(e, out, fx, dpi);
+  if (fy) (*e)->SetFloatField(e, out, fy, dpi);
+  if (fi) (*e)->SetIntField(e, out, fi, (jint)(dpi + 0.5f));
+  fprintf(stderr, "[arm_jni] DisplayMetrics filled %dx%d density=%.1f\n",
+          w, h, density);
 }
 
 void
 android_view_Display_getRealMetrics(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o;
-   if (!JVM_VA_HAS_ARGS(a)) return;
-   android_view_Display_fillMetrics(e, va_arg(a, jobject));
+  (void)o;
+  if (!JVM_VA_HAS_ARGS(a)) return;
+  android_view_Display_fillMetrics(e, va_arg(a, jobject));
 }
 void
 android_view_Display_getMetrics(JNIEnv *e, jobject o, va_list a)
 {
-   android_view_Display_getRealMetrics(e, o, a);
+  android_view_Display_getRealMetrics(e, o, a);
 }
 void java_lang_Object_getRealMetrics(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealMetrics(e, o, a); }
+{
+  android_view_Display_getRealMetrics(e, o, a);
+}
 void java_lang_Class_getRealMetrics(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealMetrics(e, o, a); }
+{
+  android_view_Display_getRealMetrics(e, o, a);
+}
 void java_lang_Object_getMetrics(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getMetrics(e, o, a); }
+{
+  android_view_Display_getMetrics(e, o, a);
+}
 void java_lang_Class_getMetrics(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getMetrics(e, o, a); }
+{
+  android_view_Display_getMetrics(e, o, a);
+}
 
 /* Display.getRealSize(Point out) / getSize(Point out).  The Point form is the
  * one most engines use to size their swapchain; it was missing while
@@ -3168,51 +3719,89 @@ void java_lang_Class_getMetrics(JNIEnv *e, jobject o, va_list a)
 static void
 android_view_Display_fillPoint(JNIEnv *e, jobject out)
 {
-   if (!e || !out) return;
-   jclass cls = (*e)->FindClass(e, "android/graphics/Point");
-   if (!cls) return;
-   jfieldID fx = (*e)->GetFieldID(e, cls, "x", "I");
-   jfieldID fy = (*e)->GetFieldID(e, cls, "y", "I");
-   if (fx) (*e)->SetIntField(e, out, fx, arm_exec_fb_width());
-   if (fy) (*e)->SetIntField(e, out, fy, arm_exec_fb_height());
+  if (!e || !out) return;
+  jclass cls = (*e)->FindClass(e, "android/graphics/Point");
+  if (!cls) return;
+  jfieldID fx = (*e)->GetFieldID(e, cls, "x", "I");
+  jfieldID fy = (*e)->GetFieldID(e, cls, "y", "I");
+  if (fx) (*e)->SetIntField(e, out, fx, arm_exec_fb_width());
+  if (fy) (*e)->SetIntField(e, out, fy, arm_exec_fb_height());
 }
 
 void
 android_view_Display_getRealSize(JNIEnv *e, jobject o, va_list a)
 {
-   (void)o;
-   if (!JVM_VA_HAS_ARGS(a)) return;
-   android_view_Display_fillPoint(e, va_arg(a, jobject));
+  (void)o;
+  if (!JVM_VA_HAS_ARGS(a)) return;
+  android_view_Display_fillPoint(e, va_arg(a, jobject));
 }
 void android_view_Display_getSize(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealSize(e, o, a); }
+{
+  android_view_Display_getRealSize(e, o, a);
+}
 void java_lang_Object_getRealSize(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealSize(e, o, a); }
+{
+  android_view_Display_getRealSize(e, o, a);
+}
 void java_lang_Class_getRealSize(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealSize(e, o, a); }
+{
+  android_view_Display_getRealSize(e, o, a);
+}
 void java_lang_Object_getSize(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealSize(e, o, a); }
+{
+  android_view_Display_getRealSize(e, o, a);
+}
 void java_lang_Class_getSize(JNIEnv *e, jobject o, va_list a)
-{ android_view_Display_getRealSize(e, o, a); }
+{
+  android_view_Display_getRealSize(e, o, a);
+}
 
 /* PowerManager thermal API (API 29+).  The emulator never throttles, so the
  * status is permanently THERMAL_STATUS_NONE and a registered listener is never
  * called back — but the calls themselves have to exist, because a game that
  * cannot register its listener dies in its device-capability setup. */
 jint android_os_PowerManager_getCurrentThermalStatus(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0; /* THERMAL_STATUS_NONE */ }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0; /* THERMAL_STATUS_NONE */
+}
 void android_os_PowerManager_addThermalStatusListener(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+}
 void android_os_PowerManager_removeThermalStatusListener(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+}
 jfloat android_os_PowerManager_getThermalHeadroom(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 0.0f; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return 0.0f;
+}
 
 /* Debug.isDebuggerConnected(): nothing is attached to the guest. */
 jint android_os_Debug_isDebuggerConnected(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return JNI_FALSE;
+}
 jint android_os_Debug_waitingForDebugger(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return JNI_FALSE; }
+{
+  (void)e;
+  (void)o;
+  (void)a;
+  return JNI_FALSE;
+}
 
 /* Dex: (Class,String,String,Z)->Method / Field.  Must take va_list like every
  * other Call* stub — CallStaticObjectMethodA builds a fake va_list over the
@@ -3220,55 +3809,55 @@ jint android_os_Debug_waitingForDebugger(JNIEnv *e, jobject o, va_list a)
  * returned null, so Unity's AndroidAgent never got getInstance. */
 jobject
 com_unity3d_player_ReflectionHelper_getMethodID(JNIEnv *env, jobject object,
-                                                va_list args)
+    va_list args)
 {
-   assert(env && object);
-   jclass clazz = va_arg(args, jclass);
-   jstring name = va_arg(args, jstring);
-   jstring sig = va_arg(args, jstring);
-   jboolean is_static = (jboolean)va_arg(args, int);
-   if (!clazz || !name || !sig) return NULL;
-   const char *utf1 = (*env)->GetStringUTFChars(env, name, NULL);
-   const char *utf2 = (*env)->GetStringUTFChars(env, sig, NULL);
-   if (!utf1 || !utf2) {
-      if (utf1) (*env)->ReleaseStringUTFChars(env, name, utf1);
-      if (utf2) (*env)->ReleaseStringUTFChars(env, sig, utf2);
-      return NULL;
-   }
-   /* Unity immediately FromReflectedMethod()'s the result.  In this JVM a
-    * jmethodID is already a Method-shaped object, so returning it matches
-    * FromReflectedMethod's identity conversion. */
-   jobject mid = is_static
-      ? (jobject)(*env)->GetStaticMethodID(env, clazz, utf1, utf2)
-      : (jobject)(*env)->GetMethodID(env, clazz, utf1, utf2);
-   (*env)->ReleaseStringUTFChars(env, name, utf1);
-   (*env)->ReleaseStringUTFChars(env, sig, utf2);
-   return mid;
+  assert(env && object);
+  jclass clazz = va_arg(args, jclass);
+  jstring name = va_arg(args, jstring);
+  jstring sig = va_arg(args, jstring);
+  jboolean is_static = (jboolean)va_arg(args, int);
+  if (!clazz || !name || !sig) return NULL;
+  const char *utf1 = (*env)->GetStringUTFChars(env, name, NULL);
+  const char *utf2 = (*env)->GetStringUTFChars(env, sig, NULL);
+  if (!utf1 || !utf2) {
+    if (utf1) (*env)->ReleaseStringUTFChars(env, name, utf1);
+    if (utf2) (*env)->ReleaseStringUTFChars(env, sig, utf2);
+    return NULL;
+  }
+  /* Unity immediately FromReflectedMethod()'s the result.  In this JVM a
+   * jmethodID is already a Method-shaped object, so returning it matches
+   * FromReflectedMethod's identity conversion. */
+  jobject mid = is_static
+                ? (jobject)(*env)->GetStaticMethodID(env, clazz, utf1, utf2)
+                : (jobject)(*env)->GetMethodID(env, clazz, utf1, utf2);
+  (*env)->ReleaseStringUTFChars(env, name, utf1);
+  (*env)->ReleaseStringUTFChars(env, sig, utf2);
+  return mid;
 }
 
 jobject
 com_unity3d_player_ReflectionHelper_getFieldID(JNIEnv *env, jobject object,
-                                               va_list args)
+    va_list args)
 {
-   assert(env && object);
-   jclass clazz = va_arg(args, jclass);
-   jstring name = va_arg(args, jstring);
-   jstring sig = va_arg(args, jstring);
-   jboolean is_static = (jboolean)va_arg(args, int);
-   if (!clazz || !name || !sig) return NULL;
-   const char *utf1 = (*env)->GetStringUTFChars(env, name, NULL);
-   const char *utf2 = (*env)->GetStringUTFChars(env, sig, NULL);
-   if (!utf1 || !utf2) {
-      if (utf1) (*env)->ReleaseStringUTFChars(env, name, utf1);
-      if (utf2) (*env)->ReleaseStringUTFChars(env, sig, utf2);
-      return NULL;
-   }
-   jobject fid = is_static
-      ? (jobject)(*env)->GetStaticFieldID(env, clazz, utf1, utf2)
-      : (jobject)(*env)->GetFieldID(env, clazz, utf1, utf2);
-   (*env)->ReleaseStringUTFChars(env, name, utf1);
-   (*env)->ReleaseStringUTFChars(env, sig, utf2);
-   return fid;
+  assert(env && object);
+  jclass clazz = va_arg(args, jclass);
+  jstring name = va_arg(args, jstring);
+  jstring sig = va_arg(args, jstring);
+  jboolean is_static = (jboolean)va_arg(args, int);
+  if (!clazz || !name || !sig) return NULL;
+  const char *utf1 = (*env)->GetStringUTFChars(env, name, NULL);
+  const char *utf2 = (*env)->GetStringUTFChars(env, sig, NULL);
+  if (!utf1 || !utf2) {
+    if (utf1) (*env)->ReleaseStringUTFChars(env, name, utf1);
+    if (utf2) (*env)->ReleaseStringUTFChars(env, sig, utf2);
+    return NULL;
+  }
+  jobject fid = is_static
+                ? (jobject)(*env)->GetStaticFieldID(env, clazz, utf1, utf2)
+                : (jobject)(*env)->GetFieldID(env, clazz, utf1, utf2);
+  (*env)->ReleaseStringUTFChars(env, name, utf1);
+  (*env)->ReleaseStringUTFChars(env, sig, utf2);
+  return fid;
 }
 
 /* Unity queues callbacks from native threads to run on the Java main thread.
@@ -3277,21 +3866,27 @@ com_unity3d_player_ReflectionHelper_getFieldID(JNIEnv *env, jobject object,
 void
 com_unity3d_player_UnityPlayer_executeMainThreadJobs(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
+  (void)env;
+  (void)object;
+  (void)args;
 }
 
 /* Same method on the 2020+ service class */
 void
 com_unity3d_player_UnityPlayerForActivityOrService_executeMainThreadJobs(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
+  (void)env;
+  (void)object;
+  (void)args;
 }
 
 void
 com_unity3d_player_UnityPlayer_executeGLThreadJobs(JNIEnv *env, jobject object, va_list args)
 {
-   (void)env; (void)object; (void)args;
-   arm_exec_drain_gl_thread_jobs();
+  (void)env;
+  (void)object;
+  (void)args;
+  arm_exec_drain_gl_thread_jobs();
 }
 
 /* UnityPlayer.currentActivity is the Activity instance launched by the process,
@@ -3301,8 +3896,8 @@ com_unity3d_player_UnityPlayer_executeGLThreadJobs(JNIEnv *env, jobject object, 
 jobject
 com_unity3d_player_UnityPlayer_currentActivity(JNIEnv *env, jobject object)
 {
-   (void)object;
-   return (*env)->NewLocalRef(env, g_current_activity);
+  (void)object;
+  return (*env)->NewLocalRef(env, g_current_activity);
 }
 
 /* PlayAssetDeliveryUnityWrapper.init(UnityPlayer, Context) — static factory that
@@ -3312,9 +3907,9 @@ com_unity3d_player_UnityPlayer_currentActivity(JNIEnv *env, jobject object)
 jobject
 com_unity3d_player_PlayAssetDeliveryUnityWrapper_init(JNIEnv *env, jclass clazz, va_list args)
 {
-   (void)args;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "com/unity3d/player/PlayAssetDeliveryUnityWrapper");
+  (void)args;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "com/unity3d/player/PlayAssetDeliveryUnityWrapper");
 }
 
 /* playCoreApiMissing() — return true so Unity skips Play Core and reads assets
@@ -3322,8 +3917,9 @@ com_unity3d_player_PlayAssetDeliveryUnityWrapper_init(JNIEnv *env, jclass clazz,
 jboolean
 com_unity3d_player_PlayAssetDeliveryUnityWrapper_playCoreApiMissing(JNIEnv *env, jobject object)
 {
-   (void)env; (void)object;
-   return 1;
+  (void)env;
+  (void)object;
+  return 1;
 }
 
 /* Unity IAP: GooglePlayPurchasing.instance(IUnityCallback) — no Play Billing in
@@ -3333,31 +3929,40 @@ com_unity3d_player_PlayAssetDeliveryUnityWrapper_playCoreApiMissing(JNIEnv *env,
 jobject
 com_unity_purchasing_googleplay_GooglePlayPurchasing_instance(JNIEnv *env, jclass clazz, jvalue *values)
 {
-   (void)clazz; (void)values;
-   static jobject sv;
-   return jvm_cached_object(env, &sv, "com/unity/purchasing/googleplay/GooglePlayPurchasing");
+  (void)clazz;
+  (void)values;
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "com/unity/purchasing/googleplay/GooglePlayPurchasing");
 }
 
 jstring
 com_blizzard_wtcg_hearthstone_DeviceSettings_GetModelNumber(JNIEnv *env, jobject object)
 {
-   return (*env)->NewStringUTF(env, "0");
+  return (*env)->NewStringUTF(env, "0");
 }
 
 /* Indexed and non-indexed MotionEvent getters have distinct JNI signatures. */
 jfloat android_view_MotionEvent_getX__I(JNIEnv *e, jobject o, va_list a)
-{ return luna_event_x(motion_payload(e, o), va_arg(a, int)); }
+{
+  return luna_event_x(motion_payload(e, o), va_arg(a, int));
+}
 jfloat android_view_MotionEvent_getY__I(JNIEnv *e, jobject o, va_list a)
-{ return luna_event_y(motion_payload(e, o), va_arg(a, int)); }
+{
+  return luna_event_y(motion_payload(e, o), va_arg(a, int));
+}
 jfloat android_view_MotionEvent_getRawX__I(JNIEnv *e, jobject o, va_list a)
-{ return luna_event_x(motion_payload(e, o), va_arg(a, int)); }
+{
+  return luna_event_x(motion_payload(e, o), va_arg(a, int));
+}
 jfloat android_view_MotionEvent_getRawY__I(JNIEnv *e, jobject o, va_list a)
-{ return luna_event_y(motion_payload(e, o), va_arg(a, int)); }
+{
+  return luna_event_y(motion_payload(e, o), va_arg(a, int));
+}
 jint android_view_MotionEvent_findPointerIndex(JNIEnv *e, jobject o, va_list a)
 {
-   const lunaria_touch_event *ev = motion_payload(e, o);
-   int id = va_arg(a, int);
-   for (int i = 0; i < luna_event_count(ev); ++i)
-      if (luna_event_id(ev, i) == id) return i;
-   return -1;
+  const lunaria_touch_event *ev = motion_payload(e, o);
+  int id = va_arg(a, int);
+  for (int i = 0; i < luna_event_count(ev); ++i)
+    if (luna_event_id(ev, i) == id) return i;
+  return -1;
 }

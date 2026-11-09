@@ -1,7 +1,16 @@
-/* MPL-2.0. java.security, javax.crypto and Android keystore key generation.
- * Implementation section included by dvm_runtime.c in declaration order.
- * Shared helpers and class registration remain in that translation unit. */
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
 
+/*
+ * java.security, javax.crypto and Android keystore key generation.
+ * Implementation section included by dvm_runtime.c in declaration order.
+ * Shared helpers and class registration remain in that translation unit.
+ */
 /* --- java.security.MessageDigest ---------------------------------------- */
 
 /* A digest is incremental.  This used to accumulate every byte handed to
@@ -16,61 +25,65 @@
  * is exactly what java.security.MessageDigest promises. */
 static const EVP_MD *md_type_for(struct dvm *vm, dvm_ref self)
 {
-   union dvm_value av = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &av);
-   const char *alg = av.l ? dvm_string_utf8(vm, av.l) : NULL;
-   if (!alg || !*alg) alg = "SHA-256";
-   /* Java spells some of these differently from OpenSSL. */
-   if (!strcasecmp(alg, "SHA")) alg = "SHA1";
-   return EVP_get_digestbyname(alg);
+  union dvm_value av = { 0 };
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &av);
+  const char *alg = av.l ? dvm_string_utf8(vm, av.l) : NULL;
+  if (!alg || !*alg) alg = "SHA-256";
+  /* Java spells some of these differently from OpenSSL. */
+  if (!strcasecmp(alg, "SHA")) alg = "SHA1";
+  return EVP_get_digestbyname(alg);
 }
 
 static EVP_MD_CTX *md_ctx(struct dvm *vm, dvm_ref self, bool create)
 {
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "ctx", "J", &v);
-   EVP_MD_CTX *ctx = (EVP_MD_CTX *)(uintptr_t)v.j;
-   if (ctx || !create) return ctx;
-   const EVP_MD *type = md_type_for(vm, self);
-   if (!type) return NULL;
-   ctx = EVP_MD_CTX_new();
-   if (!ctx) return NULL;
-   if (!EVP_DigestInit_ex(ctx, type, NULL)) { EVP_MD_CTX_free(ctx); return NULL; }
-   union dvm_value nv = { .j = (int64_t)(uintptr_t)ctx };
-   (void)dvm_set_field(vm, self, "ctx", "J", nv);
-   return ctx;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "ctx", "J", &v);
+  EVP_MD_CTX *ctx = (EVP_MD_CTX *)(uintptr_t)v.j;
+  if (ctx || !create) return ctx;
+  const EVP_MD *type = md_type_for(vm, self);
+  if (!type) return NULL;
+  ctx = EVP_MD_CTX_new();
+  if (!ctx) return NULL;
+  if (!EVP_DigestInit_ex(ctx, type, NULL)) {
+    EVP_MD_CTX_free(ctx);
+    return NULL;
+  }
+  union dvm_value nv = { .j = (int64_t)(uintptr_t)ctx };
+  (void)dvm_set_field(vm, self, "ctx", "J", nv);
+  return ctx;
 }
 
 static void md_ctx_drop(struct dvm *vm, dvm_ref self)
 {
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "ctx", "J", &v);
-   if (v.j) EVP_MD_CTX_free((EVP_MD_CTX *)(uintptr_t)v.j);
-   union dvm_value z = { .j = 0 };
-   (void)dvm_set_field(vm, self, "ctx", "J", z);
-   (void)dvm_set_field(vm, self, "fed", "J", z);
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "ctx", "J", &v);
+  if (v.j) EVP_MD_CTX_free((EVP_MD_CTX *)(uintptr_t)v.j);
+  union dvm_value z = { .j = 0 };
+  (void)dvm_set_field(vm, self, "ctx", "J", z);
+  (void)dvm_set_field(vm, self, "fed", "J", z);
 }
 
 static bool md_getInstance(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   struct dvm_class *c =
-      dvm__class_by_desc(vm, "Ljava/security/MessageDigest;");
-   dvm_ref d = c ? dvm_new_object(vm, c) : 0;
-   if (!d) RETL(0);
-   union dvm_value v = { .l = dvm_new_string(vm, alg ? alg : "SHA-256") };
-   (void)dvm_set_field(vm, d, "algorithm", "Ljava/lang/String;", v);
-   /* Unknown algorithms fail here, not at digest() — that is where the caller
-    * is prepared to catch it. */
-   if (!md_type_for(vm, d)) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s",
-                 alg ? alg : "(null)");
-      return false;
-   }
-   RETL(d);
+  (void)self;
+  (void)nargs;
+  const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  struct dvm_class *c =
+    dvm__class_by_desc(vm, "Ljava/security/MessageDigest;");
+  dvm_ref d = c ? dvm_new_object(vm, c) : 0;
+  if (!d) RETL(0);
+  union dvm_value v = { .l = dvm_new_string(vm, alg ? alg : "SHA-256") };
+  (void)dvm_set_field(vm, d, "algorithm", "Ljava/lang/String;", v);
+  /* Unknown algorithms fail here, not at digest() — that is where the caller
+   * is prepared to catch it. */
+  if (!md_type_for(vm, d)) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s",
+               alg ? alg : "(null)");
+    return false;
+  }
+  RETL(d);
 }
 
 /* The Java overload determines the input type; byte values can also be
@@ -78,33 +91,33 @@ static bool md_getInstance(struct dvm *vm, dvm_ref self,
 static bool md_feed(struct dvm *vm, dvm_ref self, const uint8_t *src,
                     size_t len, union dvm_value *out)
 {
-   (void)out;
-   EVP_MD_CTX *ctx = md_ctx(vm, self, true);
-   if (!ctx) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "digest");
-      return false;
-   }
-   if (!len) RETV();
-   /* DigestUpdate does not touch the VM — only the EVP context and the
-    * caller's byte[].  Holding the interpreter lock across a multi-megabyte
-    * MD5 of a pak (Cross Worlds' patcher) serialises every Java thread and,
-    * through JNI, every engine that wants to call into Java.  A real JVM
-    * releases its equivalent for native digests; do the same for large
-    * updates.  Tiny ones stay locked: the hand-off itself costs more. */
-   if (len >= (1u << 16)) {
-      unsigned gil = dvm_gil_unlock_all(vm);
-      (void)EVP_DigestUpdate(ctx, src, len);
-      dvm_gil_relock(vm, gil);
-   } else {
-      (void)EVP_DigestUpdate(ctx, src, len);
-   }
-   if (getenv("LUNARIA_TRACE_MD5")) {
-      union dvm_value fed = { 0 };
-      (void)dvm_get_field(vm, self, "fed", "J", &fed);
-      fed.j += (int64_t)len;
-      (void)dvm_set_field(vm, self, "fed", "J", fed);
-   }
-   RETV();
+  (void)out;
+  EVP_MD_CTX *ctx = md_ctx(vm, self, true);
+  if (!ctx) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "digest");
+    return false;
+  }
+  if (!len) RETV();
+  /* DigestUpdate does not touch the VM — only the EVP context and the
+   * caller's byte[].  Holding the interpreter lock across a multi-megabyte
+   * MD5 of a pak (Cross Worlds' patcher) serialises every Java thread and,
+   * through JNI, every engine that wants to call into Java.  A real JVM
+   * releases its equivalent for native digests; do the same for large
+   * updates.  Tiny ones stay locked: the hand-off itself costs more. */
+  if (len >= (1u << 16)) {
+    unsigned gil = dvm_gil_unlock_all(vm);
+    (void)EVP_DigestUpdate(ctx, src, len);
+    dvm_gil_relock(vm, gil);
+  } else {
+    (void)EVP_DigestUpdate(ctx, src, len);
+  }
+  if (getenv("LUNARIA_TRACE_MD5")) {
+    union dvm_value fed = { 0 };
+    (void)dvm_get_field(vm, self, "fed", "J", &fed);
+    fed.j += (int64_t)len;
+    (void)dvm_set_field(vm, self, "fed", "J", fed);
+  }
+  RETV();
 }
 
 /* The bytes update(ByteBuffer) consumes: from the position to the limit, in the
@@ -112,114 +125,117 @@ static bool md_feed(struct dvm *vm, dvm_ref self, const uint8_t *src,
  * limit as the JCA requires. */
 static bool crypto_take_buffer(struct dvm *vm, dvm_ref buffer, const uint8_t **bytes, uint32_t *count)
 {
-   if (!buffer) {
-      dvm__throw(vm, "java/lang/NullPointerException", "input buffer");
-      return false;
-   }
-   struct dvm_object *array = stream_buf(vm, buffer);
-   int32_t pos = 0, limit = 0, off = 0;
-   (void)stream_field(vm, buffer, "pos", &pos);
-   (void)stream_field(vm, buffer, "count", &limit);
-   (void)stream_field(vm, buffer, "off", &off);
-   if (!array || !array->data || pos < 0 || limit < pos || (uint32_t)limit > array->length) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid input buffer window");
-      return false;
-   }
-   *bytes = (const uint8_t *)array->data + (off > 0 ? off : 0) + pos;
-   *count = (uint32_t)(limit - pos);
-   stream_set_field(vm, buffer, "pos", limit);
-   return true;
+  if (!buffer) {
+    dvm__throw(vm, "java/lang/NullPointerException", "input buffer");
+    return false;
+  }
+  struct dvm_object *array = stream_buf(vm, buffer);
+  int32_t pos = 0, limit = 0, off = 0;
+  (void)stream_field(vm, buffer, "pos", &pos);
+  (void)stream_field(vm, buffer, "count", &limit);
+  (void)stream_field(vm, buffer, "off", &off);
+  if (!array || !array->data || pos < 0 || limit < pos || (uint32_t)limit > array->length) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid input buffer window");
+    return false;
+  }
+  *bytes = (const uint8_t *)array->data + (off > 0 ? off : 0) + pos;
+  *count = (uint32_t)(limit - pos);
+  stream_set_field(vm, buffer, "pos", limit);
+  return true;
 }
 
 static bool md_update_buffer(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                              int nargs, union dvm_value *out)
 {
-   (void)nargs;
-   const uint8_t *data; uint32_t count;
-   if (!crypto_take_buffer(vm, ARG(0).l, &data, &count)) return false;
-   return md_feed(vm, self, data, count, out);
+  (void)nargs;
+  const uint8_t *data;
+  uint32_t count;
+  if (!crypto_take_buffer(vm, ARG(0).l, &data, &count)) return false;
+  return md_feed(vm, self, data, count, out);
 }
 
 static bool md_update_byte(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)nargs;
-   const uint8_t byte = (uint8_t)ARG(0).i;
-   return md_feed(vm, self, &byte, 1, out);
+  (void)nargs;
+  const uint8_t byte = (uint8_t)ARG(0).i;
+  return md_feed(vm, self, &byte, 1, out);
 }
 
 static bool md_update(struct dvm *vm, dvm_ref self,
                       const union dvm_value *args, int nargs,
                       union dvm_value *out)
 {
-   if (!ARG(0).l) {
-      dvm__throw(vm, nargs >= 3 ? "java/lang/IllegalArgumentException" :
-                 "java/lang/NullPointerException", "null digest input");
-      return false;
-   }
-   struct dvm_object *array = dvm__obj(vm, ARG(0).l);
-   if (!array || array->kind != DVM_OBJ_ARRAY || array->elem_kind != 'B') {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "digest input is not byte[]");
-      return false;
-   }
-   const int32_t offset = nargs >= 3 ? args[1].i : 0;
-   const int32_t count = nargs >= 3 ? args[2].i : (int32_t)array->length;
-   /* MessageDigest's public check precedes Conscrypt's native range check.
-    * Use unsigned subtraction for Java's wrapping int arithmetic. */
-   if (nargs >= 3 && (int32_t)(array->length - (uint32_t)offset) < count) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "digest input buffer too short");
-      return false;
-   }
-   if (offset < 0 || count < 0 || (uint32_t)offset > array->length ||
-       (uint32_t)count > array->length - (uint32_t)offset) {
-      dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "digest input range");
-      return false;
-   }
-   const uint8_t *data = array->data;
-   return md_feed(vm, self, count ? data + offset : data, (size_t)count, out);
+  if (!ARG(0).l) {
+    dvm__throw(vm, nargs >= 3 ? "java/lang/IllegalArgumentException" :
+               "java/lang/NullPointerException", "null digest input");
+    return false;
+  }
+  struct dvm_object *array = dvm__obj(vm, ARG(0).l);
+  if (!array || array->kind != DVM_OBJ_ARRAY || array->elem_kind != 'B') {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "digest input is not byte[]");
+    return false;
+  }
+  const int32_t offset = nargs >= 3 ? args[1].i : 0;
+  const int32_t count = nargs >= 3 ? args[2].i : (int32_t)array->length;
+  /* MessageDigest's public check precedes Conscrypt's native range check.
+   * Use unsigned subtraction for Java's wrapping int arithmetic. */
+  if (nargs >= 3 && (int32_t)(array->length - (uint32_t)offset) < count) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "digest input buffer too short");
+    return false;
+  }
+  if (offset < 0 || count < 0 || (uint32_t)offset > array->length ||
+      (uint32_t)count > array->length - (uint32_t)offset) {
+    dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "digest input range");
+    return false;
+  }
+  const uint8_t *data = array->data;
+  return md_feed(vm, self, count ? data + offset : data, (size_t)count, out);
 }
 
 static bool md_reset(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs; (void)out;
-   md_ctx_drop(vm, self);
-   RETV();
+  (void)args;
+  (void)nargs;
+  (void)out;
+  md_ctx_drop(vm, self);
+  RETV();
 }
 
 static bool md_digest(struct dvm *vm, dvm_ref self,
                       const union dvm_value *args, int nargs,
                       union dvm_value *out)
 {
-   /* digest(byte[]) is update() then digest(). */
-   if (nargs >= 1) {
-      union dvm_value ignored = { 0 };
-      if (!md_update(vm, self, args, 1, &ignored)) return false;
-   }
-   EVP_MD_CTX *ctx = md_ctx(vm, self, true);   /* digest() of nothing is legal */
-   if (!ctx) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "digest");
-      return false;
-   }
-   uint8_t md[EVP_MAX_MD_SIZE];
-   unsigned mdlen = 0;
-   int ok = EVP_DigestFinal_ex(ctx, md, &mdlen);
-   if (getenv("LUNARIA_TRACE_MD5")) {
-      union dvm_value fed = { 0 };
-      (void)dvm_get_field(vm, self, "fed", "J", &fed);
-      char hex[2 * EVP_MAX_MD_SIZE + 1];
-      for (unsigned i = 0; i < mdlen; ++i)
-         snprintf(hex + 2 * i, 3, "%02x", md[i]);
-      fprintf(stderr, "[md5] fed=%lld digest=%s\n", (long long)fed.j,
-              ok ? hex : "(failed)");
-   }
-   md_ctx_drop(vm, self);                      /* next update() starts over */
-   if (!ok) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "digest failed");
-      return false;
-   }
-   RETL(make_bytes(vm, md, mdlen));
+  /* digest(byte[]) is update() then digest(). */
+  if (nargs >= 1) {
+    union dvm_value ignored = { 0 };
+    if (!md_update(vm, self, args, 1, &ignored)) return false;
+  }
+  EVP_MD_CTX *ctx = md_ctx(vm, self, true);   /* digest() of nothing is legal */
+  if (!ctx) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "digest");
+    return false;
+  }
+  uint8_t md[EVP_MAX_MD_SIZE];
+  unsigned mdlen = 0;
+  int ok = EVP_DigestFinal_ex(ctx, md, &mdlen);
+  if (getenv("LUNARIA_TRACE_MD5")) {
+    union dvm_value fed = { 0 };
+    (void)dvm_get_field(vm, self, "fed", "J", &fed);
+    char hex[2 * EVP_MAX_MD_SIZE + 1];
+    for (unsigned i = 0; i < mdlen; ++i)
+      snprintf(hex + 2 * i, 3, "%02x", md[i]);
+    fprintf(stderr, "[md5] fed=%lld digest=%s\n", (long long)fed.j,
+            ok ? hex : "(failed)");
+  }
+  md_ctx_drop(vm, self);                      /* next update() starts over */
+  if (!ok) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "digest failed");
+    return false;
+  }
+  RETL(make_bytes(vm, md, mdlen));
 }
 
 /* digest(byte[] buf, int offset, int len): the digest goes into the caller's array
@@ -228,31 +244,31 @@ static bool md_digest_into(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)nargs;
-   struct dvm_object *dst = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
-   if (!dst || dst->kind != DVM_OBJ_ARRAY) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "No output buffer given");
-      return false;
-   }
-   const int32_t offset = ARG(1).i, length = ARG(2).i;
-   if (offset < 0 || length < 0 || (uint32_t)offset > dst->length ||
-       (uint32_t)length > dst->length - (uint32_t)offset) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "Output buffer too small for specified offset and length");
-      return false;
-   }
-   const EVP_MD *type = md_type_for(vm, self);
-   const int size = type ? EVP_MD_get_size(type) : 0;
-   if (length < size) {
-      dvm__throw(vm, "java/security/DigestException", "Length must be at least %d for digest", size);
-      return false;
-   }
-   union dvm_value digest = { 0 };
-   if (!md_digest(vm, self, NULL, 0, &digest)) return false;
-   struct dvm_object *src = digest.l ? dvm__obj(vm, digest.l) : NULL;
-   dst = dvm__obj(vm, ARG(0).l);
-   if (!src || !dst) RETI(0);
-   memcpy((uint8_t *)dst->data + offset, src->data, src->length);
-   RETI((int32_t)src->length);
+  (void)nargs;
+  struct dvm_object *dst = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
+  if (!dst || dst->kind != DVM_OBJ_ARRAY) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "No output buffer given");
+    return false;
+  }
+  const int32_t offset = ARG(1).i, length = ARG(2).i;
+  if (offset < 0 || length < 0 || (uint32_t)offset > dst->length ||
+      (uint32_t)length > dst->length - (uint32_t)offset) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "Output buffer too small for specified offset and length");
+    return false;
+  }
+  const EVP_MD *type = md_type_for(vm, self);
+  const int size = type ? EVP_MD_get_size(type) : 0;
+  if (length < size) {
+    dvm__throw(vm, "java/security/DigestException", "Length must be at least %d for digest", size);
+    return false;
+  }
+  union dvm_value digest = { 0 };
+  if (!md_digest(vm, self, NULL, 0, &digest)) return false;
+  struct dvm_object *src = digest.l ? dvm__obj(vm, digest.l) : NULL;
+  dst = dvm__obj(vm, ARG(0).l);
+  if (!src || !dst) RETI(0);
+  memcpy((uint8_t *)dst->data + offset, src->data, src->length);
+  RETI((int32_t)src->length);
 }
 
 /* MessageDigest.isEqual(a, b): the same length and the same bytes, compared in
@@ -261,61 +277,64 @@ static bool md_isEqual(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   if (ARG(0).l == ARG(1).l) RETI(1);
-   if (!ARG(0).l || !ARG(1).l) RETI(0);
-   uint32_t na = 0, nb = 0;
-   const uint8_t *a = arg_bytes(vm, ARG(0).l, &na), *b = arg_bytes(vm, ARG(1).l, &nb);
-   if (na != nb) RETI(0);
-   uint8_t diff = 0;
-   for (uint32_t i = 0; i < na; ++i) diff |= (uint8_t)(a[i] ^ b[i]);
-   RETI(diff == 0);
+  (void)self;
+  (void)nargs;
+  if (ARG(0).l == ARG(1).l) RETI(1);
+  if (!ARG(0).l || !ARG(1).l) RETI(0);
+  uint32_t na = 0, nb = 0;
+  const uint8_t *a = arg_bytes(vm, ARG(0).l, &na), *b = arg_bytes(vm, ARG(1).l, &nb);
+  if (na != nb) RETI(0);
+  uint8_t diff = 0;
+  for (uint32_t i = 0; i < na; ++i) diff |= (uint8_t)(a[i] ^ b[i]);
+  RETI(diff == 0);
 }
 
 static bool md_getAlgorithm(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
-   RETL(v.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
+  RETL(v.l);
 }
 
 static bool md_getDigestLength(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   const EVP_MD *type = md_type_for(vm, self);
-   RETI(type ? EVP_MD_get_size(type) : 0);
+  (void)args;
+  (void)nargs;
+  const EVP_MD *type = md_type_for(vm, self);
+  RETI(type ? EVP_MD_get_size(type) : 0);
 }
 
 /* The digest holds a host context, not java storage, so it declares only what
  * it needs: the algorithm it was asked for and the context's address. */
 static const struct rt_field rt_digest_fields[] = {
-   { "algorithm", "Ljava/lang/String;" }, { "ctx", "J" },
-   { "fed", "J" }, F_END
+  { "algorithm", "Ljava/lang/String;" }, { "ctx", "J" },
+  { "fed", "J" }, F_END
 };
 
 static const struct rt_method rt_digest[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;",
-      md_getInstance),
-   SM("getInstance",
-      "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/MessageDigest;",
-      md_getInstance),
-   M("update", "([B)V", md_update),
-   M("update", "([BII)V", md_update),
-   M("update", "(B)V", md_update_byte),
-   M("update", "(Ljava/nio/ByteBuffer;)V", md_update_buffer),
-   M("digest", "()[B", md_digest),
-   M("digest", "([B)[B", md_digest),
-   M("digest", "([BII)I", md_digest_into),
-   SM("isEqual", "([B[B)Z", md_isEqual),
-   M("reset", "()V", md_reset),
-   M("getAlgorithm", "()Ljava/lang/String;", md_getAlgorithm),
-   M("getDigestLength", "()I", md_getDigestLength),
-   M_END,
+  SM("getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;",
+  md_getInstance),
+  SM("getInstance",
+  "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/MessageDigest;",
+  md_getInstance),
+  M("update", "([B)V", md_update),
+  M("update", "([BII)V", md_update),
+  M("update", "(B)V", md_update_byte),
+  M("update", "(Ljava/nio/ByteBuffer;)V", md_update_buffer),
+  M("digest", "()[B", md_digest),
+  M("digest", "([B)[B", md_digest),
+  M("digest", "([BII)I", md_digest_into),
+  SM("isEqual", "([B[B)Z", md_isEqual),
+  M("reset", "()V", md_reset),
+  M("getAlgorithm", "()Ljava/lang/String;", md_getAlgorithm),
+  M("getDigestLength", "()I", md_getDigestLength),
+  M_END,
 };
 
 /* DigestInputStream hashes only bytes actually read, never skipped bytes.
@@ -325,70 +344,76 @@ static bool digest_in_init(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   dvm_set_field(vm, self, "in", "Ljava/io/InputStream;", args[0]);
-   dvm_set_field(vm, self, "digest", "Ljava/security/MessageDigest;", args[1]);
-   dvm_set_field(vm, self, "on", "Z", (union dvm_value){.i = 1});
-   RETV();
+  (void)nargs;
+  (void)out;
+  dvm_set_field(vm, self, "in", "Ljava/io/InputStream;", args[0]);
+  dvm_set_field(vm, self, "digest", "Ljava/security/MessageDigest;", args[1]);
+  dvm_set_field(vm, self, "on", "Z", (union dvm_value) {
+    .i = 1
+  });
+  RETV();
 }
 
 static bool digest_in_read(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   union dvm_value source = {0}, digest = {0}, enabled = {0}, result = {0};
-   dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
-   if (!source.l) {
-      dvm__throw(vm, "java/lang/NullPointerException", "input stream");
+  union dvm_value source = {0}, digest = {0}, enabled = {0}, result = {0};
+  dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
+  if (!source.l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "input stream");
+    return false;
+  }
+  const char *sig = nargs == 0 ? "()I" : nargs >= 3 ? "([BII)I" : "([B)I";
+  if (!stream_forward(vm, source.l, "read", sig, args, nargs, &result)) return false;
+  dvm_get_field(vm, self, "on", "Z", &enabled);
+  if (enabled.i && (nargs == 0 ? result.i >= 0 : result.i > 0)) {
+    dvm_get_field(vm, self, "digest", "Ljava/security/MessageDigest;", &digest);
+    if (!digest.l) {
+      dvm__throw(vm, "java/lang/NullPointerException", "message digest");
       return false;
-   }
-   const char *sig = nargs == 0 ? "()I" : nargs >= 3 ? "([BII)I" : "([B)I";
-   if (!stream_forward(vm, source.l, "read", sig, args, nargs, &result)) return false;
-   dvm_get_field(vm, self, "on", "Z", &enabled);
-   if (enabled.i && (nargs == 0 ? result.i >= 0 : result.i > 0)) {
-      dvm_get_field(vm, self, "digest", "Ljava/security/MessageDigest;", &digest);
-      if (!digest.l) {
-         dvm__throw(vm, "java/lang/NullPointerException", "message digest");
-         return false;
-      }
-      union dvm_value update[3] = {{0}}, ignored = {0};
-      if (!nargs) update[0].i = (int8_t)result.i;
-      else {
-         update[0] = args[0];
-         update[1].i = nargs >= 3 ? args[1].i : 0;
-         update[2].i = result.i;
-      }
-      if (!stream_forward(vm, digest.l, "update", nargs ? "([BII)V" : "(B)V",
-                          update, nargs ? 3 : 1, &ignored)) return false;
-   }
-   if (out) *out = result;
-   return true;
+    }
+    union dvm_value update[3] = {{0}}, ignored = {0};
+    if (!nargs) update[0].i = (int8_t)result.i;
+    else {
+      update[0] = args[0];
+      update[1].i = nargs >= 3 ? args[1].i : 0;
+      update[2].i = result.i;
+    }
+    if (!stream_forward(vm, digest.l, "update", nargs ? "([BII)V" : "(B)V",
+                        update, nargs ? 3 : 1, &ignored)) return false;
+  }
+  if (out) *out = result;
+  return true;
 }
 
 static bool digest_in_get(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value digest = {0};
-   dvm_get_field(vm, self, "digest", "Ljava/security/MessageDigest;", &digest);
-   RETL(digest.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value digest = {0};
+  dvm_get_field(vm, self, "digest", "Ljava/security/MessageDigest;", &digest);
+  RETL(digest.l);
 }
 static bool digest_in_set(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   dvm_set_field(vm, self, "digest", "Ljava/security/MessageDigest;", args[0]);
-   RETV();
+  (void)nargs;
+  (void)out;
+  dvm_set_field(vm, self, "digest", "Ljava/security/MessageDigest;", args[0]);
+  RETV();
 }
 static bool digest_in_on(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   dvm_set_field(vm, self, "on", "Z", args[0]);
-   RETV();
+  (void)nargs;
+  (void)out;
+  dvm_set_field(vm, self, "on", "Z", args[0]);
+  RETV();
 }
 
 #define DIGEST_IN_FORWARD(fn, name, sig) \
@@ -418,123 +443,148 @@ DIGEST_IN_FORWARD(digest_in_mark_supported, "markSupported", "()Z")
 static bool cin_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   dvm_set_field(vm, self, "in", "Ljava/io/InputStream;", args[0]);
-   dvm_set_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", args[1]);
-   RETV();
+  (void)nargs;
+  (void)out;
+  dvm_set_field(vm, self, "in", "Ljava/io/InputStream;", args[0]);
+  dvm_set_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", args[1]);
+  RETV();
 }
 
 /* Make sure there is pending plaintext, or that the source is exhausted. */
 static bool cin_fill(struct dvm *vm, dvm_ref self)
 {
-   for (;;) {
-      union dvm_value pend = {0}, ppos = {0}, done = {0};
-      dvm_get_field(vm, self, "pend", "[B", &pend);
-      dvm_get_field(vm, self, "ppos", "I", &ppos);
-      dvm_get_field(vm, self, "done", "Z", &done);
-      if (pend.l && (uint32_t)ppos.i < dvm_array_length(vm, pend.l)) return true;
-      if (done.i) return true;
-      union dvm_value source = {0}, cipher = {0}, next = {0};
-      dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
-      dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
-      if (!source.l || !cipher.l) {
-         dvm__throw(vm, "java/lang/NullPointerException", "cipher stream");
-         return false;
-      }
-      dvm_ref chunk = dvm_new_array(vm, 'B', "B", 4096);
-      if (!chunk) return false;
-      dvm_pin(vm, chunk);
-      union dvm_value arg = { .l = chunk }, got = {0};
-      bool ok = stream_forward(vm, source.l, "read", "([B)I", &arg, 1, &got) && !vm->exception;
-      if (ok && got.i == 0) { dvm_unpin(vm, chunk); continue; }
-      if (ok && got.i > 0) {
-         union dvm_value up[3] = { { .l = chunk }, { .i = 0 }, { .i = got.i } };
-         ok = stream_forward(vm, cipher.l, "update", "([BII)[B", up, 3, &next) && !vm->exception;
-      } else if (ok) {
-         ok = stream_forward(vm, cipher.l, "doFinal", "()[B", NULL, 0, &next) && !vm->exception;
-         dvm_set_field(vm, self, "done", "Z", (union dvm_value){ .i = 1 });
-      }
+  for (;;) {
+    union dvm_value pend = {0}, ppos = {0}, done = {0};
+    dvm_get_field(vm, self, "pend", "[B", &pend);
+    dvm_get_field(vm, self, "ppos", "I", &ppos);
+    dvm_get_field(vm, self, "done", "Z", &done);
+    if (pend.l && (uint32_t)ppos.i < dvm_array_length(vm, pend.l)) return true;
+    if (done.i) return true;
+    union dvm_value source = {0}, cipher = {0}, next = {0};
+    dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
+    dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
+    if (!source.l || !cipher.l) {
+      dvm__throw(vm, "java/lang/NullPointerException", "cipher stream");
+      return false;
+    }
+    dvm_ref chunk = dvm_new_array(vm, 'B', "B", 4096);
+    if (!chunk) return false;
+    dvm_pin(vm, chunk);
+    union dvm_value arg = { .l = chunk }, got = {0};
+    bool ok = stream_forward(vm, source.l, "read", "([B)I", &arg, 1, &got) && !vm->exception;
+    if (ok && got.i == 0) {
       dvm_unpin(vm, chunk);
-      if (!ok) return false;
-      dvm_set_field(vm, self, "pend", "[B", next);
-      dvm_set_field(vm, self, "ppos", "I", (union dvm_value){ .i = 0 });
-   }
+      continue;
+    }
+    if (ok && got.i > 0) {
+      union dvm_value up[3] = { { .l = chunk }, { .i = 0 }, { .i = got.i } };
+      ok = stream_forward(vm, cipher.l, "update", "([BII)[B", up, 3, &next) && !vm->exception;
+    } else if (ok) {
+      ok = stream_forward(vm, cipher.l, "doFinal", "()[B", NULL, 0, &next) && !vm->exception;
+      dvm_set_field(vm, self, "done", "Z", (union dvm_value) {
+        .i = 1
+      });
+    }
+    dvm_unpin(vm, chunk);
+    if (!ok) return false;
+    dvm_set_field(vm, self, "pend", "[B", next);
+    dvm_set_field(vm, self, "ppos", "I", (union dvm_value) {
+      .i = 0
+    });
+  }
 }
 
 static bool cin_read(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   if (!cin_fill(vm, self)) return false;
-   union dvm_value pend = {0}, ppos = {0};
-   dvm_get_field(vm, self, "pend", "[B", &pend);
-   dvm_get_field(vm, self, "ppos", "I", &ppos);
-   const uint32_t have = pend.l ? dvm_array_length(vm, pend.l) : 0;
-   const uint32_t left = have > (uint32_t)ppos.i ? have - (uint32_t)ppos.i : 0;
-   const uint8_t *src = left ? (const uint8_t *)dvm_array_data(vm, pend.l) + ppos.i : NULL;
-   if (nargs == 0) {                       /* read() */
-      if (!left) RETI(-1);
-      dvm_set_field(vm, self, "ppos", "I", (union dvm_value){ .i = ppos.i + 1 });
-      RETI(src[0]);
-   }
-   int32_t off = nargs >= 3 ? args[1].i : 0;
-   int32_t len = nargs >= 3 ? args[2].i : -1;
-   if (!args[0].l) { dvm__throw(vm, "java/lang/NullPointerException", "buffer"); return false; }
-   const uint32_t size = dvm_array_length(vm, args[0].l);
-   if (len < 0) len = (int32_t)size;
-   if (off < 0 || (uint32_t)off > size || (uint32_t)len > size - (uint32_t)off) {
-      dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "off=%d len=%d", off, len);
-      return false;
-   }
-   if (!len) RETI(0);
-   if (!left) RETI(-1);
-   const uint32_t n = left < (uint32_t)len ? left : (uint32_t)len;
-   memcpy((uint8_t *)dvm_array_data(vm, args[0].l) + off, src, n);
-   dvm_set_field(vm, self, "ppos", "I", (union dvm_value){ .i = ppos.i + (int32_t)n });
-   RETI((int32_t)n);
+  if (!cin_fill(vm, self)) return false;
+  union dvm_value pend = {0}, ppos = {0};
+  dvm_get_field(vm, self, "pend", "[B", &pend);
+  dvm_get_field(vm, self, "ppos", "I", &ppos);
+  const uint32_t have = pend.l ? dvm_array_length(vm, pend.l) : 0;
+  const uint32_t left = have > (uint32_t)ppos.i ? have - (uint32_t)ppos.i : 0;
+  const uint8_t *src = left ? (const uint8_t *)dvm_array_data(vm, pend.l) + ppos.i : NULL;
+  if (nargs == 0) {                       /* read() */
+    if (!left) RETI(-1);
+    dvm_set_field(vm, self, "ppos", "I", (union dvm_value) {
+      .i = ppos.i + 1
+    });
+    RETI(src[0]);
+  }
+  int32_t off = nargs >= 3 ? args[1].i : 0;
+  int32_t len = nargs >= 3 ? args[2].i : -1;
+  if (!args[0].l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "buffer");
+    return false;
+  }
+  const uint32_t size = dvm_array_length(vm, args[0].l);
+  if (len < 0) len = (int32_t)size;
+  if (off < 0 || (uint32_t)off > size || (uint32_t)len > size - (uint32_t)off) {
+    dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "off=%d len=%d", off, len);
+    return false;
+  }
+  if (!len) RETI(0);
+  if (!left) RETI(-1);
+  const uint32_t n = left < (uint32_t)len ? left : (uint32_t)len;
+  memcpy((uint8_t *)dvm_array_data(vm, args[0].l) + off, src, n);
+  dvm_set_field(vm, self, "ppos", "I", (union dvm_value) {
+    .i = ppos.i + (int32_t)n
+  });
+  RETI((int32_t)n);
 }
 
 static bool cin_available(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                           int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value pend = {0}, ppos = {0};
-   dvm_get_field(vm, self, "pend", "[B", &pend);
-   dvm_get_field(vm, self, "ppos", "I", &ppos);
-   const uint32_t have = pend.l ? dvm_array_length(vm, pend.l) : 0;
-   RETI(have > (uint32_t)ppos.i ? (int32_t)(have - (uint32_t)ppos.i) : 0);
+  (void)args;
+  (void)nargs;
+  union dvm_value pend = {0}, ppos = {0};
+  dvm_get_field(vm, self, "pend", "[B", &pend);
+  dvm_get_field(vm, self, "ppos", "I", &ppos);
+  const uint32_t have = pend.l ? dvm_array_length(vm, pend.l) : 0;
+  RETI(have > (uint32_t)ppos.i ? (int32_t)(have - (uint32_t)ppos.i) : 0);
 }
 
 static bool cin_close(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs; (void)out;
-   union dvm_value source = {0};
-   dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
-   dvm_set_field(vm, self, "done", "Z", (union dvm_value){ .i = 1 });
-   dvm_set_field(vm, self, "pend", "[B", (union dvm_value){ .l = 0 });
-   if (source.l) return stream_forward(vm, source.l, "close", "()V", NULL, 0, NULL);
-   RETV();
+  (void)args;
+  (void)nargs;
+  (void)out;
+  union dvm_value source = {0};
+  dvm_get_field(vm, self, "in", "Ljava/io/InputStream;", &source);
+  dvm_set_field(vm, self, "done", "Z", (union dvm_value) {
+    .i = 1
+  });
+  dvm_set_field(vm, self, "pend", "[B", (union dvm_value) {
+    .l = 0
+  });
+  if (source.l) return stream_forward(vm, source.l, "close", "()V", NULL, 0, NULL);
+  RETV();
 }
 
 static bool cin_false(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
-   (void)vm; (void)self; (void)args; (void)nargs;
-   RETI(0);
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  RETI(0);
 }
 
 static const struct rt_field rt_cipher_in_fields[] = {
-   {"cipher", "Ljavax/crypto/Cipher;"}, {"pend", "[B"}, {"ppos", "I"}, {"done", "Z"}, F_END
+  {"cipher", "Ljavax/crypto/Cipher;"}, {"pend", "[B"}, {"ppos", "I"}, {"done", "Z"}, F_END
 };
 static const struct rt_method rt_cipher_in[] = {
-   M("<init>", "(Ljava/io/InputStream;Ljavax/crypto/Cipher;)V", cin_init),
-   M("read", "()I", cin_read),
-   M("read", "([B)I", cin_read),
-   M("read", "([BII)I", cin_read),
-   M("available", "()I", cin_available),
-   M("close", "()V", cin_close),
-   M("markSupported", "()Z", cin_false),
-   M_END
+  M("<init>", "(Ljava/io/InputStream;Ljavax/crypto/Cipher;)V", cin_init),
+  M("read", "()I", cin_read),
+  M("read", "([B)I", cin_read),
+  M("read", "([BII)I", cin_read),
+  M("available", "()I", cin_available),
+  M("close", "()V", cin_close),
+  M("markSupported", "()Z", cin_false),
+  M_END
 };
 
 /* javax.crypto.CipherOutputStream: bytes go through Cipher.update() on their
@@ -542,105 +592,119 @@ static const struct rt_method rt_cipher_in[] = {
 static bool cout_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   dvm_set_field(vm, self, "cout", "Ljava/io/OutputStream;", args[0]);
-   dvm_set_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", args[1]);
-   RETV();
+  (void)nargs;
+  (void)out;
+  dvm_set_field(vm, self, "cout", "Ljava/io/OutputStream;", args[0]);
+  dvm_set_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", args[1]);
+  RETV();
 }
 
 static bool cout_emit(struct dvm *vm, dvm_ref self, dvm_ref bytes)
 {
-   if (!bytes) return true;
-   union dvm_value sink = {0}, arg = { .l = bytes };
-   dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
-   return sink.l && stream_forward(vm, sink.l, "write", "([B)V", &arg, 1, NULL) && !vm->exception;
+  if (!bytes) return true;
+  union dvm_value sink = {0}, arg = { .l = bytes };
+  dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
+  return sink.l && stream_forward(vm, sink.l, "write", "([B)V", &arg, 1, NULL) && !vm->exception;
 }
 
 static bool cout_write(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   (void)out;
-   union dvm_value cipher = {0}, produced = {0};
-   dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
-   if (!cipher.l) { dvm__throw(vm, "java/lang/NullPointerException", "cipher"); return false; }
-   dvm_ref one = 0;
-   union dvm_value up[3];
-   const char *sig = nargs == 3 ? "([BII)[B" : "([B)[B";
-   if (nargs == 1 && !strcmp(builtin_sig(), "(I)V")) {
-      one = dvm_new_array(vm, 'B', "B", 1);
-      if (!one) return false;
-      ((uint8_t *)dvm_array_data(vm, one))[0] = (uint8_t)args[0].i;
-      up[0].l = one; sig = "([B)[B";
-   } else {
-      up[0] = args[0];
-      if (nargs == 3) { up[1] = args[1]; up[2] = args[2]; }
-   }
-   if (!stream_forward(vm, cipher.l, "update", sig, up, nargs == 3 ? 3 : 1, &produced) ||
-       vm->exception) return false;
-   if (!cout_emit(vm, self, produced.l)) return false;
-   RETV();
+  (void)out;
+  union dvm_value cipher = {0}, produced = {0};
+  dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
+  if (!cipher.l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "cipher");
+    return false;
+  }
+  dvm_ref one = 0;
+  union dvm_value up[3];
+  const char *sig = nargs == 3 ? "([BII)[B" : "([B)[B";
+  if (nargs == 1 && !strcmp(builtin_sig(), "(I)V")) {
+    one = dvm_new_array(vm, 'B', "B", 1);
+    if (!one) return false;
+    ((uint8_t *)dvm_array_data(vm, one))[0] = (uint8_t)args[0].i;
+    up[0].l = one;
+    sig = "([B)[B";
+  } else {
+    up[0] = args[0];
+    if (nargs == 3) {
+      up[1] = args[1];
+      up[2] = args[2];
+    }
+  }
+  if (!stream_forward(vm, cipher.l, "update", sig, up, nargs == 3 ? 3 : 1, &produced) ||
+      vm->exception) return false;
+  if (!cout_emit(vm, self, produced.l)) return false;
+  RETV();
 }
 
 static bool cout_flush(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs; (void)out;
-   union dvm_value sink = {0};
-   dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
-   if (sink.l) return stream_forward(vm, sink.l, "flush", "()V", NULL, 0, NULL);
-   RETV();
+  (void)args;
+  (void)nargs;
+  (void)out;
+  union dvm_value sink = {0};
+  dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
+  if (sink.l) return stream_forward(vm, sink.l, "flush", "()V", NULL, 0, NULL);
+  RETV();
 }
 
 static bool cout_close(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs; (void)out;
-   union dvm_value cipher = {0}, tail = {0}, sink = {0}, done = {0};
-   dvm_get_field(vm, self, "done", "Z", &done);
-   if (done.i) RETV();
-   dvm_set_field(vm, self, "done", "Z", (union dvm_value){ .i = 1 });
-   dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
-   if (cipher.l && (!stream_forward(vm, cipher.l, "doFinal", "()[B", NULL, 0, &tail) ||
-                    vm->exception || !cout_emit(vm, self, tail.l))) return false;
-   dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
-   if (sink.l) {
-      if (!stream_forward(vm, sink.l, "flush", "()V", NULL, 0, NULL)) return false;
-      return stream_forward(vm, sink.l, "close", "()V", NULL, 0, NULL);
-   }
-   RETV();
+  (void)args;
+  (void)nargs;
+  (void)out;
+  union dvm_value cipher = {0}, tail = {0}, sink = {0}, done = {0};
+  dvm_get_field(vm, self, "done", "Z", &done);
+  if (done.i) RETV();
+  dvm_set_field(vm, self, "done", "Z", (union dvm_value) {
+    .i = 1
+  });
+  dvm_get_field(vm, self, "cipher", "Ljavax/crypto/Cipher;", &cipher);
+  if (cipher.l && (!stream_forward(vm, cipher.l, "doFinal", "()[B", NULL, 0, &tail) ||
+                   vm->exception || !cout_emit(vm, self, tail.l))) return false;
+  dvm_get_field(vm, self, "cout", "Ljava/io/OutputStream;", &sink);
+  if (sink.l) {
+    if (!stream_forward(vm, sink.l, "flush", "()V", NULL, 0, NULL)) return false;
+    return stream_forward(vm, sink.l, "close", "()V", NULL, 0, NULL);
+  }
+  RETV();
 }
 
 static const struct rt_field rt_cipher_out_fields[] = {
-   {"cout", "Ljava/io/OutputStream;"}, {"cipher", "Ljavax/crypto/Cipher;"}, {"done", "Z"}, F_END
+  {"cout", "Ljava/io/OutputStream;"}, {"cipher", "Ljavax/crypto/Cipher;"}, {"done", "Z"}, F_END
 };
 static const struct rt_method rt_cipher_out[] = {
-   M("<init>", "(Ljava/io/OutputStream;Ljavax/crypto/Cipher;)V", cout_init),
-   M("write", "(I)V", cout_write),
-   M("write", "([B)V", cout_write),
-   M("write", "([BII)V", cout_write),
-   M("flush", "()V", cout_flush),
-   M("close", "()V", cout_close),
-   M_END
+  M("<init>", "(Ljava/io/OutputStream;Ljavax/crypto/Cipher;)V", cout_init),
+  M("write", "(I)V", cout_write),
+  M("write", "([B)V", cout_write),
+  M("write", "([BII)V", cout_write),
+  M("flush", "()V", cout_flush),
+  M("close", "()V", cout_close),
+  M_END
 };
 
 static const struct rt_field rt_digest_in_fields[] = {
-   {"digest", "Ljava/security/MessageDigest;"}, {"on", "Z"}, F_END
+  {"digest", "Ljava/security/MessageDigest;"}, {"on", "Z"}, F_END
 };
 static const struct rt_method rt_digest_in[] = {
-   M("<init>", "(Ljava/io/InputStream;Ljava/security/MessageDigest;)V", digest_in_init),
-   M("read", "()I", digest_in_read),
-   M("read", "([B)I", digest_in_read),
-   M("read", "([BII)I", digest_in_read),
-   M("getMessageDigest", "()Ljava/security/MessageDigest;", digest_in_get),
-   M("setMessageDigest", "(Ljava/security/MessageDigest;)V", digest_in_set),
-   M("on", "(Z)V", digest_in_on),
-   M("skip", "(J)J", digest_in_skip),
-   M("available", "()I", digest_in_available),
-   M("close", "()V", digest_in_close),
-   M("mark", "(I)V", digest_in_mark),
-   M("reset", "()V", digest_in_reset),
-   M("markSupported", "()Z", digest_in_mark_supported),
-   M_END
+  M("<init>", "(Ljava/io/InputStream;Ljava/security/MessageDigest;)V", digest_in_init),
+  M("read", "()I", digest_in_read),
+  M("read", "([B)I", digest_in_read),
+  M("read", "([BII)I", digest_in_read),
+  M("getMessageDigest", "()Ljava/security/MessageDigest;", digest_in_get),
+  M("setMessageDigest", "(Ljava/security/MessageDigest;)V", digest_in_set),
+  M("on", "(Z)V", digest_in_on),
+  M("skip", "(J)J", digest_in_skip),
+  M("available", "()I", digest_in_available),
+  M("close", "()V", digest_in_close),
+  M("mark", "(I)V", digest_in_mark),
+  M("reset", "()V", digest_in_reset),
+  M("markSupported", "()Z", digest_in_mark_supported),
+  M_END
 };
 
 /* ------------------------------------------------------------------------ *
@@ -654,10 +718,10 @@ static const struct rt_method rt_digest_in[] = {
 
 /* Cipher opmode, as java.crypto.Cipher declares them. */
 enum {
-   JCE_ENCRYPT = 1,
-   JCE_DECRYPT = 2,
-   JCE_WRAP = 3,
-   JCE_UNWRAP = 4,
+  JCE_ENCRYPT = 1,
+  JCE_DECRYPT = 2,
+  JCE_WRAP = 3,
+  JCE_UNWRAP = 4,
 };
 
 /* A Key holds its encoded form: DER for the asymmetric ones (PKCS#8 private,
@@ -666,64 +730,68 @@ enum {
 static dvm_ref key_make(struct dvm *vm, const char *desc, dvm_ref encoded,
                         const char *algorithm, int32_t kind)
 {
-   struct dvm_class *c = dvm__class_by_desc(vm, desc);
-   dvm_ref k = c ? dvm_new_object(vm, c) : 0;
-   if (!k) return 0;
-   union dvm_value v = { .l = encoded };
-   (void)dvm_set_field(vm, k, "encoded", "[B", v);
-   v.l = dvm_new_string(vm, algorithm ? algorithm : "");
-   (void)dvm_set_field(vm, k, "algorithm", "Ljava/lang/String;", v);
-   v.i = kind;
-   (void)dvm_set_field(vm, k, "kind", "I", v);
-   return k;
+  struct dvm_class *c = dvm__class_by_desc(vm, desc);
+  dvm_ref k = c ? dvm_new_object(vm, c) : 0;
+  if (!k) return 0;
+  union dvm_value v = { .l = encoded };
+  (void)dvm_set_field(vm, k, "encoded", "[B", v);
+  v.l = dvm_new_string(vm, algorithm ? algorithm : "");
+  (void)dvm_set_field(vm, k, "algorithm", "Ljava/lang/String;", v);
+  v.i = kind;
+  (void)dvm_set_field(vm, k, "kind", "I", v);
+  return k;
 }
 
 static const uint8_t *key_bytes(struct dvm *vm, dvm_ref k, uint32_t *len)
 {
-   union dvm_value v = { 0 };
-   *len = 0;
-   if (!k || !dvm_get_field(vm, k, "encoded", "[B", &v) || !v.l) return NULL;
-   return arg_bytes(vm, v.l, len);
+  union dvm_value v = { 0 };
+  *len = 0;
+  if (!k || !dvm_get_field(vm, k, "encoded", "[B", &v) || !v.l) return NULL;
+  return arg_bytes(vm, v.l, len);
 }
 
 static bool key_getEncoded(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "encoded", "[B", &v);
-   RETL(v.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "encoded", "[B", &v);
+  RETL(v.l);
 }
 
 static bool key_getAlgorithm(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
-   RETL(v.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
+  RETL(v.l);
 }
 
 static bool key_getFormat(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "kind", "I", &v);
-   RETL(dvm_new_string(vm, v.i == 1 ? "PKCS#8" : v.i == 2 ? "X.509" : "RAW"));
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "kind", "I", &v);
+  RETL(dvm_new_string(vm, v.i == 1 ? "PKCS#8" : v.i == 2 ? "X.509" : "RAW"));
 }
 
 /* KeySpec: a byte[] wrapper, so the factory can read it back. */
 static bool spec_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   union dvm_value v = { .l = ARG(0).l };
-   (void)dvm_set_field(vm, self, "encoded", "[B", v);
-   RETV();
+  (void)nargs;
+  (void)out;
+  union dvm_value v = { .l = ARG(0).l };
+  (void)dvm_set_field(vm, self, "encoded", "[B", v);
+  RETV();
 }
 
 /* SecretKeySpec(byte[] key, String algorithm) and its offset/length form. */
@@ -731,42 +799,43 @@ static bool secret_init(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   (void)out;
-   dvm_ref bytes = ARG(0).l;
-   const char *alg = NULL;
-   if (nargs >= 4) {
-      uint32_t n = 0;
-      const uint8_t *p = arg_bytes(vm, bytes, &n);
-      uint32_t off = (uint32_t)args[1].i, len = (uint32_t)args[2].i;
-      if (off > n) off = n;
-      if (len > n - off) len = n - off;
-      bytes = p ? make_bytes(vm, p + off, len) : 0;
-      alg = args[3].l ? dvm_string_utf8(vm, args[3].l) : NULL;
-   } else if (nargs >= 2) {
-      alg = args[1].l ? dvm_string_utf8(vm, args[1].l) : NULL;
-   }
-   union dvm_value v = { .l = bytes };
-   (void)dvm_set_field(vm, self, "encoded", "[B", v);
-   v.l = dvm_new_string(vm, alg ? alg : "");
-   (void)dvm_set_field(vm, self, "algorithm", "Ljava/lang/String;", v);
-   v.i = 0;
-   (void)dvm_set_field(vm, self, "kind", "I", v);
-   RETV();
+  (void)out;
+  dvm_ref bytes = ARG(0).l;
+  const char *alg = NULL;
+  if (nargs >= 4) {
+    uint32_t n = 0;
+    const uint8_t *p = arg_bytes(vm, bytes, &n);
+    uint32_t off = (uint32_t)args[1].i, len = (uint32_t)args[2].i;
+    if (off > n) off = n;
+    if (len > n - off) len = n - off;
+    bytes = p ? make_bytes(vm, p + off, len) : 0;
+    alg = args[3].l ? dvm_string_utf8(vm, args[3].l) : NULL;
+  } else if (nargs >= 2) {
+    alg = args[1].l ? dvm_string_utf8(vm, args[1].l) : NULL;
+  }
+  union dvm_value v = { .l = bytes };
+  (void)dvm_set_field(vm, self, "encoded", "[B", v);
+  v.l = dvm_new_string(vm, alg ? alg : "");
+  (void)dvm_set_field(vm, self, "algorithm", "Ljava/lang/String;", v);
+  v.i = 0;
+  (void)dvm_set_field(vm, self, "kind", "I", v);
+  RETV();
 }
 
 static bool kf_getInstance(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/security/KeyFactory;");
-   dvm_ref f = c ? dvm_new_object(vm, c) : 0;
-   if (f) {
-      union dvm_value v = { .l = dvm_new_string(vm, alg ? alg : "RSA") };
-      (void)dvm_set_field(vm, f, "algorithm", "Ljava/lang/String;", v);
-   }
-   RETL(f);
+  (void)self;
+  (void)nargs;
+  const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/security/KeyFactory;");
+  dvm_ref f = c ? dvm_new_object(vm, c) : 0;
+  if (f) {
+    union dvm_value v = { .l = dvm_new_string(vm, alg ? alg : "RSA") };
+    (void)dvm_set_field(vm, f, "algorithm", "Ljava/lang/String;", v);
+  }
+  RETL(f);
 }
 
 /* The key a device's RSA KeyFactory returns is Conscrypt's own class, which
@@ -774,11 +843,11 @@ static bool kf_getInstance(struct dvm *vm, dvm_ref self,
  * to those and read the modulus and exponents off them. */
 static const char *kf_key_class(const char *alg, int32_t kind)
 {
-   if (alg && !strcasecmp(alg, "RSA"))
-      return kind == 2 ? "Lcom/android/org/conscrypt/OpenSSLRSAPublicKey;"
-                       : "Lcom/android/org/conscrypt/OpenSSLRSAPrivateCrtKey;";
-   if(alg && !strcasecmp(alg,"EC"))return kind==2 ? "Lcom/android/org/conscrypt/OpenSSLECPublicKey;" : "Lcom/android/org/conscrypt/OpenSSLECPrivateKey;";
-   return "Ljava/security/Key;";
+  if (alg && !strcasecmp(alg, "RSA"))
+    return kind == 2 ? "Lcom/android/org/conscrypt/OpenSSLRSAPublicKey;"
+           : "Lcom/android/org/conscrypt/OpenSSLRSAPrivateCrtKey;";
+  if(alg && !strcasecmp(alg,"EC"))return kind==2 ? "Lcom/android/org/conscrypt/OpenSSLECPublicKey;" : "Lcom/android/org/conscrypt/OpenSSLECPrivateKey;";
+  return "Ljava/security/Key;";
 }
 
 /* Numeric RSA specifications are immutable BigInteger references, not an
@@ -787,68 +856,78 @@ static bool rsa_public_spec_init(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   (void)dvm_set_field(vm,self,"modulus","Ljava/math/BigInteger;",ARG(0));
-   (void)dvm_set_field(vm,self,"publicExponent","Ljava/math/BigInteger;",ARG(1));
-   RETV();
+  (void)nargs;
+  (void)out;
+  (void)dvm_set_field(vm,self,"modulus","Ljava/math/BigInteger;",ARG(0));
+  (void)dvm_set_field(vm,self,"publicExponent","Ljava/math/BigInteger;",ARG(1));
+  RETV();
 }
 
 static bool rsa_public_spec_modulus(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   return dvm_get_field(vm,self,"modulus","Ljava/math/BigInteger;",out);
+  (void)args;
+  (void)nargs;
+  return dvm_get_field(vm,self,"modulus","Ljava/math/BigInteger;",out);
 }
 
 static bool rsa_public_spec_exponent(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   return dvm_get_field(vm,self,"publicExponent","Ljava/math/BigInteger;",out);
+  (void)args;
+  (void)nargs;
+  return dvm_get_field(vm,self,"publicExponent","Ljava/math/BigInteger;",out);
 }
 
 static bool kf_rsa_public_spec(struct dvm *vm, dvm_ref spec,
                                union dvm_value *out)
 {
-   union dvm_value modulus={0}, exponent={0};
-   (void)dvm_get_field(vm,spec,"modulus","Ljava/math/BigInteger;",&modulus);
-   (void)dvm_get_field(vm,spec,"publicExponent","Ljava/math/BigInteger;",&exponent);
-   if(!modulus.l || !exponent.l) {
-      dvm__throw(vm,"java/security/spec/InvalidKeySpecException","null RSA component");
-      return false;
-   }
-   BIGNUM *n=bigint_bn(vm,modulus.l);
-   BIGNUM *e=n ? bigint_bn(vm,exponent.l) : NULL;
-   if(!n || !e) {BN_free(n);BN_free(e);return false;}
-   OSSL_PARAM_BLD *builder=OSSL_PARAM_BLD_new();
-   OSSL_PARAM *params=NULL;
-   EVP_PKEY_CTX *ctx=NULL;
-   EVP_PKEY *key=NULL;
-   bool good=!BN_is_negative(n) && !BN_is_zero(n) &&
-      !BN_is_negative(e) && !BN_is_zero(e) && builder &&
-      OSSL_PARAM_BLD_push_BN(builder,OSSL_PKEY_PARAM_RSA_N,n) &&
-      OSSL_PARAM_BLD_push_BN(builder,OSSL_PKEY_PARAM_RSA_E,e);
-   if(good) {
-      params=OSSL_PARAM_BLD_to_param(builder);
-      ctx=EVP_PKEY_CTX_new_from_name(NULL,"RSA",NULL);
-      good=params && ctx && EVP_PKEY_fromdata_init(ctx)>0 &&
+  union dvm_value modulus= {0}, exponent= {0};
+  (void)dvm_get_field(vm,spec,"modulus","Ljava/math/BigInteger;",&modulus);
+  (void)dvm_get_field(vm,spec,"publicExponent","Ljava/math/BigInteger;",&exponent);
+  if(!modulus.l || !exponent.l) {
+    dvm__throw(vm,"java/security/spec/InvalidKeySpecException","null RSA component");
+    return false;
+  }
+  BIGNUM *n=bigint_bn(vm,modulus.l);
+  BIGNUM *e=n ? bigint_bn(vm,exponent.l) : NULL;
+  if(!n || !e) {
+    BN_free(n);
+    BN_free(e);
+    return false;
+  }
+  OSSL_PARAM_BLD *builder=OSSL_PARAM_BLD_new();
+  OSSL_PARAM *params=NULL;
+  EVP_PKEY_CTX *ctx=NULL;
+  EVP_PKEY *key=NULL;
+  bool good=!BN_is_negative(n) && !BN_is_zero(n) &&
+            !BN_is_negative(e) && !BN_is_zero(e) && builder &&
+            OSSL_PARAM_BLD_push_BN(builder,OSSL_PKEY_PARAM_RSA_N,n) &&
+            OSSL_PARAM_BLD_push_BN(builder,OSSL_PKEY_PARAM_RSA_E,e);
+  if(good) {
+    params=OSSL_PARAM_BLD_to_param(builder);
+    ctx=EVP_PKEY_CTX_new_from_name(NULL,"RSA",NULL);
+    good=params && ctx && EVP_PKEY_fromdata_init(ctx)>0 &&
          EVP_PKEY_fromdata(ctx,&key,EVP_PKEY_PUBLIC_KEY,params)>0;
-   }
-   unsigned char *der=NULL;
-   int length=good ? i2d_PUBKEY(key,&der) : 0;
-   EVP_PKEY_free(key);EVP_PKEY_CTX_free(ctx);
-   OSSL_PARAM_free(params);OSSL_PARAM_BLD_free(builder);
-   BN_free(n);BN_free(e);
-   if(length<=0) {
-      OPENSSL_free(der);
-      dvm__throw(vm,"java/security/spec/InvalidKeySpecException","invalid RSA public key");
-      return false;
-   }
-   dvm_ref encoded=make_bytes(vm,der,(uint32_t)length);
-   OPENSSL_free(der);
-   RETL(key_make(vm,kf_key_class("RSA",2),encoded,"RSA",2));
+  }
+  unsigned char *der=NULL;
+  int length=good ? i2d_PUBKEY(key,&der) : 0;
+  EVP_PKEY_free(key);
+  EVP_PKEY_CTX_free(ctx);
+  OSSL_PARAM_free(params);
+  OSSL_PARAM_BLD_free(builder);
+  BN_free(n);
+  BN_free(e);
+  if(length<=0) {
+    OPENSSL_free(der);
+    dvm__throw(vm,"java/security/spec/InvalidKeySpecException","invalid RSA public key");
+    return false;
+  }
+  dvm_ref encoded=make_bytes(vm,der,(uint32_t)length);
+  OPENSSL_free(der);
+  RETL(key_make(vm,kf_key_class("RSA",2),encoded,"RSA",2));
 }
 
 /* generatePrivate / generatePublic: the spec's bytes become the key's encoded
@@ -858,35 +937,40 @@ static bool kf_generate(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out, int32_t kind)
 {
-   (void)nargs;
-   union dvm_value enc = { 0 }, alg = { 0 };
-   if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "encoded", "[B", &enc);
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &alg);
-   const char *alg_name = alg.l ? dvm_string_utf8(vm, alg.l) : "RSA";
-   struct dvm_class *spec_class=dvm_object_class(vm,ARG(0).l);
-   if(kind==2 && alg_name && !strcasecmp(alg_name,"RSA") && spec_class &&
+  (void)nargs;
+  union dvm_value enc = { 0 }, alg = { 0 };
+  if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "encoded", "[B", &enc);
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &alg);
+  const char *alg_name = alg.l ? dvm_string_utf8(vm, alg.l) : "RSA";
+  struct dvm_class *spec_class=dvm_object_class(vm,ARG(0).l);
+  if(kind==2 && alg_name && !strcasecmp(alg_name,"RSA") && spec_class &&
       dvm__class_assignable(vm,spec_class,
-         dvm__class_by_desc(vm,"Ljava/security/spec/RSAPublicKeySpec;")))
-      return kf_rsa_public_spec(vm,ARG(0).l,out);
-   if (!enc.l) {
-      if (getenv("LUNARIA_DVM_TRACE")) {
-         struct dvm_class *spec = dvm_object_class(vm, ARG(0).l);
-         fprintf(stderr, "[crypto] KeyFactory.generate%s spec=%s\n",
-                 kind == 2 ? "Public" : "Private", spec ? spec->desc : "null");
-      }
-      dvm__throw(vm, "java/security/spec/InvalidKeySpecException",
-                 "no encoded key in the spec");
+                            dvm__class_by_desc(vm,"Ljava/security/spec/RSAPublicKeySpec;")))
+    return kf_rsa_public_spec(vm,ARG(0).l,out);
+  if (!enc.l) {
+    if (getenv("LUNARIA_DVM_TRACE")) {
+      struct dvm_class *spec = dvm_object_class(vm, ARG(0).l);
+      fprintf(stderr, "[crypto] KeyFactory.generate%s spec=%s\n",
+              kind == 2 ? "Public" : "Private", spec ? spec->desc : "null");
+    }
+    dvm__throw(vm, "java/security/spec/InvalidKeySpecException",
+               "no encoded key in the spec");
+    return false;
+  }
+  if(alg_name && !strcasecmp(alg_name,"EC")) {
+    bool correct_spec=object_is_a(vm,ARG(0).l,kind==2 ? "Ljava/security/spec/X509EncodedKeySpec;" : "Ljava/security/spec/PKCS8EncodedKeySpec;");
+    uint32_t n=dvm_array_length(vm,enc.l);
+    const unsigned char *bytes=dvm_array_data(vm,enc.l),*cursor=bytes;
+    EVP_PKEY *key=correct_spec && bytes ? (kind==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n)) : NULL;
+    bool valid=key && EVP_PKEY_is_a(key,"EC") && cursor==bytes+n;
+    EVP_PKEY_free(key);
+    if(!valid) {
+      dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Invalid EC key encoding");
       return false;
-   }
-   if(alg_name && !strcasecmp(alg_name,"EC")){
-      bool correct_spec=object_is_a(vm,ARG(0).l,kind==2 ? "Ljava/security/spec/X509EncodedKeySpec;" : "Ljava/security/spec/PKCS8EncodedKeySpec;");
-      uint32_t n=dvm_array_length(vm,enc.l);const unsigned char *bytes=dvm_array_data(vm,enc.l),*cursor=bytes;
-      EVP_PKEY *key=correct_spec && bytes ? (kind==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n)) : NULL;
-      bool valid=key && EVP_PKEY_is_a(key,"EC") && cursor==bytes+n;EVP_PKEY_free(key);
-      if(!valid){dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Invalid EC key encoding");return false;}
-   }
-   const char *key_algorithm=alg_name && !strcasecmp(alg_name,"EC") ? "EC" : alg_name;
-   RETL(key_make(vm, kf_key_class(key_algorithm, kind), enc.l, key_algorithm, kind));
+    }
+  }
+  const char *key_algorithm=alg_name && !strcasecmp(alg_name,"EC") ? "EC" : alg_name;
+  RETL(key_make(vm, kf_key_class(key_algorithm, kind), enc.l, key_algorithm, kind));
 }
 
 /* The key's modulus / public exponent / private exponent as a BigInteger,
@@ -894,66 +978,69 @@ static bool kf_generate(struct dvm *vm, dvm_ref self,
 static bool rsa_key_component(struct dvm *vm, dvm_ref self, const char *param,
                               union dvm_value *out)
 {
-   uint32_t len = 0;
-   const uint8_t *kb = key_bytes(vm, self, &len);
-   union dvm_value kind = { 0 };
-   (void)dvm_get_field(vm, self, "kind", "I", &kind);
-   if (!kb) RETL(0);
-   const uint8_t *kp = kb;
-   EVP_PKEY *pkey = kind.i == 2 ? d2i_PUBKEY(NULL, &kp, len)
-                                : d2i_AutoPrivateKey(NULL, &kp, len);
-   BIGNUM *bn = NULL;
-   dvm_ref result = 0;
-   if (pkey && EVP_PKEY_get_bn_param(pkey, param, &bn) > 0 && bn) {
-      uint8_t mag[1024];
-      const int n = BN_num_bytes(bn);
-      if (n >= 0 && (size_t)n <= sizeof mag) {
-         BN_bn2bin(bn, mag);
-         struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/math/BigInteger;");
-         result = c ? dvm_new_object(vm, c) : 0;
-         if (result) bigint_store_mag(vm, result, 1, mag, (uint32_t)n);
-      }
-   }
-   BN_free(bn);
-   EVP_PKEY_free(pkey);
-   RETL(result);
+  uint32_t len = 0;
+  const uint8_t *kb = key_bytes(vm, self, &len);
+  union dvm_value kind = { 0 };
+  (void)dvm_get_field(vm, self, "kind", "I", &kind);
+  if (!kb) RETL(0);
+  const uint8_t *kp = kb;
+  EVP_PKEY *pkey = kind.i == 2 ? d2i_PUBKEY(NULL, &kp, len)
+                   : d2i_AutoPrivateKey(NULL, &kp, len);
+  BIGNUM *bn = NULL;
+  dvm_ref result = 0;
+  if (pkey && EVP_PKEY_get_bn_param(pkey, param, &bn) > 0 && bn) {
+    uint8_t mag[1024];
+    const int n = BN_num_bytes(bn);
+    if (n >= 0 && (size_t)n <= sizeof mag) {
+      BN_bn2bin(bn, mag);
+      struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/math/BigInteger;");
+      result = c ? dvm_new_object(vm, c) : 0;
+      if (result) bigint_store_mag(vm, result, 1, mag, (uint32_t)n);
+    }
+  }
+  BN_free(bn);
+  EVP_PKEY_free(pkey);
+  RETL(result);
 }
 
 static bool rsa_getModulus(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   return rsa_key_component(vm, self, OSSL_PKEY_PARAM_RSA_N, out);
+  (void)args;
+  (void)nargs;
+  return rsa_key_component(vm, self, OSSL_PKEY_PARAM_RSA_N, out);
 }
 
 static bool rsa_getPublicExponent(struct dvm *vm, dvm_ref self,
                                   const union dvm_value *args, int nargs,
                                   union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   return rsa_key_component(vm, self, OSSL_PKEY_PARAM_RSA_E, out);
+  (void)args;
+  (void)nargs;
+  return rsa_key_component(vm, self, OSSL_PKEY_PARAM_RSA_E, out);
 }
 
 static bool rsa_getPrivateExponent(struct dvm *vm, dvm_ref self,
                                    const union dvm_value *args, int nargs,
                                    union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   return rsa_key_component(vm, self, OSSL_PKEY_PARAM_RSA_D, out);
+  (void)args;
+  (void)nargs;
+  return rsa_key_component(vm, self, OSSL_PKEY_PARAM_RSA_D, out);
 }
 
 static bool kf_generatePrivate(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   return kf_generate(vm, self, args, nargs, out, 1);
+  return kf_generate(vm, self, args, nargs, out, 1);
 }
 
 static bool kf_generatePublic(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
-   return kf_generate(vm, self, args, nargs, out, 2);
+  return kf_generate(vm, self, args, nargs, out, 2);
 }
 
 
@@ -963,250 +1050,382 @@ static bool kf_generatePublic(struct dvm *vm, dvm_ref self,
  * independent key and IV streams (RFC 7292, appendix B). */
 #include <openssl/pkcs12.h>
 
-struct pbe_algorithm { const EVP_MD *md; int bits; const char *canonical; };
+struct pbe_algorithm {
+  const EVP_MD *md;
+  int bits;
+  const char *canonical;
+};
 static bool pbe_algorithm(const char *name,struct pbe_algorithm *out)
 {
-   if(!name)return false;
-   const char *hashes[]={"SHA","SHA1","SHA-1","SHA256","SHA-256"};
-   const int sizes[]={128,192,256};
-   for(unsigned h=0;h<5;++h)for(unsigned b=0;b<3;++b){
-      char candidate[96];snprintf(candidate,sizeof candidate,"PBEWITH%sAND%dBITAES-CBC-BC",hashes[h],sizes[b]);
+  if(!name)return false;
+  const char *hashes[]= {"SHA","SHA1","SHA-1","SHA256","SHA-256"};
+  const int sizes[]= {128,192,256};
+  for(unsigned h=0; h<5; ++h)for(unsigned b=0; b<3; ++b) {
+      char candidate[96];
+      snprintf(candidate,sizeof candidate,"PBEWITH%sAND%dBITAES-CBC-BC",hashes[h],sizes[b]);
       if(strcasecmp(name,candidate))continue;
-      static const char *names[]={"PBEWithSHA1And128BitAES-CBC-BC","PBEWithSHA1And192BitAES-CBC-BC","PBEWithSHA1And256BitAES-CBC-BC",
-         "PBEWithSHA256And128BitAES-CBC-BC","PBEWithSHA256And192BitAES-CBC-BC","PBEWithSHA256And256BitAES-CBC-BC"};
-      if(out)*out=(struct pbe_algorithm){h<3 ? EVP_sha1() : EVP_sha256(),sizes[b],names[(h<3 ? 0 : 3)+b]};
+      static const char *names[]= {"PBEWithSHA1And128BitAES-CBC-BC","PBEWithSHA1And192BitAES-CBC-BC","PBEWithSHA1And256BitAES-CBC-BC",
+                                   "PBEWithSHA256And128BitAES-CBC-BC","PBEWithSHA256And192BitAES-CBC-BC","PBEWithSHA256And256BitAES-CBC-BC"
+                                  };
+      if(out)*out=(struct pbe_algorithm) {
+        h<3 ? EVP_sha1() : EVP_sha256(),sizes[b],names[(h<3 ? 0 : 3)+b]
+      };
       return true;
-   }
-   return false;
+    }
+  return false;
 }
 static const EVP_MD *pbe_pbkdf2_digest(const char *name)
 {
-   if(!name)return NULL;
-   if(!strcasecmp(name,"PBKDF2WithHmacSHA1"))return EVP_sha1();
-   if(!strcasecmp(name,"PBKDF2WithHmacSHA224"))return EVP_sha224();
-   if(!strcasecmp(name,"PBKDF2WithHmacSHA256"))return EVP_sha256();
-   if(!strcasecmp(name,"PBKDF2WithHmacSHA384"))return EVP_sha384();
-   if(!strcasecmp(name,"PBKDF2WithHmacSHA512"))return EVP_sha512();
-   return NULL;
+  if(!name)return NULL;
+  if(!strcasecmp(name,"PBKDF2WithHmacSHA1"))return EVP_sha1();
+  if(!strcasecmp(name,"PBKDF2WithHmacSHA224"))return EVP_sha224();
+  if(!strcasecmp(name,"PBKDF2WithHmacSHA256"))return EVP_sha256();
+  if(!strcasecmp(name,"PBKDF2WithHmacSHA384"))return EVP_sha384();
+  if(!strcasecmp(name,"PBKDF2WithHmacSHA512"))return EVP_sha512();
+  return NULL;
 }
 static dvm_ref pbe_array_copy(struct dvm *vm,dvm_ref array,char type)
 {
-   if(!array)return 0;
-   uint32_t n=dvm_array_length(vm,array);
-   dvm_ref copy=dvm_new_array(vm,type,NULL,n);
-   if(copy && n)memcpy(dvm_array_data(vm,copy),dvm_array_data(vm,array),(size_t)n*(type=='C' ? 2 : 1));
-   return copy;
+  if(!array)return 0;
+  uint32_t n=dvm_array_length(vm,array);
+  dvm_ref copy=dvm_new_array(vm,type,NULL,n);
+  if(copy && n)memcpy(dvm_array_data(vm,copy),dvm_array_data(vm,array),(size_t)n*(type=='C' ? 2 : 1));
+  return copy;
 }
 static bool pbe_object_is(struct dvm *vm,dvm_ref object,const char *name)
 {
-   struct dvm_class *cls=object ? dvm_object_class(vm,object) : NULL;
-   return cls && dvm__class_assignable(vm,cls,dvm_find_class(vm,name));
+  struct dvm_class *cls=object ? dvm_object_class(vm,object) : NULL;
+  return cls && dvm__class_assignable(vm,cls,dvm_find_class(vm,name));
 }
 static bool pbe_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   if(nargs>1){
-      if(!ARG(1).l){dvm__throw(vm,"java/lang/NullPointerException","salt");return false;}
-      if(!dvm_array_length(vm,ARG(1).l) || ARG(2).i<=0 || (nargs>3 && ARG(3).i<=0)){
-         dvm__throw(vm,"java/lang/IllegalArgumentException","Empty salt or nonpositive iteration count/key length");return false;
-      }
-   }
-   union dvm_value v={.l=ARG(0).l ? pbe_array_copy(vm,ARG(0).l,'C') : dvm_new_array(vm,'C',NULL,0)};
-   if(!v.l)return false;dvm_set_field(vm,self,"password","[C",v);
-   v.l=nargs>1 ? pbe_array_copy(vm,ARG(1).l,'B') : 0;if(nargs>1 && !v.l)return false;dvm_set_field(vm,self,"salt","[B",v);
-   rt_set_int(vm,self,"iterations",nargs>2 ? ARG(2).i : 0);
-   rt_set_int(vm,self,"keyLength",nargs>3 ? ARG(3).i : 0);RETV();
+  if(nargs>1) {
+    if(!ARG(1).l) {
+      dvm__throw(vm,"java/lang/NullPointerException","salt");
+      return false;
+    }
+    if(!dvm_array_length(vm,ARG(1).l) || ARG(2).i<=0 || (nargs>3 && ARG(3).i<=0)) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Empty salt or nonpositive iteration count/key length");
+      return false;
+    }
+  }
+  union dvm_value v= {.l=ARG(0).l ? pbe_array_copy(vm,ARG(0).l,'C') : dvm_new_array(vm,'C',NULL,0)};
+  if(!v.l)return false;
+  dvm_set_field(vm,self,"password","[C",v);
+  v.l=nargs>1 ? pbe_array_copy(vm,ARG(1).l,'B') : 0;
+  if(nargs>1 && !v.l)return false;
+  dvm_set_field(vm,self,"salt","[B",v);
+  rt_set_int(vm,self,"iterations",nargs>2 ? ARG(2).i : 0);
+  rt_set_int(vm,self,"keyLength",nargs>3 ? ARG(3).i : 0);
+  RETV();
 }
 static bool pbe_value(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;const char *name=builtin_name();union dvm_value value={0};
-   if(!strcmp(name,"getIterationCount"))RETI(rt_get_int(vm,self,"iterations"));
-   if(!strcmp(name,"getKeyLength"))RETI(rt_get_int(vm,self,"keyLength"));
-   if(!strcmp(name,"getEncoded")){dvm_get_field(vm,self,"encoded","[B",&value);RETL(pbe_array_copy(vm,value.l,'B'));}
-   bool password=!strcmp(name,"getPassword");
-   dvm_get_field(vm,self,password ? "password" : "salt",password ? "[C" : "[B",&value);
-   if(password && !value.l){dvm__throw(vm,"java/lang/IllegalStateException","Password has been cleared");return false;}
-   RETL(pbe_array_copy(vm,value.l,password ? 'C' : 'B'));
+  (void)args;
+  (void)nargs;
+  const char *name=builtin_name();
+  union dvm_value value= {0};
+  if(!strcmp(name,"getIterationCount"))RETI(rt_get_int(vm,self,"iterations"));
+  if(!strcmp(name,"getKeyLength"))RETI(rt_get_int(vm,self,"keyLength"));
+  if(!strcmp(name,"getEncoded")) {
+    dvm_get_field(vm,self,"encoded","[B",&value);
+    RETL(pbe_array_copy(vm,value.l,'B'));
+  }
+  bool password=!strcmp(name,"getPassword");
+  dvm_get_field(vm,self,password ? "password" : "salt",password ? "[C" : "[B",&value);
+  if(password && !value.l) {
+    dvm__throw(vm,"java/lang/IllegalStateException","Password has been cleared");
+    return false;
+  }
+  RETL(pbe_array_copy(vm,value.l,password ? 'C' : 'B'));
 }
 static bool pbe_clear(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;union dvm_value pw={0};dvm_get_field(vm,self,"password","[C",&pw);
-   if(pw.l){OPENSSL_cleanse(dvm_array_data(vm,pw.l),(size_t)dvm_array_length(vm,pw.l)*2);pw.l=0;dvm_set_field(vm,self,"password","[C",pw);}RETV();
+  (void)args;
+  (void)nargs;
+  union dvm_value pw= {0};
+  dvm_get_field(vm,self,"password","[C",&pw);
+  if(pw.l) {
+    OPENSSL_cleanse(dvm_array_data(vm,pw.l),(size_t)dvm_array_length(vm,pw.l)*2);
+    pw.l=0;
+    dvm_set_field(vm,self,"password","[C",pw);
+  }
+  RETV();
 }
 static bool pbe_parameter_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","salt");return false;}
-   union dvm_value v={.l=pbe_array_copy(vm,ARG(0).l,'B')};if(!v.l)return false;
-   dvm_set_field(vm,self,"salt","[B",v);rt_set_int(vm,self,"iterations",ARG(1).i);
-   v.l=nargs>2 ? ARG(2).l : 0;dvm_set_field(vm,self,"parameterSpec","Ljava/security/spec/AlgorithmParameterSpec;",v);RETV();
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","salt");
+    return false;
+  }
+  union dvm_value v= {.l=pbe_array_copy(vm,ARG(0).l,'B')};
+  if(!v.l)return false;
+  dvm_set_field(vm,self,"salt","[B",v);
+  rt_set_int(vm,self,"iterations",ARG(1).i);
+  v.l=nargs>2 ? ARG(2).l : 0;
+  dvm_set_field(vm,self,"parameterSpec","Ljava/security/spec/AlgorithmParameterSpec;",v);
+  RETV();
 }
 static bool pbe_parameter_spec(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;union dvm_value v={0};dvm_get_field(vm,self,"parameterSpec","Ljava/security/spec/AlgorithmParameterSpec;",&v);RETL(v.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value v= {0};
+  dvm_get_field(vm,self,"parameterSpec","Ljava/security/spec/AlgorithmParameterSpec;",&v);
+  RETL(v.l);
 }
 static dvm_ref pbe_password_encoded(struct dvm *vm,dvm_ref password)
 {
-   uint32_t n=dvm_array_length(vm,password);
-   if(n>(INT_MAX/2)-1){dvm__throw(vm,"java/lang/OutOfMemoryError","PBE password is too long");return 0;}
-   dvm_ref result=dvm_new_array(vm,'B',NULL,n ? (n+1)*2 : 0);
-   if(!result)return 0;
-   const uint16_t *chars=dvm_array_data(vm,password);uint8_t *bytes=dvm_array_data(vm,result);
-   for(uint32_t i=0;i<n;++i){bytes[2*i]=(uint8_t)(chars[i]>>8);bytes[2*i+1]=(uint8_t)chars[i];}
-   return result;
+  uint32_t n=dvm_array_length(vm,password);
+  if(n>(INT_MAX/2)-1) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","PBE password is too long");
+    return 0;
+  }
+  dvm_ref result=dvm_new_array(vm,'B',NULL,n ? (n+1)*2 : 0);
+  if(!result)return 0;
+  const uint16_t *chars=dvm_array_data(vm,password);
+  uint8_t *bytes=dvm_array_data(vm,result);
+  for(uint32_t i=0; i<n; ++i) {
+    bytes[2*i]=(uint8_t)(chars[i]>>8);
+    bytes[2*i+1]=(uint8_t)chars[i];
+  }
+  return result;
 }
 static bool pbe_derive_encoded(struct dvm *vm,const struct pbe_algorithm *algorithm,dvm_ref encoded,dvm_ref salt,int iterations,dvm_ref *key,dvm_ref *iv)
 {
-   uint32_t sn=dvm_array_length(vm,salt),pn=dvm_array_length(vm,encoded);
-   uint8_t kb[32],vb[16];
-   /* The PKCS12 generator hashes once even when an externally supplied
-    * PBEParameterSpec has a nonpositive iteration count, as BC does. */
-   if(iterations<1)iterations=1;
-   bool good=encoded && sn<=INT_MAX && pn<=INT_MAX &&
-      PKCS12_key_gen_uni(dvm_array_data(vm,encoded),(int)pn,dvm_array_data(vm,salt),(int)sn,1,iterations,algorithm->bits/8,kb,algorithm->md)==1 &&
-      PKCS12_key_gen_uni(dvm_array_data(vm,encoded),(int)pn,dvm_array_data(vm,salt),(int)sn,2,iterations,16,vb,algorithm->md)==1;
-   if(good){*key=make_bytes(vm,kb,(uint32_t)algorithm->bits/8);*iv=make_bytes(vm,vb,16);good=*key && *iv;}
-   OPENSSL_cleanse(kb,sizeof kb);OPENSSL_cleanse(vb,sizeof vb);
-   if(!good && !dvm_exception(vm))dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","PKCS12 derivation failed");
-   return good;
+  uint32_t sn=dvm_array_length(vm,salt),pn=dvm_array_length(vm,encoded);
+  uint8_t kb[32],vb[16];
+  /* The PKCS12 generator hashes once even when an externally supplied
+   * PBEParameterSpec has a nonpositive iteration count, as BC does. */
+  if(iterations<1)iterations=1;
+  bool good=encoded && sn<=INT_MAX && pn<=INT_MAX &&
+            PKCS12_key_gen_uni(dvm_array_data(vm,encoded),(int)pn,dvm_array_data(vm,salt),(int)sn,1,iterations,algorithm->bits/8,kb,algorithm->md)==1 &&
+            PKCS12_key_gen_uni(dvm_array_data(vm,encoded),(int)pn,dvm_array_data(vm,salt),(int)sn,2,iterations,16,vb,algorithm->md)==1;
+  if(good) {
+    *key=make_bytes(vm,kb,(uint32_t)algorithm->bits/8);
+    *iv=make_bytes(vm,vb,16);
+    good=*key && *iv;
+  }
+  OPENSSL_cleanse(kb,sizeof kb);
+  OPENSSL_cleanse(vb,sizeof vb);
+  if(!good && !dvm_exception(vm))dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","PKCS12 derivation failed");
+  return good;
 }
 static bool pbe_derive(struct dvm *vm,const struct pbe_algorithm *algorithm,dvm_ref password,dvm_ref salt,int iterations,dvm_ref *key,dvm_ref *iv)
 {
-   dvm_ref encoded=pbe_password_encoded(vm,password);if(!encoded)return false;
-   bool good=pbe_derive_encoded(vm,algorithm,encoded,salt,iterations,key,iv);
-   OPENSSL_cleanse(dvm_array_data(vm,encoded),dvm_array_length(vm,encoded));return good;
+  dvm_ref encoded=pbe_password_encoded(vm,password);
+  if(!encoded)return false;
+  bool good=pbe_derive_encoded(vm,algorithm,encoded,salt,iterations,key,iv);
+  OPENSSL_cleanse(dvm_array_data(vm,encoded),dvm_array_length(vm,encoded));
+  return good;
 }
 static bool skf_getInstance(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)self;
-   if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","algorithm");return false;}
-   if(nargs>1){
-      const char *provider=ARG(1).l ? dvm_string_utf8(vm,ARG(1).l) : NULL;
-      if(!provider || !*provider){dvm__throw(vm,"java/lang/IllegalArgumentException","Missing provider");return false;}
-      if(strcmp(provider,"BC") && strcmp(provider,"AndroidOpenSSL")){dvm__throw(vm,"java/security/NoSuchProviderException","%s",provider);return false;}
-   }
-   const char *name=dvm_string_utf8(vm,ARG(0).l);
-   if(!pbe_algorithm(name,NULL) && !pbe_pbkdf2_digest(name)){
-      dvm__throw(vm,"java/security/NoSuchAlgorithmException","%s",name);return false;
-   }
-   dvm_ref factory=dvm_new_object(vm,dvm_find_class(vm,"javax/crypto/SecretKeyFactory"));
-   if(factory)dvm_set_field(vm,factory,"algorithm","Ljava/lang/String;",ARG(0));RETL(factory);
+  (void)self;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","algorithm");
+    return false;
+  }
+  if(nargs>1) {
+    const char *provider=ARG(1).l ? dvm_string_utf8(vm,ARG(1).l) : NULL;
+    if(!provider || !*provider) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Missing provider");
+      return false;
+    }
+    if(strcmp(provider,"BC") && strcmp(provider,"AndroidOpenSSL")) {
+      dvm__throw(vm,"java/security/NoSuchProviderException","%s",provider);
+      return false;
+    }
+  }
+  const char *name=dvm_string_utf8(vm,ARG(0).l);
+  if(!pbe_algorithm(name,NULL) && !pbe_pbkdf2_digest(name)) {
+    dvm__throw(vm,"java/security/NoSuchAlgorithmException","%s",name);
+    return false;
+  }
+  dvm_ref factory=dvm_new_object(vm,dvm_find_class(vm,"javax/crypto/SecretKeyFactory"));
+  if(factory)dvm_set_field(vm,factory,"algorithm","Ljava/lang/String;",ARG(0));
+  RETL(factory);
 }
 static bool skf_generateSecret(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;union dvm_value av={0},pw={0},salt={0};
-   dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&av);const char *name=dvm_string_utf8(vm,av.l);
-   dvm_ref spec=ARG(0).l;
-   if(!pbe_object_is(vm,spec,"javax/crypto/spec/PBEKeySpec")){
-      dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Expected PBEKeySpec");return false;
-   }
-   dvm_get_field(vm,spec,"password","[C",&pw);dvm_get_field(vm,spec,"salt","[B",&salt);
-   if(!pw.l){dvm__throw(vm,"java/lang/IllegalStateException","Password has been cleared");return false;}
-   int iterations=rt_get_int(vm,spec,"iterations"),bits=rt_get_int(vm,spec,"keyLength");
-   struct pbe_algorithm algorithm;
-   if(pbe_algorithm(name,&algorithm)){
-      dvm_ref encoded=0,iv=0;
-      if(salt.l){if(!pbe_derive(vm,&algorithm,pw.l,salt.l,iterations,&encoded,&iv))return false;}
-      else encoded=pbe_password_encoded(vm,pw.l);
-      if(!encoded)return false;
-      dvm_ref key=key_make(vm,"Lcom/android/org/bouncycastle/jcajce/provider/symmetric/util/BCPBEKey;",encoded,algorithm.canonical,0);
-      if(!key)return false;
-      union dvm_value v={.l=pbe_array_copy(vm,pw.l,'C')};dvm_set_field(vm,key,"password","[C",v);
-      v.l=pbe_array_copy(vm,salt.l,'B');dvm_set_field(vm,key,"salt","[B",v);
-      rt_set_int(vm,key,"iterations",iterations);rt_set_int(vm,key,"derived",salt.l!=0);
-      v.l=iv;dvm_set_field(vm,key,"iv","[B",v);RETL(key);
-   }
-   const EVP_MD *md=pbe_pbkdf2_digest(name);
-   if(!md || !salt.l || iterations<=0 || bits<8){dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Invalid PBKDF2 parameters");return false;}
-   uint32_t n=dvm_array_length(vm,pw.l);const uint16_t *chars=dvm_array_data(vm,pw.l);
-   if(n>(INT_MAX-1)/3){dvm__throw(vm,"java/lang/OutOfMemoryError","PBKDF2 password is too long");return false;}
-   uint8_t *password=malloc((size_t)n*3+1);if(!password){dvm__throw(vm,"java/lang/OutOfMemoryError","PBKDF2 password");return false;}
-   size_t length=0;
-   for(uint32_t i=0;i<n;++i){
-      uint32_t cp=chars[i];
-      if(cp>=0xd800 && cp<=0xdbff && i+1<n && chars[i+1]>=0xdc00 && chars[i+1]<=0xdfff){cp=0x10000+((cp-0xd800)<<10)+(chars[++i]-0xdc00);}
-      else if(cp>=0xd800 && cp<=0xdfff)cp='?';
-      if(cp<0x80)password[length++]=(uint8_t)cp;
-      else if(cp<0x800){password[length++]=0xc0|(cp>>6);password[length++]=0x80|(cp&63);}
-      else if(cp<0x10000){password[length++]=0xe0|(cp>>12);password[length++]=0x80|((cp>>6)&63);password[length++]=0x80|(cp&63);}
-      else{password[length++]=0xf0|(cp>>18);password[length++]=0x80|((cp>>12)&63);password[length++]=0x80|((cp>>6)&63);password[length++]=0x80|(cp&63);}
-   }
-   dvm_ref encoded=dvm_new_array(vm,'B',NULL,(uint32_t)bits/8);uint32_t sn=dvm_array_length(vm,salt.l);
-   bool good=encoded && sn<=INT_MAX && PKCS5_PBKDF2_HMAC((char *)password,(int)length,dvm_array_data(vm,salt.l),(int)sn,iterations,md,bits/8,dvm_array_data(vm,encoded))==1;
-   OPENSSL_cleanse(password,length);free(password);
-   if(!good){if(!dvm_exception(vm))dvm__throw(vm,"java/security/spec/InvalidKeySpecException","PBKDF2 derivation failed");return false;}
-   RETL(key_make(vm,"Ljavax/crypto/spec/SecretKeySpec;",encoded,name,0));
+  (void)nargs;
+  union dvm_value av= {0},pw= {0},salt= {0};
+  dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&av);
+  const char *name=dvm_string_utf8(vm,av.l);
+  dvm_ref spec=ARG(0).l;
+  if(!pbe_object_is(vm,spec,"javax/crypto/spec/PBEKeySpec")) {
+    dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Expected PBEKeySpec");
+    return false;
+  }
+  dvm_get_field(vm,spec,"password","[C",&pw);
+  dvm_get_field(vm,spec,"salt","[B",&salt);
+  if(!pw.l) {
+    dvm__throw(vm,"java/lang/IllegalStateException","Password has been cleared");
+    return false;
+  }
+  int iterations=rt_get_int(vm,spec,"iterations"),bits=rt_get_int(vm,spec,"keyLength");
+  struct pbe_algorithm algorithm;
+  if(pbe_algorithm(name,&algorithm)) {
+    dvm_ref encoded=0,iv=0;
+    if(salt.l) {
+      if(!pbe_derive(vm,&algorithm,pw.l,salt.l,iterations,&encoded,&iv))return false;
+    }
+    else encoded=pbe_password_encoded(vm,pw.l);
+    if(!encoded)return false;
+    dvm_ref key=key_make(vm,"Lcom/android/org/bouncycastle/jcajce/provider/symmetric/util/BCPBEKey;",encoded,algorithm.canonical,0);
+    if(!key)return false;
+    union dvm_value v= {.l=pbe_array_copy(vm,pw.l,'C')};
+    dvm_set_field(vm,key,"password","[C",v);
+    v.l=pbe_array_copy(vm,salt.l,'B');
+    dvm_set_field(vm,key,"salt","[B",v);
+    rt_set_int(vm,key,"iterations",iterations);
+    rt_set_int(vm,key,"derived",salt.l!=0);
+    v.l=iv;
+    dvm_set_field(vm,key,"iv","[B",v);
+    RETL(key);
+  }
+  const EVP_MD *md=pbe_pbkdf2_digest(name);
+  if(!md || !salt.l || iterations<=0 || bits<8) {
+    dvm__throw(vm,"java/security/spec/InvalidKeySpecException","Invalid PBKDF2 parameters");
+    return false;
+  }
+  uint32_t n=dvm_array_length(vm,pw.l);
+  const uint16_t *chars=dvm_array_data(vm,pw.l);
+  if(n>(INT_MAX-1)/3) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","PBKDF2 password is too long");
+    return false;
+  }
+  uint8_t *password=malloc((size_t)n*3+1);
+  if(!password) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","PBKDF2 password");
+    return false;
+  }
+  size_t length=0;
+  for(uint32_t i=0; i<n; ++i) {
+    uint32_t cp=chars[i];
+    if(cp>=0xd800 && cp<=0xdbff && i+1<n && chars[i+1]>=0xdc00 && chars[i+1]<=0xdfff) {
+      cp=0x10000+((cp-0xd800)<<10)+(chars[++i]-0xdc00);
+    }
+    else if(cp>=0xd800 && cp<=0xdfff)cp='?';
+    if(cp<0x80)password[length++]=(uint8_t)cp;
+    else if(cp<0x800) {
+      password[length++]=0xc0|(cp>>6);
+      password[length++]=0x80|(cp&63);
+    }
+    else if(cp<0x10000) {
+      password[length++]=0xe0|(cp>>12);
+      password[length++]=0x80|((cp>>6)&63);
+      password[length++]=0x80|(cp&63);
+    }
+    else {
+      password[length++]=0xf0|(cp>>18);
+      password[length++]=0x80|((cp>>12)&63);
+      password[length++]=0x80|((cp>>6)&63);
+      password[length++]=0x80|(cp&63);
+    }
+  }
+  dvm_ref encoded=dvm_new_array(vm,'B',NULL,(uint32_t)bits/8);
+  uint32_t sn=dvm_array_length(vm,salt.l);
+  bool good=encoded && sn<=INT_MAX && PKCS5_PBKDF2_HMAC((char *)password,(int)length,dvm_array_data(vm,salt.l),(int)sn,iterations,md,bits/8,dvm_array_data(vm,encoded))==1;
+  OPENSSL_cleanse(password,length);
+  free(password);
+  if(!good) {
+    if(!dvm_exception(vm))dvm__throw(vm,"java/security/spec/InvalidKeySpecException","PBKDF2 derivation failed");
+    return false;
+  }
+  RETL(key_make(vm,"Ljavax/crypto/spec/SecretKeySpec;",encoded,name,0));
 }
 /* Prepare a separate operational key; initializing a Cipher never changes the
  * password-only key supplied by its caller. */
 static bool pbe_cipher_key(struct dvm *vm,const char *transform,dvm_ref original,dvm_ref params,dvm_ref *key,dvm_ref *iv)
 {
-   union dvm_value av={0},encoded={0},stored_iv={0},password={0};
-   dvm_get_field(vm,original,"algorithm","Ljava/lang/String;",&av);struct pbe_algorithm algorithm;
-   bool bc_key=pbe_object_is(vm,original,"com/android/org/bouncycastle/jcajce/provider/symmetric/util/BCPBEKey");
-   if(!bc_key){
-      if(!pbe_object_is(vm,original,"javax/crypto/SecretKey")){dvm__throw(vm,"java/security/InvalidKeyException","PBE requires a SecretKey");return false;}
-      if(!pbe_algorithm(transform,&algorithm) || !pbe_object_is(vm,params,"javax/crypto/spec/PBEParameterSpec")){
-         dvm__throw(vm,"java/security/InvalidKeyException","Cipher requires a PBE key or PBE parameters");return false;
+  union dvm_value av= {0},encoded= {0},stored_iv= {0},password= {0};
+  dvm_get_field(vm,original,"algorithm","Ljava/lang/String;",&av);
+  struct pbe_algorithm algorithm;
+  bool bc_key=pbe_object_is(vm,original,"com/android/org/bouncycastle/jcajce/provider/symmetric/util/BCPBEKey");
+  if(!bc_key) {
+    if(!pbe_object_is(vm,original,"javax/crypto/SecretKey")) {
+      dvm__throw(vm,"java/security/InvalidKeyException","PBE requires a SecretKey");
+      return false;
+    }
+    if(!pbe_algorithm(transform,&algorithm) || !pbe_object_is(vm,params,"javax/crypto/spec/PBEParameterSpec")) {
+      dvm__throw(vm,"java/security/InvalidKeyException","Cipher requires a PBE key or PBE parameters");
+      return false;
+    }
+    struct dvm_method *get_encoded=dvm_find_method(vm,dvm_object_class(vm,original),"getEncoded","()[B");
+    if(!get_encoded || !dvm_call(vm,get_encoded,original,NULL,0,&encoded))return false;
+    union dvm_value salt= {0};
+    dvm_get_field(vm,params,"salt","[B",&salt);
+    if(!encoded.l || !pbe_derive_encoded(vm,&algorithm,encoded.l,salt.l,rt_get_int(vm,params,"iterations"),&encoded.l,iv))return false;
+    *key=key_make(vm,"Ljavax/crypto/spec/SecretKeySpec;",encoded.l,"AES",0);
+    return *key!=0;
+  }
+  if(!av.l || !pbe_algorithm(dvm_string_utf8(vm,av.l),&algorithm)) {
+    dvm__throw(vm,"java/security/InvalidKeyException","Unsupported PBE key");
+    return false;
+  }
+  dvm_get_field(vm,original,"password","[C",&password);
+  if(!password.l) {
+    dvm__throw(vm,"java/security/InvalidKeyException","Missing PBE password");
+    return false;
+  }
+  if(rt_get_int(vm,original,"derived")) {
+    dvm_get_field(vm,original,"encoded","[B",&encoded);
+    dvm_get_field(vm,original,"iv","[B",&stored_iv);
+    *iv=stored_iv.l;
+    if(params && !pbe_object_is(vm,params,"javax/crypto/spec/PBEParameterSpec")) {
+      union dvm_value override= {0};
+      dvm_get_field(vm,params,"iv","[B",&override);
+      if(!override.l) {
+        dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","Unsupported PBE parameters");
+        return false;
       }
-      struct dvm_method *get_encoded=dvm_find_method(vm,dvm_object_class(vm,original),"getEncoded","()[B");
-      if(!get_encoded || !dvm_call(vm,get_encoded,original,NULL,0,&encoded))return false;
-      union dvm_value salt={0};dvm_get_field(vm,params,"salt","[B",&salt);
-      if(!encoded.l || !pbe_derive_encoded(vm,&algorithm,encoded.l,salt.l,rt_get_int(vm,params,"iterations"),&encoded.l,iv))return false;
-      *key=key_make(vm,"Ljavax/crypto/spec/SecretKeySpec;",encoded.l,"AES",0);return *key!=0;
-   }
-   if(!av.l || !pbe_algorithm(dvm_string_utf8(vm,av.l),&algorithm)){
-      dvm__throw(vm,"java/security/InvalidKeyException","Unsupported PBE key");return false;
-   }
-   dvm_get_field(vm,original,"password","[C",&password);
-   if(!password.l){dvm__throw(vm,"java/security/InvalidKeyException","Missing PBE password");return false;}
-   if(rt_get_int(vm,original,"derived")){
-      dvm_get_field(vm,original,"encoded","[B",&encoded);dvm_get_field(vm,original,"iv","[B",&stored_iv);
-      *iv=stored_iv.l;
-      if(params && !pbe_object_is(vm,params,"javax/crypto/spec/PBEParameterSpec")){
-         union dvm_value override={0};dvm_get_field(vm,params,"iv","[B",&override);
-         if(!override.l){dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","Unsupported PBE parameters");return false;}
-         *iv=override.l;
-      }
-   }else{
-      if(!pbe_object_is(vm,params,"javax/crypto/spec/PBEParameterSpec")){
-         dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","PBE requires salt and iteration count");return false;
-      }
-      union dvm_value salt={0};dvm_get_field(vm,params,"salt","[B",&salt);
-      if(!pbe_derive(vm,&algorithm,password.l,salt.l,rt_get_int(vm,params,"iterations"),&encoded.l,iv))return false;
-   }
-   *key=key_make(vm,"Ljavax/crypto/spec/SecretKeySpec;",encoded.l,"AES",0);return *key!=0;
+      *iv=override.l;
+    }
+  } else {
+    if(!pbe_object_is(vm,params,"javax/crypto/spec/PBEParameterSpec")) {
+      dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","PBE requires salt and iteration count");
+      return false;
+    }
+    union dvm_value salt= {0};
+    dvm_get_field(vm,params,"salt","[B",&salt);
+    if(!pbe_derive(vm,&algorithm,password.l,salt.l,rt_get_int(vm,params,"iterations"),&encoded.l,iv))return false;
+  }
+  *key=key_make(vm,"Ljavax/crypto/spec/SecretKeySpec;",encoded.l,"AES",0);
+  return *key!=0;
 }
-static const struct rt_field rt_pbe_key_spec_fields[]={
-   {"password","[C"},{"salt","[B"},{"iterations","I"},{"keyLength","I"},F_END
+static const struct rt_field rt_pbe_key_spec_fields[]= {
+  {"password","[C"},{"salt","[B"},{"iterations","I"},{"keyLength","I"},F_END
 };
-static const struct rt_method rt_pbe_key_spec[]={
-   M("<init>","([C)V",pbe_init),M("<init>","([C[BI)V",pbe_init),M("<init>","([C[BII)V",pbe_init),
-   M("getPassword","()[C",pbe_value),M("getSalt","()[B",pbe_value),M("getIterationCount","()I",pbe_value),
-   M("getKeyLength","()I",pbe_value),M("clearPassword","()V",pbe_clear),M_END
+static const struct rt_method rt_pbe_key_spec[]= {
+  M("<init>","([C)V",pbe_init),M("<init>","([C[BI)V",pbe_init),M("<init>","([C[BII)V",pbe_init),
+  M("getPassword","()[C",pbe_value),M("getSalt","()[B",pbe_value),M("getIterationCount","()I",pbe_value),
+  M("getKeyLength","()I",pbe_value),M("clearPassword","()V",pbe_clear),M_END
 };
-static const struct rt_field rt_pbe_parameter_fields[]={
-   {"salt","[B"},{"iterations","I"},{"parameterSpec","Ljava/security/spec/AlgorithmParameterSpec;"},F_END
+static const struct rt_field rt_pbe_parameter_fields[]= {
+  {"salt","[B"},{"iterations","I"},{"parameterSpec","Ljava/security/spec/AlgorithmParameterSpec;"},F_END
 };
-static const struct rt_method rt_pbe_parameter[]={
-   M("<init>","([BI)V",pbe_parameter_init),M("<init>","([BILjava/security/spec/AlgorithmParameterSpec;)V",pbe_parameter_init),
-   M("getSalt","()[B",pbe_value),M("getIterationCount","()I",pbe_value),
-   M("getParameterSpec","()Ljava/security/spec/AlgorithmParameterSpec;",pbe_parameter_spec),M_END
+static const struct rt_method rt_pbe_parameter[]= {
+  M("<init>","([BI)V",pbe_parameter_init),M("<init>","([BILjava/security/spec/AlgorithmParameterSpec;)V",pbe_parameter_init),
+  M("getSalt","()[B",pbe_value),M("getIterationCount","()I",pbe_value),
+  M("getParameterSpec","()Ljava/security/spec/AlgorithmParameterSpec;",pbe_parameter_spec),M_END
 };
-static const struct rt_field rt_pbe_key_fields[]={
-   {"password","[C"},{"salt","[B"},{"iterations","I"},{"iv","[B"},{"derived","I"},F_END
+static const struct rt_field rt_pbe_key_fields[]= {
+  {"password","[C"},{"salt","[B"},{"iterations","I"},{"iv","[B"},{"derived","I"},F_END
 };
-static const char *const rt_pbe_key_ifaces[]={"Ljavax/crypto/interfaces/PBEKey;",NULL};
-static const struct rt_method rt_pbe_key[]={
-   M("getEncoded","()[B",pbe_value),
-   M("getPassword","()[C",pbe_value),M("getSalt","()[B",pbe_value),M("getIterationCount","()I",pbe_value),M_END
+static const char *const rt_pbe_key_ifaces[]= {"Ljavax/crypto/interfaces/PBEKey;",NULL};
+static const struct rt_method rt_pbe_key[]= {
+  M("getEncoded","()[B",pbe_value),
+  M("getPassword","()[C",pbe_value),M("getSalt","()[B",pbe_value),M("getIterationCount","()I",pbe_value),M_END
 };
-static const struct rt_method rt_secret_key_factory[]={
-   SM("getInstance","(Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",skf_getInstance),
-   SM("getInstance","(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",skf_getInstance),
-   M("getAlgorithm","()Ljava/lang/String;",key_getAlgorithm),
-   M("generateSecret","(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",skf_generateSecret),M_END
+static const struct rt_method rt_secret_key_factory[]= {
+  SM("getInstance","(Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",skf_getInstance),
+  SM("getInstance","(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",skf_getInstance),
+  M("getAlgorithm","()Ljava/lang/String;",key_getAlgorithm),
+  M("generateSecret","(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",skf_generateSecret),M_END
 };
 
-static const char *const rt_secret_key_ifaces[]={"Ljavax/crypto/SecretKey;",NULL};
+static const char *const rt_secret_key_ifaces[]= {"Ljavax/crypto/SecretKey;",NULL};
 /* ======== end dvm_pbe.h ======== */
 
 /* --- javax.crypto.Cipher ------------------------------------------------ */
@@ -1215,376 +1434,381 @@ static void cipher_parse(const char *, char *, size_t, char *, size_t, char *, s
 
 static bool cipher_validate_transform(struct dvm *vm, const char *t)
 {
-   char alg[128], mode[128], pad[128];
-   if (!t || !*t || strlen(t) >= sizeof alg) goto algorithm_error;
-   cipher_parse(t, alg, sizeof alg, mode, sizeof mode, pad, sizeof pad);
-   if (!*alg || (strchr(t, '/') && (!*mode || !*pad || strchr(pad, '/'))))
-      goto algorithm_error;
-   bool aes = !strcasecmp(alg, "AES");
-   bool rsa = !strcasecmp(alg, "RSA");
-   bool des = !strcasecmp(alg, "DES") || !strcasecmp(alg, "DESede") ||
-              !strcasecmp(alg, "TripleDES");
-   bool rc4 = !strcasecmp(alg, "ARCFOUR") || !strcasecmp(alg, "RC4");
-   if (!aes && !rsa && !des && !rc4) goto algorithm_error;
-   if (*mode && strcasecmp(mode, "ECB") &&
-       !(rsa && !strcasecmp(mode, "NONE")) &&
-       !((aes || des) && !strcasecmp(mode, "CBC")) &&
-       !(aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "GCM"))))
-      goto algorithm_error;
-   bool padding = !*pad || !strcasecmp(pad, "NoPadding") ||
-      (!rsa && !rc4 && (!strcasecmp(pad, "PKCS5Padding") || !strcasecmp(pad, "PKCS7Padding"))) ||
-      (rsa && (!strcasecmp(pad, "PKCS1Padding") || !strcasecmp(pad, "OAEPPadding") ||
-               !strcasecmp(pad, "OAEPWithSHA-1AndMGF1Padding") ||
-               !strcasecmp(pad, "OAEPWithSHA-224AndMGF1Padding") ||
-               !strcasecmp(pad, "OAEPWithSHA-256AndMGF1Padding") ||
-               !strcasecmp(pad, "OAEPWithSHA-384AndMGF1Padding") ||
-               !strcasecmp(pad, "OAEPWithSHA-512AndMGF1Padding")));
-   if (aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "GCM")))
-      padding = !strcasecmp(pad, "NoPadding");
-   if (!padding) {
-      dvm__throw(vm, "javax/crypto/NoSuchPaddingException", "%s", pad);
-      return false;
-   }
-   return true;
+  char alg[128], mode[128], pad[128];
+  if (!t || !*t || strlen(t) >= sizeof alg) goto algorithm_error;
+  cipher_parse(t, alg, sizeof alg, mode, sizeof mode, pad, sizeof pad);
+  if (!*alg || (strchr(t, '/') && (!*mode || !*pad || strchr(pad, '/'))))
+    goto algorithm_error;
+  bool aes = !strcasecmp(alg, "AES");
+  bool rsa = !strcasecmp(alg, "RSA");
+  bool des = !strcasecmp(alg, "DES") || !strcasecmp(alg, "DESede") ||
+             !strcasecmp(alg, "TripleDES");
+  bool rc4 = !strcasecmp(alg, "ARCFOUR") || !strcasecmp(alg, "RC4");
+  if (!aes && !rsa && !des && !rc4) goto algorithm_error;
+  if (*mode && strcasecmp(mode, "ECB") &&
+      !(rsa && !strcasecmp(mode, "NONE")) &&
+      !((aes || des) && !strcasecmp(mode, "CBC")) &&
+      !(aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "GCM"))))
+    goto algorithm_error;
+  bool padding = !*pad || !strcasecmp(pad, "NoPadding") ||
+                 (!rsa && !rc4 && (!strcasecmp(pad, "PKCS5Padding") || !strcasecmp(pad, "PKCS7Padding"))) ||
+                 (rsa && (!strcasecmp(pad, "PKCS1Padding") || !strcasecmp(pad, "OAEPPadding") ||
+                          !strcasecmp(pad, "OAEPWithSHA-1AndMGF1Padding") ||
+                          !strcasecmp(pad, "OAEPWithSHA-224AndMGF1Padding") ||
+                          !strcasecmp(pad, "OAEPWithSHA-256AndMGF1Padding") ||
+                          !strcasecmp(pad, "OAEPWithSHA-384AndMGF1Padding") ||
+                          !strcasecmp(pad, "OAEPWithSHA-512AndMGF1Padding")));
+  if (aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "GCM")))
+    padding = !strcasecmp(pad, "NoPadding");
+  if (!padding) {
+    dvm__throw(vm, "javax/crypto/NoSuchPaddingException", "%s", pad);
+    return false;
+  }
+  return true;
 algorithm_error:
-   dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", t ? t : "null");
-   return false;
+  dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", t ? t : "null");
+  return false;
 }
 
 static bool cipher_getInstance(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   const char *t = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   if (!cipher_validate_transform(vm, t)) return false;
-   struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/crypto/Cipher;");
-   dvm_ref k = c ? dvm_new_object(vm, c) : 0;
-   if (k) {
-      union dvm_value v = { .l = dvm_new_string(vm, t ? t : "") };
-      (void)dvm_set_field(vm, k, "transform", "Ljava/lang/String;", v);
-      (void)dvm_set_field(vm, k, "algorithm", "Ljava/lang/String;", v);
-      v.l = security_builtin_provider(vm);
-      (void)dvm_set_field(vm, k, "provider", "Ljava/security/Provider;", v);
-   }
-   RETL(k);
+  (void)self;
+  (void)nargs;
+  const char *t = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  if (!cipher_validate_transform(vm, t)) return false;
+  struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/crypto/Cipher;");
+  dvm_ref k = c ? dvm_new_object(vm, c) : 0;
+  if (k) {
+    union dvm_value v = { .l = dvm_new_string(vm, t ? t : "") };
+    (void)dvm_set_field(vm, k, "transform", "Ljava/lang/String;", v);
+    (void)dvm_set_field(vm, k, "algorithm", "Ljava/lang/String;", v);
+    v.l = security_builtin_provider(vm);
+    (void)dvm_set_field(vm, k, "provider", "Ljava/security/Provider;", v);
+  }
+  RETL(k);
 }
 
 static bool cipher_getProvider(struct dvm *vm, dvm_ref self,
-                                const union dvm_value *args, int nargs,
-                                union dvm_value *out)
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value provider = {0};
-   (void)dvm_get_field(vm, self, "provider", "Ljava/security/Provider;", &provider);
-   RETL(provider.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value provider = {0};
+  (void)dvm_get_field(vm, self, "provider", "Ljava/security/Provider;", &provider);
+  RETL(provider.l);
 }
 
 static bool cipher_getInstance_provider(struct dvm *vm, dvm_ref self,
                                         const union dvm_value *args, int nargs,
                                         union dvm_value *out)
 {
-   if (nargs < 2 || !args[1].l) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
-      return false;
-   }
-   if (args[1].l != security_builtin_provider(vm)) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException",
-                 "No Cipher service in the specified provider");
-      return false;
-   }
-   return cipher_getInstance(vm, self, args, 1, out);
+  if (nargs < 2 || !args[1].l) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
+    return false;
+  }
+  if (args[1].l != security_builtin_provider(vm)) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException",
+               "No Cipher service in the specified provider");
+    return false;
+  }
+  return cipher_getInstance(vm, self, args, 1, out);
 }
 
 static bool cipher_getInstance_named(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
-   const char *name = nargs > 1 && args[1].l ? dvm_string_utf8(vm, args[1].l) : NULL;
-   if (!name || !*name) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
-      return false;
-   }
-   /* Android 12's providers include "BC" next to "AndroidOpenSSL"; both serve
-    * the transformations this runtime implements (PKCS7 padding is PKCS5's). */
-   if (strcmp(name, "AndroidOpenSSL") && strcmp(name, "BC")) {
-      dvm__throw(vm, "java/security/NoSuchProviderException", "%s", name);
-      return false;
-   }
-   return cipher_getInstance(vm, self, args, 1, out);
+  const char *name = nargs > 1 && args[1].l ? dvm_string_utf8(vm, args[1].l) : NULL;
+  if (!name || !*name) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
+    return false;
+  }
+  /* Android 12's providers include "BC" next to "AndroidOpenSSL"; both serve
+   * the transformations this runtime implements (PKCS7 padding is PKCS5's). */
+  if (strcmp(name, "AndroidOpenSSL") && strcmp(name, "BC")) {
+    dvm__throw(vm, "java/security/NoSuchProviderException", "%s", name);
+    return false;
+  }
+  return cipher_getInstance(vm, self, args, 1, out);
 }
 
 /* Native state follows the Java object's lifetime. */
 static void cipher_state_destroy(void *data)
 {
-   EVP_CIPHER_CTX_free(data);
+  EVP_CIPHER_CTX_free(data);
 }
 static void cipher_state_clear(struct dvm *vm, dvm_ref self)
 {
-   struct dvm_object *object = dvm__obj(vm, self);
-   if (object && object->data) {
-      cipher_state_destroy(object->data);
-      object->data = NULL;
-      object->data_destroy = NULL;
-   }
+  struct dvm_object *object = dvm__obj(vm, self);
+  if (object && object->data) {
+    cipher_state_destroy(object->data);
+    object->data = NULL;
+    object->data_destroy = NULL;
+  }
 }
 
 static bool cipher_init(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   (void)out;
-   union dvm_value empty = {0};
-   cipher_state_clear(vm, self);
-   (void)dvm_set_field(vm, self, "pending", "[B", empty);
-   (void)dvm_set_field(vm, self, "opmode", "I", empty);
-   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", empty);
-   if (ARG(0).i < JCE_ENCRYPT || ARG(0).i > JCE_UNWRAP) {
-      dvm__throw(vm, "java/security/InvalidParameterException", "unsupported cipher mode");
+  (void)out;
+  union dvm_value empty = {0};
+  cipher_state_clear(vm, self);
+  (void)dvm_set_field(vm, self, "pending", "[B", empty);
+  (void)dvm_set_field(vm, self, "opmode", "I", empty);
+  (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", empty);
+  if (ARG(0).i < JCE_ENCRYPT || ARG(0).i > JCE_UNWRAP) {
+    dvm__throw(vm, "java/security/InvalidParameterException", "unsupported cipher mode");
+    return false;
+  }
+  if (nargs < 2 || !args[1].l) {
+    dvm__throw(vm, "java/security/InvalidKeyException", "no key");
+    return false;
+  }
+  const struct dvm_method *method = dvm__builtin_method();
+  const bool with_params = method && strstr(method->sig, "Ljava/security/spec/AlgorithmParameterSpec;");
+  dvm_ref params = with_params && nargs >= 3 ? args[2].l : 0;
+  dvm_ref random = with_params ? (nargs>=4 ? args[3].l : 0) : (nargs>=3 ? args[2].l : 0);
+  union dvm_value iv = {0}, transform = {0};
+  if (params) (void)dvm_get_field(vm, params, "iv", "[B", &iv);
+  (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
+  char alg[128], mode[128], pad[128];
+  cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
+               mode, sizeof mode, pad, sizeof pad);
+  dvm_ref operational_key=args[1].l;
+  bool pbe=pbe_algorithm(dvm_string_utf8(vm,transform.l),NULL);
+  if(pbe && !pbe_cipher_key(vm,dvm_string_utf8(vm,transform.l),args[1].l,params,&operational_key,&iv.l))return false;
+  const bool rsa = !strcasecmp(alg, "RSA");
+  const bool gcm = !strcasecmp(mode, "GCM");
+  const bool encrypting = ARG(0).i == JCE_ENCRYPT || ARG(0).i == JCE_WRAP;
+  int expected = gcm ? 12 : (!strcasecmp(mode, "CBC") || !strcasecmp(mode, "CTR"))
+                 ? (!strcasecmp(alg, "AES") ? 16 : 8) : 0;
+  if (!rsa) {
+    if (params && !iv.l) {
+      dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "unsupported cipher parameters");
       return false;
-   }
-   if (nargs < 2 || !args[1].l) {
-      dvm__throw(vm, "java/security/InvalidKeyException", "no key");
+    }
+    if (iv.l && ((!expected) || (gcm ? !dvm_array_length(vm, iv.l)
+                                 : dvm_array_length(vm, iv.l) != (uint32_t)expected))) {
+      dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "invalid IV length");
       return false;
-   }
-   const struct dvm_method *method = dvm__builtin_method();
-   const bool with_params = method && strstr(method->sig, "Ljava/security/spec/AlgorithmParameterSpec;");
-   dvm_ref params = with_params && nargs >= 3 ? args[2].l : 0;
-   dvm_ref random = with_params ? (nargs>=4 ? args[3].l : 0) : (nargs>=3 ? args[2].l : 0);
-   union dvm_value iv = {0}, transform = {0};
-   if (params) (void)dvm_get_field(vm, params, "iv", "[B", &iv);
-   (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
-   char alg[128], mode[128], pad[128];
-   cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
-                mode, sizeof mode, pad, sizeof pad);
-   dvm_ref operational_key=args[1].l;
-   bool pbe=pbe_algorithm(dvm_string_utf8(vm,transform.l),NULL);
-   if(pbe && !pbe_cipher_key(vm,dvm_string_utf8(vm,transform.l),args[1].l,params,&operational_key,&iv.l))return false;
-   const bool rsa = !strcasecmp(alg, "RSA");
-   const bool gcm = !strcasecmp(mode, "GCM");
-   const bool encrypting = ARG(0).i == JCE_ENCRYPT || ARG(0).i == JCE_WRAP;
-   int expected = gcm ? 12 : (!strcasecmp(mode, "CBC") || !strcasecmp(mode, "CTR"))
-      ? (!strcasecmp(alg, "AES") ? 16 : 8) : 0;
-   if (!rsa) {
-      if (params && !iv.l) {
-         dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "unsupported cipher parameters");
-         return false;
+    }
+    if (!iv.l && expected) {
+      if (!encrypting) {
+        dvm__throw(vm, with_params ? "java/security/InvalidAlgorithmParameterException"
+                   : "java/security/InvalidKeyException", "IV must be specified");
+        return false;
       }
-      if (iv.l && ((!expected) || (gcm ? !dvm_array_length(vm, iv.l)
-                                  : dvm_array_length(vm, iv.l) != (uint32_t)expected))) {
-         dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "invalid IV length");
-         return false;
+      iv.l = dvm_new_array(vm, 'B', NULL, (uint32_t)expected);
+      if (!iv.l) return false;
+      if (random) {
+        struct dvm_method *next = dvm_find_method(vm, dvm_object_class(vm, random), "nextBytes", "([B)V");
+        union dvm_value ignored = {0};
+        if (!next || !dvm_call(vm, next, random, &iv, 1, &ignored)) return false;
+      } else if (RAND_bytes(dvm_array_data(vm, iv.l), expected) != 1) {
+        dvm__throw(vm, "java/security/ProviderException", "CSPRNG failed while generating an IV");
+        return false;
       }
-      if (!iv.l && expected) {
-         if (!encrypting) {
-            dvm__throw(vm, with_params ? "java/security/InvalidAlgorithmParameterException"
-                                      : "java/security/InvalidKeyException", "IV must be specified");
-            return false;
-         }
-         iv.l = dvm_new_array(vm, 'B', NULL, (uint32_t)expected);
-         if (!iv.l) return false;
-         if (random) {
-            struct dvm_method *next = dvm_find_method(vm, dvm_object_class(vm, random), "nextBytes", "([B)V");
-            union dvm_value ignored = {0};
-            if (!next || !dvm_call(vm, next, random, &iv, 1, &ignored)) return false;
-         } else if (RAND_bytes(dvm_array_data(vm, iv.l), expected) != 1) {
-            dvm__throw(vm, "java/security/ProviderException", "CSPRNG failed while generating an IV");
-            return false;
-         }
-      } else if (iv.l) {
-         uint32_t length = 0;
-         const uint8_t *bytes = arg_bytes(vm, iv.l, &length);
-         iv.l = make_bytes(vm, bytes, length);
-      }
-   }
-   union dvm_value value = {.i = ARG(0).i};
-   (void)dvm_set_field(vm, self, "opmode", "I", value);
-   value.l = operational_key;
-   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", value);
-   (void)dvm_set_field(vm, self, "iv", "[B", iv);
-   (void)dvm_set_field(vm, self, "aad", "[B", empty);
-   RETV();
+    } else if (iv.l) {
+      uint32_t length = 0;
+      const uint8_t *bytes = arg_bytes(vm, iv.l, &length);
+      iv.l = make_bytes(vm, bytes, length);
+    }
+  }
+  union dvm_value value = {.i = ARG(0).i};
+  (void)dvm_set_field(vm, self, "opmode", "I", value);
+  value.l = operational_key;
+  (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", value);
+  (void)dvm_set_field(vm, self, "iv", "[B", iv);
+  (void)dvm_set_field(vm, self, "aad", "[B", empty);
+  RETV();
 }
 
 static bool cipher_updateAAD(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)out;
-   uint32_t input_len = 0;
-   const uint8_t *input = arg_bytes(vm, ARG(0).l, &input_len);
-   uint32_t offset = 0, count = input_len;
-   if (nargs >= 3) {
-      if (args[1].i < 0 || args[2].i < 0 ||
-          (uint32_t)args[1].i > input_len ||
-          (uint32_t)args[2].i > input_len - (uint32_t)args[1].i) {
-         dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "AAD range");
-         return false;
-      }
-      offset = (uint32_t)args[1].i;
-      count = (uint32_t)args[2].i;
-   }
-   union dvm_value oldv = { 0 };
-   (void)dvm_get_field(vm, self, "aad", "[B", &oldv);
-   uint32_t old_len = 0;
-   const uint8_t *old = oldv.l ? arg_bytes(vm, oldv.l, &old_len) : NULL;
-   dvm_ref joined = dvm_new_array(vm, 'B', "B", old_len + count);
-   struct dvm_object *array = joined ? dvm__obj(vm, joined) : NULL;
-   if (!array || !array->data) RETV();
-   if (old_len && old) memcpy(array->data, old, old_len);
-   if (count && input)
-      memcpy((uint8_t *)array->data + old_len, input + offset, count);
-   union dvm_value next = { .l = joined };
-   (void)dvm_set_field(vm, self, "aad", "[B", next);
-   RETV();
+  (void)out;
+  uint32_t input_len = 0;
+  const uint8_t *input = arg_bytes(vm, ARG(0).l, &input_len);
+  uint32_t offset = 0, count = input_len;
+  if (nargs >= 3) {
+    if (args[1].i < 0 || args[2].i < 0 ||
+        (uint32_t)args[1].i > input_len ||
+        (uint32_t)args[2].i > input_len - (uint32_t)args[1].i) {
+      dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "AAD range");
+      return false;
+    }
+    offset = (uint32_t)args[1].i;
+    count = (uint32_t)args[2].i;
+  }
+  union dvm_value oldv = { 0 };
+  (void)dvm_get_field(vm, self, "aad", "[B", &oldv);
+  uint32_t old_len = 0;
+  const uint8_t *old = oldv.l ? arg_bytes(vm, oldv.l, &old_len) : NULL;
+  dvm_ref joined = dvm_new_array(vm, 'B', "B", old_len + count);
+  struct dvm_object *array = joined ? dvm__obj(vm, joined) : NULL;
+  if (!array || !array->data) RETV();
+  if (old_len && old) memcpy(array->data, old, old_len);
+  if (count && input)
+    memcpy((uint8_t *)array->data + old_len, input + offset, count);
+  union dvm_value next = { .l = joined };
+  (void)dvm_set_field(vm, self, "aad", "[B", next);
+  RETV();
 }
 
 /* Splits "AES/CBC/PKCS5Padding" into its three parts. */
 static void cipher_parse(const char *t, char *alg, size_t na, char *mode,
                          size_t nm, char *pad, size_t np)
 {
-   snprintf(alg, na, "%s", t ? t : "");
-   mode[0] = pad[0] = '\0';
-   if(pbe_algorithm(t,NULL)){
-      snprintf(alg,na,"AES");snprintf(mode,nm,"CBC");snprintf(pad,np,"PKCS7Padding");return;
-   }
-   char *slash = strchr(alg, '/');
-   if (!slash) return;
-   *slash = '\0';
-   snprintf(mode, nm, "%s", slash + 1);
-   char *slash2 = strchr(mode, '/');
-   if (!slash2) return;
-   *slash2 = '\0';
-   snprintf(pad, np, "%s", slash2 + 1);
+  snprintf(alg, na, "%s", t ? t : "");
+  mode[0] = pad[0] = '\0';
+  if(pbe_algorithm(t,NULL)) {
+    snprintf(alg,na,"AES");
+    snprintf(mode,nm,"CBC");
+    snprintf(pad,np,"PKCS7Padding");
+    return;
+  }
+  char *slash = strchr(alg, '/');
+  if (!slash) return;
+  *slash = '\0';
+  snprintf(mode, nm, "%s", slash + 1);
+  char *slash2 = strchr(mode, '/');
+  if (!slash2) return;
+  *slash2 = '\0';
+  snprintf(pad, np, "%s", slash2 + 1);
 }
 
 static bool cipher_fail(struct dvm *vm, const char *what)
 {
-   unsigned long e = ERR_get_error();
-   char ebuf[128] = "";
-   if (e) ERR_error_string_n(e, ebuf, sizeof ebuf);
-   dvm__throw(vm, "javax/crypto/BadPaddingException", "%s%s%s", what,
-              ebuf[0] ? ": " : "", ebuf);
-   return false;
+  unsigned long e = ERR_get_error();
+  char ebuf[128] = "";
+  if (e) ERR_error_string_n(e, ebuf, sizeof ebuf);
+  dvm__throw(vm, "javax/crypto/BadPaddingException", "%s%s%s", what,
+             ebuf[0] ? ": " : "", ebuf);
+  return false;
 }
 
 static bool cipher_rsa(struct dvm *vm, int opmode, const char *pad,
                        const uint8_t *key, uint32_t keylen, int32_t kind,
                        const uint8_t *in, uint32_t inlen, union dvm_value *out)
 {
-   const uint8_t *kp = key;
-   EVP_PKEY *pkey = kind == 2 ? d2i_PUBKEY(NULL, &kp, keylen)
-                              : d2i_AutoPrivateKey(NULL, &kp, keylen);
-   if (!pkey) return cipher_fail(vm, "cannot read the RSA key");
+  const uint8_t *kp = key;
+  EVP_PKEY *pkey = kind == 2 ? d2i_PUBKEY(NULL, &kp, keylen)
+                   : d2i_AutoPrivateKey(NULL, &kp, keylen);
+  if (!pkey) return cipher_fail(vm, "cannot read the RSA key");
 
-   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
-   bool enc = opmode == JCE_ENCRYPT || opmode == JCE_WRAP;
-   const EVP_MD *oaep_md = NULL;
-   int ok = ctx && (enc ? EVP_PKEY_encrypt_init(ctx)
-                        : EVP_PKEY_decrypt_init(ctx)) > 0;
-   if (ok) {
-      int p = RSA_PKCS1_PADDING;
-      bool oaep = pad && luna_strcasestr(pad, "OAEP");
-      if (oaep) p = RSA_PKCS1_OAEP_PADDING;
-      else if (pad && (!strcasecmp(pad, "NoPadding") || !*pad))
-         p = RSA_NO_PADDING;
-      ok = EVP_PKEY_CTX_set_rsa_padding(ctx, p) > 0;
+  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+  bool enc = opmode == JCE_ENCRYPT || opmode == JCE_WRAP;
+  const EVP_MD *oaep_md = NULL;
+  int ok = ctx && (enc ? EVP_PKEY_encrypt_init(ctx)
+                   : EVP_PKEY_decrypt_init(ctx)) > 0;
+  if (ok) {
+    int p = RSA_PKCS1_PADDING;
+    bool oaep = pad && luna_strcasestr(pad, "OAEP");
+    if (oaep) p = RSA_PKCS1_OAEP_PADDING;
+    else if (pad && (!strcasecmp(pad, "NoPadding") || !*pad))
+      p = RSA_NO_PADDING;
+    ok = EVP_PKEY_CTX_set_rsa_padding(ctx, p) > 0;
 
-      /* "OAEPWithSHA-256AndMGF1Padding" names the label digest.  Which digest
-       * MGF1 then uses is not settled: Sun's provider keeps SHA-1 while
-       * Conscrypt and BouncyCastle follow the name, and the transformation
-       * alone cannot say which one wrote the ciphertext.  The label digest is
-       * set here and the MGF1 choice is decided by trying both below. */
-      if (ok && oaep) {
-         const char *w = luna_strcasestr(pad, "OAEPWith");
-         if (w) {
-            char name[32];
-            const char *b = w + 8;
-            const char *e = luna_strcasestr(b, "And");
-            size_t n = e ? (size_t)(e - b) : strlen(b);
-            if (n >= sizeof name) n = sizeof name - 1;
-            memcpy(name, b, n);
-            name[n] = '\0';
-            oaep_md = EVP_get_digestbyname(name);
-         }
-         if (oaep_md) ok = EVP_PKEY_CTX_set_rsa_oaep_md(ctx, oaep_md) > 0;
+    /* "OAEPWithSHA-256AndMGF1Padding" names the label digest.  Which digest
+     * MGF1 then uses is not settled: Sun's provider keeps SHA-1 while
+     * Conscrypt and BouncyCastle follow the name, and the transformation
+     * alone cannot say which one wrote the ciphertext.  The label digest is
+     * set here and the MGF1 choice is decided by trying both below. */
+    if (ok && oaep) {
+      const char *w = luna_strcasestr(pad, "OAEPWith");
+      if (w) {
+        char name[32];
+        const char *b = w + 8;
+        const char *e = luna_strcasestr(b, "And");
+        size_t n = e ? (size_t)(e - b) : strlen(b);
+        if (n >= sizeof name) n = sizeof name - 1;
+        memcpy(name, b, n);
+        name[n] = '\0';
+        oaep_md = EVP_get_digestbyname(name);
       }
-   }
+      if (oaep_md) ok = EVP_PKEY_CTX_set_rsa_oaep_md(ctx, oaep_md) > 0;
+    }
+  }
 
-   size_t outlen = 0;
-   if (ok)
-      ok = (enc ? EVP_PKEY_encrypt(ctx, NULL, &outlen, in, inlen)
-                : EVP_PKEY_decrypt(ctx, NULL, &outlen, in, inlen)) > 0;
-   uint8_t *buf = ok ? malloc(outlen ? outlen : 1) : NULL;
-   if (buf)
-      ok = (enc ? EVP_PKEY_encrypt(ctx, buf, &outlen, in, inlen)
-                : EVP_PKEY_decrypt(ctx, buf, &outlen, in, inlen)) > 0;
+  size_t outlen = 0;
+  if (ok)
+    ok = (enc ? EVP_PKEY_encrypt(ctx, NULL, &outlen, in, inlen)
+          : EVP_PKEY_decrypt(ctx, NULL, &outlen, in, inlen)) > 0;
+  uint8_t *buf = ok ? malloc(outlen ? outlen : 1) : NULL;
+  if (buf)
+    ok = (enc ? EVP_PKEY_encrypt(ctx, buf, &outlen, in, inlen)
+          : EVP_PKEY_decrypt(ctx, buf, &outlen, in, inlen)) > 0;
 
-   /* An OAEP decrypt that fails only tells us the padding did not check out,
-    * which is exactly what the wrong MGF1 digest looks like.  Retry once with
-    * the other reading of the transformation name before giving up. */
-   if (!ok && !enc && oaep_md && buf) {
-      ERR_clear_error();
-      const EVP_MD *alt = oaep_md == EVP_sha1() ? EVP_sha256() : EVP_sha1();
-      EVP_PKEY_CTX *c2 = EVP_PKEY_CTX_new(pkey, NULL);
-      if (c2 && EVP_PKEY_decrypt_init(c2) > 0 &&
-          EVP_PKEY_CTX_set_rsa_padding(c2, RSA_PKCS1_OAEP_PADDING) > 0 &&
-          EVP_PKEY_CTX_set_rsa_oaep_md(c2, oaep_md) > 0 &&
-          EVP_PKEY_CTX_set_rsa_mgf1_md(c2, alt) > 0) {
-         outlen = 0;
-         if (EVP_PKEY_decrypt(c2, NULL, &outlen, in, inlen) > 0) {
-            uint8_t *b2 = malloc(outlen ? outlen : 1);
-            if (b2 && EVP_PKEY_decrypt(c2, b2, &outlen, in, inlen) > 0) {
-               free(buf);
-               buf = b2;
-               ok = true;
-            } else {
-               free(b2);
-            }
-         }
+  /* An OAEP decrypt that fails only tells us the padding did not check out,
+   * which is exactly what the wrong MGF1 digest looks like.  Retry once with
+   * the other reading of the transformation name before giving up. */
+  if (!ok && !enc && oaep_md && buf) {
+    ERR_clear_error();
+    const EVP_MD *alt = oaep_md == EVP_sha1() ? EVP_sha256() : EVP_sha1();
+    EVP_PKEY_CTX *c2 = EVP_PKEY_CTX_new(pkey, NULL);
+    if (c2 && EVP_PKEY_decrypt_init(c2) > 0 &&
+        EVP_PKEY_CTX_set_rsa_padding(c2, RSA_PKCS1_OAEP_PADDING) > 0 &&
+        EVP_PKEY_CTX_set_rsa_oaep_md(c2, oaep_md) > 0 &&
+        EVP_PKEY_CTX_set_rsa_mgf1_md(c2, alt) > 0) {
+      outlen = 0;
+      if (EVP_PKEY_decrypt(c2, NULL, &outlen, in, inlen) > 0) {
+        uint8_t *b2 = malloc(outlen ? outlen : 1);
+        if (b2 && EVP_PKEY_decrypt(c2, b2, &outlen, in, inlen) > 0) {
+          free(buf);
+          buf = b2;
+          ok = true;
+        } else {
+          free(b2);
+        }
       }
-      EVP_PKEY_CTX_free(c2);
-   }
-   EVP_PKEY_CTX_free(ctx);
-   EVP_PKEY_free(pkey);
-   if (!ok || !buf) {
-      free(buf);
-      char what[128];
-      snprintf(what, sizeof what, "RSA/%s %s failed", pad && *pad ? pad : "-",
-               enc ? "encrypt" : "decrypt");
-      return cipher_fail(vm, what);
-   }
-   dvm_ref r = make_bytes(vm, buf, (uint32_t)outlen);
-   free(buf);
-   RETL(r);
+    }
+    EVP_PKEY_CTX_free(c2);
+  }
+  EVP_PKEY_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  if (!ok || !buf) {
+    free(buf);
+    char what[128];
+    snprintf(what, sizeof what, "RSA/%s %s failed", pad && *pad ? pad : "-",
+             enc ? "encrypt" : "decrypt");
+    return cipher_fail(vm, what);
+  }
+  dvm_ref r = make_bytes(vm, buf, (uint32_t)outlen);
+  free(buf);
+  RETL(r);
 }
 
 static const EVP_CIPHER *cipher_pick(const char *alg, const char *mode,
                                      uint32_t keylen)
 {
-   bool cbc = !strcasecmp(mode, "CBC");
-   bool ecb = !strcasecmp(mode, "ECB") || !*mode;
-   bool gcm = !strcasecmp(mode, "GCM");
-   bool ctr = !strcasecmp(mode, "CTR");
-   if (!strcasecmp(alg, "AES")) {
-      if (keylen == 16)
-         return gcm ? EVP_aes_128_gcm() : ctr ? EVP_aes_128_ctr()
-              : cbc ? EVP_aes_128_cbc() : ecb ? EVP_aes_128_ecb() : NULL;
-      if (keylen == 24)
-         return gcm ? EVP_aes_192_gcm() : ctr ? EVP_aes_192_ctr()
-              : cbc ? EVP_aes_192_cbc() : ecb ? EVP_aes_192_ecb() : NULL;
-      if (keylen == 32)
-         return gcm ? EVP_aes_256_gcm() : ctr ? EVP_aes_256_ctr()
-              : cbc ? EVP_aes_256_cbc() : ecb ? EVP_aes_256_ecb() : NULL;
-      return NULL;
-   }
-   if (!strcasecmp(alg, "DESede") || !strcasecmp(alg, "TripleDES"))
-      return cbc ? EVP_des_ede3_cbc() : EVP_des_ede3_ecb();
-   if (!strcasecmp(alg, "DES"))
-      return cbc ? EVP_des_cbc() : EVP_des_ecb();
-   if (!strcasecmp(alg, "ARCFOUR") || !strcasecmp(alg, "RC4"))
-      return EVP_rc4();
-   return NULL;
+  bool cbc = !strcasecmp(mode, "CBC");
+  bool ecb = !strcasecmp(mode, "ECB") || !*mode;
+  bool gcm = !strcasecmp(mode, "GCM");
+  bool ctr = !strcasecmp(mode, "CTR");
+  if (!strcasecmp(alg, "AES")) {
+    if (keylen == 16)
+      return gcm ? EVP_aes_128_gcm() : ctr ? EVP_aes_128_ctr()
+             : cbc ? EVP_aes_128_cbc() : ecb ? EVP_aes_128_ecb() : NULL;
+    if (keylen == 24)
+      return gcm ? EVP_aes_192_gcm() : ctr ? EVP_aes_192_ctr()
+             : cbc ? EVP_aes_192_cbc() : ecb ? EVP_aes_192_ecb() : NULL;
+    if (keylen == 32)
+      return gcm ? EVP_aes_256_gcm() : ctr ? EVP_aes_256_ctr()
+             : cbc ? EVP_aes_256_cbc() : ecb ? EVP_aes_256_ecb() : NULL;
+    return NULL;
+  }
+  if (!strcasecmp(alg, "DESede") || !strcasecmp(alg, "TripleDES"))
+    return cbc ? EVP_des_ede3_cbc() : EVP_des_ede3_ecb();
+  if (!strcasecmp(alg, "DES"))
+    return cbc ? EVP_des_cbc() : EVP_des_ecb();
+  if (!strcasecmp(alg, "ARCFOUR") || !strcasecmp(alg, "RC4"))
+    return EVP_rc4();
+  return NULL;
 }
 
 static bool cipher_sym(struct dvm *vm, int opmode, const char *alg,
@@ -1593,67 +1817,67 @@ static bool cipher_sym(struct dvm *vm, int opmode, const char *alg,
                        const uint8_t *aad, uint32_t aadlen,
                        const uint8_t *in, uint32_t inlen, union dvm_value *out)
 {
-   const EVP_CIPHER *type = cipher_pick(alg, mode, keylen);
-   if (!type) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s/%s", alg,
-                 mode);
-      return false;
-   }
-   bool enc = opmode == JCE_ENCRYPT || opmode == JCE_WRAP;
-   /* Java's PKCS5Padding is PKCS#7, which is what OpenSSL applies by default;
-    * NoPadding turns it off. */
-   bool padding = !pad || !*pad || strcasecmp(pad, "NoPadding") != 0;
+  const EVP_CIPHER *type = cipher_pick(alg, mode, keylen);
+  if (!type) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s/%s", alg,
+               mode);
+    return false;
+  }
+  bool enc = opmode == JCE_ENCRYPT || opmode == JCE_WRAP;
+  /* Java's PKCS5Padding is PKCS#7, which is what OpenSSL applies by default;
+   * NoPadding turns it off. */
+  bool padding = !pad || !*pad || strcasecmp(pad, "NoPadding") != 0;
 
-   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-   if (!ctx) return cipher_fail(vm, "cipher init failed");
-   int ok = EVP_CipherInit_ex(ctx, type, NULL, NULL, NULL, enc) > 0;
-   if (ok && ivlen && EVP_CIPHER_CTX_get_iv_length(ctx) != (int)ivlen)
-      ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, (int)ivlen,
-                               NULL) > 0;
-   if (ok) ok = EVP_CipherInit_ex(ctx, NULL, NULL, key, ivlen ? iv : NULL,
-                                  enc) > 0;
-   if (ok) EVP_CIPHER_CTX_set_padding(ctx, padding);
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) return cipher_fail(vm, "cipher init failed");
+  int ok = EVP_CipherInit_ex(ctx, type, NULL, NULL, NULL, enc) > 0;
+  if (ok && ivlen && EVP_CIPHER_CTX_get_iv_length(ctx) != (int)ivlen)
+    ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, (int)ivlen,
+                             NULL) > 0;
+  if (ok) ok = EVP_CipherInit_ex(ctx, NULL, NULL, key, ivlen ? iv : NULL,
+                                   enc) > 0;
+  if (ok) EVP_CIPHER_CTX_set_padding(ctx, padding);
 
-   /* GCM carries a 16-byte tag at the end of the ciphertext, the way the JCE
-    * presents it. */
-   bool gcm = !strcasecmp(mode, "GCM");
-   uint32_t body = inlen;
-   if (ok && gcm && !enc) {
-      if (inlen < 16) ok = 0;
-      else {
-         body = inlen - 16;
-         ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
-                                  (void *)(uintptr_t)(in + body)) > 0;
-      }
-   }
+  /* GCM carries a 16-byte tag at the end of the ciphertext, the way the JCE
+   * presents it. */
+  bool gcm = !strcasecmp(mode, "GCM");
+  uint32_t body = inlen;
+  if (ok && gcm && !enc) {
+    if (inlen < 16) ok = 0;
+    else {
+      body = inlen - 16;
+      ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16,
+                               (void *)(uintptr_t)(in + body)) > 0;
+    }
+  }
 
-   int aad_out = 0;
-   if (ok && gcm && aadlen)
-      ok = EVP_CipherUpdate(ctx, NULL, &aad_out, aad, (int)aadlen) > 0;
+  int aad_out = 0;
+  if (ok && gcm && aadlen)
+    ok = EVP_CipherUpdate(ctx, NULL, &aad_out, aad, (int)aadlen) > 0;
 
-   uint8_t *buf = ok ? malloc((size_t)inlen + EVP_MAX_BLOCK_LENGTH + 16) : NULL;
-   int n = 0, total = 0;
-   if (buf) ok = EVP_CipherUpdate(ctx, buf, &n, in, (int)body) > 0;
-   if (ok) {
-      total = n;
-      ok = EVP_CipherFinal_ex(ctx, buf + total, &n) > 0;
-   }
-   if (ok) {
-      total += n;
-      if (gcm && enc) {
-         ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16,
-                                  buf + total) > 0;
-         if (ok) total += 16;
-      }
-   }
-   EVP_CIPHER_CTX_free(ctx);
-   if (!ok || !buf) {
-      free(buf);
-      return cipher_fail(vm, enc ? "encrypt failed" : "decrypt failed");
-   }
-   dvm_ref r = make_bytes(vm, buf, (uint32_t)total);
-   free(buf);
-   RETL(r);
+  uint8_t *buf = ok ? malloc((size_t)inlen + EVP_MAX_BLOCK_LENGTH + 16) : NULL;
+  int n = 0, total = 0;
+  if (buf) ok = EVP_CipherUpdate(ctx, buf, &n, in, (int)body) > 0;
+  if (ok) {
+    total = n;
+    ok = EVP_CipherFinal_ex(ctx, buf + total, &n) > 0;
+  }
+  if (ok) {
+    total += n;
+    if (gcm && enc) {
+      ok = EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16,
+                               buf + total) > 0;
+      if (ok) total += 16;
+    }
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok || !buf) {
+    free(buf);
+    return cipher_fail(vm, enc ? "encrypt failed" : "decrypt failed");
+  }
+  dvm_ref r = make_bytes(vm, buf, (uint32_t)total);
+  free(buf);
+  RETL(r);
 }
 
 /* Clone before processing so an undersized output does not consume input or
@@ -1664,482 +1888,552 @@ static bool cipher_update_bytes(struct dvm *vm, dvm_ref self,
                                 uint8_t **output, int *written,
                                 EVP_CIPHER_CTX **next, bool *buffered)
 {
-   union dvm_value op={0}, transform={0}, keyref={0}, ivref={0};
-   (void)dvm_get_field(vm,self,"opmode","I",&op);
-   if (op.i != JCE_ENCRYPT && op.i != JCE_DECRYPT) {
-      dvm__throw(vm,"java/lang/IllegalStateException","cipher is not initialized for encryption/decryption");
-      return false;
-   }
-   (void)dvm_get_field(vm,self,"transform","Ljava/lang/String;",&transform);
-   char alg[128],mode[128],pad[128];
-   cipher_parse(dvm_string_utf8(vm,transform.l),alg,sizeof alg,mode,sizeof mode,pad,sizeof pad);
-   *buffered = !strcasecmp(alg,"RSA") || !strcasecmp(mode,"GCM");
-   *written=0; *output=NULL; *next=NULL;
-   if (*buffered) return true;
-   EVP_CIPHER_CTX *ctx=EVP_CIPHER_CTX_new();
-   struct dvm_object *object=dvm__obj(vm,self);
-   int ok=ctx != NULL;
-   if (ok && object->data) ok=EVP_CIPHER_CTX_copy(ctx,object->data)>0;
-   else if (ok) {
-      uint32_t keylen=0,ivlen=0;
-      (void)dvm_get_field(vm,self,"key","Ljava/lang/Object;",&keyref);
-      (void)dvm_get_field(vm,self,"iv","[B",&ivref);
-      const uint8_t *key=key_bytes(vm,keyref.l,&keylen);
-      const uint8_t *iv=ivref.l?arg_bytes(vm,ivref.l,&ivlen):NULL;
-      const EVP_CIPHER *type=cipher_pick(alg,mode,keylen);
-      ok=key && type && EVP_CipherInit_ex(ctx,type,NULL,key,iv,op.i==JCE_ENCRYPT)>0;
-      if(ok) ok=EVP_CIPHER_CTX_set_padding(ctx,strcasecmp(pad,"NoPadding")!=0)>0;
-   }
-   if(ok) *output=malloc((size_t)length+EVP_MAX_BLOCK_LENGTH);
-   if(ok && !*output) ok=0;
-   if(ok && length) ok=EVP_CipherUpdate(ctx,*output,written,input,(int)length)>0;
-   if(!ok) {
-      free(*output); *output=NULL; EVP_CIPHER_CTX_free(ctx);
-      return cipher_fail(vm,"cipher update failed");
-   }
-   *next=ctx;
-   return true;
+  union dvm_value op= {0}, transform= {0}, keyref= {0}, ivref= {0};
+  (void)dvm_get_field(vm,self,"opmode","I",&op);
+  if (op.i != JCE_ENCRYPT && op.i != JCE_DECRYPT) {
+    dvm__throw(vm,"java/lang/IllegalStateException","cipher is not initialized for encryption/decryption");
+    return false;
+  }
+  (void)dvm_get_field(vm,self,"transform","Ljava/lang/String;",&transform);
+  char alg[128],mode[128],pad[128];
+  cipher_parse(dvm_string_utf8(vm,transform.l),alg,sizeof alg,mode,sizeof mode,pad,sizeof pad);
+  *buffered = !strcasecmp(alg,"RSA") || !strcasecmp(mode,"GCM");
+  *written=0;
+  *output=NULL;
+  *next=NULL;
+  if (*buffered) return true;
+  EVP_CIPHER_CTX *ctx=EVP_CIPHER_CTX_new();
+  struct dvm_object *object=dvm__obj(vm,self);
+  int ok=ctx != NULL;
+  if (ok && object->data) ok=EVP_CIPHER_CTX_copy(ctx,object->data)>0;
+  else if (ok) {
+    uint32_t keylen=0,ivlen=0;
+    (void)dvm_get_field(vm,self,"key","Ljava/lang/Object;",&keyref);
+    (void)dvm_get_field(vm,self,"iv","[B",&ivref);
+    const uint8_t *key=key_bytes(vm,keyref.l,&keylen);
+    const uint8_t *iv=ivref.l?arg_bytes(vm,ivref.l,&ivlen):NULL;
+    const EVP_CIPHER *type=cipher_pick(alg,mode,keylen);
+    ok=key && type && EVP_CipherInit_ex(ctx,type,NULL,key,iv,op.i==JCE_ENCRYPT)>0;
+    if(ok) ok=EVP_CIPHER_CTX_set_padding(ctx,strcasecmp(pad,"NoPadding")!=0)>0;
+  }
+  if(ok) *output=malloc((size_t)length+EVP_MAX_BLOCK_LENGTH);
+  if(ok && !*output) ok=0;
+  if(ok && length) ok=EVP_CipherUpdate(ctx,*output,written,input,(int)length)>0;
+  if(!ok) {
+    free(*output);
+    *output=NULL;
+    EVP_CIPHER_CTX_free(ctx);
+    return cipher_fail(vm,"cipher update failed");
+  }
+  *next=ctx;
+  return true;
 }
 static bool cipher_commit_update(struct dvm *vm,dvm_ref self,
                                  EVP_CIPHER_CTX *next,bool buffered,
                                  const uint8_t *input,uint32_t length)
 {
-   if(buffered) {
-      union dvm_value old={0}; uint32_t size=0;
-      (void)dvm_get_field(vm,self,"pending","[B",&old);
-      const uint8_t *bytes=old.l?arg_bytes(vm,old.l,&size):NULL;
-      if(length>INT32_MAX-size) {
-         dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input too large"); return false;
-      }
-      dvm_ref joined=dvm_new_array(vm,'B',NULL,size+length);
-      if(!joined) return false;
-      uint8_t *dest=dvm_array_data(vm,joined);
-      if(size) memcpy(dest,bytes,size);
-      if(length) memcpy(dest+size,input,length);
-      union dvm_value value={.l=joined};
-      return dvm_set_field(vm,self,"pending","[B",value);
-   }
-   cipher_state_clear(vm,self);
-   struct dvm_object *object=dvm__obj(vm,self);
-   object->data=next; object->data_destroy=cipher_state_destroy;
-   return true;
+  if(buffered) {
+    union dvm_value old= {0};
+    uint32_t size=0;
+    (void)dvm_get_field(vm,self,"pending","[B",&old);
+    const uint8_t *bytes=old.l?arg_bytes(vm,old.l,&size):NULL;
+    if(length>INT32_MAX-size) {
+      dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input too large");
+      return false;
+    }
+    dvm_ref joined=dvm_new_array(vm,'B',NULL,size+length);
+    if(!joined) return false;
+    uint8_t *dest=dvm_array_data(vm,joined);
+    if(size) memcpy(dest,bytes,size);
+    if(length) memcpy(dest+size,input,length);
+    union dvm_value value= {.l=joined};
+    return dvm_set_field(vm,self,"pending","[B",value);
+  }
+  cipher_state_clear(vm,self);
+  struct dvm_object *object=dvm__obj(vm,self);
+  object->data=next;
+  object->data_destroy=cipher_state_destroy;
+  return true;
 }
 static bool cipher_update_buffers(struct dvm *vm,dvm_ref self,
                                   const union dvm_value *args,int nargs,
                                   union dvm_value *out)
 {
-   (void)nargs;
-   if(!ARG(0).l || !ARG(1).l) {
-      dvm__throw(vm,"java/lang/NullPointerException","cipher buffer"); return false;
-   }
-   if(ARG(0).l==ARG(1).l) {
-      dvm__throw(vm,"java/lang/IllegalArgumentException","input and output are the same buffer"); return false;
-   }
-   union dvm_value readonly={0};
-   (void)dvm_get_field(vm,ARG(1).l,"readOnly","Z",&readonly);
-   if(readonly.i) {
-      dvm__throw(vm,"java/nio/ReadOnlyBufferException","cipher output"); return false;
-   }
-   struct dvm_object *src=stream_buf(vm,ARG(0).l),*dst=stream_buf(vm,ARG(1).l);
-   int32_t ip=0,il=0,op=0,ol=0;
-   (void)stream_field(vm,ARG(0).l,"pos",&ip);
-   (void)stream_field(vm,ARG(0).l,"count",&il);
-   (void)stream_field(vm,ARG(1).l,"pos",&op);
-   (void)stream_field(vm,ARG(1).l,"count",&ol);
-   if(!src || !dst || ip<0 || il<ip || (uint32_t)il>src->length ||
+  (void)nargs;
+  if(!ARG(0).l || !ARG(1).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","cipher buffer");
+    return false;
+  }
+  if(ARG(0).l==ARG(1).l) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","input and output are the same buffer");
+    return false;
+  }
+  union dvm_value readonly= {0};
+  (void)dvm_get_field(vm,ARG(1).l,"readOnly","Z",&readonly);
+  if(readonly.i) {
+    dvm__throw(vm,"java/nio/ReadOnlyBufferException","cipher output");
+    return false;
+  }
+  struct dvm_object *src=stream_buf(vm,ARG(0).l),*dst=stream_buf(vm,ARG(1).l);
+  int32_t ip=0,il=0,op=0,ol=0;
+  (void)stream_field(vm,ARG(0).l,"pos",&ip);
+  (void)stream_field(vm,ARG(0).l,"count",&il);
+  (void)stream_field(vm,ARG(1).l,"pos",&op);
+  (void)stream_field(vm,ARG(1).l,"count",&ol);
+  if(!src || !dst || ip<0 || il<ip || (uint32_t)il>src->length ||
       op<0 || ol<op || (uint32_t)ol>dst->length) {
-      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher buffer window"); return false;
-   }
-   const uint8_t *input=src->data?(uint8_t *)src->data+ip:(const uint8_t *)"";
-   uint8_t *bytes=NULL; int written=0; EVP_CIPHER_CTX *next=NULL; bool buffered=false;
-   if(!cipher_update_bytes(vm,self,input,(uint32_t)(il-ip),&bytes,&written,&next,&buffered)) return false;
-   if(written>ol-op) {
-      free(bytes); EVP_CIPHER_CTX_free(next);
-      dvm__throw(vm,"javax/crypto/ShortBufferException","output buffer too small"); return false;
-   }
-   if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)(il-ip))) {
-      free(bytes); EVP_CIPHER_CTX_free(next); return false;
-   }
-   if(written) memcpy((uint8_t *)dst->data+op,bytes,(size_t)written);
-   free(bytes);
-   stream_set_field(vm,ARG(0).l,"pos",il);
-   stream_set_field(vm,ARG(1).l,"pos",op+written);
-   RETI(written);
+    dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher buffer window");
+    return false;
+  }
+  const uint8_t *input=src->data?(uint8_t *)src->data+ip:(const uint8_t *)"";
+  uint8_t *bytes=NULL;
+  int written=0;
+  EVP_CIPHER_CTX *next=NULL;
+  bool buffered=false;
+  if(!cipher_update_bytes(vm,self,input,(uint32_t)(il-ip),&bytes,&written,&next,&buffered)) return false;
+  if(written>ol-op) {
+    free(bytes);
+    EVP_CIPHER_CTX_free(next);
+    dvm__throw(vm,"javax/crypto/ShortBufferException","output buffer too small");
+    return false;
+  }
+  if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)(il-ip))) {
+    free(bytes);
+    EVP_CIPHER_CTX_free(next);
+    return false;
+  }
+  if(written) memcpy((uint8_t *)dst->data+op,bytes,(size_t)written);
+  free(bytes);
+  stream_set_field(vm,ARG(0).l,"pos",il);
+  stream_set_field(vm,ARG(1).l,"pos",op+written);
+  RETI(written);
 }
 
 static bool cipher_update_array(struct dvm *vm,dvm_ref self,
                                 const union dvm_value *args,int nargs,
                                 union dvm_value *out)
 {
-   if(!ARG(0).l) {
-      dvm__throw(vm,"java/lang/IllegalArgumentException","null cipher input"); return false;
-   }
-   uint32_t size=0; const uint8_t *input=arg_bytes(vm,ARG(0).l,&size);
-   int32_t offset=nargs>=3?ARG(1).i:0;
-   int32_t length=nargs>=3?ARG(2).i:(int32_t)size;
-   if(offset<0 || length<0 || (uint32_t)offset>size || (uint32_t)length>size-(uint32_t)offset) {
-      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher input range"); return false;
-   }
-   if(input) input+=offset;
-   uint8_t *bytes=NULL; int written=0; EVP_CIPHER_CTX *next=NULL; bool buffered=false;
-   if(!cipher_update_bytes(vm,self,input,(uint32_t)length,&bytes,&written,&next,&buffered)) return false;
-   dvm_ref result=written?make_bytes(vm,bytes,(uint32_t)written):0;
-   free(bytes);
-   if(written && !result) { EVP_CIPHER_CTX_free(next); return false; }
-   if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)length)) {
-      EVP_CIPHER_CTX_free(next); return false;
-   }
-   RETL(result);
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","null cipher input");
+    return false;
+  }
+  uint32_t size=0;
+  const uint8_t *input=arg_bytes(vm,ARG(0).l,&size);
+  int32_t offset=nargs>=3?ARG(1).i:0;
+  int32_t length=nargs>=3?ARG(2).i:(int32_t)size;
+  if(offset<0 || length<0 || (uint32_t)offset>size || (uint32_t)length>size-(uint32_t)offset) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher input range");
+    return false;
+  }
+  if(input) input+=offset;
+  uint8_t *bytes=NULL;
+  int written=0;
+  EVP_CIPHER_CTX *next=NULL;
+  bool buffered=false;
+  if(!cipher_update_bytes(vm,self,input,(uint32_t)length,&bytes,&written,&next,&buffered)) return false;
+  dvm_ref result=written?make_bytes(vm,bytes,(uint32_t)written):0;
+  free(bytes);
+  if(written && !result) {
+    EVP_CIPHER_CTX_free(next);
+    return false;
+  }
+  if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)length)) {
+    EVP_CIPHER_CTX_free(next);
+    return false;
+  }
+  RETL(result);
 }
 
 static bool cipher_doFinal(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   union dvm_value tv = { 0 }, ov = { 0 }, kv = { 0 }, ivv = { 0 }, aadv = { 0 };
-   (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &tv);
-   (void)dvm_get_field(vm, self, "opmode", "I", &ov);
-   if (!ov.i) {
-      dvm__throw(vm, "java/lang/IllegalStateException", "cipher is not initialized");
+  union dvm_value tv = { 0 }, ov = { 0 }, kv = { 0 }, ivv = { 0 }, aadv = { 0 };
+  (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &tv);
+  (void)dvm_get_field(vm, self, "opmode", "I", &ov);
+  if (!ov.i) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "cipher is not initialized");
+    return false;
+  }
+  (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &kv);
+  (void)dvm_get_field(vm, self, "iv", "[B", &ivv);
+  (void)dvm_get_field(vm, self, "aad", "[B", &aadv);
+
+  /* "RSA/ECB/OAEPWithSHA-256AndMGF1Padding" is 37 characters, and the middle
+   * buffer briefly holds everything after the algorithm. */
+  char alg[128], mode[128], pad[128];
+  cipher_parse(tv.l ? dvm_string_utf8(vm, tv.l) : "", alg, sizeof alg, mode,
+               sizeof mode, pad, sizeof pad);
+
+  uint32_t keylen = 0, ivlen = 0, aadlen = 0, inlen = 0;
+  const uint8_t *key = key_bytes(vm, kv.l, &keylen);
+  const uint8_t *iv = ivv.l ? arg_bytes(vm, ivv.l, &ivlen) : NULL;
+  const uint8_t *aad = aadv.l ? arg_bytes(vm, aadv.l, &aadlen) : NULL;
+  const uint8_t *in = nargs ? arg_bytes(vm, ARG(0).l, &inlen) : NULL;
+  if (nargs >= 3) {
+    uint32_t off = (uint32_t)args[1].i, len = (uint32_t)args[2].i;
+    if (off > inlen || len > inlen - off) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher input range");
       return false;
-   }
-   (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &kv);
-   (void)dvm_get_field(vm, self, "iv", "[B", &ivv);
-   (void)dvm_get_field(vm, self, "aad", "[B", &aadv);
+    }
+    if (in) in += off;
+    inlen = len;
+  }
+  if (!key) {
+    dvm__throw(vm, "java/security/InvalidKeyException", "no key");
+    return false;
+  }
+  if (!in) {
+    in = (const uint8_t *)"";
+    inlen = 0;
+  }
 
-   /* "RSA/ECB/OAEPWithSHA-256AndMGF1Padding" is 37 characters, and the middle
-    * buffer briefly holds everything after the algorithm. */
-   char alg[128], mode[128], pad[128];
-   cipher_parse(tv.l ? dvm_string_utf8(vm, tv.l) : "", alg, sizeof alg, mode,
-                sizeof mode, pad, sizeof pad);
-
-   uint32_t keylen = 0, ivlen = 0, aadlen = 0, inlen = 0;
-   const uint8_t *key = key_bytes(vm, kv.l, &keylen);
-   const uint8_t *iv = ivv.l ? arg_bytes(vm, ivv.l, &ivlen) : NULL;
-   const uint8_t *aad = aadv.l ? arg_bytes(vm, aadv.l, &aadlen) : NULL;
-   const uint8_t *in = nargs ? arg_bytes(vm, ARG(0).l, &inlen) : NULL;
-   if (nargs >= 3) {
-      uint32_t off = (uint32_t)args[1].i, len = (uint32_t)args[2].i;
-      if (off > inlen || len > inlen - off) {
-         dvm__throw(vm,"java/lang/IllegalArgumentException","invalid cipher input range");
-         return false;
-      }
-      if (in) in += off;
-      inlen = len;
-   }
-   if (!key) {
-      dvm__throw(vm, "java/security/InvalidKeyException", "no key");
-      return false;
-   }
-   if (!in) { in = (const uint8_t *)""; inlen = 0; }
-
-   union dvm_value kind = { 0 };
-   if (kv.l) (void)dvm_get_field(vm, kv.l, "kind", "I", &kind);
-   if (getenv("LUNARIA_HTTP_TRACE"))
-      fprintf(stderr, "[jce] %s alg=%s mode=%s pad=%s key=%u(kind %d) iv=%u "
-              "in=%u\n", ov.i == 1 ? "encrypt" : ov.i == 2 ? "decrypt" : "?",
-              alg, mode, pad, keylen, kind.i, ivlen, inlen);
-   struct dvm_object *object=dvm__obj(vm,self);
-   if(object && object->data) {
-      uint8_t *bytes=NULL; int written=0,tail=0;
-      EVP_CIPHER_CTX *next=NULL; bool buffered=false;
-      if(!cipher_update_bytes(vm,self,in,inlen,&bytes,&written,&next,&buffered)) return false;
-      int final_ok=EVP_CipherFinal_ex(next,bytes+written,&tail)>0;
-      EVP_CIPHER_CTX_free(next);
-      if(!final_ok) { free(bytes); return cipher_fail(vm,"cipher final failed"); }
-      dvm_ref result=make_bytes(vm,bytes,(uint32_t)(written+tail));
+  union dvm_value kind = { 0 };
+  if (kv.l) (void)dvm_get_field(vm, kv.l, "kind", "I", &kind);
+  if (getenv("LUNARIA_HTTP_TRACE"))
+    fprintf(stderr, "[jce] %s alg=%s mode=%s pad=%s key=%u(kind %d) iv=%u "
+                    "in=%u\n", ov.i == 1 ? "encrypt" : ov.i == 2 ? "decrypt" : "?",
+            alg, mode, pad, keylen, kind.i, ivlen, inlen);
+  struct dvm_object *object=dvm__obj(vm,self);
+  if(object && object->data) {
+    uint8_t *bytes=NULL;
+    int written=0,tail=0;
+    EVP_CIPHER_CTX *next=NULL;
+    bool buffered=false;
+    if(!cipher_update_bytes(vm,self,in,inlen,&bytes,&written,&next,&buffered)) return false;
+    int final_ok=EVP_CipherFinal_ex(next,bytes+written,&tail)>0;
+    EVP_CIPHER_CTX_free(next);
+    if(!final_ok) {
       free(bytes);
-      if(!result) return false;
-      cipher_state_clear(vm,self);
-      union dvm_value empty={0};
-      (void)dvm_set_field(vm,self,"aad","[B",empty);
-      RETL(result);
-   }
-   union dvm_value pending={0}; uint32_t pending_len=0;
-   (void)dvm_get_field(vm,self,"pending","[B",&pending);
-   const uint8_t *prefix=pending.l?arg_bytes(vm,pending.l,&pending_len):NULL;
-   uint8_t *joined=NULL;
-   if(pending_len) {
-      if(inlen>INT32_MAX-pending_len) {
-         dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input too large"); return false;
-      }
-      joined=malloc((size_t)pending_len+inlen);
-      if(!joined) { dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input"); return false; }
-      memcpy(joined,prefix,pending_len);
-      if(inlen) memcpy(joined+pending_len,in,inlen);
-      in=joined; inlen+=pending_len;
-   }
-   bool ok = !strcasecmp(alg, "RSA")
-      ? cipher_rsa(vm, ov.i, pad, key, keylen, kind.i, in, inlen, out)
-      : cipher_sym(vm, ov.i, alg, mode, pad, key, keylen, iv, ivlen, aad,
-                   aadlen, in, inlen, out);
-   free(joined);
-   if (ok) {
-      union dvm_value empty = { .l = 0 };
-      (void)dvm_set_field(vm, self, "pending", "[B", empty);
-      (void)dvm_set_field(vm, self, "aad", "[B", empty);
-   }
-   return ok;
+      return cipher_fail(vm,"cipher final failed");
+    }
+    dvm_ref result=make_bytes(vm,bytes,(uint32_t)(written+tail));
+    free(bytes);
+    if(!result) return false;
+    cipher_state_clear(vm,self);
+    union dvm_value empty= {0};
+    (void)dvm_set_field(vm,self,"aad","[B",empty);
+    RETL(result);
+  }
+  union dvm_value pending= {0};
+  uint32_t pending_len=0;
+  (void)dvm_get_field(vm,self,"pending","[B",&pending);
+  const uint8_t *prefix=pending.l?arg_bytes(vm,pending.l,&pending_len):NULL;
+  uint8_t *joined=NULL;
+  if(pending_len) {
+    if(inlen>INT32_MAX-pending_len) {
+      dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input too large");
+      return false;
+    }
+    joined=malloc((size_t)pending_len+inlen);
+    if(!joined) {
+      dvm__throw(vm,"java/lang/OutOfMemoryError","cipher input");
+      return false;
+    }
+    memcpy(joined,prefix,pending_len);
+    if(inlen) memcpy(joined+pending_len,in,inlen);
+    in=joined;
+    inlen+=pending_len;
+  }
+  bool ok = !strcasecmp(alg, "RSA")
+            ? cipher_rsa(vm, ov.i, pad, key, keylen, kind.i, in, inlen, out)
+            : cipher_sym(vm, ov.i, alg, mode, pad, key, keylen, iv, ivlen, aad,
+                         aadlen, in, inlen, out);
+  free(joined);
+  if (ok) {
+    union dvm_value empty = { .l = 0 };
+    (void)dvm_set_field(vm, self, "pending", "[B", empty);
+    (void)dvm_set_field(vm, self, "aad", "[B", empty);
+  }
+  return ok;
 }
 
 static bool cipher_doFinal_into(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out)
 {
-   if (nargs < 5) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "doFinal args");
-      return false;
-   }
-   struct dvm_object *object=dvm__obj(vm,self);
-   EVP_CIPHER_CTX *saved=NULL;
-   if(object && object->data) {
-      saved=EVP_CIPHER_CTX_new();
-      if(!saved || EVP_CIPHER_CTX_copy(saved,object->data)<=0) {
-         EVP_CIPHER_CTX_free(saved); return cipher_fail(vm,"cannot preserve cipher state");
-      }
-   }
-   union dvm_value aad={0},pending={0};
-   (void)dvm_get_field(vm,self,"aad","[B",&aad);
-   (void)dvm_get_field(vm,self,"pending","[B",&pending);
-   union dvm_value bytes = { 0 };
-   if (!cipher_doFinal(vm, self, args, 3, &bytes)) {
-      EVP_CIPHER_CTX_free(saved); return false;
-   }
-   struct dvm_object *src = bytes.l ? dvm__obj(vm, bytes.l) : NULL;
-   struct dvm_object *dst = args[3].l ? dvm__obj(vm, args[3].l) : NULL;
-   int32_t offset = args[4].i;
-   if (!src || src->kind != DVM_OBJ_ARRAY || !dst ||
-       dst->kind != DVM_OBJ_ARRAY || offset < 0 ||
-       (uint32_t)offset > dst->length ||
-       src->length > dst->length - (uint32_t)offset) {
-      cipher_state_clear(vm,self);
-      object=dvm__obj(vm,self);
-      object->data=saved;
-      object->data_destroy=saved?cipher_state_destroy:NULL;
-      (void)dvm_set_field(vm,self,"aad","[B",aad);
-      (void)dvm_set_field(vm,self,"pending","[B",pending);
-      dvm__throw(vm, "javax/crypto/ShortBufferException", "output buffer too small");
-      return false;
-   }
-   EVP_CIPHER_CTX_free(saved);
-   if (src->length)
-      memcpy((uint8_t *)dst->data + offset, src->data, src->length);
-   RETI((int32_t)src->length);
+  if (nargs < 5) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "doFinal args");
+    return false;
+  }
+  struct dvm_object *object=dvm__obj(vm,self);
+  EVP_CIPHER_CTX *saved=NULL;
+  if(object && object->data) {
+    saved=EVP_CIPHER_CTX_new();
+    if(!saved || EVP_CIPHER_CTX_copy(saved,object->data)<=0) {
+      EVP_CIPHER_CTX_free(saved);
+      return cipher_fail(vm,"cannot preserve cipher state");
+    }
+  }
+  union dvm_value aad= {0},pending= {0};
+  (void)dvm_get_field(vm,self,"aad","[B",&aad);
+  (void)dvm_get_field(vm,self,"pending","[B",&pending);
+  union dvm_value bytes = { 0 };
+  if (!cipher_doFinal(vm, self, args, 3, &bytes)) {
+    EVP_CIPHER_CTX_free(saved);
+    return false;
+  }
+  struct dvm_object *src = bytes.l ? dvm__obj(vm, bytes.l) : NULL;
+  struct dvm_object *dst = args[3].l ? dvm__obj(vm, args[3].l) : NULL;
+  int32_t offset = args[4].i;
+  if (!src || src->kind != DVM_OBJ_ARRAY || !dst ||
+      dst->kind != DVM_OBJ_ARRAY || offset < 0 ||
+      (uint32_t)offset > dst->length ||
+      src->length > dst->length - (uint32_t)offset) {
+    cipher_state_clear(vm,self);
+    object=dvm__obj(vm,self);
+    object->data=saved;
+    object->data_destroy=saved?cipher_state_destroy:NULL;
+    (void)dvm_set_field(vm,self,"aad","[B",aad);
+    (void)dvm_set_field(vm,self,"pending","[B",pending);
+    dvm__throw(vm, "javax/crypto/ShortBufferException", "output buffer too small");
+    return false;
+  }
+  EVP_CIPHER_CTX_free(saved);
+  if (src->length)
+    memcpy((uint8_t *)dst->data + offset, src->data, src->length);
+  RETI((int32_t)src->length);
 }
 
 static bool cipher_getBlockSize(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value transform = {0};
-   (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
-   char alg[128], mode[128], pad[128];
-   cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
-                mode, sizeof mode, pad, sizeof pad);
-   /* Report the cipher's block, not EVP's streaming update granularity:
-    * AES CTR/GCM still have 16-byte blocks before and after init(). */
-   if (!strcasecmp(alg, "AES")) RETI(16);
-   if (!strcasecmp(alg, "DES") || !strcasecmp(alg, "DESede") ||
-       !strcasecmp(alg, "TripleDES")) RETI(8);
-   if (strcasecmp(alg, "RSA")) RETI(0); /* RC4 is a stream cipher. */
+  (void)args;
+  (void)nargs;
+  union dvm_value transform = {0};
+  (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
+  char alg[128], mode[128], pad[128];
+  cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
+               mode, sizeof mode, pad, sizeof pad);
+  /* Report the cipher's block, not EVP's streaming update granularity:
+   * AES CTR/GCM still have 16-byte blocks before and after init(). */
+  if (!strcasecmp(alg, "AES")) RETI(16);
+  if (!strcasecmp(alg, "DES") || !strcasecmp(alg, "DESede") ||
+      !strcasecmp(alg, "TripleDES")) RETI(8);
+  if (strcasecmp(alg, "RSA")) RETI(0); /* RC4 is a stream cipher. */
 
-   /* Conscrypt RSA reports the maximum input block for the current mode. */
-   union dvm_value key = {0}, kind = {0}, op = {0};
-   (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &key);
-   if (!key.l) {
-      dvm__throw(vm, "java/lang/IllegalStateException", "cipher is not initialized");
-      return false;
-   }
-   uint32_t length = 0;
-   const uint8_t *encoded = key_bytes(vm, key.l, &length);
-   (void)dvm_get_field(vm, key.l, "kind", "I", &kind);
-   const uint8_t *cursor = encoded;
-   EVP_PKEY *pkey = !encoded ? NULL : kind.i == 2
-      ? d2i_PUBKEY(NULL, &cursor, length)
-      : d2i_AutoPrivateKey(NULL, &cursor, length);
-   if (!pkey) return cipher_fail(vm, "cannot read the RSA key");
-   int size = EVP_PKEY_get_size(pkey);
-   EVP_PKEY_free(pkey);
-   (void)dvm_get_field(vm, self, "opmode", "I", &op);
-   if (op.i == JCE_ENCRYPT || op.i == JCE_WRAP) {
-      if (luna_strcasestr(pad, "OAEP")) {
-         int digest = 20;
-         if (luna_strcasestr(pad, "SHA-224")) digest = 28;
-         else if (luna_strcasestr(pad, "SHA-256")) digest = 32;
-         else if (luna_strcasestr(pad, "SHA-384")) digest = 48;
-         else if (luna_strcasestr(pad, "SHA-512")) digest = 64;
-         size -= 2 * digest + 2;
-      } else if (!strcasecmp(pad, "PKCS1Padding") || !*pad) size -= 11;
-   }
-   RETI(size);
+  /* Conscrypt RSA reports the maximum input block for the current mode. */
+  union dvm_value key = {0}, kind = {0}, op = {0};
+  (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &key);
+  if (!key.l) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "cipher is not initialized");
+    return false;
+  }
+  uint32_t length = 0;
+  const uint8_t *encoded = key_bytes(vm, key.l, &length);
+  (void)dvm_get_field(vm, key.l, "kind", "I", &kind);
+  const uint8_t *cursor = encoded;
+  EVP_PKEY *pkey = !encoded ? NULL : kind.i == 2
+                   ? d2i_PUBKEY(NULL, &cursor, length)
+                   : d2i_AutoPrivateKey(NULL, &cursor, length);
+  if (!pkey) return cipher_fail(vm, "cannot read the RSA key");
+  int size = EVP_PKEY_get_size(pkey);
+  EVP_PKEY_free(pkey);
+  (void)dvm_get_field(vm, self, "opmode", "I", &op);
+  if (op.i == JCE_ENCRYPT || op.i == JCE_WRAP) {
+    if (luna_strcasestr(pad, "OAEP")) {
+      int digest = 20;
+      if (luna_strcasestr(pad, "SHA-224")) digest = 28;
+      else if (luna_strcasestr(pad, "SHA-256")) digest = 32;
+      else if (luna_strcasestr(pad, "SHA-384")) digest = 48;
+      else if (luna_strcasestr(pad, "SHA-512")) digest = 64;
+      size -= 2 * digest + 2;
+    } else if (!strcasecmp(pad, "PKCS1Padding") || !*pad) size -= 11;
+  }
+  RETI(size);
 }
 
 static bool cipher_getIV(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "iv", "[B", &v);
-   if (!v.l) RETL(0);
-   uint32_t length = 0;
-   const uint8_t *bytes = arg_bytes(vm, v.l, &length);
-   RETL(make_bytes(vm, bytes, length));
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "iv", "[B", &v);
+  if (!v.l) RETL(0);
+  uint32_t length = 0;
+  const uint8_t *bytes = arg_bytes(vm, v.l, &length);
+  RETL(make_bytes(vm, bytes, length));
 }
 
 /* --- javax.crypto.Mac --------------------------------------------------- */
 
 /* Keep constant-size host digest state; data_destroy releases both contexts
  * when the Java object is reclaimed or the VM is destroyed. */
-struct mac_state { EVP_MD_CTX *initial, *active; };
+struct mac_state {
+  EVP_MD_CTX *initial, *active;
+};
 static void mac_destroy(void *data)
 {
-   struct mac_state *state = data;
-   if (!state) return;
-   EVP_MD_CTX_free(state->initial);
-   EVP_MD_CTX_free(state->active);
-   free(state);
+  struct mac_state *state = data;
+  if (!state) return;
+  EVP_MD_CTX_free(state->initial);
+  EVP_MD_CTX_free(state->active);
+  free(state);
 }
 static const EVP_MD *mac_type(const char *algorithm)
 {
-   return algorithm && !strncasecmp(algorithm, "Hmac", 4) ?
-      EVP_get_digestbyname(algorithm + 4) : NULL;
+  return algorithm && !strncasecmp(algorithm, "Hmac", 4) ?
+         EVP_get_digestbyname(algorithm + 4) : NULL;
 }
 static struct mac_state *mac_ready(struct dvm *vm, dvm_ref self)
 {
-   struct dvm_object *object = dvm__obj(vm, self);
-   struct mac_state *state = object ? object->data : NULL;
-   if (!state) dvm__throw(vm, "java/lang/IllegalStateException", "MAC not initialized");
-   return state;
+  struct dvm_object *object = dvm__obj(vm, self);
+  struct mac_state *state = object ? object->data : NULL;
+  if (!state) dvm__throw(vm, "java/lang/IllegalStateException", "MAC not initialized");
+  return state;
 }
 static bool mac_getInstance(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   if (!alg) {
-      dvm__throw(vm, "java/lang/NullPointerException", "algorithm"); return false;
-   }
-   if (!mac_type(alg)) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg); return false;
-   }
-   dvm_ref m = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljavax/crypto/Mac;"));
-   if (m) (void)dvm_set_field(vm, m, "algorithm", "Ljava/lang/String;", ARG(0));
-   RETL(m);
+  (void)self;
+  (void)nargs;
+  const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  if (!alg) {
+    dvm__throw(vm, "java/lang/NullPointerException", "algorithm");
+    return false;
+  }
+  if (!mac_type(alg)) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg);
+    return false;
+  }
+  dvm_ref m = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljavax/crypto/Mac;"));
+  if (m) (void)dvm_set_field(vm, m, "algorithm", "Ljava/lang/String;", ARG(0));
+  RETL(m);
 }
 static bool mac_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   uint32_t length = 0;
-   const uint8_t *bytes = key_bytes(vm, ARG(0).l, &length);
-   if (!ARG(0).l || !bytes || !length) {
-      dvm__throw(vm, "java/security/InvalidKeyException", "invalid MAC key"); return false;
-   }
-   union dvm_value algorithm = {0};
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
-   const EVP_MD *md = mac_type(dvm_string_utf8(vm, algorithm.l));
-   struct mac_state *state = calloc(1, sizeof *state);
-   EVP_PKEY *key = EVP_PKEY_new_raw_private_key(EVP_PKEY_HMAC, NULL, bytes, length);
-   if (state) {
-      state->initial = EVP_MD_CTX_new(); state->active = EVP_MD_CTX_new();
-   }
-   int good = state && state->initial && state->active && key &&
-      EVP_DigestSignInit(state->initial, NULL, md, NULL, key) == 1 &&
-      EVP_MD_CTX_copy_ex(state->active, state->initial) == 1;
-   EVP_PKEY_free(key);
-   if (!good) {
-      mac_destroy(state);
-      dvm__throw(vm, "java/security/InvalidKeyException", "cannot initialize MAC"); return false;
-   }
-   struct dvm_object *object = dvm__obj(vm, self);
-   mac_destroy(object->data);
-   object->data = state; object->data_destroy = mac_destroy;
-   RETV();
+  (void)nargs;
+  (void)out;
+  uint32_t length = 0;
+  const uint8_t *bytes = key_bytes(vm, ARG(0).l, &length);
+  if (!ARG(0).l || !bytes || !length) {
+    dvm__throw(vm, "java/security/InvalidKeyException", "invalid MAC key");
+    return false;
+  }
+  union dvm_value algorithm = {0};
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
+  const EVP_MD *md = mac_type(dvm_string_utf8(vm, algorithm.l));
+  struct mac_state *state = calloc(1, sizeof *state);
+  EVP_PKEY *key = EVP_PKEY_new_raw_private_key(EVP_PKEY_HMAC, NULL, bytes, length);
+  if (state) {
+    state->initial = EVP_MD_CTX_new();
+    state->active = EVP_MD_CTX_new();
+  }
+  int good = state && state->initial && state->active && key &&
+             EVP_DigestSignInit(state->initial, NULL, md, NULL, key) == 1 &&
+             EVP_MD_CTX_copy_ex(state->active, state->initial) == 1;
+  EVP_PKEY_free(key);
+  if (!good) {
+    mac_destroy(state);
+    dvm__throw(vm, "java/security/InvalidKeyException", "cannot initialize MAC");
+    return false;
+  }
+  struct dvm_object *object = dvm__obj(vm, self);
+  mac_destroy(object->data);
+  object->data = state;
+  object->data_destroy = mac_destroy;
+  RETV();
 }
 static bool mac_reset(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs; (void)out;
-   struct dvm_object *object = dvm__obj(vm, self);
-   struct mac_state *state = object ? object->data : NULL;
-   if (state && EVP_MD_CTX_copy_ex(state->active, state->initial) != 1) {
-      dvm__throw(vm, "java/security/ProviderException", "MAC reset failed"); return false;
-   }
-   RETV();
+  (void)args;
+  (void)nargs;
+  (void)out;
+  struct dvm_object *object = dvm__obj(vm, self);
+  struct mac_state *state = object ? object->data : NULL;
+  if (state && EVP_MD_CTX_copy_ex(state->active, state->initial) != 1) {
+    dvm__throw(vm, "java/security/ProviderException", "MAC reset failed");
+    return false;
+  }
+  RETV();
 }
 static bool mac_update(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   (void)out;
-   struct mac_state *state = mac_ready(vm, self);
-   if (!state) return false;
-   /* Both array overloads ignore null after checking initialization. */
-   uint32_t length = 0;
-   const uint8_t *bytes = arg_bytes(vm, ARG(0).l, &length);
-   if (!ARG(0).l) RETV();
-   if (nargs == 3) {
-      int32_t offset = ARG(1).i, count = ARG(2).i;
-      if (!bytes || offset < 0 || count < 0 || (uint32_t)offset > length ||
-          (uint32_t)count > length - (uint32_t)offset) {
-         dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid MAC input range"); return false;
-      }
-      bytes += offset; length = (uint32_t)count;
-   }
-   if (length && EVP_DigestSignUpdate(state->active, bytes, length) != 1) {
-      dvm__throw(vm, "java/security/ProviderException", "MAC update failed"); return false;
-   }
-   RETV();
+  (void)out;
+  struct mac_state *state = mac_ready(vm, self);
+  if (!state) return false;
+  /* Both array overloads ignore null after checking initialization. */
+  uint32_t length = 0;
+  const uint8_t *bytes = arg_bytes(vm, ARG(0).l, &length);
+  if (!ARG(0).l) RETV();
+  if (nargs == 3) {
+    int32_t offset = ARG(1).i, count = ARG(2).i;
+    if (!bytes || offset < 0 || count < 0 || (uint32_t)offset > length ||
+        (uint32_t)count > length - (uint32_t)offset) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid MAC input range");
+      return false;
+    }
+    bytes += offset;
+    length = (uint32_t)count;
+  }
+  if (length && EVP_DigestSignUpdate(state->active, bytes, length) != 1) {
+    dvm__throw(vm, "java/security/ProviderException", "MAC update failed");
+    return false;
+  }
+  RETV();
 }
 static bool mac_update_buffer(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                               int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   struct mac_state *state = mac_ready(vm, self);
-   if (!state) return false;
-   const uint8_t *data; uint32_t count;
-   if (!crypto_take_buffer(vm, ARG(0).l, &data, &count)) return false;
-   if (count && EVP_DigestSignUpdate(state->active, data, count) != 1) {
-      dvm__throw(vm, "java/security/ProviderException", "MAC update failed"); return false;
-   }
-   RETV();
+  (void)nargs;
+  (void)out;
+  struct mac_state *state = mac_ready(vm, self);
+  if (!state) return false;
+  const uint8_t *data;
+  uint32_t count;
+  if (!crypto_take_buffer(vm, ARG(0).l, &data, &count)) return false;
+  if (count && EVP_DigestSignUpdate(state->active, data, count) != 1) {
+    dvm__throw(vm, "java/security/ProviderException", "MAC update failed");
+    return false;
+  }
+  RETV();
 }
 static bool mac_update_byte(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                             int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   struct mac_state *state = mac_ready(vm, self);
-   if (!state) return false;
-   uint8_t byte = (uint8_t)ARG(0).i;
-   if (EVP_DigestSignUpdate(state->active, &byte, 1) != 1) {
-      dvm__throw(vm, "java/security/ProviderException", "MAC update failed"); return false;
-   }
-   RETV();
+  (void)nargs;
+  (void)out;
+  struct mac_state *state = mac_ready(vm, self);
+  if (!state) return false;
+  uint8_t byte = (uint8_t)ARG(0).i;
+  if (EVP_DigestSignUpdate(state->active, &byte, 1) != 1) {
+    dvm__throw(vm, "java/security/ProviderException", "MAC update failed");
+    return false;
+  }
+  RETV();
 }
 static bool mac_doFinal(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   struct mac_state *state = mac_ready(vm, self);
-   if (!state) return false;
-   if (nargs && !mac_update(vm, self, args, 1, out)) return false;
-   uint8_t bytes[EVP_MAX_MD_SIZE]; size_t length = sizeof bytes;
-   if (EVP_DigestSignFinal(state->active, bytes, &length) != 1) {
-      dvm__throw(vm, "java/security/ProviderException", "MAC finalization failed"); return false;
-   }
-   if (!mac_reset(vm, self, NULL, 0, out)) return false;
-   RETL(make_bytes(vm, bytes, (uint32_t)length));
+  struct mac_state *state = mac_ready(vm, self);
+  if (!state) return false;
+  if (nargs && !mac_update(vm, self, args, 1, out)) return false;
+  uint8_t bytes[EVP_MAX_MD_SIZE];
+  size_t length = sizeof bytes;
+  if (EVP_DigestSignFinal(state->active, bytes, &length) != 1) {
+    dvm__throw(vm, "java/security/ProviderException", "MAC finalization failed");
+    return false;
+  }
+  if (!mac_reset(vm, self, NULL, 0, out)) return false;
+  RETL(make_bytes(vm, bytes, (uint32_t)length));
 }
 static bool mac_length(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value algorithm = {0};
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
-   const EVP_MD *md = mac_type(dvm_string_utf8(vm, algorithm.l));
-   RETI(md ? EVP_MD_get_size(md) : 0);
+  (void)args;
+  (void)nargs;
+  union dvm_value algorithm = {0};
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
+  const EVP_MD *md = mac_type(dvm_string_utf8(vm, algorithm.l));
+  RETI(md ? EVP_MD_get_size(md) : 0);
 }
 
 /* --- java.security.Signature ------------------------------------------- */
@@ -2147,139 +2441,168 @@ static bool mac_length(struct dvm *vm, dvm_ref self, const union dvm_value *args
 /* "<digest>with<key algorithm>" (SHA256withRSA, SHA1withECDSA, NONEwithRSA,
  * SHA256withRSA/PSS).  The bytes of update() are kept until sign()/verify(),
  * which is when OpenSSL sees them; a key that does not parse fails there. */
-struct sig_alg { char digest[16]; bool none, pss, ecdsa; };
+struct sig_alg {
+  char digest[16];
+  bool none, pss, ecdsa;
+};
 
 static bool sig_parse(const char *name, struct sig_alg *a)
 {
-   memset(a, 0, sizeof *a);
-   const char *with = name ? luna_strcasestr(name, "with") : NULL;
-   if (!with || with == name || (size_t)(with - name) >= sizeof a->digest) return false;
-   memcpy(a->digest, name, (size_t)(with - name));
-   const char *key = with + 4;
-   a->none = !strcasecmp(a->digest, "NONE");
-   a->pss = luna_strcasestr(key, "/PSS") != NULL || !strncasecmp(key, "RSASSA-PSS", 10);
-   a->ecdsa = !strncasecmp(key, "ECDSA", 5);
-   if (!a->ecdsa && strncasecmp(key, "RSA", 3)) return false;
-   if (!a->none && !EVP_get_digestbyname(a->digest)) return false;
-   return true;
+  memset(a, 0, sizeof *a);
+  const char *with = name ? luna_strcasestr(name, "with") : NULL;
+  if (!with || with == name || (size_t)(with - name) >= sizeof a->digest) return false;
+  memcpy(a->digest, name, (size_t)(with - name));
+  const char *key = with + 4;
+  a->none = !strcasecmp(a->digest, "NONE");
+  a->pss = luna_strcasestr(key, "/PSS") != NULL || !strncasecmp(key, "RSASSA-PSS", 10);
+  a->ecdsa = !strncasecmp(key, "ECDSA", 5);
+  if (!a->ecdsa && strncasecmp(key, "RSA", 3)) return false;
+  if (!a->none && !EVP_get_digestbyname(a->digest)) return false;
+  return true;
 }
 
 static bool sig_getInstance(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   struct sig_alg parsed;
-   if (!sig_parse(alg, &parsed)) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg ? alg : "null");
-      return false;
-   }
-   dvm_ref sig = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/security/Signature;"));
-   if (sig) {
-      (void)dvm_set_field(vm, sig, "algorithm", "Ljava/lang/String;",
-                          (union dvm_value){ .l = dvm_new_string(vm, alg) });
-      (void)dvm_set_field(vm, sig, "provider", "Ljava/security/Provider;",
-                          (union dvm_value){ .l = security_builtin_provider(vm) });
-   }
-   RETL(sig);
+  (void)self;
+  (void)nargs;
+  const char *alg = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  struct sig_alg parsed;
+  if (!sig_parse(alg, &parsed)) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg ? alg : "null");
+    return false;
+  }
+  dvm_ref sig = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/security/Signature;"));
+  if (sig) {
+    (void)dvm_set_field(vm, sig, "algorithm", "Ljava/lang/String;",
+    (union dvm_value) {
+      .l = dvm_new_string(vm, alg)
+    });
+    (void)dvm_set_field(vm, sig, "provider", "Ljava/security/Provider;",
+    (union dvm_value) {
+      .l = security_builtin_provider(vm)
+    });
+  }
+  RETL(sig);
 }
 
 static bool sig_init(struct dvm *vm, dvm_ref self, dvm_ref key, int32_t state)
 {
-   if (!key) {
-      dvm__throw(vm, "java/security/InvalidKeyException", "key is null");
-      return false;
-   }
-   union dvm_value algorithm={0},kind={0};
-   dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
-   dvm_get_field(vm,key,"kind","I",&kind);
-   struct sig_alg parsed;uint32_t size=0;
-   const unsigned char *encoded=key_bytes(vm,key,&size),*cursor=encoded;
-   EVP_PKEY *native=!encoded ? NULL : state==2 ? d2i_PUBKEY(NULL,&cursor,size) : d2i_AutoPrivateKey(NULL,&cursor,size);
-   bool valid=sig_parse(dvm_string_utf8(vm,algorithm.l),&parsed) && native &&
-      kind.i==(state==2 ? 2 : 1) && (parsed.ecdsa ? EVP_PKEY_is_a(native,"EC") :
-         EVP_PKEY_is_a(native,"RSA") || (parsed.pss && EVP_PKEY_is_a(native,"RSA-PSS")));
-   EVP_PKEY_free(native);
-   if(!valid){dvm__throw(vm,"java/security/InvalidKeyException","Key does not match signature algorithm");return false;}
-   (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", (union dvm_value){ .l = key });
-   (void)dvm_set_field(vm, self, "state", "I", (union dvm_value){ .i = state });
-   (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value){ .l = 0 });
-   return true;
+  if (!key) {
+    dvm__throw(vm, "java/security/InvalidKeyException", "key is null");
+    return false;
+  }
+  union dvm_value algorithm= {0},kind= {0};
+  dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+  dvm_get_field(vm,key,"kind","I",&kind);
+  struct sig_alg parsed;
+  uint32_t size=0;
+  const unsigned char *encoded=key_bytes(vm,key,&size),*cursor=encoded;
+  EVP_PKEY *native=!encoded ? NULL : state==2 ? d2i_PUBKEY(NULL,&cursor,size) : d2i_AutoPrivateKey(NULL,&cursor,size);
+  bool valid=sig_parse(dvm_string_utf8(vm,algorithm.l),&parsed) && native &&
+             kind.i==(state==2 ? 2 : 1) && (parsed.ecdsa ? EVP_PKEY_is_a(native,"EC") :
+               EVP_PKEY_is_a(native,"RSA") || (parsed.pss && EVP_PKEY_is_a(native,"RSA-PSS")));
+  EVP_PKEY_free(native);
+  if(!valid) {
+    dvm__throw(vm,"java/security/InvalidKeyException","Key does not match signature algorithm");
+    return false;
+  }
+  (void)dvm_set_field(vm, self, "key", "Ljava/lang/Object;", (union dvm_value) {
+    .l = key
+  });
+  (void)dvm_set_field(vm, self, "state", "I", (union dvm_value) {
+    .i = state
+  });
+  (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value) {
+    .l = 0
+  });
+  return true;
 }
 
 static bool sig_initSign(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                          int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   if (!sig_init(vm, self, ARG(0).l, 1)) return false;
-   RETV();
+  (void)nargs;
+  (void)out;
+  if (!sig_init(vm, self, ARG(0).l, 1)) return false;
+  RETV();
 }
 
 static bool sig_initVerify(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   if (!sig_init(vm, self, ARG(0).l, 2)) return false;
-   RETV();
+  (void)nargs;
+  (void)out;
+  if (!sig_init(vm, self, ARG(0).l, 2)) return false;
+  RETV();
 }
 
 static bool sig_append(struct dvm *vm, dvm_ref self, const uint8_t *p, uint32_t n)
 {
-   union dvm_value state = { 0 }, old = { 0 };
-   (void)dvm_get_field(vm, self, "state", "I", &state);
-   if (!state.i) {
-      dvm__throw(vm, "java/security/SignatureException", "Signature object not initialized");
-      return false;
-   }
-   (void)dvm_get_field(vm, self, "data", "[B", &old);
-   uint32_t old_len = 0;
-   const uint8_t *op = arg_bytes(vm, old.l, &old_len);
-   uint8_t *all = malloc((size_t)old_len + n + 1);
-   if (!all) { dvm__throw(vm, "java/lang/OutOfMemoryError", "Signature"); return false; }
-   if (old_len) memcpy(all, op, old_len);
-   if (n) memcpy(all + old_len, p, n);
-   dvm_ref merged = make_bytes(vm, all, old_len + n);
-   free(all);
-   (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value){ .l = merged });
-   return true;
+  union dvm_value state = { 0 }, old = { 0 };
+  (void)dvm_get_field(vm, self, "state", "I", &state);
+  if (!state.i) {
+    dvm__throw(vm, "java/security/SignatureException", "Signature object not initialized");
+    return false;
+  }
+  (void)dvm_get_field(vm, self, "data", "[B", &old);
+  uint32_t old_len = 0;
+  const uint8_t *op = arg_bytes(vm, old.l, &old_len);
+  uint8_t *all = malloc((size_t)old_len + n + 1);
+  if (!all) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "Signature");
+    return false;
+  }
+  if (old_len) memcpy(all, op, old_len);
+  if (n) memcpy(all + old_len, p, n);
+  dvm_ref merged = make_bytes(vm, all, old_len + n);
+  free(all);
+  (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value) {
+    .l = merged
+  });
+  return true;
 }
 
 static bool sig_update(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   (void)out;
-   uint32_t len = 0;
-   const uint8_t *p = arg_bytes(vm, ARG(0).l, &len);
-   if (nargs >= 3) {
-      if (!p || ARG(1).i < 0 || ARG(2).i < 0 || (uint32_t)ARG(1).i > len ||
-          (uint32_t)ARG(2).i > len - (uint32_t)ARG(1).i) {
-         dvm__throw(vm, "java/lang/IllegalArgumentException", "bad offset or length");
-         return false;
-      }
-      p += ARG(1).i; len = (uint32_t)ARG(2).i;
-   }
-   if (!sig_append(vm, self, p, len)) return false;
-   RETV();
+  (void)out;
+  uint32_t len = 0;
+  const uint8_t *p = arg_bytes(vm, ARG(0).l, &len);
+  if (nargs >= 3) {
+    if (!p || ARG(1).i < 0 || ARG(2).i < 0 || (uint32_t)ARG(1).i > len ||
+        (uint32_t)ARG(2).i > len - (uint32_t)ARG(1).i) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "bad offset or length");
+      return false;
+    }
+    p += ARG(1).i;
+    len = (uint32_t)ARG(2).i;
+  }
+  if (!sig_append(vm, self, p, len)) return false;
+  RETV();
 }
 
 static bool sig_update_buffer(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                               int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   const uint8_t *data; uint32_t count;
-   if (!crypto_take_buffer(vm, ARG(0).l, &data, &count)) return false;
-   if (!sig_append(vm, self, data, count)) return false;
-   RETV();
+  (void)nargs;
+  (void)out;
+  const uint8_t *data;
+  uint32_t count;
+  if (!crypto_take_buffer(vm, ARG(0).l, &data, &count)) return false;
+  if (!sig_append(vm, self, data, count)) return false;
+  RETV();
 }
 
 static bool sig_update_byte(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                             int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   const uint8_t b = (uint8_t)ARG(0).i;
-   if (!sig_append(vm, self, &b, 1)) return false;
-   RETV();
+  (void)nargs;
+  (void)out;
+  const uint8_t b = (uint8_t)ARG(0).i;
+  if (!sig_append(vm, self, &b, 1)) return false;
+  RETV();
 }
 
 /* RSASSA-PKCS1-v1_5 built from its two parts: the DER DigestInfo of the hash,
@@ -2290,32 +2613,40 @@ static bool sig_update_byte(struct dvm *vm, dvm_ref self, const union dvm_value 
 static int sig_digest_info(const EVP_MD *md, const uint8_t *data, uint32_t len,
                            uint8_t **der, int *der_len)
 {
-   /* DigestInfo ::= SEQUENCE { SEQUENCE { OID, NULL }, OCTET STRING }.  Written
-    * out rather than asked of X509_ALGOR_set_md, which leaves the NULL
-    * parameter off for some digests; RFC 8017 has it present.  Every length
-    * here is below 128, so each is a single byte. */
-   uint8_t hash[EVP_MAX_MD_SIZE];
-   unsigned hash_len = 0;
-   const ASN1_OBJECT *oid = OBJ_nid2obj(EVP_MD_get_type(md));
-   const int oid_len = oid ? OBJ_length(oid) : 0;
-   *der = NULL;
-   if (!oid || oid_len <= 0 || oid_len > 16 ||
-       !EVP_Digest(data, len, hash, &hash_len, md, NULL) || hash_len > 64)
-      return 0;
-   const int algorithm = 2 + oid_len + 2;
-   const int total = 2 + algorithm + 2 + (int)hash_len;
-   uint8_t *out = malloc((size_t)total + 2);
-   if (!out) return 0;
-   int at = 0;
-   out[at++] = 0x30; out[at++] = (uint8_t)total;
-   out[at++] = 0x30; out[at++] = (uint8_t)algorithm;
-   out[at++] = 0x06; out[at++] = (uint8_t)oid_len;
-   memcpy(out + at, OBJ_get0_data(oid), (size_t)oid_len); at += oid_len;
-   out[at++] = 0x05; out[at++] = 0x00;
-   out[at++] = 0x04; out[at++] = (uint8_t)hash_len;
-   memcpy(out + at, hash, hash_len); at += (int)hash_len;
-   *der = out; *der_len = at;
-   return 1;
+  /* DigestInfo ::= SEQUENCE { SEQUENCE { OID, NULL }, OCTET STRING }.  Written
+   * out rather than asked of X509_ALGOR_set_md, which leaves the NULL
+   * parameter off for some digests; RFC 8017 has it present.  Every length
+   * here is below 128, so each is a single byte. */
+  uint8_t hash[EVP_MAX_MD_SIZE];
+  unsigned hash_len = 0;
+  const ASN1_OBJECT *oid = OBJ_nid2obj(EVP_MD_get_type(md));
+  const int oid_len = oid ? OBJ_length(oid) : 0;
+  *der = NULL;
+  if (!oid || oid_len <= 0 || oid_len > 16 ||
+      !EVP_Digest(data, len, hash, &hash_len, md, NULL) || hash_len > 64)
+    return 0;
+  const int algorithm = 2 + oid_len + 2;
+  const int total = 2 + algorithm + 2 + (int)hash_len;
+  uint8_t *out = malloc((size_t)total + 2);
+  if (!out) return 0;
+  int at = 0;
+  out[at++] = 0x30;
+  out[at++] = (uint8_t)total;
+  out[at++] = 0x30;
+  out[at++] = (uint8_t)algorithm;
+  out[at++] = 0x06;
+  out[at++] = (uint8_t)oid_len;
+  memcpy(out + at, OBJ_get0_data(oid), (size_t)oid_len);
+  at += oid_len;
+  out[at++] = 0x05;
+  out[at++] = 0x00;
+  out[at++] = 0x04;
+  out[at++] = (uint8_t)hash_len;
+  memcpy(out + at, hash, hash_len);
+  at += (int)hash_len;
+  *der = out;
+  *der_len = at;
+  return 1;
 }
 
 static int sig_rsa_pkcs1(EVP_PKEY *pkey, const EVP_MD *md, bool verify,
@@ -2323,200 +2654,211 @@ static int sig_rsa_pkcs1(EVP_PKEY *pkey, const EVP_MD *md, bool verify,
                          const uint8_t *sig_in, uint32_t sig_in_len,
                          uint8_t **sig_out, size_t *sig_out_len)
 {
-   uint8_t *der = NULL;
-   int der_len = 0, result = -2;
-   if (!sig_digest_info(md, data, dlen, &der, &der_len)) return -2;
-   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
-   if (ctx && (verify ? EVP_PKEY_verify_recover_init(ctx) : EVP_PKEY_sign_init(ctx)) > 0 &&
-       EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0) {
-      if (verify) {
-         size_t n = 0;
-         uint8_t *plain = NULL;
-         if (EVP_PKEY_verify_recover(ctx, NULL, &n, sig_in, sig_in_len) > 0 &&
-             (plain = malloc(n)) != NULL) {
-            result = EVP_PKEY_verify_recover(ctx, plain, &n, sig_in, sig_in_len) > 0 &&
-                     n == (size_t)der_len && !memcmp(plain, der, n);
-            free(plain);
-         } else result = 0;   /* a signature that is not a valid RSA block */
-      } else {
-         size_t n = 0;
-         if (EVP_PKEY_sign(ctx, NULL, &n, der, (size_t)der_len) > 0 &&
-             (*sig_out = malloc(n)) != NULL &&
-             EVP_PKEY_sign(ctx, *sig_out, &n, der, (size_t)der_len) > 0) {
-            *sig_out_len = n; result = 1;
-         }
+  uint8_t *der = NULL;
+  int der_len = 0, result = -2;
+  if (!sig_digest_info(md, data, dlen, &der, &der_len)) return -2;
+  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+  if (ctx && (verify ? EVP_PKEY_verify_recover_init(ctx) : EVP_PKEY_sign_init(ctx)) > 0 &&
+      EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) > 0) {
+    if (verify) {
+      size_t n = 0;
+      uint8_t *plain = NULL;
+      if (EVP_PKEY_verify_recover(ctx, NULL, &n, sig_in, sig_in_len) > 0 &&
+          (plain = malloc(n)) != NULL) {
+        result = EVP_PKEY_verify_recover(ctx, plain, &n, sig_in, sig_in_len) > 0 &&
+                 n == (size_t)der_len && !memcmp(plain, der, n);
+        free(plain);
+      } else result = 0;   /* a signature that is not a valid RSA block */
+    } else {
+      size_t n = 0;
+      if (EVP_PKEY_sign(ctx, NULL, &n, der, (size_t)der_len) > 0 &&
+          (*sig_out = malloc(n)) != NULL &&
+          EVP_PKEY_sign(ctx, *sig_out, &n, der, (size_t)der_len) > 0) {
+        *sig_out_len = n;
+        result = 1;
       }
-   }
-   EVP_PKEY_CTX_free(ctx);
-   free(der);
-   return result;
+    }
+  }
+  EVP_PKEY_CTX_free(ctx);
+  free(der);
+  return result;
 }
 
 /* Signs or verifies the accumulated bytes; the key and algorithm are read back
  * from the object.  Returns 1/0, or -1 with an exception pending. */
 static const char *pkey_failed_exception(const uint8_t *kb)
 {
-   return kb ? "java/security/SignatureException" : "java/security/InvalidKeyException";
+  return kb ? "java/security/SignatureException" : "java/security/InvalidKeyException";
 }
 
 static int sig_finish(struct dvm *vm, dvm_ref self, bool verify,
                       const uint8_t *sig_in, uint32_t sig_in_len,
                       uint8_t **sig_out, size_t *sig_out_len)
 {
-   union dvm_value av = { 0 }, kv = { 0 }, state = { 0 }, data = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &av);
-   (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &kv);
-   (void)dvm_get_field(vm, self, "state", "I", &state);
-   (void)dvm_get_field(vm, self, "data", "[B", &data);
-   if (state.i != (verify ? 2 : 1)) {
-      dvm__throw(vm, "java/security/SignatureException", "Signature object not initialized");
-      return -1;
-   }
-   struct sig_alg alg;
-   if (!sig_parse(av.l ? dvm_string_utf8(vm, av.l) : NULL, &alg)) return -1;
-   uint32_t klen = 0, dlen = 0;
-   const uint8_t *kb = key_bytes(vm, kv.l, &klen);
-   const uint8_t *db = arg_bytes(vm, data.l, &dlen);
-   const uint8_t *kp = kb;
-   unsigned depth = dvm_gil_unlock_all(vm);
-   EVP_PKEY *pkey = !kb ? NULL : verify ? d2i_PUBKEY(NULL, &kp, klen)
-                                        : d2i_AutoPrivateKey(NULL, &kp, klen);
-   EVP_MD_CTX *mctx = pkey ? EVP_MD_CTX_new() : NULL;
-   EVP_PKEY_CTX *pctx = NULL;
-   const EVP_MD *md = alg.none ? NULL : EVP_get_digestbyname(alg.digest);
-   int result = -2;
-   if (alg.none) {
-      /* No digest: the caller's bytes are what RSA signs (PKCS#1 v1.5). */
-      pctx = pkey ? EVP_PKEY_CTX_new(pkey, NULL) : NULL;
-      if (pctx && (verify ? EVP_PKEY_verify_init(pctx) : EVP_PKEY_sign_init(pctx)) > 0 &&
-          (alg.ecdsa || EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) > 0)) {
-         if (verify) {
-            result = EVP_PKEY_verify(pctx, sig_in, sig_in_len, db ? db : (const uint8_t *)"", dlen) == 1;
-         } else {
-            size_t n = 0;
-            if (EVP_PKEY_sign(pctx, NULL, &n, db ? db : (const uint8_t *)"", dlen) > 0 &&
-                (*sig_out = malloc(n)) != NULL &&
-                EVP_PKEY_sign(pctx, *sig_out, &n, db ? db : (const uint8_t *)"", dlen) > 0) {
-               *sig_out_len = n; result = 1;
-            }
-         }
+  union dvm_value av = { 0 }, kv = { 0 }, state = { 0 }, data = { 0 };
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &av);
+  (void)dvm_get_field(vm, self, "key", "Ljava/lang/Object;", &kv);
+  (void)dvm_get_field(vm, self, "state", "I", &state);
+  (void)dvm_get_field(vm, self, "data", "[B", &data);
+  if (state.i != (verify ? 2 : 1)) {
+    dvm__throw(vm, "java/security/SignatureException", "Signature object not initialized");
+    return -1;
+  }
+  struct sig_alg alg;
+  if (!sig_parse(av.l ? dvm_string_utf8(vm, av.l) : NULL, &alg)) return -1;
+  uint32_t klen = 0, dlen = 0;
+  const uint8_t *kb = key_bytes(vm, kv.l, &klen);
+  const uint8_t *db = arg_bytes(vm, data.l, &dlen);
+  const uint8_t *kp = kb;
+  unsigned depth = dvm_gil_unlock_all(vm);
+  EVP_PKEY *pkey = !kb ? NULL : verify ? d2i_PUBKEY(NULL, &kp, klen)
+                   : d2i_AutoPrivateKey(NULL, &kp, klen);
+  EVP_MD_CTX *mctx = pkey ? EVP_MD_CTX_new() : NULL;
+  EVP_PKEY_CTX *pctx = NULL;
+  const EVP_MD *md = alg.none ? NULL : EVP_get_digestbyname(alg.digest);
+  int result = -2;
+  if (alg.none) {
+    /* No digest: the caller's bytes are what RSA signs (PKCS#1 v1.5). */
+    pctx = pkey ? EVP_PKEY_CTX_new(pkey, NULL) : NULL;
+    if (pctx && (verify ? EVP_PKEY_verify_init(pctx) : EVP_PKEY_sign_init(pctx)) > 0 &&
+        (alg.ecdsa || EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) > 0)) {
+      if (verify) {
+        result = EVP_PKEY_verify(pctx, sig_in, sig_in_len, db ? db : (const uint8_t *)"", dlen) == 1;
+      } else {
+        size_t n = 0;
+        if (EVP_PKEY_sign(pctx, NULL, &n, db ? db : (const uint8_t *)"", dlen) > 0 &&
+            (*sig_out = malloc(n)) != NULL &&
+            EVP_PKEY_sign(pctx, *sig_out, &n, db ? db : (const uint8_t *)"", dlen) > 0) {
+          *sig_out_len = n;
+          result = 1;
+        }
       }
-      EVP_PKEY_CTX_free(pctx);
-   } else if (pkey && md && !alg.ecdsa && !alg.pss) {
-      result = sig_rsa_pkcs1(pkey, md, verify, db ? db : (const uint8_t *)"", dlen,
-                             sig_in, sig_in_len, sig_out, sig_out_len);
-   } else if (mctx && md) {
-      int init = verify ? EVP_DigestVerifyInit(mctx, &pctx, md, NULL, pkey)
-                        : EVP_DigestSignInit(mctx, &pctx, md, NULL, pkey);
-      if (init > 0 && alg.pss && !alg.ecdsa &&
-          (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) <= 0 ||
-           EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, -1) <= 0 ||
-           EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md) <= 0))
-         init = 0;
-      if (init > 0) {
-         if (verify) {
-            result = EVP_DigestVerify(mctx, sig_in, sig_in_len, db ? db : (const uint8_t *)"", dlen) == 1;
-         } else {
-            size_t n = 0;
-            if (EVP_DigestSign(mctx, NULL, &n, db ? db : (const uint8_t *)"", dlen) > 0 &&
-                (*sig_out = malloc(n)) != NULL &&
-                EVP_DigestSign(mctx, *sig_out, &n, db ? db : (const uint8_t *)"", dlen) > 0) {
-               *sig_out_len = n; result = 1;
-            }
-         }
+    }
+    EVP_PKEY_CTX_free(pctx);
+  } else if (pkey && md && !alg.ecdsa && !alg.pss) {
+    result = sig_rsa_pkcs1(pkey, md, verify, db ? db : (const uint8_t *)"", dlen,
+                           sig_in, sig_in_len, sig_out, sig_out_len);
+  } else if (mctx && md) {
+    int init = verify ? EVP_DigestVerifyInit(mctx, &pctx, md, NULL, pkey)
+               : EVP_DigestSignInit(mctx, &pctx, md, NULL, pkey);
+    if (init > 0 && alg.pss && !alg.ecdsa &&
+        (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) <= 0 ||
+         EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, -1) <= 0 ||
+         EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, md) <= 0))
+      init = 0;
+    if (init > 0) {
+      if (verify) {
+        result = EVP_DigestVerify(mctx, sig_in, sig_in_len, db ? db : (const uint8_t *)"", dlen) == 1;
+      } else {
+        size_t n = 0;
+        if (EVP_DigestSign(mctx, NULL, &n, db ? db : (const uint8_t *)"", dlen) > 0 &&
+            (*sig_out = malloc(n)) != NULL &&
+            EVP_DigestSign(mctx, *sig_out, &n, db ? db : (const uint8_t *)"", dlen) > 0) {
+          *sig_out_len = n;
+          result = 1;
+        }
       }
-   }
-   EVP_MD_CTX_free(mctx);
-   EVP_PKEY_free(pkey);
-   dvm_gil_relock(vm, depth);
-   char why[160] = "";
-   if (result == -2) ERR_error_string_n(ERR_peek_last_error(), why, sizeof why);
-   if (getenv("LUNARIA_TRACE_SIG")) {
-      uint8_t h[32] = { 0 };
-      unsigned hl = 0;
-      if (db) (void)EVP_Digest(db, dlen, h, &hl, EVP_sha256(), NULL);
-      fprintf(stderr, "[sig] %s %s key=%u data=%u sig=%u result=%d data-sha256=%02x%02x%02x%02x%02x%02x%02x%02x sig-head=%02x%02x%02x%02x err=%s\n",
-              verify ? "verify" : "sign", av.l ? dvm_string_utf8(vm, av.l) : "?", klen, dlen, sig_in_len,
-              result, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
-              sig_in && sig_in_len >= 4 ? sig_in[0] : 0, sig_in && sig_in_len >= 4 ? sig_in[1] : 0,
-              sig_in && sig_in_len >= 4 ? sig_in[2] : 0, sig_in && sig_in_len >= 4 ? sig_in[3] : 0,
-              ERR_error_string(ERR_peek_last_error(), NULL));
-   }
-   ERR_clear_error();
-   if (result == -2) {
-      if (sig_out) { free(*sig_out); *sig_out = NULL; }
-      dvm__throw(vm, pkey_failed_exception(kb), "cannot %s with this key (%s: %s)",
-                 verify ? "verify" : "sign", av.l ? dvm_string_utf8(vm, av.l) : "?", why);
-      return -1;
-   }
-   /* The object is ready for the next message. */
-   (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value){ .l = 0 });
-   return result;
+    }
+  }
+  EVP_MD_CTX_free(mctx);
+  EVP_PKEY_free(pkey);
+  dvm_gil_relock(vm, depth);
+  char why[160] = "";
+  if (result == -2) ERR_error_string_n(ERR_peek_last_error(), why, sizeof why);
+  if (getenv("LUNARIA_TRACE_SIG")) {
+    uint8_t h[32] = { 0 };
+    unsigned hl = 0;
+    if (db) (void)EVP_Digest(db, dlen, h, &hl, EVP_sha256(), NULL);
+    fprintf(stderr, "[sig] %s %s key=%u data=%u sig=%u result=%d data-sha256=%02x%02x%02x%02x%02x%02x%02x%02x sig-head=%02x%02x%02x%02x err=%s\n",
+            verify ? "verify" : "sign", av.l ? dvm_string_utf8(vm, av.l) : "?", klen, dlen, sig_in_len,
+            result, h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7],
+            sig_in && sig_in_len >= 4 ? sig_in[0] : 0, sig_in && sig_in_len >= 4 ? sig_in[1] : 0,
+            sig_in && sig_in_len >= 4 ? sig_in[2] : 0, sig_in && sig_in_len >= 4 ? sig_in[3] : 0,
+            ERR_error_string(ERR_peek_last_error(), NULL));
+  }
+  ERR_clear_error();
+  if (result == -2) {
+    if (sig_out) {
+      free(*sig_out);
+      *sig_out = NULL;
+    }
+    dvm__throw(vm, pkey_failed_exception(kb), "cannot %s with this key (%s: %s)",
+               verify ? "verify" : "sign", av.l ? dvm_string_utf8(vm, av.l) : "?", why);
+    return -1;
+  }
+  /* The object is ready for the next message. */
+  (void)dvm_set_field(vm, self, "data", "[B", (union dvm_value) {
+    .l = 0
+  });
+  return result;
 }
 
 static bool sig_sign(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   uint8_t *sig = NULL;
-   size_t n = 0;
-   if (sig_finish(vm, self, false, NULL, 0, &sig, &n) < 0) return false;
-   dvm_ref bytes = make_bytes(vm, sig, (uint32_t)n);
-   free(sig);
-   RETL(bytes);
+  (void)args;
+  (void)nargs;
+  uint8_t *sig = NULL;
+  size_t n = 0;
+  if (sig_finish(vm, self, false, NULL, 0, &sig, &n) < 0) return false;
+  dvm_ref bytes = make_bytes(vm, sig, (uint32_t)n);
+  free(sig);
+  RETL(bytes);
 }
 
 static bool sig_verify(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
-   uint32_t len = 0;
-   const uint8_t *p = arg_bytes(vm, ARG(0).l, &len);
-   if (!p) {
-      dvm__throw(vm, "java/lang/NullPointerException", "signature");
+  uint32_t len = 0;
+  const uint8_t *p = arg_bytes(vm, ARG(0).l, &len);
+  if (!p) {
+    dvm__throw(vm, "java/lang/NullPointerException", "signature");
+    return false;
+  }
+  if (nargs >= 3) {
+    if (ARG(1).i < 0 || ARG(2).i < 0 || (uint32_t)ARG(1).i > len ||
+        (uint32_t)ARG(2).i > len - (uint32_t)ARG(1).i) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "bad offset or length");
       return false;
-   }
-   if (nargs >= 3) {
-      if (ARG(1).i < 0 || ARG(2).i < 0 || (uint32_t)ARG(1).i > len ||
-          (uint32_t)ARG(2).i > len - (uint32_t)ARG(1).i) {
-         dvm__throw(vm, "java/lang/IllegalArgumentException", "bad offset or length");
-         return false;
-      }
-      p += ARG(1).i; len = (uint32_t)ARG(2).i;
-   }
-   const int ok = sig_finish(vm, self, true, p, len, NULL, NULL);
-   if (ok < 0) return false;
-   RETI(ok);
+    }
+    p += ARG(1).i;
+    len = (uint32_t)ARG(2).i;
+  }
+  const int ok = sig_finish(vm, self, true, p, len, NULL, NULL);
+  if (ok < 0) return false;
+  RETI(ok);
 }
 
 static bool sig_getAlgorithm(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                              int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
-   RETL(v.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
+  RETL(v.l);
 }
 
 static const struct rt_field rt_sig_fields[] = {
-   { "algorithm", "Ljava/lang/String;" }, { "provider", "Ljava/security/Provider;" },
-   { "key", "Ljava/lang/Object;" }, { "state", "I" }, { "data", "[B" }, F_END
+  { "algorithm", "Ljava/lang/String;" }, { "provider", "Ljava/security/Provider;" },
+  { "key", "Ljava/lang/Object;" }, { "state", "I" }, { "data", "[B" }, F_END
 };
 static const struct rt_method rt_sig[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljava/security/Signature;", sig_getInstance),
-   SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Signature;",
-      sig_getInstance),
-   M("getAlgorithm", "()Ljava/lang/String;", sig_getAlgorithm),
-   M("initSign", "(Ljava/security/PrivateKey;)V", sig_initSign),
-   M("initSign", "(Ljava/security/PrivateKey;Ljava/security/SecureRandom;)V", sig_initSign),
-   M("initVerify", "(Ljava/security/PublicKey;)V", sig_initVerify),
-   M("update", "([B)V", sig_update),
-   M("update", "([BII)V", sig_update),
-   M("update", "(B)V", sig_update_byte),
-   M("update", "(Ljava/nio/ByteBuffer;)V", sig_update_buffer),
-   M("sign", "()[B", sig_sign),
-   M("verify", "([B)Z", sig_verify),
-   M("verify", "([BII)Z", sig_verify),
-   M_END
+  SM("getInstance", "(Ljava/lang/String;)Ljava/security/Signature;", sig_getInstance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Signature;",
+  sig_getInstance),
+  M("getAlgorithm", "()Ljava/lang/String;", sig_getAlgorithm),
+  M("initSign", "(Ljava/security/PrivateKey;)V", sig_initSign),
+  M("initSign", "(Ljava/security/PrivateKey;Ljava/security/SecureRandom;)V", sig_initSign),
+  M("initVerify", "(Ljava/security/PublicKey;)V", sig_initVerify),
+  M("update", "([B)V", sig_update),
+  M("update", "([BII)V", sig_update),
+  M("update", "(B)V", sig_update_byte),
+  M("update", "(Ljava/nio/ByteBuffer;)V", sig_update_buffer),
+  M("sign", "()[B", sig_sign),
+  M("verify", "([B)Z", sig_verify),
+  M("verify", "([BII)Z", sig_verify),
+  M_END
 };
 
 /* --- java.security.SecureRandom ----------------------------------------- */
@@ -2525,16 +2867,18 @@ static bool sr_nextBytes(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)self; (void)nargs; (void)out;
-   struct dvm_object *a = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
-   if (a && a->kind == DVM_OBJ_ARRAY && a->data && a->length)
-      RAND_bytes(a->data, (int)a->length);
-   RETV();
+  (void)self;
+  (void)nargs;
+  (void)out;
+  struct dvm_object *a = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
+  if (a && a->kind == DVM_OBJ_ARRAY && a->data && a->length)
+    RAND_bytes(a->data, (int)a->length);
+  RETV();
 }
 
 static const struct rt_field rt_key_fields[] = {
-   { "encoded", "[B" }, { "algorithm", "Ljava/lang/String;" },
-   { "kind", "I" }, F_END
+  { "encoded", "[B" }, { "algorithm", "Ljava/lang/String;" },
+  { "kind", "I" }, F_END
 };
 
 
@@ -2542,172 +2886,333 @@ static const struct rt_field rt_key_fields[] = {
 /* MPL-2.0. EC parameters and key components backed by OpenSSL's real groups. */
 static bool ec_gen_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","name");return false;}
-   dvm_set_field(vm,self,"name","Ljava/lang/String;",ARG(0));RETV();
+  (void)nargs;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","name");
+    return false;
+  }
+  dvm_set_field(vm,self,"name","Ljava/lang/String;",ARG(0));
+  RETV();
 }
 static bool ec_name(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
-{(void)args;(void)nargs;return dvm_get_field(vm,self,"name","Ljava/lang/String;",out);}
+{
+  (void)args;
+  (void)nargs;
+  return dvm_get_field(vm,self,"name","Ljava/lang/String;",out);
+}
 static int ec_curve_nid(const char *name)
 {
-   if(!name)return NID_undef;
-   if(!strcmp(name,"secp256r1"))return NID_X9_62_prime256v1;
-   int nid=OBJ_txt2nid(name);return nid;
+  if(!name)return NID_undef;
+  if(!strcmp(name,"secp256r1"))return NID_X9_62_prime256v1;
+  int nid=OBJ_txt2nid(name);
+  return nid;
 }
 static int ec_size_nid(int bits)
 {
-   switch(bits){case 224:return NID_secp224r1;case 256:return NID_X9_62_prime256v1;
-      case 384:return NID_secp384r1;case 521:return NID_secp521r1;default:return NID_undef;}
+  switch(bits) {
+  case 224:
+    return NID_secp224r1;
+  case 256:
+    return NID_X9_62_prime256v1;
+  case 384:
+    return NID_secp384r1;
+  case 521:
+    return NID_secp521r1;
+  default:
+    return NID_undef;
+  }
 }
 static bool ec_point_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;if(!ARG(0).l || !ARG(1).l){dvm__throw(vm,"java/lang/NullPointerException","coordinate");return false;}
-   dvm_set_field(vm,self,"x","Ljava/math/BigInteger;",ARG(0));dvm_set_field(vm,self,"y","Ljava/math/BigInteger;",ARG(1));RETV();
+  (void)nargs;
+  if(!ARG(0).l || !ARG(1).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","coordinate");
+    return false;
+  }
+  dvm_set_field(vm,self,"x","Ljava/math/BigInteger;",ARG(0));
+  dvm_set_field(vm,self,"y","Ljava/math/BigInteger;",ARG(1));
+  RETV();
 }
 static bool ec_value(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;const char *method=builtin_name(),*field=NULL,*type="Ljava/math/BigInteger;";
-   if(!strcmp(method,"getAffineX"))field="x";else if(!strcmp(method,"getAffineY"))field="y";
-   else if(!strcmp(method,"getP"))field="p";else if(!strcmp(method,"getA"))field="a";
-   else if(!strcmp(method,"getB"))field="b";else if(!strcmp(method,"getOrder"))field="order";
-   else if(!strcmp(method,"getCofactor")){field="cofactor";type="I";}
-   else if(!strcmp(method,"getField")){field="field";type="Ljava/security/spec/ECField;";}
-   else if(!strcmp(method,"getCurve")){field="curve";type="Ljava/security/spec/EllipticCurve;";}
-   else if(!strcmp(method,"getGenerator")){field="generator";type="Ljava/security/spec/ECPoint;";}
-   else if(!strcmp(method,"getSeed")){
-      union dvm_value seed={0};dvm_get_field(vm,self,"seed","[B",&seed);
-      if(!seed.l)RETL(0);RETL(make_bytes(vm,dvm_array_data(vm,seed.l),dvm_array_length(vm,seed.l)));
-   }
-   return field && dvm_get_field(vm,self,field,type,out);
+  (void)args;
+  (void)nargs;
+  const char *method=builtin_name(),*field=NULL,*type="Ljava/math/BigInteger;";
+  if(!strcmp(method,"getAffineX"))field="x";
+  else if(!strcmp(method,"getAffineY"))field="y";
+  else if(!strcmp(method,"getP"))field="p";
+  else if(!strcmp(method,"getA"))field="a";
+  else if(!strcmp(method,"getB"))field="b";
+  else if(!strcmp(method,"getOrder"))field="order";
+  else if(!strcmp(method,"getCofactor")) {
+    field="cofactor";
+    type="I";
+  }
+  else if(!strcmp(method,"getField")) {
+    field="field";
+    type="Ljava/security/spec/ECField;";
+  }
+  else if(!strcmp(method,"getCurve")) {
+    field="curve";
+    type="Ljava/security/spec/EllipticCurve;";
+  }
+  else if(!strcmp(method,"getGenerator")) {
+    field="generator";
+    type="Ljava/security/spec/ECPoint;";
+  }
+  else if(!strcmp(method,"getSeed")) {
+    union dvm_value seed= {0};
+    dvm_get_field(vm,self,"seed","[B",&seed);
+    if(!seed.l)RETL(0);
+    RETL(make_bytes(vm,dvm_array_data(vm,seed.l),dvm_array_length(vm,seed.l)));
+  }
+  return field && dvm_get_field(vm,self,field,type,out);
 }
 static bool ec_field_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;if(!ARG(0).l){dvm__throw(vm,"java/lang/NullPointerException","p");return false;}
-   BIGNUM *p=bigint_bn(vm,ARG(0).l);bool valid=p && !BN_is_negative(p) && !BN_is_zero(p);BN_free(p);
-   if(!valid){dvm__throw(vm,"java/lang/IllegalArgumentException","p must be positive");return false;}
-   dvm_set_field(vm,self,"p","Ljava/math/BigInteger;",ARG(0));RETV();
+  (void)nargs;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","p");
+    return false;
+  }
+  BIGNUM *p=bigint_bn(vm,ARG(0).l);
+  bool valid=p && !BN_is_negative(p) && !BN_is_zero(p);
+  BN_free(p);
+  if(!valid) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","p must be positive");
+    return false;
+  }
+  dvm_set_field(vm,self,"p","Ljava/math/BigInteger;",ARG(0));
+  RETV();
 }
 static bool ec_field_size(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;union dvm_value p={0};dvm_get_field(vm,self,"p","Ljava/math/BigInteger;",&p);
-   BIGNUM *bn=bigint_bn(vm,p.l);if(!bn)return false;int bits=BN_num_bits(bn);BN_free(bn);RETI(bits);
+  (void)args;
+  (void)nargs;
+  union dvm_value p= {0};
+  dvm_get_field(vm,self,"p","Ljava/math/BigInteger;",&p);
+  BIGNUM *bn=bigint_bn(vm,p.l);
+  if(!bn)return false;
+  int bits=BN_num_bits(bn);
+  BN_free(bn);
+  RETI(bits);
 }
 static bool ec_curve_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   if(!ARG(0).l || !ARG(1).l || !ARG(2).l){dvm__throw(vm,"java/lang/NullPointerException","curve");return false;}
-   if(object_is_a(vm,ARG(0).l,"Ljava/security/spec/ECFieldFp;")){
-      union dvm_value p={0};dvm_get_field(vm,ARG(0).l,"p","Ljava/math/BigInteger;",&p);
-      BIGNUM *prime=bigint_bn(vm,p.l),*a=bigint_bn(vm,ARG(1).l),*b=bigint_bn(vm,ARG(2).l);
-      bool valid=prime && a && b && !BN_is_negative(a) && !BN_is_negative(b) && BN_cmp(a,prime)<0 && BN_cmp(b,prime)<0;
-      BN_free(prime);BN_free(a);BN_free(b);
-      if(!valid){dvm__throw(vm,"java/lang/IllegalArgumentException","curve coefficient out of range");return false;}
-   }
-   dvm_set_field(vm,self,"field","Ljava/security/spec/ECField;",ARG(0));
-   dvm_set_field(vm,self,"a","Ljava/math/BigInteger;",ARG(1));dvm_set_field(vm,self,"b","Ljava/math/BigInteger;",ARG(2));
-   union dvm_value seed={0};if(nargs>3 && ARG(3).l)seed.l=make_bytes(vm,dvm_array_data(vm,ARG(3).l),dvm_array_length(vm,ARG(3).l));
-   dvm_set_field(vm,self,"seed","[B",seed);RETV();
+  if(!ARG(0).l || !ARG(1).l || !ARG(2).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","curve");
+    return false;
+  }
+  if(object_is_a(vm,ARG(0).l,"Ljava/security/spec/ECFieldFp;")) {
+    union dvm_value p= {0};
+    dvm_get_field(vm,ARG(0).l,"p","Ljava/math/BigInteger;",&p);
+    BIGNUM *prime=bigint_bn(vm,p.l),*a=bigint_bn(vm,ARG(1).l),*b=bigint_bn(vm,ARG(2).l);
+    bool valid=prime && a && b && !BN_is_negative(a) && !BN_is_negative(b) && BN_cmp(a,prime)<0 && BN_cmp(b,prime)<0;
+    BN_free(prime);
+    BN_free(a);
+    BN_free(b);
+    if(!valid) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","curve coefficient out of range");
+      return false;
+    }
+  }
+  dvm_set_field(vm,self,"field","Ljava/security/spec/ECField;",ARG(0));
+  dvm_set_field(vm,self,"a","Ljava/math/BigInteger;",ARG(1));
+  dvm_set_field(vm,self,"b","Ljava/math/BigInteger;",ARG(2));
+  union dvm_value seed= {0};
+  if(nargs>3 && ARG(3).l)seed.l=make_bytes(vm,dvm_array_data(vm,ARG(3).l),dvm_array_length(vm,ARG(3).l));
+  dvm_set_field(vm,self,"seed","[B",seed);
+  RETV();
 }
 static bool ec_params_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;if(!ARG(0).l || !ARG(1).l || !ARG(2).l){dvm__throw(vm,"java/lang/NullPointerException","EC parameters");return false;}
-   BIGNUM *order=bigint_bn(vm,ARG(2).l);bool valid=order && !BN_is_negative(order) && !BN_is_zero(order) && ARG(3).i>0;BN_free(order);
-   if(!valid){dvm__throw(vm,"java/lang/IllegalArgumentException","order and cofactor must be positive");return false;}
-   dvm_set_field(vm,self,"curve","Ljava/security/spec/EllipticCurve;",ARG(0));dvm_set_field(vm,self,"generator","Ljava/security/spec/ECPoint;",ARG(1));
-   dvm_set_field(vm,self,"order","Ljava/math/BigInteger;",ARG(2));dvm_set_field(vm,self,"cofactor","I",ARG(3));RETV();
+  (void)nargs;
+  if(!ARG(0).l || !ARG(1).l || !ARG(2).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","EC parameters");
+    return false;
+  }
+  BIGNUM *order=bigint_bn(vm,ARG(2).l);
+  bool valid=order && !BN_is_negative(order) && !BN_is_zero(order) && ARG(3).i>0;
+  BN_free(order);
+  if(!valid) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","order and cofactor must be positive");
+    return false;
+  }
+  dvm_set_field(vm,self,"curve","Ljava/security/spec/EllipticCurve;",ARG(0));
+  dvm_set_field(vm,self,"generator","Ljava/security/spec/ECPoint;",ARG(1));
+  dvm_set_field(vm,self,"order","Ljava/math/BigInteger;",ARG(2));
+  dvm_set_field(vm,self,"cofactor","I",ARG(3));
+  RETV();
 }
 static BIGNUM *ec_bn_field(struct dvm *vm,dvm_ref object,const char *field)
-{union dvm_value value={0};dvm_get_field(vm,object,field,"Ljava/math/BigInteger;",&value);return value.l ? bigint_bn(vm,value.l) : NULL;}
+{
+  union dvm_value value= {0};
+  dvm_get_field(vm,object,field,"Ljava/math/BigInteger;",&value);
+  return value.l ? bigint_bn(vm,value.l) : NULL;
+}
 static EC_GROUP *ec_group_from_spec(struct dvm *vm,dvm_ref spec)
 {
-   if(object_is_a(vm,spec,"Ljava/security/spec/ECGenParameterSpec;")){
-      union dvm_value name={0};dvm_get_field(vm,spec,"name","Ljava/lang/String;",&name);
-      int nid=ec_curve_nid(dvm_string_utf8(vm,name.l));return nid==NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
-   }
-   if(!object_is_a(vm,spec,"Ljava/security/spec/ECParameterSpec;"))return NULL;
-   union dvm_value curve={0},field={0},generator={0},cofactor={0};
-   dvm_get_field(vm,spec,"curve","Ljava/security/spec/EllipticCurve;",&curve);
-   dvm_get_field(vm,curve.l,"field","Ljava/security/spec/ECField;",&field);
-   if(!object_is_a(vm,field.l,"Ljava/security/spec/ECFieldFp;"))return NULL;
-   dvm_get_field(vm,spec,"generator","Ljava/security/spec/ECPoint;",&generator);dvm_get_field(vm,spec,"cofactor","I",&cofactor);
-   BIGNUM *p=ec_bn_field(vm,field.l,"p"),*a=ec_bn_field(vm,curve.l,"a"),*b=ec_bn_field(vm,curve.l,"b"),
-      *x=ec_bn_field(vm,generator.l,"x"),*y=ec_bn_field(vm,generator.l,"y"),*order=ec_bn_field(vm,spec,"order"),*h=BN_new();
-   EC_GROUP *group=p && a && b ? EC_GROUP_new_curve_GFp(p,a,b,NULL) : NULL;EC_POINT *point=group ? EC_POINT_new(group) : NULL;
-   bool valid=point && x && y && order && h && BN_set_word(h,(unsigned)cofactor.i) &&
-      EC_POINT_set_affine_coordinates(group,point,x,y,NULL) && EC_GROUP_set_generator(group,point,order,h) && EC_GROUP_check(group,NULL);
-   EC_POINT_free(point);BN_free(p);BN_free(a);BN_free(b);BN_free(x);BN_free(y);BN_free(order);BN_free(h);
-   if(!valid){EC_GROUP_free(group);return NULL;}return group;
+  if(object_is_a(vm,spec,"Ljava/security/spec/ECGenParameterSpec;")) {
+    union dvm_value name= {0};
+    dvm_get_field(vm,spec,"name","Ljava/lang/String;",&name);
+    int nid=ec_curve_nid(dvm_string_utf8(vm,name.l));
+    return nid==NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
+  }
+  if(!object_is_a(vm,spec,"Ljava/security/spec/ECParameterSpec;"))return NULL;
+  union dvm_value curve= {0},field= {0},generator= {0},cofactor= {0};
+  dvm_get_field(vm,spec,"curve","Ljava/security/spec/EllipticCurve;",&curve);
+  dvm_get_field(vm,curve.l,"field","Ljava/security/spec/ECField;",&field);
+  if(!object_is_a(vm,field.l,"Ljava/security/spec/ECFieldFp;"))return NULL;
+  dvm_get_field(vm,spec,"generator","Ljava/security/spec/ECPoint;",&generator);
+  dvm_get_field(vm,spec,"cofactor","I",&cofactor);
+  BIGNUM *p=ec_bn_field(vm,field.l,"p"),*a=ec_bn_field(vm,curve.l,"a"),*b=ec_bn_field(vm,curve.l,"b"),
+                                                                        *x=ec_bn_field(vm,generator.l,"x"),*y=ec_bn_field(vm,generator.l,"y"),*order=ec_bn_field(vm,spec,"order"),*h=BN_new();
+  EC_GROUP *group=p && a && b ? EC_GROUP_new_curve_GFp(p,a,b,NULL) : NULL;
+  EC_POINT *point=group ? EC_POINT_new(group) : NULL;
+  bool valid=point && x && y && order && h && BN_set_word(h,(unsigned)cofactor.i) &&
+             EC_POINT_set_affine_coordinates(group,point,x,y,NULL) && EC_GROUP_set_generator(group,point,order,h) && EC_GROUP_check(group,NULL);
+  EC_POINT_free(point);
+  BN_free(p);
+  BN_free(a);
+  BN_free(b);
+  BN_free(x);
+  BN_free(y);
+  BN_free(order);
+  BN_free(h);
+  if(!valid) {
+    EC_GROUP_free(group);
+    return NULL;
+  }
+  return group;
 }
 static bool ec_store_group(struct dvm *vm,dvm_ref generator,EC_GROUP *group)
 {
-   unsigned char *der=NULL;int n=i2d_ECPKParameters(group,&der);
-   dvm_ref bytes=n>0 ? make_bytes(vm,der,(uint32_t)n) : 0;OPENSSL_free(der);
-   if(!bytes)return false;
-   return dvm_set_field(vm,generator,"parameters","[B",(union dvm_value){.l=bytes});
+  unsigned char *der=NULL;
+  int n=i2d_ECPKParameters(group,&der);
+  dvm_ref bytes=n>0 ? make_bytes(vm,der,(uint32_t)n) : 0;
+  OPENSSL_free(der);
+  if(!bytes)return false;
+  return dvm_set_field(vm,generator,"parameters","[B",(union dvm_value) {
+    .l=bytes
+  });
 }
 static bool ec_key_number(struct dvm *vm,dvm_ref self,const char *name,union dvm_value *out)
 {
-   uint32_t n=0;const unsigned char *bytes=key_bytes(vm,self,&n),*cursor=bytes;union dvm_value kind={0};dvm_get_field(vm,self,"kind","I",&kind);
-   EVP_PKEY *key=!bytes ? NULL : kind.i==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n);
-   BIGNUM *bn=NULL;bool good=key && EVP_PKEY_is_a(key,"EC") && EVP_PKEY_get_bn_param(key,name,&bn)>0;
-   if(good)good=bigint_bn_result(vm,bn,out);BN_clear_free(bn);EVP_PKEY_free(key);
-   if(!good && !dvm_exception(vm))dvm__throw(vm,"java/security/ProviderException","Cannot read EC key component");return good;
+  uint32_t n=0;
+  const unsigned char *bytes=key_bytes(vm,self,&n),*cursor=bytes;
+  union dvm_value kind= {0};
+  dvm_get_field(vm,self,"kind","I",&kind);
+  EVP_PKEY *key=!bytes ? NULL : kind.i==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n);
+  BIGNUM *bn=NULL;
+  bool good=key && EVP_PKEY_is_a(key,"EC") && EVP_PKEY_get_bn_param(key,name,&bn)>0;
+  if(good)good=bigint_bn_result(vm,bn,out);
+  BN_clear_free(bn);
+  EVP_PKEY_free(key);
+  if(!good && !dvm_exception(vm))dvm__throw(vm,"java/security/ProviderException","Cannot read EC key component");
+  return good;
 }
 static bool ec_public_point(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;dvm_ref point=dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECPoint"));if(!point)return false;
-   dvm_pin(vm,point);union dvm_value value={0};bool good=ec_key_number(vm,self,OSSL_PKEY_PARAM_EC_PUB_X,&value);
-   if(good)dvm_set_field(vm,point,"x","Ljava/math/BigInteger;",value);
-   if(good)good=ec_key_number(vm,self,OSSL_PKEY_PARAM_EC_PUB_Y,&value);
-   if(good)dvm_set_field(vm,point,"y","Ljava/math/BigInteger;",value);dvm_unpin(vm,point);
-   if(!good)return false;RETL(point);
+  (void)args;
+  (void)nargs;
+  dvm_ref point=dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECPoint"));
+  if(!point)return false;
+  dvm_pin(vm,point);
+  union dvm_value value= {0};
+  bool good=ec_key_number(vm,self,OSSL_PKEY_PARAM_EC_PUB_X,&value);
+  if(good)dvm_set_field(vm,point,"x","Ljava/math/BigInteger;",value);
+  if(good)good=ec_key_number(vm,self,OSSL_PKEY_PARAM_EC_PUB_Y,&value);
+  if(good)dvm_set_field(vm,point,"y","Ljava/math/BigInteger;",value);
+  dvm_unpin(vm,point);
+  if(!good)return false;
+  RETL(point);
 }
 static bool ec_private_scalar(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
-{(void)args;(void)nargs;return ec_key_number(vm,self,OSSL_PKEY_PARAM_PRIV_KEY,out);}
+{
+  (void)args;
+  (void)nargs;
+  return ec_key_number(vm,self,OSSL_PKEY_PARAM_PRIV_KEY,out);
+}
 static bool ec_group_bn(struct dvm *vm,dvm_ref object,const char *name,const BIGNUM *bn)
-{union dvm_value v={0};return bigint_bn_result(vm,bn,&v) && dvm_set_field(vm,object,name,"Ljava/math/BigInteger;",v);}
+{
+  union dvm_value v= {0};
+  return bigint_bn_result(vm,bn,&v) && dvm_set_field(vm,object,name,"Ljava/math/BigInteger;",v);
+}
 static bool ec_key_params(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)args;(void)nargs;uint32_t n=0;const unsigned char *bytes=key_bytes(vm,self,&n),*cursor=bytes;
-   union dvm_value kind={0};dvm_get_field(vm,self,"kind","I",&kind);
-   EVP_PKEY *key=!bytes ? NULL : kind.i==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n);
-   unsigned char *der=NULL;int size=key ? i2d_KeyParams(key,&der) : 0;cursor=der;
-   EC_GROUP *group=size>0 ? d2i_ECPKParameters(NULL,&cursor,size) : NULL;OPENSSL_free(der);EVP_PKEY_free(key);
-   if(!group){dvm__throw(vm,"java/security/ProviderException","Cannot read EC parameters");return false;}
-   BIGNUM *p=BN_new(),*a=BN_new(),*b=BN_new(),*order=BN_new(),*h=BN_new(),*x=BN_new(),*y=BN_new();
-   bool good=p && a && b && order && h && x && y && EC_GROUP_get_curve(group,p,a,b,NULL) &&
-      EC_GROUP_get_order(group,order,NULL) && EC_GROUP_get_cofactor(group,h,NULL) &&
-      EC_POINT_get_affine_coordinates(group,EC_GROUP_get0_generator(group),x,y,NULL);
-   dvm_ref result=good ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECParameterSpec")) : 0;
-   dvm_pin(vm,result);
-   dvm_ref curve=result ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/EllipticCurve")) : 0;
-   if(curve)dvm_set_field(vm,result,"curve","Ljava/security/spec/EllipticCurve;",(union dvm_value){.l=curve});
-   dvm_ref field=curve ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECFieldFp")) : 0;
-   if(field)dvm_set_field(vm,curve,"field","Ljava/security/spec/ECField;",(union dvm_value){.l=field});
-   good=good && field && ec_group_bn(vm,field,"p",p) && ec_group_bn(vm,curve,"a",a) && ec_group_bn(vm,curve,"b",b) && ec_group_bn(vm,result,"order",order);
-   dvm_ref point=good ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECPoint")) : 0;
-   if(point)dvm_set_field(vm,result,"generator","Ljava/security/spec/ECPoint;",(union dvm_value){.l=point});
-   good=good && point && ec_group_bn(vm,point,"x",x) && ec_group_bn(vm,point,"y",y);
-   if(good)dvm_set_field(vm,result,"cofactor","I",(union dvm_value){.i=(int32_t)BN_get_word(h)});
-   const unsigned char *seed=EC_GROUP_get0_seed(group);size_t seed_size=EC_GROUP_get_seed_len(group);
-   if(good && seed_size)dvm_set_field(vm,curve,"seed","[B",(union dvm_value){.l=make_bytes(vm,seed,(uint32_t)seed_size)});
-   dvm_unpin(vm,result);BN_free(p);BN_free(a);BN_free(b);BN_free(order);BN_free(h);BN_free(x);BN_free(y);EC_GROUP_free(group);
-   if(!good)return false;RETL(result);
+  (void)args;
+  (void)nargs;
+  uint32_t n=0;
+  const unsigned char *bytes=key_bytes(vm,self,&n),*cursor=bytes;
+  union dvm_value kind= {0};
+  dvm_get_field(vm,self,"kind","I",&kind);
+  EVP_PKEY *key=!bytes ? NULL : kind.i==2 ? d2i_PUBKEY(NULL,&cursor,n) : d2i_AutoPrivateKey(NULL,&cursor,n);
+  unsigned char *der=NULL;
+  int size=key ? i2d_KeyParams(key,&der) : 0;
+  cursor=der;
+  EC_GROUP *group=size>0 ? d2i_ECPKParameters(NULL,&cursor,size) : NULL;
+  OPENSSL_free(der);
+  EVP_PKEY_free(key);
+  if(!group) {
+    dvm__throw(vm,"java/security/ProviderException","Cannot read EC parameters");
+    return false;
+  }
+  BIGNUM *p=BN_new(),*a=BN_new(),*b=BN_new(),*order=BN_new(),*h=BN_new(),*x=BN_new(),*y=BN_new();
+  bool good=p && a && b && order && h && x && y && EC_GROUP_get_curve(group,p,a,b,NULL) &&
+            EC_GROUP_get_order(group,order,NULL) && EC_GROUP_get_cofactor(group,h,NULL) &&
+            EC_POINT_get_affine_coordinates(group,EC_GROUP_get0_generator(group),x,y,NULL);
+  dvm_ref result=good ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECParameterSpec")) : 0;
+  dvm_pin(vm,result);
+  dvm_ref curve=result ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/EllipticCurve")) : 0;
+  if(curve)dvm_set_field(vm,result,"curve","Ljava/security/spec/EllipticCurve;",(union dvm_value) {
+    .l=curve
+  });
+  dvm_ref field=curve ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECFieldFp")) : 0;
+  if(field)dvm_set_field(vm,curve,"field","Ljava/security/spec/ECField;",(union dvm_value) {
+    .l=field
+  });
+  good=good && field && ec_group_bn(vm,field,"p",p) && ec_group_bn(vm,curve,"a",a) && ec_group_bn(vm,curve,"b",b) && ec_group_bn(vm,result,"order",order);
+  dvm_ref point=good ? dvm_new_object(vm,dvm_find_class(vm,"java/security/spec/ECPoint")) : 0;
+  if(point)dvm_set_field(vm,result,"generator","Ljava/security/spec/ECPoint;",(union dvm_value) {
+    .l=point
+  });
+  good=good && point && ec_group_bn(vm,point,"x",x) && ec_group_bn(vm,point,"y",y);
+  if(good)dvm_set_field(vm,result,"cofactor","I",(union dvm_value) {
+    .i=(int32_t)BN_get_word(h)
+  });
+  const unsigned char *seed=EC_GROUP_get0_seed(group);
+  size_t seed_size=EC_GROUP_get_seed_len(group);
+  if(good && seed_size)dvm_set_field(vm,curve,"seed","[B",(union dvm_value) {
+    .l=make_bytes(vm,seed,(uint32_t)seed_size)
+  });
+  dvm_unpin(vm,result);
+  BN_free(p);
+  BN_free(a);
+  BN_free(b);
+  BN_free(order);
+  BN_free(h);
+  BN_free(x);
+  BN_free(y);
+  EC_GROUP_free(group);
+  if(!good)return false;
+  RETL(result);
 }
-static const struct rt_field rt_ec_gen_fields[]={{"name","Ljava/lang/String;"},F_END};
-static const struct rt_method rt_ec_gen[]={M("<init>","(Ljava/lang/String;)V",ec_gen_init),M("getName","()Ljava/lang/String;",ec_name),M_END};
-static const struct rt_field rt_ec_point_fields[]={{"x","Ljava/math/BigInteger;"},{"y","Ljava/math/BigInteger;"},F_END};
-static const struct rt_method rt_ec_point[]={M("<init>","(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",ec_point_init),M("getAffineX","()Ljava/math/BigInteger;",ec_value),M("getAffineY","()Ljava/math/BigInteger;",ec_value),M_END};
-static const struct rt_field rt_ec_field_fields[]={{"p","Ljava/math/BigInteger;"},F_END};
-static const struct rt_method rt_ec_field[]={M("<init>","(Ljava/math/BigInteger;)V",ec_field_init),M("getP","()Ljava/math/BigInteger;",ec_value),M("getFieldSize","()I",ec_field_size),M_END};
-static const struct rt_field rt_ec_curve_fields[]={{"field","Ljava/security/spec/ECField;"},{"a","Ljava/math/BigInteger;"},{"b","Ljava/math/BigInteger;"},{"seed","[B"},F_END};
-static const struct rt_method rt_ec_curve[]={M("<init>","(Ljava/security/spec/ECField;Ljava/math/BigInteger;Ljava/math/BigInteger;)V",ec_curve_init),M("<init>","(Ljava/security/spec/ECField;Ljava/math/BigInteger;Ljava/math/BigInteger;[B)V",ec_curve_init),M("getField","()Ljava/security/spec/ECField;",ec_value),M("getA","()Ljava/math/BigInteger;",ec_value),M("getB","()Ljava/math/BigInteger;",ec_value),M("getSeed","()[B",ec_value),M_END};
-static const struct rt_field rt_ec_params_fields[]={{"curve","Ljava/security/spec/EllipticCurve;"},{"generator","Ljava/security/spec/ECPoint;"},{"order","Ljava/math/BigInteger;"},{"cofactor","I"},F_END};
-static const struct rt_method rt_ec_params[]={M("<init>","(Ljava/security/spec/EllipticCurve;Ljava/security/spec/ECPoint;Ljava/math/BigInteger;I)V",ec_params_init),M("getCurve","()Ljava/security/spec/EllipticCurve;",ec_value),M("getGenerator","()Ljava/security/spec/ECPoint;",ec_value),M("getOrder","()Ljava/math/BigInteger;",ec_value),M("getCofactor","()I",ec_value),M_END};
-static const struct rt_method rt_ec_public_key[]={M("getW","()Ljava/security/spec/ECPoint;",ec_public_point),M("getParams","()Ljava/security/spec/ECParameterSpec;",ec_key_params),M_END};
-static const struct rt_method rt_ec_private_key[]={M("getS","()Ljava/math/BigInteger;",ec_private_scalar),M("getParams","()Ljava/security/spec/ECParameterSpec;",ec_key_params),M_END};
-static const char *const rt_ec_public_ifaces[]={"Ljava/security/interfaces/ECPublicKey;","Ljava/security/interfaces/ECKey;",NULL};
-static const char *const rt_ec_private_ifaces[]={"Ljava/security/interfaces/ECPrivateKey;","Ljava/security/interfaces/ECKey;",NULL};
-static const char *const rt_ec_field_ifaces[]={"Ljava/security/spec/ECField;",NULL};
-static const char *const rt_ec_param_ifaces[]={"Ljava/security/spec/AlgorithmParameterSpec;",NULL};
+static const struct rt_field rt_ec_gen_fields[]= {{"name","Ljava/lang/String;"},F_END};
+static const struct rt_method rt_ec_gen[]= {M("<init>","(Ljava/lang/String;)V",ec_gen_init),M("getName","()Ljava/lang/String;",ec_name),M_END};
+static const struct rt_field rt_ec_point_fields[]= {{"x","Ljava/math/BigInteger;"},{"y","Ljava/math/BigInteger;"},F_END};
+static const struct rt_method rt_ec_point[]= {M("<init>","(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",ec_point_init),M("getAffineX","()Ljava/math/BigInteger;",ec_value),M("getAffineY","()Ljava/math/BigInteger;",ec_value),M_END};
+static const struct rt_field rt_ec_field_fields[]= {{"p","Ljava/math/BigInteger;"},F_END};
+static const struct rt_method rt_ec_field[]= {M("<init>","(Ljava/math/BigInteger;)V",ec_field_init),M("getP","()Ljava/math/BigInteger;",ec_value),M("getFieldSize","()I",ec_field_size),M_END};
+static const struct rt_field rt_ec_curve_fields[]= {{"field","Ljava/security/spec/ECField;"},{"a","Ljava/math/BigInteger;"},{"b","Ljava/math/BigInteger;"},{"seed","[B"},F_END};
+static const struct rt_method rt_ec_curve[]= {M("<init>","(Ljava/security/spec/ECField;Ljava/math/BigInteger;Ljava/math/BigInteger;)V",ec_curve_init),M("<init>","(Ljava/security/spec/ECField;Ljava/math/BigInteger;Ljava/math/BigInteger;[B)V",ec_curve_init),M("getField","()Ljava/security/spec/ECField;",ec_value),M("getA","()Ljava/math/BigInteger;",ec_value),M("getB","()Ljava/math/BigInteger;",ec_value),M("getSeed","()[B",ec_value),M_END};
+static const struct rt_field rt_ec_params_fields[]= {{"curve","Ljava/security/spec/EllipticCurve;"},{"generator","Ljava/security/spec/ECPoint;"},{"order","Ljava/math/BigInteger;"},{"cofactor","I"},F_END};
+static const struct rt_method rt_ec_params[]= {M("<init>","(Ljava/security/spec/EllipticCurve;Ljava/security/spec/ECPoint;Ljava/math/BigInteger;I)V",ec_params_init),M("getCurve","()Ljava/security/spec/EllipticCurve;",ec_value),M("getGenerator","()Ljava/security/spec/ECPoint;",ec_value),M("getOrder","()Ljava/math/BigInteger;",ec_value),M("getCofactor","()I",ec_value),M_END};
+static const struct rt_method rt_ec_public_key[]= {M("getW","()Ljava/security/spec/ECPoint;",ec_public_point),M("getParams","()Ljava/security/spec/ECParameterSpec;",ec_key_params),M_END};
+static const struct rt_method rt_ec_private_key[]= {M("getS","()Ljava/math/BigInteger;",ec_private_scalar),M("getParams","()Ljava/security/spec/ECParameterSpec;",ec_key_params),M_END};
+static const char *const rt_ec_public_ifaces[]= {"Ljava/security/interfaces/ECPublicKey;","Ljava/security/interfaces/ECKey;",NULL};
+static const char *const rt_ec_private_ifaces[]= {"Ljava/security/interfaces/ECPrivateKey;","Ljava/security/interfaces/ECKey;",NULL};
+static const char *const rt_ec_field_ifaces[]= {"Ljava/security/spec/ECField;",NULL};
+static const char *const rt_ec_param_ifaces[]= {"Ljava/security/spec/AlgorithmParameterSpec;",NULL};
 /* ======== end dvm_ec.h ======== */
 
 /* Software RSA uses the crypto backend already linked by the runtime.
@@ -2717,151 +3222,190 @@ static bool kpg_instance(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   if (!ARG(0).l) {
-      dvm__throw(vm, "java/lang/NullPointerException", "algorithm");
-      return false;
-   }
-   const char *name = dvm_string_utf8(vm, ARG(0).l);
-   if (!name || (strcasecmp(name,"RSA") && strcasecmp(name,"EC"))) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", name ? name : "");
-      return false;
-   }
-   dvm_ref generator = dvm_new_object(vm,
-      dvm__class_by_desc(vm, "Ljava/security/KeyPairGenerator;"));
-   (void)dvm_set_field(vm, generator, "algorithm", "Ljava/lang/String;",
-      (union dvm_value){.l = dvm_new_string(vm,!strcasecmp(name,"EC") ? "EC" : "RSA")});
-   (void)dvm_set_field(vm, generator, "keySize", "I", (union dvm_value){.i = !strcasecmp(name,"EC") ? 256 : 2048});
-   if(!strcasecmp(name,"EC")){EC_GROUP *group=EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);bool good=group && ec_store_group(vm,generator,group);EC_GROUP_free(group);if(!good)return false;}
-   RETL(generator);
+  (void)self;
+  (void)nargs;
+  if (!ARG(0).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "algorithm");
+    return false;
+  }
+  const char *name = dvm_string_utf8(vm, ARG(0).l);
+  if (!name || (strcasecmp(name,"RSA") && strcasecmp(name,"EC"))) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", name ? name : "");
+    return false;
+  }
+  dvm_ref generator = dvm_new_object(vm,
+                                     dvm__class_by_desc(vm, "Ljava/security/KeyPairGenerator;"));
+  (void)dvm_set_field(vm, generator, "algorithm", "Ljava/lang/String;",
+  (union dvm_value) {
+    .l = dvm_new_string(vm,!strcasecmp(name,"EC") ? "EC" : "RSA")
+  });
+  (void)dvm_set_field(vm, generator, "keySize", "I", (union dvm_value) {
+    .i = !strcasecmp(name,"EC") ? 256 : 2048
+  });
+  if(!strcasecmp(name,"EC")) {
+    EC_GROUP *group=EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    bool good=group && ec_store_group(vm,generator,group);
+    EC_GROUP_free(group);
+    if(!good)return false;
+  }
+  RETL(generator);
 }
 
 static bool kpg_initialize(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   int bits = ARG(0).i;
-   union dvm_value algorithm={0};dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
-   const char *name=dvm_string_utf8(vm,algorithm.l);
-   if(name && !strcasecmp(name,"EC")){
-      int nid=ec_size_nid(bits);EC_GROUP *group=nid==NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
-      if(!group){dvm__throw(vm,"java/security/InvalidParameterException","Unknown EC key size %d",bits);return false;}
-      bool good=ec_store_group(vm,self,group);EC_GROUP_free(group);if(!good)return false;
-      dvm_set_field(vm,self,"keySize","I",(union dvm_value){.i=bits});RETV();
-   }
-   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
-   int valid = bits > 0 && ctx && EVP_PKEY_keygen_init(ctx) > 0 &&
-      EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits) > 0;
-   EVP_PKEY_CTX_free(ctx);
-   if (!valid) {
-      dvm__throw(vm, "java/security/InvalidParameterException", "RSA key size %d", bits);
+  (void)nargs;
+  (void)out;
+  int bits = ARG(0).i;
+  union dvm_value algorithm= {0};
+  dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+  const char *name=dvm_string_utf8(vm,algorithm.l);
+  if(name && !strcasecmp(name,"EC")) {
+    int nid=ec_size_nid(bits);
+    EC_GROUP *group=nid==NID_undef ? NULL : EC_GROUP_new_by_curve_name(nid);
+    if(!group) {
+      dvm__throw(vm,"java/security/InvalidParameterException","Unknown EC key size %d",bits);
       return false;
-   }
-   (void)dvm_set_field(vm, self, "keySize", "I", (union dvm_value){.i = bits});
-   RETV();
+    }
+    bool good=ec_store_group(vm,self,group);
+    EC_GROUP_free(group);
+    if(!good)return false;
+    dvm_set_field(vm,self,"keySize","I",(union dvm_value) {
+      .i=bits
+    });
+    RETV();
+  }
+  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+  int valid = bits > 0 && ctx && EVP_PKEY_keygen_init(ctx) > 0 &&
+              EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, bits) > 0;
+  EVP_PKEY_CTX_free(ctx);
+  if (!valid) {
+    dvm__throw(vm, "java/security/InvalidParameterException", "RSA key size %d", bits);
+    return false;
+  }
+  (void)dvm_set_field(vm, self, "keySize", "I", (union dvm_value) {
+    .i = bits
+  });
+  RETV();
 }
 
 static bool kpg_initialize_spec(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-   (void)nargs;union dvm_value algorithm={0};dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
-   const char *name=dvm_string_utf8(vm,algorithm.l);
-   EC_GROUP *group=name && !strcasecmp(name,"EC") ? ec_group_from_spec(vm,ARG(0).l) : NULL;
-   if(!group){dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","Unsupported key generation parameters");return false;}
-   bool good=ec_store_group(vm,self,group);EC_GROUP_free(group);if(!good)return false;RETV();
+  (void)nargs;
+  union dvm_value algorithm= {0};
+  dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+  const char *name=dvm_string_utf8(vm,algorithm.l);
+  EC_GROUP *group=name && !strcasecmp(name,"EC") ? ec_group_from_spec(vm,ARG(0).l) : NULL;
+  if(!group) {
+    dvm__throw(vm,"java/security/InvalidAlgorithmParameterException","Unsupported key generation parameters");
+    return false;
+  }
+  bool good=ec_store_group(vm,self,group);
+  EC_GROUP_free(group);
+  if(!good)return false;
+  RETV();
 }
 
 static bool kp_init(struct dvm *vm, dvm_ref self,
                     const union dvm_value *args, int nargs, union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   (void)dvm_set_field(vm, self, "publicKey", "Ljava/security/PublicKey;", ARG(0));
-   (void)dvm_set_field(vm, self, "privateKey", "Ljava/security/PrivateKey;", ARG(1));
-   RETV();
+  (void)nargs;
+  (void)out;
+  (void)dvm_set_field(vm, self, "publicKey", "Ljava/security/PublicKey;", ARG(0));
+  (void)dvm_set_field(vm, self, "privateKey", "Ljava/security/PrivateKey;", ARG(1));
+  RETV();
 }
 
 static bool kp_public(struct dvm *vm, dvm_ref self,
                       const union dvm_value *args, int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   (void)dvm_get_field(vm, self, "publicKey", "Ljava/security/PublicKey;", out);
-   return true;
+  (void)args;
+  (void)nargs;
+  (void)dvm_get_field(vm, self, "publicKey", "Ljava/security/PublicKey;", out);
+  return true;
 }
 
 static bool kp_private(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   (void)dvm_get_field(vm, self, "privateKey", "Ljava/security/PrivateKey;", out);
-   return true;
+  (void)args;
+  (void)nargs;
+  (void)dvm_get_field(vm, self, "privateKey", "Ljava/security/PrivateKey;", out);
+  return true;
 }
 
 static bool kpg_generate(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs, union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value bits = {0},algorithm={0},parameters={0};
-   (void)dvm_get_field(vm, self, "keySize", "I", &bits);
-   dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
-   bool ec=!strcasecmp(dvm_string_utf8(vm,algorithm.l),"EC");
-   dvm_get_field(vm,self,"parameters","[B",&parameters);
-   uint32_t parameter_size=parameters.l ? dvm_array_length(vm,parameters.l) : 0;
-   const unsigned char *parameter_bytes=parameters.l ? dvm_array_data(vm,parameters.l) : NULL;
-   EVP_PKEY *domain=ec && parameter_bytes ? d2i_KeyParams(EVP_PKEY_EC,NULL,&parameter_bytes,parameter_size) : NULL;
-   unsigned depth = dvm_gil_unlock_all(vm);
-   EVP_PKEY_CTX *ctx=ec ? (domain ? EVP_PKEY_CTX_new(domain,NULL) : NULL) : EVP_PKEY_CTX_new_id(EVP_PKEY_RSA,NULL);
-   EVP_PKEY *key = NULL;
-   int ok=ctx && EVP_PKEY_keygen_init(ctx)>0 && (ec || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx,bits.i)>0) && EVP_PKEY_keygen(ctx,&key)>0;
-   EVP_PKEY_free(domain);
-   EVP_PKEY_CTX_free(ctx);
-   unsigned char *pub = NULL, *priv = NULL;
-   PKCS8_PRIV_KEY_INFO *p8 = ok ? EVP_PKEY2PKCS8(key) : NULL;
-   int pub_len = ok ? i2d_PUBKEY(key, &pub) : 0;
-   int priv_len = p8 ? i2d_PKCS8_PRIV_KEY_INFO(p8, &priv) : 0;
-   PKCS8_PRIV_KEY_INFO_free(p8);
-   EVP_PKEY_free(key);
-   dvm_gil_relock(vm, depth);
-   if (!ok || pub_len <= 0 || priv_len <= 0) {
-      OPENSSL_free(pub); OPENSSL_free(priv);
-      dvm__throw(vm, "java/security/ProviderException", "Key pair generation failed");
-      return false;
-   }
-   const char *key_algorithm=ec ? "EC" : "RSA";
-   dvm_ref public_key=key_make(vm,kf_key_class(key_algorithm,2),make_bytes(vm,pub,(uint32_t)pub_len),key_algorithm,2);
-   dvm_pin(vm,public_key);
-   dvm_ref private_key=key_make(vm,kf_key_class(key_algorithm,1),make_bytes(vm,priv,(uint32_t)priv_len),key_algorithm,1);
-   dvm_pin(vm,private_key);
-   OPENSSL_free(pub); OPENSSL_clear_free(priv, (size_t)priv_len);
-   dvm_ref pair = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/security/KeyPair;"));
-   union dvm_value keys[] = {{.l = public_key}, {.l = private_key}}, ignored;
-   bool good=pair && public_key && private_key && kp_init(vm,pair,keys,2,&ignored);
-   dvm_unpin(vm,public_key);dvm_unpin(vm,private_key);if(!good)return false;
-   RETL(pair);
+  (void)args;
+  (void)nargs;
+  union dvm_value bits = {0},algorithm= {0},parameters= {0};
+  (void)dvm_get_field(vm, self, "keySize", "I", &bits);
+  dvm_get_field(vm,self,"algorithm","Ljava/lang/String;",&algorithm);
+  bool ec=!strcasecmp(dvm_string_utf8(vm,algorithm.l),"EC");
+  dvm_get_field(vm,self,"parameters","[B",&parameters);
+  uint32_t parameter_size=parameters.l ? dvm_array_length(vm,parameters.l) : 0;
+  const unsigned char *parameter_bytes=parameters.l ? dvm_array_data(vm,parameters.l) : NULL;
+  EVP_PKEY *domain=ec && parameter_bytes ? d2i_KeyParams(EVP_PKEY_EC,NULL,&parameter_bytes,parameter_size) : NULL;
+  unsigned depth = dvm_gil_unlock_all(vm);
+  EVP_PKEY_CTX *ctx=ec ? (domain ? EVP_PKEY_CTX_new(domain,NULL) : NULL) : EVP_PKEY_CTX_new_id(EVP_PKEY_RSA,NULL);
+  EVP_PKEY *key = NULL;
+  int ok=ctx && EVP_PKEY_keygen_init(ctx)>0 && (ec || EVP_PKEY_CTX_set_rsa_keygen_bits(ctx,bits.i)>0) && EVP_PKEY_keygen(ctx,&key)>0;
+  EVP_PKEY_free(domain);
+  EVP_PKEY_CTX_free(ctx);
+  unsigned char *pub = NULL, *priv = NULL;
+  PKCS8_PRIV_KEY_INFO *p8 = ok ? EVP_PKEY2PKCS8(key) : NULL;
+  int pub_len = ok ? i2d_PUBKEY(key, &pub) : 0;
+  int priv_len = p8 ? i2d_PKCS8_PRIV_KEY_INFO(p8, &priv) : 0;
+  PKCS8_PRIV_KEY_INFO_free(p8);
+  EVP_PKEY_free(key);
+  dvm_gil_relock(vm, depth);
+  if (!ok || pub_len <= 0 || priv_len <= 0) {
+    OPENSSL_free(pub);
+    OPENSSL_free(priv);
+    dvm__throw(vm, "java/security/ProviderException", "Key pair generation failed");
+    return false;
+  }
+  const char *key_algorithm=ec ? "EC" : "RSA";
+  dvm_ref public_key=key_make(vm,kf_key_class(key_algorithm,2),make_bytes(vm,pub,(uint32_t)pub_len),key_algorithm,2);
+  dvm_pin(vm,public_key);
+  dvm_ref private_key=key_make(vm,kf_key_class(key_algorithm,1),make_bytes(vm,priv,(uint32_t)priv_len),key_algorithm,1);
+  dvm_pin(vm,private_key);
+  OPENSSL_free(pub);
+  OPENSSL_clear_free(priv, (size_t)priv_len);
+  dvm_ref pair = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljava/security/KeyPair;"));
+  union dvm_value keys[] = {{.l = public_key}, {.l = private_key}}, ignored;
+  bool good=pair && public_key && private_key && kp_init(vm,pair,keys,2,&ignored);
+  dvm_unpin(vm,public_key);
+  dvm_unpin(vm,private_key);
+  if(!good)return false;
+  RETL(pair);
 }
 
 static const struct rt_field rt_kpg_fields[] = {
-   {"algorithm", "Ljava/lang/String;"}, {"keySize", "I"}, {"parameters","[B"}, F_END
+  {"algorithm", "Ljava/lang/String;"}, {"keySize", "I"}, {"parameters","[B"}, F_END
 };
 static const struct rt_field rt_kp_fields[] = {
-   {"publicKey", "Ljava/security/PublicKey;"},
-   {"privateKey", "Ljava/security/PrivateKey;"}, F_END
+  {"publicKey", "Ljava/security/PublicKey;"},
+  {"privateKey", "Ljava/security/PrivateKey;"}, F_END
 };
 static const struct rt_method rt_kpg[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;", kpg_instance),
-   SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyPairGenerator;", kpg_instance),
-   SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/KeyPairGenerator;", kpg_instance),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M("initialize", "(I)V", kpg_initialize),
-   M("initialize", "(ILjava/security/SecureRandom;)V", kpg_initialize),
-   M("initialize","(Ljava/security/spec/AlgorithmParameterSpec;)V",kpg_initialize_spec),
-   M("initialize","(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",kpg_initialize_spec),
-   M("generateKeyPair", "()Ljava/security/KeyPair;", kpg_generate),
-   M("genKeyPair", "()Ljava/security/KeyPair;", kpg_generate), M_END
+  SM("getInstance", "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;", kpg_instance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyPairGenerator;", kpg_instance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/KeyPairGenerator;", kpg_instance),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M("initialize", "(I)V", kpg_initialize),
+  M("initialize", "(ILjava/security/SecureRandom;)V", kpg_initialize),
+  M("initialize","(Ljava/security/spec/AlgorithmParameterSpec;)V",kpg_initialize_spec),
+  M("initialize","(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",kpg_initialize_spec),
+  M("generateKeyPair", "()Ljava/security/KeyPair;", kpg_generate),
+  M("genKeyPair", "()Ljava/security/KeyPair;", kpg_generate), M_END
 };
 static const struct rt_method rt_kp[] = {
-   M("<init>", "(Ljava/security/PublicKey;Ljava/security/PrivateKey;)V", kp_init),
-   M("getPublic", "()Ljava/security/PublicKey;", kp_public),
-   M("getPrivate", "()Ljava/security/PrivateKey;", kp_private), M_END
+  M("<init>", "(Ljava/security/PublicKey;Ljava/security/PrivateKey;)V", kp_init),
+  M("getPublic", "()Ljava/security/PublicKey;", kp_public),
+  M("getPrivate", "()Ljava/security/PrivateKey;", kp_private), M_END
 };
 
 /* android.security.keystore.KeyGenParameterSpec(+Builder).
@@ -2875,84 +3419,86 @@ static bool kgs_builder_init(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   union dvm_value alias = { .l = ARG(0).l }, purposes = { .i = ARG(1).i };
-   (void)dvm_set_field(vm, self, "keystoreAlias", "Ljava/lang/String;", alias);
-   (void)dvm_set_field(vm, self, "purposes", "I", purposes);
-   RETV();
+  (void)nargs;
+  (void)out;
+  union dvm_value alias = { .l = ARG(0).l }, purposes = { .i = ARG(1).i };
+  (void)dvm_set_field(vm, self, "keystoreAlias", "Ljava/lang/String;", alias);
+  (void)dvm_set_field(vm, self, "purposes", "I", purposes);
+  RETV();
 }
 
 static bool kgs_builder_build(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   struct dvm_class *c = dvm__class_by_desc(vm,
-      "Landroid/security/keystore/KeyGenParameterSpec;");
-   dvm_ref spec = c ? dvm_new_object(vm, c) : 0;
-   if (!spec) RETL(0);
-   static const char *const copy[] = {
-      "keystoreAlias", "blockModes", "encryptionPaddings", "digests",
-      "signaturePaddings", NULL
-   };
-   for (int i = 0; copy[i]; ++i) {
-      union dvm_value v = { 0 };
-      const char *sig = (i == 0) ? "Ljava/lang/String;" : "[Ljava/lang/String;";
-      if (dvm_get_field(vm, self, copy[i], sig, &v) && v.l)
-         (void)dvm_set_field(vm, spec, copy[i], sig, v);
-   }
-   static const char *const copy_int[] = {
-      "purposes", "keySize", "randomizedEncryptionRequired", "randomizedSet",
-      "userAuthenticationRequired", NULL
-   };
-   for (int i = 0; copy_int[i]; ++i) {
-      union dvm_value v = { 0 };
-      (void)dvm_get_field(vm, self, copy_int[i], "I", &v);
-      (void)dvm_set_field(vm, spec, copy_int[i], "I", v);
-   }
-   RETL(spec);
+  (void)args;
+  (void)nargs;
+  struct dvm_class *c = dvm__class_by_desc(vm,
+                        "Landroid/security/keystore/KeyGenParameterSpec;");
+  dvm_ref spec = c ? dvm_new_object(vm, c) : 0;
+  if (!spec) RETL(0);
+  static const char *const copy[] = {
+    "keystoreAlias", "blockModes", "encryptionPaddings", "digests",
+    "signaturePaddings", NULL
+  };
+  for (int i = 0; copy[i]; ++i) {
+    union dvm_value v = { 0 };
+    const char *sig = (i == 0) ? "Ljava/lang/String;" : "[Ljava/lang/String;";
+    if (dvm_get_field(vm, self, copy[i], sig, &v) && v.l)
+      (void)dvm_set_field(vm, spec, copy[i], sig, v);
+  }
+  static const char *const copy_int[] = {
+    "purposes", "keySize", "randomizedEncryptionRequired", "randomizedSet",
+    "userAuthenticationRequired", NULL
+  };
+  for (int i = 0; copy_int[i]; ++i) {
+    union dvm_value v = { 0 };
+    (void)dvm_get_field(vm, self, copy_int[i], "I", &v);
+    (void)dvm_set_field(vm, spec, copy_int[i], "I", v);
+  }
+  RETL(spec);
 }
 
 static bool kgs_set_block_modes(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out)
 {
-   (void)nargs;
-   union dvm_value v = { .l = ARG(0).l };
-   (void)dvm_set_field(vm, self, "blockModes", "[Ljava/lang/String;", v);
-   RETL(self);
+  (void)nargs;
+  union dvm_value v = { .l = ARG(0).l };
+  (void)dvm_set_field(vm, self, "blockModes", "[Ljava/lang/String;", v);
+  RETL(self);
 }
 
 static bool kgs_set_enc_paddings(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
 {
-   (void)nargs;
-   union dvm_value v = { .l = ARG(0).l };
-   (void)dvm_set_field(vm, self, "encryptionPaddings", "[Ljava/lang/String;", v);
-   RETL(self);
+  (void)nargs;
+  union dvm_value v = { .l = ARG(0).l };
+  (void)dvm_set_field(vm, self, "encryptionPaddings", "[Ljava/lang/String;", v);
+  RETL(self);
 }
 
 static bool kgs_set_digests(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
-   (void)nargs;
-   union dvm_value v = { .l = ARG(0).l };
-   (void)dvm_set_field(vm, self, "digests", "[Ljava/lang/String;", v);
-   RETL(self);
+  (void)nargs;
+  union dvm_value v = { .l = ARG(0).l };
+  (void)dvm_set_field(vm, self, "digests", "[Ljava/lang/String;", v);
+  RETL(self);
 }
 
 static bool kgs_set_key_size(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)nargs;
-   /* The size has to survive into the Spec: KeyGenerator.init(spec) reads it
-    * to decide how many bits to draw, and a zero there is not "the default",
-    * it is an InvalidAlgorithmParameterException on a real device. */
-   rt_set_int(vm, self, "keySize", ARG(0).i);
-   RETL(self);
+  (void)nargs;
+  /* The size has to survive into the Spec: KeyGenerator.init(spec) reads it
+   * to decide how many bits to draw, and a zero there is not "the default",
+   * it is an InvalidAlgorithmParameterException on a real device. */
+  rt_set_int(vm, self, "keySize", ARG(0).i);
+  RETL(self);
 }
 
 /* Android's defaults: randomized encryption is required unless the caller
@@ -2962,147 +3508,152 @@ static bool kgs_set_randomized(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
 {
-   (void)nargs;
-   rt_set_int(vm, self, "randomizedEncryptionRequired", ARG(0).i ? 1 : 0);
-   rt_set_int(vm, self, "randomizedSet", 1);
-   RETL(self);
+  (void)nargs;
+  rt_set_int(vm, self, "randomizedEncryptionRequired", ARG(0).i ? 1 : 0);
+  rt_set_int(vm, self, "randomizedSet", 1);
+  RETL(self);
 }
 
 static bool kgs_set_user_auth(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
-   (void)nargs;
-   rt_set_int(vm, self, "userAuthenticationRequired", ARG(0).i ? 1 : 0);
-   RETL(self);
+  (void)nargs;
+  rt_set_int(vm, self, "userAuthenticationRequired", ARG(0).i ? 1 : 0);
+  RETL(self);
 }
 
 static bool kgs_is_randomized(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   if (!rt_get_int(vm, self, "randomizedSet")) RETI(1);   /* Android default */
-   RETI(rt_get_int(vm, self, "randomizedEncryptionRequired") ? 1 : 0);
+  (void)args;
+  (void)nargs;
+  if (!rt_get_int(vm, self, "randomizedSet")) RETI(1);   /* Android default */
+  RETI(rt_get_int(vm, self, "randomizedEncryptionRequired") ? 1 : 0);
 }
 
 static bool kgs_is_user_auth(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   RETI(rt_get_int(vm, self, "userAuthenticationRequired") ? 1 : 0);
+  (void)args;
+  (void)nargs;
+  RETI(rt_get_int(vm, self, "userAuthenticationRequired") ? 1 : 0);
 }
 
 static bool kgs_set_sig_paddings(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
 {
-   (void)nargs;
-   union dvm_value v = { .l = ARG(0).l };
-   (void)dvm_set_field(vm, self, "signaturePaddings", "[Ljava/lang/String;", v);
-   RETL(self);
+  (void)nargs;
+  union dvm_value v = { .l = ARG(0).l };
+  (void)dvm_set_field(vm, self, "signaturePaddings", "[Ljava/lang/String;", v);
+  RETL(self);
 }
 
 static const struct rt_field rt_kgs_builder_fields[] = {
-   { "keystoreAlias", "Ljava/lang/String;" },
-   { "purposes", "I" },
-   { "keySize", "I" },
-   { "randomizedEncryptionRequired", "I" }, { "randomizedSet", "I" },
-   { "userAuthenticationRequired", "I" },
-   { "blockModes", "[Ljava/lang/String;" },
-   { "encryptionPaddings", "[Ljava/lang/String;" },
-   { "digests", "[Ljava/lang/String;" },
-   { "signaturePaddings", "[Ljava/lang/String;" },
-   F_END
+  { "keystoreAlias", "Ljava/lang/String;" },
+  { "purposes", "I" },
+  { "keySize", "I" },
+  { "randomizedEncryptionRequired", "I" }, { "randomizedSet", "I" },
+  { "userAuthenticationRequired", "I" },
+  { "blockModes", "[Ljava/lang/String;" },
+  { "encryptionPaddings", "[Ljava/lang/String;" },
+  { "digests", "[Ljava/lang/String;" },
+  { "signaturePaddings", "[Ljava/lang/String;" },
+  F_END
 };
 
 static const struct rt_method rt_kgs_builder[] = {
-   M("<init>", "(Ljava/lang/String;I)V", kgs_builder_init),
-   M("setBlockModes",
-     "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_block_modes),
-   M("setEncryptionPaddings",
-     "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_enc_paddings),
-   M("setDigests",
-     "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_digests),
-   M("setKeySize", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_key_size),
-   M("setSignaturePaddings",
-     "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_sig_paddings),
-   M("setRandomizedEncryptionRequired",
-     "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_randomized),
-   M("setUserAuthenticationRequired",
-     "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
-     kgs_set_user_auth),
-   /* Settings that do not change what this software keystore generates: the
-    * Builder keeps its place in a chained call and says nothing else. */
-   M("setAttestationChallenge", "([B)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setIsStrongBoxBacked", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setCertificateSubject", "(Ljavax/security/auth/x500/X500Principal;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setCertificateSerialNumber", "(Ljava/math/BigInteger;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setCertificateNotBefore", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setCertificateNotAfter", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setKeyValidityStart", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setKeyValidityEnd", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setKeyValidityForOriginationEnd", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setKeyValidityForConsumptionEnd", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setUserAuthenticationValidityDurationSeconds", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setAlgorithmParameterSpec", "(Ljava/security/spec/AlgorithmParameterSpec;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setInvalidatedByBiometricEnrollment", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setUserPresenceRequired", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setUnlockedDeviceRequired", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setDevicePropertiesAttestationIncluded", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setMgf1Digests", "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("setUniqueIdIncluded", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
-   M("build", "()Landroid/security/keystore/KeyGenParameterSpec;",
-     kgs_builder_build),
-   M_END,
+  M("<init>", "(Ljava/lang/String;I)V", kgs_builder_init),
+  M("setBlockModes",
+  "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_block_modes),
+  M("setEncryptionPaddings",
+  "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_enc_paddings),
+  M("setDigests",
+  "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_digests),
+  M("setKeySize", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_key_size),
+  M("setSignaturePaddings",
+  "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_sig_paddings),
+  M("setRandomizedEncryptionRequired",
+  "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_randomized),
+  M("setUserAuthenticationRequired",
+  "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+  kgs_set_user_auth),
+  /* Settings that do not change what this software keystore generates: the
+   * Builder keeps its place in a chained call and says nothing else. */
+  M("setAttestationChallenge", "([B)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setIsStrongBoxBacked", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setCertificateSubject", "(Ljavax/security/auth/x500/X500Principal;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setCertificateSerialNumber", "(Ljava/math/BigInteger;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setCertificateNotBefore", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setCertificateNotAfter", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setKeyValidityStart", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setKeyValidityEnd", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setKeyValidityForOriginationEnd", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setKeyValidityForConsumptionEnd", "(Ljava/util/Date;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setUserAuthenticationValidityDurationSeconds", "(I)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setAlgorithmParameterSpec", "(Ljava/security/spec/AlgorithmParameterSpec;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setInvalidatedByBiometricEnrollment", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setUserPresenceRequired", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setUnlockedDeviceRequired", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setDevicePropertiesAttestationIncluded", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setMgf1Digests", "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("setUniqueIdIncluded", "(Z)Landroid/security/keystore/KeyGenParameterSpec$Builder;", return_self),
+  M("build", "()Landroid/security/keystore/KeyGenParameterSpec;",
+  kgs_builder_build),
+  M_END,
 };
 
 static bool kgs_get_alias(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "keystoreAlias", "Ljava/lang/String;", &v);
-   RETL(v.l);
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "keystoreAlias", "Ljava/lang/String;", &v);
+  RETL(v.l);
 }
 
 static bool kgs_get_key_size(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   RETI(rt_get_int(vm, self, "keySize"));
+  (void)args;
+  (void)nargs;
+  RETI(rt_get_int(vm, self, "keySize"));
 }
 
 static const struct rt_field rt_kgs_fields[] = {
-   { "keystoreAlias", "Ljava/lang/String;" },
-   { "purposes", "I" },
-   { "keySize", "I" },
-   { "randomizedEncryptionRequired", "I" }, { "randomizedSet", "I" },
-   { "userAuthenticationRequired", "I" },
-   { "blockModes", "[Ljava/lang/String;" },
-   { "encryptionPaddings", "[Ljava/lang/String;" },
-   { "digests", "[Ljava/lang/String;" },
-   { "signaturePaddings", "[Ljava/lang/String;" },
-   F_END
+  { "keystoreAlias", "Ljava/lang/String;" },
+  { "purposes", "I" },
+  { "keySize", "I" },
+  { "randomizedEncryptionRequired", "I" }, { "randomizedSet", "I" },
+  { "userAuthenticationRequired", "I" },
+  { "blockModes", "[Ljava/lang/String;" },
+  { "encryptionPaddings", "[Ljava/lang/String;" },
+  { "digests", "[Ljava/lang/String;" },
+  { "signaturePaddings", "[Ljava/lang/String;" },
+  F_END
 };
 
 static bool kgs_get_purposes(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value v = { 0 };
-   (void)dvm_get_field(vm, self, "purposes", "I", &v);
-   RETI(v.i);
+  (void)args;
+  (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "purposes", "I", &v);
+  RETI(v.i);
 }
 
 /* androidx.security's MasterKeys.validate() reads every parameter back off the
@@ -3126,16 +3677,16 @@ KGS_GET_STR_ARRAY(kgs_get_sig_paddings, "signaturePaddings")
 #undef KGS_GET_STR_ARRAY
 
 static const struct rt_method rt_kgs[] = {
-   M("getKeystoreAlias", "()Ljava/lang/String;", kgs_get_alias),
-   M("getPurposes", "()I", kgs_get_purposes),
-   M("getKeySize", "()I", kgs_get_key_size),
-   M("getBlockModes", "()[Ljava/lang/String;", kgs_get_block_modes),
-   M("getEncryptionPaddings", "()[Ljava/lang/String;", kgs_get_enc_paddings),
-   M("getDigests", "()[Ljava/lang/String;", kgs_get_digests),
-   M("getSignaturePaddings", "()[Ljava/lang/String;", kgs_get_sig_paddings),
-   M("isRandomizedEncryptionRequired", "()Z", kgs_is_randomized),
-   M("isUserAuthenticationRequired", "()Z", kgs_is_user_auth),
-   M_END,
+  M("getKeystoreAlias", "()Ljava/lang/String;", kgs_get_alias),
+  M("getPurposes", "()I", kgs_get_purposes),
+  M("getKeySize", "()I", kgs_get_key_size),
+  M("getBlockModes", "()[Ljava/lang/String;", kgs_get_block_modes),
+  M("getEncryptionPaddings", "()[Ljava/lang/String;", kgs_get_enc_paddings),
+  M("getDigests", "()[Ljava/lang/String;", kgs_get_digests),
+  M("getSignaturePaddings", "()[Ljava/lang/String;", kgs_get_sig_paddings),
+  M("isRandomizedEncryptionRequired", "()Z", kgs_is_randomized),
+  M("isUserAuthenticationRequired", "()Z", kgs_is_user_auth),
+  M_END,
 };
 
 /* javax.crypto.KeyGenerator.
@@ -3148,141 +3699,144 @@ static const struct rt_method rt_kgs[] = {
  * host CSPRNG work and all VM mutation stays under the DVM interpreter lock;
  * no additional mutex is needed. */
 static const struct rt_field rt_key_generator_fields[] = {
-   { "algorithm", "Ljava/lang/String;" },
-   { "provider", "Ljava/lang/String;" },
-   { "params", "Ljava/security/spec/AlgorithmParameterSpec;" },
-   { "keySize", "I" },
-   F_END
+  { "algorithm", "Ljava/lang/String;" },
+  { "provider", "Ljava/lang/String;" },
+  { "params", "Ljava/security/spec/AlgorithmParameterSpec;" },
+  { "keySize", "I" },
+  F_END
 };
 
 static bool kg_supported(const char *algorithm)
 {
-   return algorithm &&
-      (!strcasecmp(algorithm, "AES") || !strcasecmp(algorithm, "DES") ||
-       !strcasecmp(algorithm, "DESede") ||
-       !strncasecmp(algorithm, "Hmac", 4));
+  return algorithm &&
+         (!strcasecmp(algorithm, "AES") || !strcasecmp(algorithm, "DES") ||
+          !strcasecmp(algorithm, "DESede") ||
+          !strncasecmp(algorithm, "Hmac", 4));
 }
 
 static int32_t kg_default_bits(const char *algorithm)
 {
-   if (algorithm && !strcasecmp(algorithm, "DES")) return 56;
-   if (algorithm && !strcasecmp(algorithm, "DESede")) return 168;
-   if (algorithm && !strncasecmp(algorithm, "Hmac", 4)) {
-      const char *digest = algorithm + 4;
-      const EVP_MD *md = EVP_get_digestbyname(digest);
-      int n = md ? EVP_MD_get_size(md) : 0;
-      if (n > 0) return n * 8;
-   }
-   return 128;
+  if (algorithm && !strcasecmp(algorithm, "DES")) return 56;
+  if (algorithm && !strcasecmp(algorithm, "DESede")) return 168;
+  if (algorithm && !strncasecmp(algorithm, "Hmac", 4)) {
+    const char *digest = algorithm + 4;
+    const EVP_MD *md = EVP_get_digestbyname(digest);
+    int n = md ? EVP_MD_get_size(md) : 0;
+    if (n > 0) return n * 8;
+  }
+  return 128;
 }
 
 static bool kg_getInstance(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)self;
-   const char *algorithm = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-   if (!kg_supported(algorithm)) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s",
-                 algorithm ? algorithm : "(null)");
-      return false;
-   }
-   struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/crypto/KeyGenerator;");
-   dvm_ref generator = c ? dvm_new_object(vm, c) : 0;
-   if (!generator) RETL(0);
-   union dvm_value v = { .l = dvm_new_string(vm, algorithm) };
-   (void)dvm_set_field(vm, generator, "algorithm", "Ljava/lang/String;", v);
-   if (nargs >= 2 && ARG(1).l) {
-      v.l = ARG(1).l;
-      (void)dvm_set_field(vm, generator, "provider", "Ljava/lang/String;", v);
-   }
-   v.i = kg_default_bits(algorithm);
-   (void)dvm_set_field(vm, generator, "keySize", "I", v);
-   RETL(generator);
+  (void)self;
+  const char *algorithm = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  if (!kg_supported(algorithm)) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s",
+               algorithm ? algorithm : "(null)");
+    return false;
+  }
+  struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/crypto/KeyGenerator;");
+  dvm_ref generator = c ? dvm_new_object(vm, c) : 0;
+  if (!generator) RETL(0);
+  union dvm_value v = { .l = dvm_new_string(vm, algorithm) };
+  (void)dvm_set_field(vm, generator, "algorithm", "Ljava/lang/String;", v);
+  if (nargs >= 2 && ARG(1).l) {
+    v.l = ARG(1).l;
+    (void)dvm_set_field(vm, generator, "provider", "Ljava/lang/String;", v);
+  }
+  v.i = kg_default_bits(algorithm);
+  (void)dvm_set_field(vm, generator, "keySize", "I", v);
+  RETL(generator);
 }
 
 static bool kg_init_bits(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   int32_t bits = ARG(0).i;
-   if (bits <= 0 || (bits & 7)) {
-      dvm__throw(vm, "java/security/InvalidParameterException",
-                 "invalid key size %d", bits);
-      return false;
-   }
-   union dvm_value v = { .i = bits };
-   (void)dvm_set_field(vm, self, "keySize", "I", v);
-   RETV();
+  (void)nargs;
+  (void)out;
+  int32_t bits = ARG(0).i;
+  if (bits <= 0 || (bits & 7)) {
+    dvm__throw(vm, "java/security/InvalidParameterException",
+               "invalid key size %d", bits);
+    return false;
+  }
+  union dvm_value v = { .i = bits };
+  (void)dvm_set_field(vm, self, "keySize", "I", v);
+  RETV();
 }
 
 static bool kg_init_spec(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   (void)nargs; (void)out;
-   dvm_ref params = ARG(0).l;
-   if (!params) {
-      dvm__throw(vm, "java/security/InvalidAlgorithmParameterException",
-                 "params == null");
-      return false;
-   }
-   union dvm_value v = { .l = params };
-   (void)dvm_set_field(vm, self, "params",
-                       "Ljava/security/spec/AlgorithmParameterSpec;", v);
-   union dvm_value size = { 0 };
-   if (dvm_get_field(vm, params, "keySize", "I", &size) && size.i > 0)
-      (void)dvm_set_field(vm, self, "keySize", "I", size);
-   RETV();
+  (void)nargs;
+  (void)out;
+  dvm_ref params = ARG(0).l;
+  if (!params) {
+    dvm__throw(vm, "java/security/InvalidAlgorithmParameterException",
+               "params == null");
+    return false;
+  }
+  union dvm_value v = { .l = params };
+  (void)dvm_set_field(vm, self, "params",
+                      "Ljava/security/spec/AlgorithmParameterSpec;", v);
+  union dvm_value size = { 0 };
+  if (dvm_get_field(vm, params, "keySize", "I", &size) && size.i > 0)
+    (void)dvm_set_field(vm, self, "keySize", "I", size);
+  RETV();
 }
 
 static bool kg_generateKey(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   union dvm_value algorithm = { 0 }, provider = { 0 }, params = { 0 };
-   union dvm_value size = { 0 }, alias = { 0 };
-   (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
-   (void)dvm_get_field(vm, self, "provider", "Ljava/lang/String;", &provider);
-   (void)dvm_get_field(vm, self, "params",
-                       "Ljava/security/spec/AlgorithmParameterSpec;", &params);
-   (void)dvm_get_field(vm, self, "keySize", "I", &size);
-   const char *alg = algorithm.l ? dvm_string_utf8(vm, algorithm.l) : NULL;
-   const char *prov = provider.l ? dvm_string_utf8(vm, provider.l) : NULL;
-   int32_t bits = size.i > 0 ? size.i : kg_default_bits(alg);
-   /* DES and DESede carry parity bits in their encoded keys. */
-   int32_t bytes = alg && !strcasecmp(alg, "DES") ? 8
-                 : alg && !strcasecmp(alg, "DESede") ? 24 : bits / 8;
-   if (bytes <= 0 || bytes > 1024) {
-      dvm__throw(vm, "java/security/InvalidParameterException",
-                 "invalid key size %d", bits);
-      return false;
-   }
-   dvm_ref encoded = dvm_new_array(vm, 'B', "B", (uint32_t)bytes);
-   struct dvm_object *array = encoded ? dvm__obj(vm, encoded) : NULL;
-   if (!array || !array->data || RAND_bytes(array->data, bytes) != 1) {
-      dvm__throw(vm, "java/security/ProviderException",
-                 "CSPRNG failed while generating %s", alg ? alg : "key");
-      return false;
-   }
-   dvm_ref key = key_make(vm, "Ljavax/crypto/SecretKey;", encoded,
-                          alg ? alg : "", 0);
-   if (!key) RETL(0);
+  (void)args;
+  (void)nargs;
+  union dvm_value algorithm = { 0 }, provider = { 0 }, params = { 0 };
+  union dvm_value size = { 0 }, alias = { 0 };
+  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &algorithm);
+  (void)dvm_get_field(vm, self, "provider", "Ljava/lang/String;", &provider);
+  (void)dvm_get_field(vm, self, "params",
+                      "Ljava/security/spec/AlgorithmParameterSpec;", &params);
+  (void)dvm_get_field(vm, self, "keySize", "I", &size);
+  const char *alg = algorithm.l ? dvm_string_utf8(vm, algorithm.l) : NULL;
+  const char *prov = provider.l ? dvm_string_utf8(vm, provider.l) : NULL;
+  int32_t bits = size.i > 0 ? size.i : kg_default_bits(alg);
+  /* DES and DESede carry parity bits in their encoded keys. */
+  int32_t bytes = alg && !strcasecmp(alg, "DES") ? 8
+                  : alg && !strcasecmp(alg, "DESede") ? 24 : bits / 8;
+  if (bytes <= 0 || bytes > 1024) {
+    dvm__throw(vm, "java/security/InvalidParameterException",
+               "invalid key size %d", bits);
+    return false;
+  }
+  dvm_ref encoded = dvm_new_array(vm, 'B', "B", (uint32_t)bytes);
+  struct dvm_object *array = encoded ? dvm__obj(vm, encoded) : NULL;
+  if (!array || !array->data || RAND_bytes(array->data, bytes) != 1) {
+    dvm__throw(vm, "java/security/ProviderException",
+               "CSPRNG failed while generating %s", alg ? alg : "key");
+    return false;
+  }
+  dvm_ref key = key_make(vm, "Ljavax/crypto/SecretKey;", encoded,
+                         alg ? alg : "", 0);
+  if (!key) RETL(0);
 
-   if (params.l)
-      (void)dvm_get_field(vm, params.l, "keystoreAlias",
-                          "Ljava/lang/String;", &alias);
-   if (prov && !strcasecmp(prov, "AndroidKeyStore")) {
-      if (!alias.l) {
-         dvm__throw(vm, "java/security/InvalidAlgorithmParameterException",
-                    "AndroidKeyStore generation requires an alias");
-         return false;
-      }
-      (void)ks_set_alias(vm, 0, alias.l, key);
-   }
-   RETL(key);
+  if (params.l)
+    (void)dvm_get_field(vm, params.l, "keystoreAlias",
+                        "Ljava/lang/String;", &alias);
+  if (prov && !strcasecmp(prov, "AndroidKeyStore")) {
+    if (!alias.l) {
+      dvm__throw(vm, "java/security/InvalidAlgorithmParameterException",
+                 "AndroidKeyStore generation requires an alias");
+      return false;
+    }
+    (void)ks_set_alias(vm, 0, alias.l, key);
+  }
+  RETL(key);
 }
 
 /* ---- AndroidKeyStore persistence -----------------------------------------
@@ -3294,475 +3848,494 @@ static bool kg_generateKey(struct dvm *vm, dvm_ref self,
  * Alias characters that cannot be a path component become '_'. */
 static void ks_data_dir(char *buf, size_t n)
 {
-   const char *f = getenv("ANDROID_FILES_DIR");
-   if (f && *f) {
-      size_t len = strlen(f), tail = strlen("/files");
-      if (len > tail && !strcmp(f + len - tail, "/files"))
-         snprintf(buf, n, "%.*s/misc/keystore", (int)(len - tail), f);
-      else
-         snprintf(buf, n, "%s/misc/keystore", f);
-      return;
-   }
-   snprintf(buf, n, "/tmp/lunaria-keystore");
+  const char *f = getenv("ANDROID_FILES_DIR");
+  if (f && *f) {
+    size_t len = strlen(f), tail = strlen("/files");
+    if (len > tail && !strcmp(f + len - tail, "/files"))
+      snprintf(buf, n, "%.*s/misc/keystore", (int)(len - tail), f);
+    else
+      snprintf(buf, n, "%s/misc/keystore", f);
+    return;
+  }
+  snprintf(buf, n, "/tmp/lunaria-keystore");
 }
 
 static void ks_alias_path(const char *alias, char *buf, size_t n)
 {
-   char dir[DVM_PATH_MAX - 300];
-   ks_data_dir(dir, sizeof dir);
-   char safe[256];
-   size_t i = 0;
-   for (; alias && alias[i] && i < sizeof safe - 1; ++i) {
-      unsigned char c = (unsigned char)alias[i];
-      safe[i] = (c == '/' || c == '\\' || c < 0x20) ? '_' : (char)c;
-   }
-   safe[i] = '\0';
-   snprintf(buf, n, "%s/%s.bin", dir, safe[0] ? safe : "_");
+  char dir[DVM_PATH_MAX - 300];
+  ks_data_dir(dir, sizeof dir);
+  char safe[256];
+  size_t i = 0;
+  for (; alias && alias[i] && i < sizeof safe - 1; ++i) {
+    unsigned char c = (unsigned char)alias[i];
+    safe[i] = (c == '/' || c == '\\' || c < 0x20) ? '_' : (char)c;
+  }
+  safe[i] = '\0';
+  snprintf(buf, n, "%s/%s.bin", dir, safe[0] ? safe : "_");
 }
 
 static void ks_persist(struct dvm *vm, dvm_ref alias, dvm_ref key)
 {
-   const char *aname = alias ? dvm_string_utf8(vm, alias) : NULL;
-   if (!aname || !*aname || !key) return;
-   union dvm_value enc = { 0 }, alg = { 0 };
-   if (!dvm_get_field(vm, key, "encoded", "[B", &enc) || !enc.l) return;
-   (void)dvm_get_field(vm, key, "algorithm", "Ljava/lang/String;", &alg);
-   uint32_t key_len = 0;
-   const uint8_t *key_bytes_p = arg_bytes(vm, enc.l, &key_len);
-   if (!key_bytes_p || !key_len || key_len > 4096u) return;
-   const char *alg_s = alg.l ? dvm_string_utf8(vm, alg.l) : "AES";
-   if (!alg_s) alg_s = "AES";
-   uint32_t alg_len = (uint32_t)strlen(alg_s);
-   if (alg_len > 256u) alg_len = 256u;
+  const char *aname = alias ? dvm_string_utf8(vm, alias) : NULL;
+  if (!aname || !*aname || !key) return;
+  union dvm_value enc = { 0 }, alg = { 0 };
+  if (!dvm_get_field(vm, key, "encoded", "[B", &enc) || !enc.l) return;
+  (void)dvm_get_field(vm, key, "algorithm", "Ljava/lang/String;", &alg);
+  uint32_t key_len = 0;
+  const uint8_t *key_bytes_p = arg_bytes(vm, enc.l, &key_len);
+  if (!key_bytes_p || !key_len || key_len > 4096u) return;
+  const char *alg_s = alg.l ? dvm_string_utf8(vm, alg.l) : "AES";
+  if (!alg_s) alg_s = "AES";
+  uint32_t alg_len = (uint32_t)strlen(alg_s);
+  if (alg_len > 256u) alg_len = 256u;
 
-   char dir[DVM_PATH_MAX - 300], path[DVM_PATH_MAX], tmp[DVM_PATH_MAX + 8];
-   ks_data_dir(dir, sizeof dir);
-   prefs_mkdir_p(dir);
-   ks_alias_path(aname, path, sizeof path);
-   snprintf(tmp, sizeof tmp, "%s.tmp", path);
+  char dir[DVM_PATH_MAX - 300], path[DVM_PATH_MAX], tmp[DVM_PATH_MAX + 8];
+  ks_data_dir(dir, sizeof dir);
+  prefs_mkdir_p(dir);
+  ks_alias_path(aname, path, sizeof path);
+  snprintf(tmp, sizeof tmp, "%s.tmp", path);
 
-   FILE *fp = luna_file_fopen(tmp, "wb");
-   if (!fp) return;
-   const char magic[4] = { 'A', 'K', 'S', '1' };
-   uint8_t le[4];
-   int ok = fwrite(magic, 1, 4, fp) == 4;
-   le[0] = (uint8_t)alg_len;
-   le[1] = (uint8_t)(alg_len >> 8);
-   le[2] = (uint8_t)(alg_len >> 16);
-   le[3] = (uint8_t)(alg_len >> 24);
-   ok = ok && fwrite(le, 1, 4, fp) == 4;
-   ok = ok && fwrite(alg_s, 1, alg_len, fp) == alg_len;
-   le[0] = (uint8_t)key_len;
-   le[1] = (uint8_t)(key_len >> 8);
-   le[2] = (uint8_t)(key_len >> 16);
-   le[3] = (uint8_t)(key_len >> 24);
-   ok = ok && fwrite(le, 1, 4, fp) == 4;
-   ok = ok && fwrite(key_bytes_p, 1, key_len, fp) == key_len;
-   if (fclose(fp) != 0) ok = 0;
-   if (!ok) { luna_file_unlink(tmp); return; }
-   if (luna_file_rename(tmp, path) != 0) luna_file_unlink(tmp);
+  FILE *fp = luna_file_fopen(tmp, "wb");
+  if (!fp) return;
+  const char magic[4] = { 'A', 'K', 'S', '1' };
+  uint8_t le[4];
+  int ok = fwrite(magic, 1, 4, fp) == 4;
+  le[0] = (uint8_t)alg_len;
+  le[1] = (uint8_t)(alg_len >> 8);
+  le[2] = (uint8_t)(alg_len >> 16);
+  le[3] = (uint8_t)(alg_len >> 24);
+  ok = ok && fwrite(le, 1, 4, fp) == 4;
+  ok = ok && fwrite(alg_s, 1, alg_len, fp) == alg_len;
+  le[0] = (uint8_t)key_len;
+  le[1] = (uint8_t)(key_len >> 8);
+  le[2] = (uint8_t)(key_len >> 16);
+  le[3] = (uint8_t)(key_len >> 24);
+  ok = ok && fwrite(le, 1, 4, fp) == 4;
+  ok = ok && fwrite(key_bytes_p, 1, key_len, fp) == key_len;
+  if (fclose(fp) != 0) ok = 0;
+  if (!ok) {
+    luna_file_unlink(tmp);
+    return;
+  }
+  if (luna_file_rename(tmp, path) != 0) luna_file_unlink(tmp);
 }
 
 static dvm_ref ks_load_one(struct dvm *vm, const char *alias_utf8)
 {
-   if (!alias_utf8 || !*alias_utf8) return 0;
-   char path[DVM_PATH_MAX];
-   ks_alias_path(alias_utf8, path, sizeof path);
-   FILE *fp = luna_file_fopen(path, "rb");
-   if (!fp) return 0;
-   char magic[4];
-   uint8_t le[4];
-   uint32_t alg_len = 0, key_len = 0;
-   char alg[257];
-   uint8_t keybuf[4096];
-   int ok = fread(magic, 1, 4, fp) == 4 &&
-            magic[0] == 'A' && magic[1] == 'K' &&
-            magic[2] == 'S' && magic[3] == '1';
-   ok = ok && fread(le, 1, 4, fp) == 4;
-   if (ok)
-      alg_len = (uint32_t)le[0] | ((uint32_t)le[1] << 8) |
-                ((uint32_t)le[2] << 16) | ((uint32_t)le[3] << 24);
-   ok = ok && alg_len > 0 && alg_len < sizeof alg;
-   ok = ok && fread(alg, 1, alg_len, fp) == alg_len;
-   if (ok) alg[alg_len] = '\0';
-   ok = ok && fread(le, 1, 4, fp) == 4;
-   if (ok)
-      key_len = (uint32_t)le[0] | ((uint32_t)le[1] << 8) |
-                ((uint32_t)le[2] << 16) | ((uint32_t)le[3] << 24);
-   ok = ok && key_len > 0 && key_len <= sizeof keybuf;
-   ok = ok && fread(keybuf, 1, key_len, fp) == key_len;
-   fclose(fp);
-   if (!ok) return 0;
-   dvm_ref encoded = make_bytes(vm, keybuf, key_len);
-   return key_make(vm, "Ljavax/crypto/SecretKey;", encoded, alg, 0);
+  if (!alias_utf8 || !*alias_utf8) return 0;
+  char path[DVM_PATH_MAX];
+  ks_alias_path(alias_utf8, path, sizeof path);
+  FILE *fp = luna_file_fopen(path, "rb");
+  if (!fp) return 0;
+  char magic[4];
+  uint8_t le[4];
+  uint32_t alg_len = 0, key_len = 0;
+  char alg[257];
+  uint8_t keybuf[4096];
+  int ok = fread(magic, 1, 4, fp) == 4 &&
+           magic[0] == 'A' && magic[1] == 'K' &&
+           magic[2] == 'S' && magic[3] == '1';
+  ok = ok && fread(le, 1, 4, fp) == 4;
+  if (ok)
+    alg_len = (uint32_t)le[0] | ((uint32_t)le[1] << 8) |
+              ((uint32_t)le[2] << 16) | ((uint32_t)le[3] << 24);
+  ok = ok && alg_len > 0 && alg_len < sizeof alg;
+  ok = ok && fread(alg, 1, alg_len, fp) == alg_len;
+  if (ok) alg[alg_len] = '\0';
+  ok = ok && fread(le, 1, 4, fp) == 4;
+  if (ok)
+    key_len = (uint32_t)le[0] | ((uint32_t)le[1] << 8) |
+              ((uint32_t)le[2] << 16) | ((uint32_t)le[3] << 24);
+  ok = ok && key_len > 0 && key_len <= sizeof keybuf;
+  ok = ok && fread(keybuf, 1, key_len, fp) == key_len;
+  fclose(fp);
+  if (!ok) return 0;
+  dvm_ref encoded = make_bytes(vm, keybuf, key_len);
+  return key_make(vm, "Ljavax/crypto/SecretKey;", encoded, alg, 0);
 }
 
 static void ks_hydrate(struct dvm *vm, dvm_ref map)
 {
-   if (!map) return;
-   char dir[DVM_PATH_MAX];
-   ks_data_dir(dir, sizeof dir);
-   luna_directory *d = luna_directory_open(dir);
-   if (!d) return;
-   luna_directory_entry *de;
-   while ((de = luna_directory_read(d))) {
-      const char *name = de->d_name;
-      size_t n = strlen(name);
-      if (n < 5 || strcmp(name + n - 4, ".bin") != 0) continue;
-      char alias[256];
-      if (n - 4 >= sizeof alias) continue;
-      memcpy(alias, name, n - 4);
-      alias[n - 4] = '\0';
-      dvm_ref key = ks_load_one(vm, alias);
-      if (!key) continue;
-      dvm_ref a = dvm_new_string(vm, alias);
-      union dvm_value kv[2] = { { .l = a }, { .l = key } };
-      union dvm_value ignored = { 0 };
-      (void)map_put(vm, map, kv, 2, &ignored);
-   }
-   luna_directory_close(d);
+  if (!map) return;
+  char dir[DVM_PATH_MAX];
+  ks_data_dir(dir, sizeof dir);
+  luna_directory *d = luna_directory_open(dir);
+  if (!d) return;
+  luna_directory_entry *de;
+  while ((de = luna_directory_read(d))) {
+    const char *name = de->d_name;
+    size_t n = strlen(name);
+    if (n < 5 || strcmp(name + n - 4, ".bin") != 0) continue;
+    char alias[256];
+    if (n - 4 >= sizeof alias) continue;
+    memcpy(alias, name, n - 4);
+    alias[n - 4] = '\0';
+    dvm_ref key = ks_load_one(vm, alias);
+    if (!key) continue;
+    dvm_ref a = dvm_new_string(vm, alias);
+    union dvm_value kv[2] = { { .l = a }, { .l = key } };
+    union dvm_value ignored = { 0 };
+    (void)map_put(vm, map, kv, 2, &ignored);
+  }
+  luna_directory_close(d);
 }
 
 static const struct rt_method rt_key_generator[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-      kg_getInstance),
-   SM("getInstance",
-      "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
-      kg_getInstance),
-   M("init", "(I)V", kg_init_bits),
-   M("init", "(ILjava/security/SecureRandom;)V", kg_init_bits),
-   M("init", "(Ljava/security/spec/AlgorithmParameterSpec;)V", kg_init_spec),
-   M("init", "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
-     kg_init_spec),
-   M("generateKey", "()Ljavax/crypto/SecretKey;", kg_generateKey),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M_END,
+  SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
+  kg_getInstance),
+  SM("getInstance",
+  "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;",
+  kg_getInstance),
+  M("init", "(I)V", kg_init_bits),
+  M("init", "(ILjava/security/SecureRandom;)V", kg_init_bits),
+  M("init", "(Ljava/security/spec/AlgorithmParameterSpec;)V", kg_init_spec),
+  M("init", "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+  kg_init_spec),
+  M("generateKey", "()Ljavax/crypto/SecretKey;", kg_generateKey),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M_END,
 };
 
 static const struct rt_field rt_spec_fields[] = {
-   { "encoded", "[B" }, { "iv", "[B" }, { "tagLen", "I" }, F_END
+  { "encoded", "[B" }, { "iv", "[B" }, { "tagLen", "I" }, F_END
 };
 
 static const struct rt_field rt_cipher_fields[] = {
-   { "provider", "Ljava/security/Provider;" },
-   { "transform", "Ljava/lang/String;" }, { "opmode", "I" },
-   { "key", "Ljava/lang/Object;" }, { "iv", "[B" },
-   { "aad", "[B" }, { "pending", "[B" },
-   { "algorithm", "Ljava/lang/String;" }, F_END
+  { "provider", "Ljava/security/Provider;" },
+  { "transform", "Ljava/lang/String;" }, { "opmode", "I" },
+  { "key", "Ljava/lang/Object;" }, { "iv", "[B" },
+  { "aad", "[B" }, { "pending", "[B" },
+  { "algorithm", "Ljava/lang/String;" }, F_END
 };
 
 static const struct rt_method rt_key[] = {
-   M("getEncoded", "()[B", key_getEncoded),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M("getFormat", "()Ljava/lang/String;", key_getFormat),
-   M_END,
+  M("getEncoded", "()[B", key_getEncoded),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M("getFormat", "()Ljava/lang/String;", key_getFormat),
+  M_END,
 };
 
 static const struct rt_method rt_rsa_public_key[] = {
-   M("getEncoded", "()[B", key_getEncoded),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M("getFormat", "()Ljava/lang/String;", key_getFormat),
-   M("getModulus", "()Ljava/math/BigInteger;", rsa_getModulus),
-   M("getPublicExponent", "()Ljava/math/BigInteger;", rsa_getPublicExponent),
-   M_END,
+  M("getEncoded", "()[B", key_getEncoded),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M("getFormat", "()Ljava/lang/String;", key_getFormat),
+  M("getModulus", "()Ljava/math/BigInteger;", rsa_getModulus),
+  M("getPublicExponent", "()Ljava/math/BigInteger;", rsa_getPublicExponent),
+  M_END,
 };
 
 static const struct rt_method rt_rsa_private_key[] = {
-   M("getEncoded", "()[B", key_getEncoded),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M("getFormat", "()Ljava/lang/String;", key_getFormat),
-   M("getModulus", "()Ljava/math/BigInteger;", rsa_getModulus),
-   M("getPrivateExponent", "()Ljava/math/BigInteger;", rsa_getPrivateExponent),
-   M("getPublicExponent", "()Ljava/math/BigInteger;", rsa_getPublicExponent),
-   M_END,
+  M("getEncoded", "()[B", key_getEncoded),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M("getFormat", "()Ljava/lang/String;", key_getFormat),
+  M("getModulus", "()Ljava/math/BigInteger;", rsa_getModulus),
+  M("getPrivateExponent", "()Ljava/math/BigInteger;", rsa_getPrivateExponent),
+  M("getPublicExponent", "()Ljava/math/BigInteger;", rsa_getPublicExponent),
+  M_END,
 };
 
 static const struct rt_method rt_secret_key[] = {
-   M("<init>", "([BLjava/lang/String;)V", secret_init),
-   M("<init>", "([BIILjava/lang/String;)V", secret_init),
-   M("getEncoded", "()[B", key_getEncoded),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M("getFormat", "()Ljava/lang/String;", key_getFormat),
-   M_END,
+  M("<init>", "([BLjava/lang/String;)V", secret_init),
+  M("<init>", "([BIILjava/lang/String;)V", secret_init),
+  M("getEncoded", "()[B", key_getEncoded),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M("getFormat", "()Ljava/lang/String;", key_getFormat),
+  M_END,
 };
 
 static const struct rt_method rt_key_spec[] = {
-   M("<init>", "([B)V", spec_init),
-   M("getEncoded", "()[B", key_getEncoded),
-   M_END,
+  M("<init>", "([B)V", spec_init),
+  M("getEncoded", "()[B", key_getEncoded),
+  M_END,
 };
 
 static const char *const rt_iface_key_spec[] = {"Ljava/security/spec/KeySpec;",NULL};
 static const struct rt_field rt_encoded_key_spec_fields[] = {
-   {"encoded","[B"},F_END
+  {"encoded","[B"},F_END
 };
 static const struct rt_field rt_rsa_public_spec_fields[] = {
-   {"modulus","Ljava/math/BigInteger;"},
-   {"publicExponent","Ljava/math/BigInteger;"},F_END
+  {"modulus","Ljava/math/BigInteger;"},
+  {"publicExponent","Ljava/math/BigInteger;"},F_END
 };
 static const struct rt_method rt_rsa_public_spec[] = {
-   M("<init>","(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",rsa_public_spec_init),
-   M("getModulus","()Ljava/math/BigInteger;",rsa_public_spec_modulus),
-   M("getPublicExponent","()Ljava/math/BigInteger;",rsa_public_spec_exponent),
-   M_END
+  M("<init>","(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",rsa_public_spec_init),
+  M("getModulus","()Ljava/math/BigInteger;",rsa_public_spec_modulus),
+  M("getPublicExponent","()Ljava/math/BigInteger;",rsa_public_spec_exponent),
+  M_END
 };
 
 /* IvParameterSpec / GCMParameterSpec both surface the IV through `iv`. */
 static bool iv_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                     int nargs, union dvm_value *out)
 {
-   (void)out;
-   /* IvParameterSpec(byte[,off,len]) and
-    * GCMParameterSpec(tagLen,byte[,off,len]) both make a defensive copy. */
-   /* The constructor is told apart by its arity (Iv: 1 or 3, GCM: 2 or 4),
-    * never by what the first argument happens to hold: GCM's tag length is an
-    * int whose bits can equal a live object's reference. */
-   const bool gcm = (nargs & 1) == 0;
-   const int byte_arg = gcm ? 1 : 0;
-   dvm_ref source = byte_arg < nargs ? args[byte_arg].l : 0;
-   uint32_t source_len = 0;
-   const uint8_t *source_data = arg_bytes(vm, source, &source_len);
-   int offset_arg = byte_arg + 1, length_arg = byte_arg + 2;
-   int32_t offset = 0, length = (int32_t)source_len;
-   if (nargs > length_arg) {
-      offset = args[offset_arg].i;
-      length = args[length_arg].i;
-   }
-   if (!source_data || offset < 0 || length < 0 ||
-       (uint32_t)offset > source_len ||
-       (uint32_t)length > source_len - (uint32_t)offset) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid IV range");
-      return false;
-   }
-   union dvm_value v = {
-      .l = make_bytes(vm, source_data + offset, (uint32_t)length)
-   };
-   (void)dvm_set_field(vm, self, "iv", "[B", v);
-   if (gcm) {
-      v.i = ARG(0).i;
-      (void)dvm_set_field(vm, self, "tagLen", "I", v);
-   }
-   RETV();
+  (void)out;
+  /* IvParameterSpec(byte[,off,len]) and
+   * GCMParameterSpec(tagLen,byte[,off,len]) both make a defensive copy. */
+  /* The constructor is told apart by its arity (Iv: 1 or 3, GCM: 2 or 4),
+   * never by what the first argument happens to hold: GCM's tag length is an
+   * int whose bits can equal a live object's reference. */
+  const bool gcm = (nargs & 1) == 0;
+  const int byte_arg = gcm ? 1 : 0;
+  dvm_ref source = byte_arg < nargs ? args[byte_arg].l : 0;
+  uint32_t source_len = 0;
+  const uint8_t *source_data = arg_bytes(vm, source, &source_len);
+  int offset_arg = byte_arg + 1, length_arg = byte_arg + 2;
+  int32_t offset = 0, length = (int32_t)source_len;
+  if (nargs > length_arg) {
+    offset = args[offset_arg].i;
+    length = args[length_arg].i;
+  }
+  if (!source_data || offset < 0 || length < 0 ||
+      (uint32_t)offset > source_len ||
+      (uint32_t)length > source_len - (uint32_t)offset) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid IV range");
+    return false;
+  }
+  union dvm_value v = {
+    .l = make_bytes(vm, source_data + offset, (uint32_t)length)
+  };
+  (void)dvm_set_field(vm, self, "iv", "[B", v);
+  if (gcm) {
+    v.i = ARG(0).i;
+    (void)dvm_set_field(vm, self, "tagLen", "I", v);
+  }
+  RETV();
 }
 
 static bool iv_getIV(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-   return cipher_getIV(vm, self, args, nargs, out);
+  return cipher_getIV(vm, self, args, nargs, out);
 }
 
 static bool gcm_getTLen(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   (void)args; (void)nargs;
-   RETI(rt_get_int(vm, self, "tagLen"));
+  (void)args;
+  (void)nargs;
+  RETI(rt_get_int(vm, self, "tagLen"));
 }
 
 static const struct rt_method rt_iv_spec[] = {
-   M("<init>", "([B)V", iv_init),
-   M("<init>", "([BII)V", iv_init),
-   M("<init>", "(I[B)V", iv_init),
-   M("<init>", "(I[BII)V", iv_init),
-   M("getIV", "()[B", iv_getIV),
-   M("getTLen", "()I", gcm_getTLen),
-   M_END,
+  M("<init>", "([B)V", iv_init),
+  M("<init>", "([BII)V", iv_init),
+  M("<init>", "(I[B)V", iv_init),
+  M("<init>", "(I[BII)V", iv_init),
+  M("getIV", "()[B", iv_getIV),
+  M("getTLen", "()I", gcm_getTLen),
+  M_END,
 };
 
 static const struct rt_method rt_key_factory[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljava/security/KeyFactory;",
-      kf_getInstance),
-   SM("getInstance",
-      "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyFactory;",
-      kf_getInstance),
-   M("generatePrivate",
-     "(Ljava/security/spec/KeySpec;)Ljava/security/PrivateKey;",
-     kf_generatePrivate),
-   M("generatePublic",
-     "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;",
-     kf_generatePublic),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M_END,
+  SM("getInstance", "(Ljava/lang/String;)Ljava/security/KeyFactory;",
+  kf_getInstance),
+  SM("getInstance",
+  "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyFactory;",
+  kf_getInstance),
+  M("generatePrivate",
+  "(Ljava/security/spec/KeySpec;)Ljava/security/PrivateKey;",
+  kf_generatePrivate),
+  M("generatePublic",
+  "(Ljava/security/spec/KeySpec;)Ljava/security/PublicKey;",
+  kf_generatePublic),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M_END,
 };
 
 static const struct rt_method rt_cipher[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
-      cipher_getInstance),
-   SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
-      cipher_getInstance_named),
-   SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Cipher;",
-      cipher_getInstance_provider),
-   M("init", "(ILjava/security/Key;)V", cipher_init),
-   M("init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
-     cipher_init),
-   M("init", "(ILjava/security/Key;Ljava/security/SecureRandom;)V", cipher_init),
-   M("init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V", cipher_init),
-   M("doFinal", "([B)[B", cipher_doFinal),
-   M("doFinal", "()[B", cipher_doFinal),
-   M("update", "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I", cipher_update_buffers),
-   M("update", "([B)[B", cipher_update_array),
-   M("update", "([BII)[B", cipher_update_array),
-   M("doFinal", "([BII)[B", cipher_doFinal),
-   M("doFinal", "([BII[BI)I", cipher_doFinal_into),
-   M("updateAAD", "([B)V", cipher_updateAAD),
-   M("updateAAD", "([BII)V", cipher_updateAAD),
-   M("getIV", "()[B", cipher_getIV),
-   M("getBlockSize", "()I", cipher_getBlockSize),
-   M("getProvider", "()Ljava/security/Provider;", cipher_getProvider),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M_END,
+  SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
+  cipher_getInstance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Cipher;",
+  cipher_getInstance_named),
+  SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Cipher;",
+  cipher_getInstance_provider),
+  M("init", "(ILjava/security/Key;)V", cipher_init),
+  M("init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;)V",
+  cipher_init),
+  M("init", "(ILjava/security/Key;Ljava/security/SecureRandom;)V", cipher_init),
+  M("init", "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V", cipher_init),
+  M("doFinal", "([B)[B", cipher_doFinal),
+  M("doFinal", "()[B", cipher_doFinal),
+  M("update", "(Ljava/nio/ByteBuffer;Ljava/nio/ByteBuffer;)I", cipher_update_buffers),
+  M("update", "([B)[B", cipher_update_array),
+  M("update", "([BII)[B", cipher_update_array),
+  M("doFinal", "([BII)[B", cipher_doFinal),
+  M("doFinal", "([BII[BI)I", cipher_doFinal_into),
+  M("updateAAD", "([B)V", cipher_updateAAD),
+  M("updateAAD", "([BII)V", cipher_updateAAD),
+  M("getIV", "()[B", cipher_getIV),
+  M("getBlockSize", "()I", cipher_getBlockSize),
+  M("getProvider", "()Ljava/security/Provider;", cipher_getProvider),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M_END,
 };
 
 static const struct rt_field rt_mac_fields[] = {
-   { "algorithm", "Ljava/lang/String;" }, F_END
+  { "algorithm", "Ljava/lang/String;" }, F_END
 };
 static const struct rt_method rt_mac[] = {
-   SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", mac_getInstance),
-   M("init", "(Ljava/security/Key;)V", mac_init),
-   M("update", "([B)V", mac_update),
-   M("update", "([BII)V", mac_update),
-   M("update", "(B)V", mac_update_byte),
-   M("update", "(Ljava/nio/ByteBuffer;)V", mac_update_buffer),
-   M("reset", "()V", mac_reset),
-   M("getMacLength", "()I", mac_length),
-   M("doFinal", "()[B", mac_doFinal),
-   M("doFinal", "([B)[B", mac_doFinal),
-   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
-   M_END,
+  SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", mac_getInstance),
+  M("init", "(Ljava/security/Key;)V", mac_init),
+  M("update", "([B)V", mac_update),
+  M("update", "([BII)V", mac_update),
+  M("update", "(B)V", mac_update_byte),
+  M("update", "(Ljava/nio/ByteBuffer;)V", mac_update_buffer),
+  M("reset", "()V", mac_reset),
+  M("getMacLength", "()I", mac_length),
+  M("doFinal", "()[B", mac_doFinal),
+  M("doFinal", "([B)[B", mac_doFinal),
+  M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
+  M_END,
 };
 
 /* SecureRandom extends Random, so the whole Random surface has to work off the
  * same CSPRNG — the SDKs pick nextInt()/nextLong() as often as nextBytes(). */
 static bool sr_rand64(uint64_t *value)
 {
-   unsigned char buf[8];
-   if (RAND_bytes(buf, (int)sizeof buf) != 1) return false;
-   *value = 0;
-   for (size_t i = 0; i < sizeof buf; ++i) *value = (*value << 8) | buf[i];
-   return true;
+  unsigned char buf[8];
+  if (RAND_bytes(buf, (int)sizeof buf) != 1) return false;
+  *value = 0;
+  for (size_t i = 0; i < sizeof buf; ++i) *value = (*value << 8) | buf[i];
+  return true;
 }
 
 static bool sr_nextInt(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
-   (void)vm; (void)self;
-   uint64_t r = 0;
-   if (!sr_rand64(&r)) RETI(0);
-   if (nargs < 1) RETI((int32_t)(uint32_t)r);
-   int32_t bound = ARG(0).i;
-   if (bound <= 0) RETI(0);   /* Random.nextInt(<=0) is an error, not a value */
-   RETI((int32_t)(r % (uint64_t)bound));
+  (void)vm;
+  (void)self;
+  uint64_t r = 0;
+  if (!sr_rand64(&r)) RETI(0);
+  if (nargs < 1) RETI((int32_t)(uint32_t)r);
+  int32_t bound = ARG(0).i;
+  if (bound <= 0) RETI(0);   /* Random.nextInt(<=0) is an error, not a value */
+  RETI((int32_t)(r % (uint64_t)bound));
 }
 
 static bool sr_nextLong(struct dvm *vm, dvm_ref self,
                         const union dvm_value *args, int nargs,
                         union dvm_value *out)
 {
-   (void)vm; (void)self; (void)args; (void)nargs;
-   uint64_t r = 0;
-   if (!sr_rand64(&r)) RETJ(0);
-   RETJ((int64_t)r);
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  uint64_t r = 0;
+  if (!sr_rand64(&r)) RETJ(0);
+  RETJ((int64_t)r);
 }
 
 static bool sr_nextBoolean(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)vm; (void)self; (void)args; (void)nargs;
-   uint64_t r = 0;
-   if (!sr_rand64(&r)) RETI(0);
-   RETI((int32_t)(r & 1u));
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  uint64_t r = 0;
+  if (!sr_rand64(&r)) RETI(0);
+  RETI((int32_t)(r & 1u));
 }
 
 static bool sr_nextDouble(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
-   (void)vm; (void)self; (void)args; (void)nargs;
-   uint64_t r = 0;
-   if (!sr_rand64(&r)) RETD(0.0);
-   RETD((double)(r >> 11) / (double)(1ULL << 53));
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  uint64_t r = 0;
+  if (!sr_rand64(&r)) RETD(0.0);
+  RETD((double)(r >> 11) / (double)(1ULL << 53));
 }
 
 static bool sr_nextFloat(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
 {
-   union dvm_value d = { 0 };
-   if (!sr_nextDouble(vm, self, args, nargs, &d)) return false;
-   RETF((float)d.d);
+  union dvm_value d = { 0 };
+  if (!sr_nextDouble(vm, self, args, nargs, &d)) return false;
+  RETF((float)d.d);
 }
 
 static bool sr_getSeed(struct dvm *vm, dvm_ref self,
                        const union dvm_value *args, int nargs,
                        union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   int32_t n = ARG(0).i;
-   if (n < 0) n = 0;
-   dvm_ref a = dvm_new_array(vm, 'B', "B", n);
-   struct dvm_object *o = a ? dvm__obj(vm, a) : NULL;
-   if (o && o->data && n) RAND_bytes(o->data, n);
-   RETL(a);
+  (void)self;
+  (void)nargs;
+  int32_t n = ARG(0).i;
+  if (n < 0) n = 0;
+  dvm_ref a = dvm_new_array(vm, 'B', "B", n);
+  struct dvm_object *o = a ? dvm__obj(vm, a) : NULL;
+  if (o && o->data && n) RAND_bytes(o->data, n);
+  RETL(a);
 }
 
 static bool sr_getInstance(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
 {
-   (void)self; (void)args; (void)nargs;
-   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/security/SecureRandom;");
-   RETL(c ? dvm_new_object(vm, c) : 0);
+  (void)self;
+  (void)args;
+  (void)nargs;
+  struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/security/SecureRandom;");
+  RETL(c ? dvm_new_object(vm, c) : 0);
 }
 
 static bool sr_getInstance_provider(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
 {
-   if (nargs < 2 || !args[1].l) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
-      return false;
-   }
-   if (args[1].l != security_builtin_provider(vm)) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "No SecureRandom service in the specified provider");
-      return false;
-   }
-   const char *algorithm = args[0].l ? dvm_string_utf8(vm, args[0].l) : NULL;
-   if (!algorithm) {
-      dvm__throw(vm, "java/lang/NullPointerException", "algorithm");
-      return false;
-   }
-   if (strcasecmp(algorithm, "SHA1PRNG")) {
-      dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", algorithm);
-      return false;
-   }
-   return sr_getInstance(vm, self, args, 1, out);
+  if (nargs < 2 || !args[1].l) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
+    return false;
+  }
+  if (args[1].l != security_builtin_provider(vm)) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "No SecureRandom service in the specified provider");
+    return false;
+  }
+  const char *algorithm = args[0].l ? dvm_string_utf8(vm, args[0].l) : NULL;
+  if (!algorithm) {
+    dvm__throw(vm, "java/lang/NullPointerException", "algorithm");
+    return false;
+  }
+  if (strcasecmp(algorithm, "SHA1PRNG")) {
+    dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", algorithm);
+    return false;
+  }
+  return sr_getInstance(vm, self, args, 1, out);
 }
 
 static bool sr_getInstance_named(struct dvm *vm, dvm_ref self,
                                  const union dvm_value *args, int nargs,
                                  union dvm_value *out)
 {
-   const char *provider = nargs > 1 && args[1].l ? dvm_string_utf8(vm, args[1].l) : NULL;
-   if (!provider || !*provider) {
-      dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
-      return false;
-   }
-   if (strcmp(provider, "AndroidOpenSSL")) {
-      dvm__throw(vm, "java/security/NoSuchProviderException", "%s", provider);
-      return false;
-   }
-   union dvm_value a[2] = { args[0], { .l = security_builtin_provider(vm) } };
-   return sr_getInstance_provider(vm, self, a, 2, out);
+  const char *provider = nargs > 1 && args[1].l ? dvm_string_utf8(vm, args[1].l) : NULL;
+  if (!provider || !*provider) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "Missing provider");
+    return false;
+  }
+  if (strcmp(provider, "AndroidOpenSSL")) {
+    dvm__throw(vm, "java/security/NoSuchProviderException", "%s", provider);
+    return false;
+  }
+  union dvm_value a[2] = { args[0], { .l = security_builtin_provider(vm) } };
+  return sr_getInstance_provider(vm, self, a, 2, out);
 }
 
 static bool sr_getAlgorithm(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
-   (void)self; (void)args; (void)nargs;
-   RETL(dvm_new_string(vm, "SHA1PRNG"));
+  (void)self;
+  (void)args;
+  (void)nargs;
+  RETL(dvm_new_string(vm, "SHA1PRNG"));
 }
 
 /* SecureRandom's seeding calls.  Its contract is explicit that a given seed
@@ -3774,49 +4347,52 @@ static bool sr_setSeed_bytes(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
-   (void)self; (void)nargs;
-   const void *b = dvm_array_data(vm, ARG(0).l);
-   uint32_t n = dvm_array_length(vm, ARG(0).l);
-   if (b && n) RAND_seed(b, (int)n);
-   RETV();
+  (void)self;
+  (void)nargs;
+  const void *b = dvm_array_data(vm, ARG(0).l);
+  uint32_t n = dvm_array_length(vm, ARG(0).l);
+  if (b && n) RAND_seed(b, (int)n);
+  RETV();
 }
 
 static bool sr_setSeed_long(struct dvm *vm, dvm_ref self,
                             const union dvm_value *args, int nargs,
                             union dvm_value *out)
 {
-   (void)vm; (void)self; (void)nargs;
-   int64_t v = ARG(0).j;
-   RAND_seed(&v, (int)sizeof v);
-   RETV();
+  (void)vm;
+  (void)self;
+  (void)nargs;
+  int64_t v = ARG(0).j;
+  RAND_seed(&v, (int)sizeof v);
+  RETV();
 }
 
 static const struct rt_method rt_secure_random[] = {
-   /* Constructing a SecureRandom picks a provider; here there is one CSPRNG
-    * and it needs no per-instance state, so there is nothing to construct.
-    * The seeding constructor is a different matter — see setSeed below. */
-   M("<init>", "()V", empty_void),
-   M("<init>", "([B)V", sr_setSeed_bytes),
-   SM("getInstance", "(Ljava/lang/String;)Ljava/security/SecureRandom;",
-      sr_getInstance),
-   SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/SecureRandom;",
-      sr_getInstance_named),
-   SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/SecureRandom;",
-      sr_getInstance_provider),
-   SM("getInstanceStrong", "()Ljava/security/SecureRandom;", sr_getInstance),
-   SM("getSeed", "(I)[B", sr_getSeed),
-   M("generateSeed", "(I)[B", sr_getSeed),
-   M("setSeed", "(J)V", sr_setSeed_long),
-   M("setSeed", "([B)V", sr_setSeed_bytes),
-   M("nextBytes", "([B)V", sr_nextBytes),
-   M("nextInt", "()I", sr_nextInt),
-   M("nextInt", "(I)I", sr_nextInt),
-   M("nextLong", "()J", sr_nextLong),
-   M("nextBoolean", "()Z", sr_nextBoolean),
-   M("nextFloat", "()F", sr_nextFloat),
-   M("nextDouble", "()D", sr_nextDouble),
-   M("getAlgorithm", "()Ljava/lang/String;", sr_getAlgorithm),
-   M_END,
+  /* Constructing a SecureRandom picks a provider; here there is one CSPRNG
+   * and it needs no per-instance state, so there is nothing to construct.
+   * The seeding constructor is a different matter — see setSeed below. */
+  M("<init>", "()V", empty_void),
+  M("<init>", "([B)V", sr_setSeed_bytes),
+  SM("getInstance", "(Ljava/lang/String;)Ljava/security/SecureRandom;",
+  sr_getInstance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/SecureRandom;",
+  sr_getInstance_named),
+  SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/SecureRandom;",
+  sr_getInstance_provider),
+  SM("getInstanceStrong", "()Ljava/security/SecureRandom;", sr_getInstance),
+  SM("getSeed", "(I)[B", sr_getSeed),
+  M("generateSeed", "(I)[B", sr_getSeed),
+  M("setSeed", "(J)V", sr_setSeed_long),
+  M("setSeed", "([B)V", sr_setSeed_bytes),
+  M("nextBytes", "([B)V", sr_nextBytes),
+  M("nextInt", "()I", sr_nextInt),
+  M("nextInt", "(I)I", sr_nextInt),
+  M("nextLong", "()J", sr_nextLong),
+  M("nextBoolean", "()Z", sr_nextBoolean),
+  M("nextFloat", "()F", sr_nextFloat),
+  M("nextDouble", "()D", sr_nextDouble),
+  M("getAlgorithm", "()Ljava/lang/String;", sr_getAlgorithm),
+  M_END,
 };
 
 

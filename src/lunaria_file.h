@@ -1,3 +1,11 @@
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
 /* Host file management: process scratch files and persistent guest links. */
 #ifndef LUNARIA_FILE_H
 #define LUNARIA_FILE_H
@@ -18,7 +26,7 @@ char *luna_java_file_resolve(const char *parent,const char *child);
 /* Canonicalize a logical path across mounts, including nonexistent names.
  * Resolve links before '..', then project existing targets into that namespace. */
 char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
-   luna_symlink_mapper mapper,luna_symlink_mapper reverse);
+                                    luna_symlink_mapper mapper,luna_symlink_mapper reverse);
 /* Return nonzero for modeled inodes, projecting guest uid/gid/mode.
  * Unmanaged host scratch paths retain host semantics. */
 typedef int (*luna_file_inode_mapper)(const char *,luna_file_info *);

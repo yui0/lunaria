@@ -4,7 +4,9 @@
  * This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
- *
+ */
+
+/*
  * See dvm_media.h.
  */
 
@@ -25,174 +27,198 @@
 #include <unistd.h>
 
 struct liq_image {
-    struct liq_image *next;
-    struct liq_queue *queue;
-    uint8_t *pixels;
-    unsigned width, height;
-    int64_t timestamp;
+  struct liq_image *next;
+  struct liq_queue *queue;
+  uint8_t *pixels;
+  unsigned width, height;
+  int64_t timestamp;
 };
 struct liq_queue {
-    atomic_uint refs;
-    pthread_mutex_t mutex;
-    pthread_cond_t changed;
-    struct liq_image *head, *tail;
-    unsigned max_images, capacity, buffers, acquired;
-    uint64_t sequence;
-    bool closed;
-    liq_notify_fn notify;
-    void *notify_context;
+  atomic_uint refs;
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+  struct liq_image *head, *tail;
+  unsigned max_images, capacity, buffers, acquired;
+  uint64_t sequence;
+  bool closed;
+  liq_notify_fn notify;
+  void *notify_context;
 };
 static void image_free(struct liq_image *image)
 {
-    free(image->pixels);
-    free(image);
+  free(image->pixels);
+  free(image);
 }
 struct liq_queue *liq_new(unsigned max_images, unsigned capacity)
 {
-    if (!max_images || capacity < max_images) return NULL;
-    struct liq_queue *queue = calloc(1, sizeof *queue);
-    if (!queue) return NULL;
-    if (pthread_mutex_init(&queue->mutex, NULL)) { free(queue); return NULL; }
-    if (pthread_cond_init(&queue->changed, NULL)) {
-        pthread_mutex_destroy(&queue->mutex); free(queue); return NULL;
-    }
-    atomic_init(&queue->refs, 1);
-    queue->max_images = max_images;
-    queue->capacity = capacity;
-    return queue;
+  if (!max_images || capacity < max_images) return NULL;
+  struct liq_queue *queue = calloc(1, sizeof *queue);
+  if (!queue) return NULL;
+  if (pthread_mutex_init(&queue->mutex, NULL)) {
+    free(queue);
+    return NULL;
+  }
+  if (pthread_cond_init(&queue->changed, NULL)) {
+    pthread_mutex_destroy(&queue->mutex);
+    free(queue);
+    return NULL;
+  }
+  atomic_init(&queue->refs, 1);
+  queue->max_images = max_images;
+  queue->capacity = capacity;
+  return queue;
 }
 void liq_ref(struct liq_queue *queue)
 {
-    if (queue) atomic_fetch_add_explicit(&queue->refs, 1, memory_order_relaxed);
+  if (queue) atomic_fetch_add_explicit(&queue->refs, 1, memory_order_relaxed);
 }
 void liq_unref(struct liq_queue *queue)
 {
-    if (!queue || atomic_fetch_sub_explicit(&queue->refs, 1, memory_order_acq_rel) != 1) return;
-    struct liq_image *image = queue->head;
-    while (image) { struct liq_image *next = image->next; image_free(image); image = next; }
-    pthread_mutex_destroy(&queue->mutex);
-    pthread_cond_destroy(&queue->changed);
-    free(queue);
+  if (!queue || atomic_fetch_sub_explicit(&queue->refs, 1, memory_order_acq_rel) != 1) return;
+  struct liq_image *image = queue->head;
+  while (image) {
+    struct liq_image *next = image->next;
+    image_free(image);
+    image = next;
+  }
+  pthread_mutex_destroy(&queue->mutex);
+  pthread_cond_destroy(&queue->changed);
+  free(queue);
 }
 void liq_close(struct liq_queue *queue)
 {
-    if (!queue) return;
-    pthread_mutex_lock(&queue->mutex);
-    if (queue->closed) { pthread_mutex_unlock(&queue->mutex); return; }
-    queue->closed = true;
-    struct liq_image *image = queue->head;
-    queue->head = queue->tail = NULL;
-    queue->buffers = queue->acquired;
-    pthread_cond_broadcast(&queue->changed);
-    if (queue->notify) queue->notify(queue->notify_context, queue->sequence, true);
+  if (!queue) return;
+  pthread_mutex_lock(&queue->mutex);
+  if (queue->closed) {
     pthread_mutex_unlock(&queue->mutex);
-    while (image) { struct liq_image *next = image->next; image_free(image); image = next; }
+    return;
+  }
+  queue->closed = true;
+  struct liq_image *image = queue->head;
+  queue->head = queue->tail = NULL;
+  queue->buffers = queue->acquired;
+  pthread_cond_broadcast(&queue->changed);
+  if (queue->notify) queue->notify(queue->notify_context, queue->sequence, true);
+  pthread_mutex_unlock(&queue->mutex);
+  while (image) {
+    struct liq_image *next = image->next;
+    image_free(image);
+    image = next;
+  }
 }
 int liq_submit(struct liq_queue *queue, uint8_t **pixels, size_t bytes,
                unsigned width, unsigned height, int64_t timestamp_ns)
 {
-    if (!queue) return LIQ_INVALID_OBJECT;
-    if (!pixels || !*pixels || !width || !height || width > SIZE_MAX / 4u / height ||
-        bytes < (size_t)width * height * 4u) return LIQ_INVALID_PARAMETER;
-    pthread_mutex_lock(&queue->mutex);
-    int status = queue->closed ? LIQ_INVALID_OBJECT : queue->buffers >= queue->capacity ? LIQ_WOULD_BLOCK : LIQ_OK;
-    struct liq_image *image = status == LIQ_OK ? calloc(1, sizeof *image) : NULL;
-    if (status == LIQ_OK && !image) status = LIQ_NO_MEMORY;
-    if (status == LIQ_OK) {
-        image->queue = queue;
-        image->pixels = *pixels;
-        image->width = width;
-        image->height = height;
-        image->timestamp = timestamp_ns;
-        if (queue->tail) queue->tail->next = image;
-        else queue->head = image;
-        queue->tail = image;
-        ++queue->buffers;
-        ++queue->sequence;
-        *pixels = NULL;
-        if (queue->notify) queue->notify(queue->notify_context, queue->sequence, false);
-    }
-    pthread_mutex_unlock(&queue->mutex);
-    return status;
+  if (!queue) return LIQ_INVALID_OBJECT;
+  if (!pixels || !*pixels || !width || !height || width > SIZE_MAX / 4u / height ||
+      bytes < (size_t)width * height * 4u) return LIQ_INVALID_PARAMETER;
+  pthread_mutex_lock(&queue->mutex);
+  int status = queue->closed ? LIQ_INVALID_OBJECT : queue->buffers >= queue->capacity ? LIQ_WOULD_BLOCK : LIQ_OK;
+  struct liq_image *image = status == LIQ_OK ? calloc(1, sizeof *image) : NULL;
+  if (status == LIQ_OK && !image) status = LIQ_NO_MEMORY;
+  if (status == LIQ_OK) {
+    image->queue = queue;
+    image->pixels = *pixels;
+    image->width = width;
+    image->height = height;
+    image->timestamp = timestamp_ns;
+    if (queue->tail) queue->tail->next = image;
+    else queue->head = image;
+    queue->tail = image;
+    ++queue->buffers;
+    ++queue->sequence;
+    *pixels = NULL;
+    if (queue->notify) queue->notify(queue->notify_context, queue->sequence, false);
+  }
+  pthread_mutex_unlock(&queue->mutex);
+  return status;
 }
 int liq_acquire(struct liq_queue *queue, bool latest, struct liq_image **out)
 {
-    if (!out) return LIQ_INVALID_PARAMETER;
-    *out = NULL;
-    if (!queue) return LIQ_INVALID_OBJECT;
-    pthread_mutex_lock(&queue->mutex);
-    int status = queue->closed ? LIQ_INVALID_OBJECT : queue->acquired >= queue->max_images ? LIQ_MAX_ACQUIRED : !queue->head ? LIQ_NO_BUFFER : LIQ_OK;
-    if (status == LIQ_OK) {
-        /* acquireLatest needs room to temporarily acquire two images. With
-         * less margin, Android cannot discard the older image for a newer one. */
-        if (latest && queue->max_images - queue->acquired >= 2) {
-            while (queue->head->next) {
-                struct liq_image *old = queue->head;
-                queue->head = old->next;
-                --queue->buffers;
-                image_free(old);
-                pthread_cond_broadcast(&queue->changed);
-            }
-        }
-        struct liq_image *image = queue->head;
-        queue->head = image->next;
-        if (!queue->head) queue->tail = NULL;
-        image->next = NULL;
-        ++queue->acquired;
-        liq_ref(queue);
-        *out = image;
+  if (!out) return LIQ_INVALID_PARAMETER;
+  *out = NULL;
+  if (!queue) return LIQ_INVALID_OBJECT;
+  pthread_mutex_lock(&queue->mutex);
+  int status = queue->closed ? LIQ_INVALID_OBJECT : queue->acquired >= queue->max_images ? LIQ_MAX_ACQUIRED : !queue->head ? LIQ_NO_BUFFER : LIQ_OK;
+  if (status == LIQ_OK) {
+    /* acquireLatest needs room to temporarily acquire two images. With
+     * less margin, Android cannot discard the older image for a newer one. */
+    if (latest && queue->max_images - queue->acquired >= 2) {
+      while (queue->head->next) {
+        struct liq_image *old = queue->head;
+        queue->head = old->next;
+        --queue->buffers;
+        image_free(old);
+        pthread_cond_broadcast(&queue->changed);
+      }
     }
-    pthread_mutex_unlock(&queue->mutex);
-    return status;
+    struct liq_image *image = queue->head;
+    queue->head = image->next;
+    if (!queue->head) queue->tail = NULL;
+    image->next = NULL;
+    ++queue->acquired;
+    liq_ref(queue);
+    *out = image;
+  }
+  pthread_mutex_unlock(&queue->mutex);
+  return status;
 }
 void liq_release(struct liq_image *image)
 {
-    if (!image) return;
-    struct liq_queue *queue = image->queue;
-    pthread_mutex_lock(&queue->mutex);
-    --queue->acquired;
-    --queue->buffers;
-    pthread_cond_broadcast(&queue->changed);
-    pthread_mutex_unlock(&queue->mutex);
-    image_free(image);
-    liq_unref(queue);
+  if (!image) return;
+  struct liq_queue *queue = image->queue;
+  pthread_mutex_lock(&queue->mutex);
+  --queue->acquired;
+  --queue->buffers;
+  pthread_cond_broadcast(&queue->changed);
+  pthread_mutex_unlock(&queue->mutex);
+  image_free(image);
+  liq_unref(queue);
 }
-const uint8_t *liq_pixels(const struct liq_image *image) { return image ? image->pixels : NULL; }
-unsigned liq_width(const struct liq_image *image) { return image ? image->width : 0; }
-unsigned liq_height(const struct liq_image *image) { return image ? image->height : 0; }
-int64_t liq_timestamp(const struct liq_image *image) { return image ? image->timestamp : 0; }
+const uint8_t *liq_pixels(const struct liq_image *image) {
+  return image ? image->pixels : NULL;
+}
+unsigned liq_width(const struct liq_image *image) {
+  return image ? image->width : 0;
+}
+unsigned liq_height(const struct liq_image *image) {
+  return image ? image->height : 0;
+}
+int64_t liq_timestamp(const struct liq_image *image) {
+  return image ? image->timestamp : 0;
+}
 uint64_t liq_sequence(struct liq_queue *queue)
 {
-    if (!queue) return 0;
-    pthread_mutex_lock(&queue->mutex);
-    uint64_t sequence = queue->sequence;
-    pthread_mutex_unlock(&queue->mutex);
-    return sequence;
+  if (!queue) return 0;
+  pthread_mutex_lock(&queue->mutex);
+  uint64_t sequence = queue->sequence;
+  pthread_mutex_unlock(&queue->mutex);
+  return sequence;
 }
 void liq_set_notify(struct liq_queue *queue, liq_notify_fn notify, void *context)
 {
-    if (!queue) return;
-    pthread_mutex_lock(&queue->mutex);
-    queue->notify = notify;
-    queue->notify_context = notify ? context : NULL;
-    if (notify) notify(context, queue->sequence, queue->closed);
-    pthread_mutex_unlock(&queue->mutex);
+  if (!queue) return;
+  pthread_mutex_lock(&queue->mutex);
+  queue->notify = notify;
+  queue->notify_context = notify ? context : NULL;
+  if (notify) notify(context, queue->sequence, queue->closed);
+  pthread_mutex_unlock(&queue->mutex);
 }
 int liq_wait_space(struct liq_queue *queue, unsigned timeout_ms)
 {
-    if (!queue) return LIQ_INVALID_OBJECT;
-    struct timespec until;
-    if (clock_gettime(CLOCK_REALTIME, &until)) return LIQ_INVALID_OBJECT;
-    uint64_t ns = (uint64_t)until.tv_nsec + (uint64_t)timeout_ms * 1000000;
-    until.tv_sec += (time_t)(ns / 1000000000);
-    until.tv_nsec = (long)(ns % 1000000000);
-    pthread_mutex_lock(&queue->mutex);
-    while (!queue->closed && queue->buffers >= queue->capacity && timeout_ms) {
-        if (pthread_cond_timedwait(&queue->changed, &queue->mutex, &until)) break;
-    }
-    int status = queue->closed ? LIQ_INVALID_OBJECT : queue->buffers >= queue->capacity ? LIQ_WOULD_BLOCK : LIQ_OK;
-    pthread_mutex_unlock(&queue->mutex);
-    return status;
+  if (!queue) return LIQ_INVALID_OBJECT;
+  struct timespec until;
+  if (clock_gettime(CLOCK_REALTIME, &until)) return LIQ_INVALID_OBJECT;
+  uint64_t ns = (uint64_t)until.tv_nsec + (uint64_t)timeout_ms * 1000000;
+  until.tv_sec += (time_t)(ns / 1000000000);
+  until.tv_nsec = (long)(ns % 1000000000);
+  pthread_mutex_lock(&queue->mutex);
+  while (!queue->closed && queue->buffers >= queue->capacity && timeout_ms) {
+    if (pthread_cond_timedwait(&queue->changed, &queue->mutex, &until)) break;
+  }
+  int status = queue->closed ? LIQ_INVALID_OBJECT : queue->buffers >= queue->capacity ? LIQ_WOULD_BLOCK : LIQ_OK;
+  pthread_mutex_unlock(&queue->mutex);
+  return status;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -208,46 +234,48 @@ int liq_wait_space(struct liq_queue *queue, unsigned timeout_ms)
 typedef const struct ISVCDecoderVtbl *ISVCDecoder;
 
 struct SSysMEMBuffer {
-   int iWidth, iHeight, iFormat, iStride[2];
+  int iWidth, iHeight, iFormat, iStride[2];
 };
 
 struct SBufferInfo {
-   int iBufferStatus;
-   unsigned long long uiInBsTimeStamp;
-   unsigned long long uiOutYuvTimeStamp;
-   union { struct SSysMEMBuffer sSystemBuffer; } UsrData;
-   unsigned char *pDst[3];
+  int iBufferStatus;
+  unsigned long long uiInBsTimeStamp;
+  unsigned long long uiOutYuvTimeStamp;
+  union {
+    struct SSysMEMBuffer sSystemBuffer;
+  } UsrData;
+  unsigned char *pDst[3];
 };
 
 struct SVideoProperty {
-   unsigned int size;
-   int eVideoBsType;
+  unsigned int size;
+  int eVideoBsType;
 };
 
 struct SDecodingParam {
-   char *pFileNameRestructed;
-   unsigned int uiCpuLoad;
-   unsigned char uiTargetDqLayer;
-   int eEcActiveIdc;
-   bool bParseOnly;
-   struct SVideoProperty sVideoProperty;
+  char *pFileNameRestructed;
+  unsigned int uiCpuLoad;
+  unsigned char uiTargetDqLayer;
+  int eEcActiveIdc;
+  bool bParseOnly;
+  struct SVideoProperty sVideoProperty;
 };
 
 struct ISVCDecoderVtbl {
-   long (*Initialize)(ISVCDecoder *, const struct SDecodingParam *);
-   long (*Uninitialize)(ISVCDecoder *);
-   int (*DecodeFrame)(ISVCDecoder *, const unsigned char *, int,
-                      unsigned char **, int *, int *, int *);
-   int (*DecodeFrameNoDelay)(ISVCDecoder *, const unsigned char *, int,
-                             unsigned char **, struct SBufferInfo *);
-   int (*DecodeFrame2)(ISVCDecoder *, const unsigned char *, int,
-                       unsigned char **, struct SBufferInfo *);
-   int (*FlushFrame)(ISVCDecoder *, unsigned char **, struct SBufferInfo *);
-   int (*DecodeParser)(ISVCDecoder *, const unsigned char *, int, void *);
-   int (*DecodeFrameEx)(ISVCDecoder *, const unsigned char *, int,
-                        unsigned char *, int, int *, int *, int *, int *);
-   long (*SetOption)(ISVCDecoder *, int, void *);
-   long (*GetOption)(ISVCDecoder *, int, void *);
+  long (*Initialize)(ISVCDecoder *, const struct SDecodingParam *);
+  long (*Uninitialize)(ISVCDecoder *);
+  int (*DecodeFrame)(ISVCDecoder *, const unsigned char *, int,
+                     unsigned char **, int *, int *, int *);
+  int (*DecodeFrameNoDelay)(ISVCDecoder *, const unsigned char *, int,
+                            unsigned char **, struct SBufferInfo *);
+  int (*DecodeFrame2)(ISVCDecoder *, const unsigned char *, int,
+                      unsigned char **, struct SBufferInfo *);
+  int (*FlushFrame)(ISVCDecoder *, unsigned char **, struct SBufferInfo *);
+  int (*DecodeParser)(ISVCDecoder *, const unsigned char *, int, void *);
+  int (*DecodeFrameEx)(ISVCDecoder *, const unsigned char *, int,
+                       unsigned char *, int, int *, int *, int *, int *);
+  long (*SetOption)(ISVCDecoder *, int, void *);
+  long (*GetOption)(ISVCDecoder *, int, void *);
 };
 
 /* ERROR_CON_IDC: conceal a damaged slice from the frame before it rather than
@@ -262,78 +290,78 @@ static void (*lm_WelsDestroyDecoder)(ISVCDecoder *);
  * or the system loader's own search. */
 static void *openh264_dlopen(void)
 {
-   const char *env = getenv("LUNARIA_OPENH264");
-   if (env && *env) return luna_os_library_open_local(env);
+  const char *env = getenv("LUNARIA_OPENH264");
+  if (env && *env) return luna_os_library_open_local(env);
 
-   char self[PATH_MAX];
-   if (luna_os_executable_path(self, sizeof self) == 0) {
-      char *slash = strrchr(self, '/');
-      if (slash) {
-         char path[PATH_MAX];
-         *slash = '\0';
-         if ((size_t)snprintf(path, sizeof path, "%s/runtime/%s",
-                              self,
+  char self[PATH_MAX];
+  if (luna_os_executable_path(self, sizeof self) == 0) {
+    char *slash = strrchr(self, '/');
+    if (slash) {
+      char path[PATH_MAX];
+      *slash = '\0';
+      if ((size_t)snprintf(path, sizeof path, "%s/runtime/%s",
+                           self,
 #ifdef _WIN32
-                              "openh264.dll"
+                           "openh264.dll"
 #elif defined(__APPLE__)
-                              "libopenh264.dylib"
+                           "libopenh264.dylib"
 #else
-                              "libopenh264.so"
+                           "libopenh264.so"
 #endif
-                              ) < sizeof path) {
-            void *h = luna_os_library_open_local(path);
-            if (h) return h;
-         }
+                          ) < sizeof path) {
+        void *h = luna_os_library_open_local(path);
+        if (h) return h;
       }
-   }
+    }
+  }
 
-   static const char *const fallbacks[] = {
+  static const char *const fallbacks[] = {
 #ifdef _WIN32
-      "openh264.dll",
-      "libopenh264.dll",
+    "openh264.dll",
+    "libopenh264.dll",
 #elif defined(__APPLE__)
-      "/usr/local/lib/lunaria/libopenh264.dylib",
-      "libopenh264.dylib",
+    "/usr/local/lib/lunaria/libopenh264.dylib",
+    "libopenh264.dylib",
 #else
-      "/usr/local/lib/lunaria/libopenh264.so",
-      "libopenh264.so",
-      "libopenh264.so.7",
+    "/usr/local/lib/lunaria/libopenh264.so",
+    "libopenh264.so",
+    "libopenh264.so.7",
 #endif
-   };
-   for (size_t i = 0; i < sizeof fallbacks / sizeof *fallbacks; ++i) {
-      void *h = luna_os_library_open_local(fallbacks[i]);
-      if (h) return h;
-   }
-   return NULL;
+  };
+  for (size_t i = 0; i < sizeof fallbacks / sizeof *fallbacks; ++i) {
+    void *h = luna_os_library_open_local(fallbacks[i]);
+    if (h) return h;
+  }
+  return NULL;
 }
 
 /* True once the library is loaded and its two entry points resolved.  Reported
  * exactly once, so a run without it says so instead of going quiet. */
 static bool openh264_ready(void)
 {
-   static int state = -1;
-   if (state >= 0) return state == 1;
+  static int state = -1;
+  if (state >= 0) return state == 1;
 
-   void *h = openh264_dlopen();
-   if (!h) {
-      fprintf(stderr, "[media] no openh264: %s\n"
-              "[media] H.264 decoding is unavailable — run `make fetch-openh264`"
-              " or set LUNARIA_OPENH264\n", luna_os_library_error());
-      state = 0;
-      return false;
-   }
-   *(void **)&lm_WelsCreateDecoder = luna_os_library_symbol(h, "WelsCreateDecoder");
-   *(void **)&lm_WelsDestroyDecoder = luna_os_library_symbol(h, "WelsDestroyDecoder");
-   if (!lm_WelsCreateDecoder || !lm_WelsDestroyDecoder) {
-      fprintf(stderr, "[media] openh264 loaded but WelsCreateDecoder is missing\n");
-      state = 0;
-      return false;
-   }
-   unsigned (*ver)(void) = NULL;
-   *(void **)&ver = luna_os_library_symbol(h, "WelsGetCodecVersion");
-   fprintf(stderr, "[media] openh264 ready%s\n", ver ? "" : " (version unknown)");
-   state = 1;
-   return true;
+  void *h = openh264_dlopen();
+  if (!h) {
+    fprintf(stderr, "[media] no openh264: %s\n"
+                    "[media] H.264 decoding is unavailable — run `make fetch-openh264`"
+                    " or set LUNARIA_OPENH264\n", luna_os_library_error());
+    state = 0;
+    return false;
+  }
+  *(void **)&lm_WelsCreateDecoder = luna_os_library_symbol(h, "WelsCreateDecoder");
+  *(void **)&lm_WelsDestroyDecoder = luna_os_library_symbol(h, "WelsDestroyDecoder");
+  if (!lm_WelsCreateDecoder || !lm_WelsDestroyDecoder) {
+    fprintf(stderr, "[media] openh264 loaded but WelsCreateDecoder is missing\n");
+    state = 0;
+    return false;
+  }
+  unsigned (*ver)(void) = NULL;
+  *(void **)&ver = luna_os_library_symbol(h, "WelsGetCodecVersion");
+  fprintf(stderr, "[media] openh264 ready%s\n", ver ? "" : " (version unknown)");
+  state = 1;
+  return true;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -367,34 +395,35 @@ static bool openh264_ready(void)
 
 enum { AV_PIX_FMT_YUV420P = 0, AV_PIX_FMT_YUVJ420P = 12 };
 enum { AV_SAMPLE_FMT_S16 = 1, AV_SAMPLE_FMT_FLT = 3,
-       AV_SAMPLE_FMT_S16P = 6, AV_SAMPLE_FMT_FLTP = 8 };
+       AV_SAMPLE_FMT_S16P = 6, AV_SAMPLE_FMT_FLTP = 8
+     };
 
 static struct {
-   void (*register_all)(void);
-   void *(*find_decoder_by_name)(const char *);
-   void *(*alloc_context3)(void *);
-   int (*open2)(void *, void *, void **);
-   int (*decode_audio4)(void *, void *, int *, const void *);
-   int (*close)(void *);
-   void (*free)(void *);
-   void (*init_packet)(void *);
-   void *(*frame_alloc)(void);
-   void (*frame_free)(void **);
-   int (*frame_channels)(const void *);
-   int (*frame_sample_rate)(const void *);
-   /* video: optional — a libavcodec without them still decodes AAC */
-   int (*decode_video2)(void *, void *, int *, const void *);
-   int64_t (*frame_best_effort_ts)(const void *);
-   void (*flush_buffers)(void *);
+  void (*register_all)(void);
+  void *(*find_decoder_by_name)(const char *);
+  void *(*alloc_context3)(void *);
+  int (*open2)(void *, void *, void **);
+  int (*decode_audio4)(void *, void *, int *, const void *);
+  int (*close)(void *);
+  void (*free)(void *);
+  void (*init_packet)(void *);
+  void *(*frame_alloc)(void);
+  void (*frame_free)(void **);
+  int (*frame_channels)(const void *);
+  int (*frame_sample_rate)(const void *);
+  /* video: optional — a libavcodec without them still decodes AAC */
+  int (*decode_video2)(void *, void *, int *, const void *);
+  int64_t (*frame_best_effort_ts)(const void *);
+  void (*flush_buffers)(void *);
 } av;
 
 static void *dlopen_any(const char *const *names, size_t n)
 {
-   for (size_t i = 0; i < n; ++i) {
-      void *h = luna_os_library_open_local(names[i]);
-      if (h) return h;
-   }
-   return NULL;
+  for (size_t i = 0; i < n; ++i) {
+    void *h = luna_os_library_open_local(names[i]);
+    if (h) return h;
+  }
+  return NULL;
 }
 
 /* av_init_packet() writes AV_NOPTS_VALUE into pts and dts and clears buf.
@@ -405,86 +434,86 @@ static void *dlopen_any(const char *const *names, size_t n)
  * decode_aac does.) */
 static bool avcodec_probe_layout(void)
 {
-   unsigned char pkt[AVPKT_BYTES];
-   memset(pkt, 0xA5, sizeof pkt);
-   av.init_packet(pkt);
-   int64_t pts, dts;
-   void *buf;
-   memcpy(&buf, pkt, sizeof buf);
-   memcpy(&pts, pkt + AVPKT_PTS_OFF, 8);
-   memcpy(&dts, pkt + AVPKT_DTS_OFF, 8);
-   return buf == NULL && pts == INT64_MIN && dts == INT64_MIN;
+  unsigned char pkt[AVPKT_BYTES];
+  memset(pkt, 0xA5, sizeof pkt);
+  av.init_packet(pkt);
+  int64_t pts, dts;
+  void *buf;
+  memcpy(&buf, pkt, sizeof buf);
+  memcpy(&pts, pkt + AVPKT_PTS_OFF, 8);
+  memcpy(&dts, pkt + AVPKT_DTS_OFF, 8);
+  return buf == NULL && pts == INT64_MIN && dts == INT64_MIN;
 }
 
 static bool avcodec_ready(void)
 {
-   static int state = -1;
-   if (state >= 0) return state == 1;
-   state = 0;
+  static int state = -1;
+  if (state >= 0) return state == 1;
+  state = 0;
 
-   static const char *const codec_names[] = {
-      #ifdef _WIN32
-      "avcodec-55.dll", "libavcodec-55.dll",
+  static const char *const codec_names[] = {
+#ifdef _WIN32
+    "avcodec-55.dll", "libavcodec-55.dll",
 #else
-      "libavcodec.so.55", "libavcodec.so",
+    "libavcodec.so.55", "libavcodec.so",
 #endif
-   };
-   static const char *const util_names[] = {
-      #ifdef _WIN32
-      "avutil-52.dll", "libavutil-52.dll",
+  };
+  static const char *const util_names[] = {
+#ifdef _WIN32
+    "avutil-52.dll", "libavutil-52.dll",
 #else
-      "libavutil.so.52", "libavutil.so",
+    "libavutil.so.52", "libavutil.so",
 #endif
-   };
-   const char *env = getenv("LUNARIA_LIBAVCODEC");
-   void *c = env && *env ? luna_os_library_open_local(env)
-                         : dlopen_any(codec_names, 2);
-   void *u = dlopen_any(util_names, 2);
-   if (!c || !u) {
-      fprintf(stderr, "[media] no libavcodec/libavutil: %s\n"
-              "[media] AAC and libavcodec H.264 decoding are unavailable\n",
-              luna_os_library_error());
-      return false;
-   }
+  };
+  const char *env = getenv("LUNARIA_LIBAVCODEC");
+  void *c = env && *env ? luna_os_library_open_local(env)
+            : dlopen_any(codec_names, 2);
+  void *u = dlopen_any(util_names, 2);
+  if (!c || !u) {
+    fprintf(stderr, "[media] no libavcodec/libavutil: %s\n"
+                    "[media] AAC and libavcodec H.264 decoding are unavailable\n",
+            luna_os_library_error());
+    return false;
+  }
 #define AV_SYM(dst, lib, name) \
    do { *(void **)&av.dst = luna_os_library_symbol(lib, name); if (!av.dst) { \
         fprintf(stderr, "[media] libav: %s missing\n", name); return false; } } while (0)
-   AV_SYM(register_all, c, "avcodec_register_all");
-   AV_SYM(find_decoder_by_name, c, "avcodec_find_decoder_by_name");
-   AV_SYM(alloc_context3, c, "avcodec_alloc_context3");
-   AV_SYM(open2, c, "avcodec_open2");
-   AV_SYM(decode_audio4, c, "avcodec_decode_audio4");
-   AV_SYM(close, c, "avcodec_close");
-   AV_SYM(free, u, "av_free");
-   AV_SYM(init_packet, c, "av_init_packet");
-   AV_SYM(frame_alloc, u, "av_frame_alloc");
-   AV_SYM(frame_free, u, "av_frame_free");
-   AV_SYM(frame_channels, u, "av_frame_get_channels");
-   AV_SYM(frame_sample_rate, u, "av_frame_get_sample_rate");
+  AV_SYM(register_all, c, "avcodec_register_all");
+  AV_SYM(find_decoder_by_name, c, "avcodec_find_decoder_by_name");
+  AV_SYM(alloc_context3, c, "avcodec_alloc_context3");
+  AV_SYM(open2, c, "avcodec_open2");
+  AV_SYM(decode_audio4, c, "avcodec_decode_audio4");
+  AV_SYM(close, c, "avcodec_close");
+  AV_SYM(free, u, "av_free");
+  AV_SYM(init_packet, c, "av_init_packet");
+  AV_SYM(frame_alloc, u, "av_frame_alloc");
+  AV_SYM(frame_free, u, "av_frame_free");
+  AV_SYM(frame_channels, u, "av_frame_get_channels");
+  AV_SYM(frame_sample_rate, u, "av_frame_get_sample_rate");
 #undef AV_SYM
-   *(void **)&av.decode_video2 = luna_os_library_symbol(c, "avcodec_decode_video2");
-   *(void **)&av.frame_best_effort_ts = luna_os_library_symbol(u, "av_frame_get_best_effort_timestamp");
-   *(void **)&av.flush_buffers = luna_os_library_symbol(c, "avcodec_flush_buffers");
+  *(void **)&av.decode_video2 = luna_os_library_symbol(c, "avcodec_decode_video2");
+  *(void **)&av.frame_best_effort_ts = luna_os_library_symbol(u, "av_frame_get_best_effort_timestamp");
+  *(void **)&av.flush_buffers = luna_os_library_symbol(c, "avcodec_flush_buffers");
 
-   if (!avcodec_probe_layout()) {
-      fprintf(stderr, "[media] libavcodec AVPacket layout is not the one this "
-              "build understands — AAC decoding disabled\n");
-      return false;
-   }
-   av.register_all();
-   fprintf(stderr, "[media] libavcodec ready (aac %s, h264 %s, vp9 %s)\n",
-           av.find_decoder_by_name("aac") ? "yes" : "no",
-           av.decode_video2 && av.frame_best_effort_ts &&
-           av.find_decoder_by_name("h264") ? "yes" : "no",
-           av.decode_video2 && av.frame_best_effort_ts &&
-           av.find_decoder_by_name("vp9") ? "yes" : "no");
-   state = 1;
-   return true;
+  if (!avcodec_probe_layout()) {
+    fprintf(stderr, "[media] libavcodec AVPacket layout is not the one this "
+                    "build understands — AAC decoding disabled\n");
+    return false;
+  }
+  av.register_all();
+  fprintf(stderr, "[media] libavcodec ready (aac %s, h264 %s, vp9 %s)\n",
+          av.find_decoder_by_name("aac") ? "yes" : "no",
+          av.decode_video2 && av.frame_best_effort_ts &&
+          av.find_decoder_by_name("h264") ? "yes" : "no",
+          av.decode_video2 && av.frame_best_effort_ts &&
+          av.find_decoder_by_name("vp9") ? "yes" : "no");
+  state = 1;
+  return true;
 }
 
 static bool avcodec_aac_ready(void)
 {
-   return avcodec_ready() && av.find_decoder_by_name("aac");
+  return avcodec_ready() && av.find_decoder_by_name("aac");
 }
 
 /* A device's MediaCodec decodes every H.264 profile a movie is mastered in —
@@ -493,24 +522,24 @@ static bool avcodec_aac_ready(void)
  * h264 is used whenever it is present. */
 static bool avcodec_video_ready(const char *name)
 {
-   return avcodec_ready() && av.decode_video2 && av.frame_best_effort_ts &&
-          av.flush_buffers && av.find_decoder_by_name(name);
+  return avcodec_ready() && av.decode_video2 && av.frame_best_effort_ts &&
+         av.flush_buffers && av.find_decoder_by_name(name);
 }
 
 static bool avcodec_h264_ready(void)
 {
-   return avcodec_video_ready("h264");
+  return avcodec_video_ready("h264");
 }
 
 static bool avcodec_vp9_ready(void)
 {
-   return avcodec_video_ready("vp9");
+  return avcodec_video_ready("vp9");
 }
 
 static bool is_vp9_mime(const char *mime)
 {
-   return !strcasecmp(mime, "video/x-vnd.on2.vp9") ||
-          !strcasecmp(mime, "video/vp9");
+  return !strcasecmp(mime, "video/x-vnd.on2.vp9") ||
+         !strcasecmp(mime, "video/vp9");
 }
 
 /* ------------------------------------------------------------------------ *
@@ -522,252 +551,289 @@ static bool is_vp9_mime(const char *mime)
  * replace another immediate frame, but never an explicitly scheduled frame. */
 #define LM_SINK_QUEUE_CAP 2u
 struct lm_sinkbuf {
-   uint8_t *rgba;
-   size_t cap;
-   int w, h;
-   int64_t ts_ns, due_ns;
-   bool timed;
+  uint8_t *rgba;
+  size_t cap;
+  int w, h;
+  int64_t ts_ns, due_ns;
+  bool timed;
 };
 
 struct lm_sink {
-   atomic_uint refs;
-   pthread_mutex_t mu;
-   pthread_cond_t space;
-   struct lm_sinkbuf front, queued[LM_SINK_QUEUE_CAP], back;
-   unsigned head, count;
-   int64_t ts_ns;
-   uint64_t commit_id, front_serial;
-   bool abandoned;
-   struct liq_queue *images;
-   int commit_status;       /* producer-owned; explains a rejected commit */
+  atomic_uint refs;
+  pthread_mutex_t mu;
+  pthread_cond_t space;
+  struct lm_sinkbuf front, queued[LM_SINK_QUEUE_CAP], back;
+  unsigned head, count;
+  int64_t ts_ns;
+  uint64_t commit_id, front_serial;
+  bool abandoned;
+  struct liq_queue *images;
+  int commit_status;       /* producer-owned; explains a rejected commit */
 };
 
 struct lm_sink *lm_sink_new(void)
 {
-   struct lm_sink *s = calloc(1, sizeof(struct lm_sink));
-   if (s) {
-      atomic_init(&s->refs, 1);
-      pthread_mutex_init(&s->mu, NULL);
-      pthread_cond_init(&s->space, NULL);
-   }
-   return s;
+  struct lm_sink *s = calloc(1, sizeof(struct lm_sink));
+  if (s) {
+    atomic_init(&s->refs, 1);
+    pthread_mutex_init(&s->mu, NULL);
+    pthread_cond_init(&s->space, NULL);
+  }
+  return s;
 }
 
 struct lm_sink *lm_sink_new_reader(unsigned max_images, unsigned capacity)
 {
-   struct lm_sink *s = lm_sink_new();
-   if (!s) return NULL;
-   s->images = liq_new(max_images, capacity);
-   if (!s->images) { lm_sink_free(s); return NULL; }
-   return s;
+  struct lm_sink *s = lm_sink_new();
+  if (!s) return NULL;
+  s->images = liq_new(max_images, capacity);
+  if (!s->images) {
+    lm_sink_free(s);
+    return NULL;
+  }
+  return s;
 }
 struct liq_queue *lm_sink_image_queue(struct lm_sink *s)
 {
-   return s ? s->images : NULL;
+  return s ? s->images : NULL;
 }
 
 void lm_sink_ref(struct lm_sink *s)
 {
-   if (s) atomic_fetch_add_explicit(&s->refs, 1, memory_order_relaxed);
+  if (s) atomic_fetch_add_explicit(&s->refs, 1, memory_order_relaxed);
 }
 
 void lm_sink_free(struct lm_sink *s)
 {
-   if (!s || atomic_fetch_sub_explicit(&s->refs, 1, memory_order_acq_rel) != 1) return;
-   free(s->front.rgba);
-   for (unsigned i=0;i<LM_SINK_QUEUE_CAP;++i) free(s->queued[i].rgba);
-   free(s->back.rgba);
-   liq_close(s->images);
-   liq_unref(s->images);
-   pthread_cond_destroy(&s->space);
-   pthread_mutex_destroy(&s->mu);
-   free(s);
+  if (!s || atomic_fetch_sub_explicit(&s->refs, 1, memory_order_acq_rel) != 1) return;
+  free(s->front.rgba);
+  for (unsigned i=0; i<LM_SINK_QUEUE_CAP; ++i) free(s->queued[i].rgba);
+  free(s->back.rgba);
+  liq_close(s->images);
+  liq_unref(s->images);
+  pthread_cond_destroy(&s->space);
+  pthread_mutex_destroy(&s->mu);
+  free(s);
 }
 
 uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h)
 {
-   if (!s || w <= 0 || h <= 0) return NULL;
-   pthread_mutex_lock(&s->mu);bool abandoned=s->abandoned;pthread_mutex_unlock(&s->mu);
-   if(abandoned) return NULL;
-   if ((size_t)w > SIZE_MAX / 4u / (size_t)h) return NULL;
-   size_t need = (size_t)w * (size_t)h * 4u;
-   struct lm_sinkbuf *b = &s->back;
-   if (need > b->cap) {
-      uint8_t *p = realloc(b->rgba, need);
-      if (!p) return NULL;
-      b->rgba = p;
-      b->cap = need;
-   }
-   return b->rgba;
+  if (!s || w <= 0 || h <= 0) return NULL;
+  pthread_mutex_lock(&s->mu);
+  bool abandoned=s->abandoned;
+  pthread_mutex_unlock(&s->mu);
+  if(abandoned) return NULL;
+  if ((size_t)w > SIZE_MAX / 4u / (size_t)h) return NULL;
+  size_t need = (size_t)w * (size_t)h * 4u;
+  struct lm_sinkbuf *b = &s->back;
+  if (need > b->cap) {
+    uint8_t *p = realloc(b->rgba, need);
+    if (!p) return NULL;
+    b->rgba = p;
+    b->cap = need;
+  }
+  return b->rgba;
 }
 
 static bool sink_commit(struct lm_sink *s,int w,int h,int64_t timestamp_ns,bool timed)
 {
-   if (s) s->commit_status = LIQ_INVALID_PARAMETER;
-   if (!s || !s->back.rgba || w <= 0 || h <= 0) return false;
-   if ((size_t)w > SIZE_MAX / 4u / (size_t)h ||
-       (size_t)w * (size_t)h * 4u > s->back.cap) return false;
-   s->back.w = w;
-   s->back.h = h;
-   s->back.ts_ns = timestamp_ns;
-   s->back.timed = timed;
-   s->back.due_ns = timed ? timestamp_ns : 0;
-   pthread_mutex_lock(&s->mu);
-   if(s->abandoned) {s->commit_status=LIQ_INVALID_OBJECT;pthread_mutex_unlock(&s->mu);return false;}
-   if (s->images) {
-      int status = liq_submit(s->images, &s->back.rgba, s->back.cap,
-                              (unsigned)w, (unsigned)h, timestamp_ns);
-      s->commit_status = status;
-      if (status == LIQ_OK) {
-         s->back.cap = 0;
-         s->ts_ns = timestamp_ns;
-         ++s->commit_id;
-      }
-      pthread_mutex_unlock(&s->mu);
-      return status == LIQ_OK;
-   }
-   unsigned tail=(s->head+s->count)%LM_SINK_QUEUE_CAP;
-   bool replace=s->count && !timed && !s->queued[(tail+LM_SINK_QUEUE_CAP-1)%LM_SINK_QUEUE_CAP].timed;
-   if (replace) tail=(tail+LM_SINK_QUEUE_CAP-1)%LM_SINK_QUEUE_CAP;
-   else if (s->count==LM_SINK_QUEUE_CAP) {
-      s->commit_status=LIQ_WOULD_BLOCK;
-      pthread_mutex_unlock(&s->mu);
-      return false;
-   }
-   struct lm_sinkbuf t=s->queued[tail];
-   s->queued[tail]=s->back;s->back=t;
-   if (!replace) ++s->count;
-   s->ts_ns=timestamp_ns;
-   ++s->commit_id;
-   s->commit_status=LIQ_OK;
-   pthread_mutex_unlock(&s->mu);
-   return true;
+  if (s) s->commit_status = LIQ_INVALID_PARAMETER;
+  if (!s || !s->back.rgba || w <= 0 || h <= 0) return false;
+  if ((size_t)w > SIZE_MAX / 4u / (size_t)h ||
+      (size_t)w * (size_t)h * 4u > s->back.cap) return false;
+  s->back.w = w;
+  s->back.h = h;
+  s->back.ts_ns = timestamp_ns;
+  s->back.timed = timed;
+  s->back.due_ns = timed ? timestamp_ns : 0;
+  pthread_mutex_lock(&s->mu);
+  if(s->abandoned) {
+    s->commit_status=LIQ_INVALID_OBJECT;
+    pthread_mutex_unlock(&s->mu);
+    return false;
+  }
+  if (s->images) {
+    int status = liq_submit(s->images, &s->back.rgba, s->back.cap,
+                            (unsigned)w, (unsigned)h, timestamp_ns);
+    s->commit_status = status;
+    if (status == LIQ_OK) {
+      s->back.cap = 0;
+      s->ts_ns = timestamp_ns;
+      ++s->commit_id;
+    }
+    pthread_mutex_unlock(&s->mu);
+    return status == LIQ_OK;
+  }
+  unsigned tail=(s->head+s->count)%LM_SINK_QUEUE_CAP;
+  bool replace=s->count && !timed && !s->queued[(tail+LM_SINK_QUEUE_CAP-1)%LM_SINK_QUEUE_CAP].timed;
+  if (replace) tail=(tail+LM_SINK_QUEUE_CAP-1)%LM_SINK_QUEUE_CAP;
+  else if (s->count==LM_SINK_QUEUE_CAP) {
+    s->commit_status=LIQ_WOULD_BLOCK;
+    pthread_mutex_unlock(&s->mu);
+    return false;
+  }
+  struct lm_sinkbuf t=s->queued[tail];
+  s->queued[tail]=s->back;
+  s->back=t;
+  if (!replace) ++s->count;
+  s->ts_ns=timestamp_ns;
+  ++s->commit_id;
+  s->commit_status=LIQ_OK;
+  pthread_mutex_unlock(&s->mu);
+  return true;
 }
 bool lm_sink_commit(struct lm_sink *s,int w,int h,int64_t timestamp_ns)
-{ return sink_commit(s,w,h,timestamp_ns,false); }
+{
+  return sink_commit(s,w,h,timestamp_ns,false);
+}
 bool lm_sink_commit_at(struct lm_sink *s,int w,int h,int64_t timestamp_ns)
-{ return sink_commit(s,w,h,timestamp_ns,true); }
+{
+  return sink_commit(s,w,h,timestamp_ns,true);
+}
 
 /* A finite wait lets the codec recheck flush/stop independently of the sink.
  * There is no retry timer in acquisition: take/abandon signal available space. */
 static void sink_wait_space(struct lm_sink *s)
 {
-   struct timespec until;clock_gettime(CLOCK_REALTIME,&until);
-   until.tv_nsec+=10000000;
-   if (until.tv_nsec>=1000000000) {++until.tv_sec;until.tv_nsec-=1000000000;}
-   pthread_mutex_lock(&s->mu);
-   if (!s->abandoned && s->count==LM_SINK_QUEUE_CAP)
-      (void)pthread_cond_timedwait(&s->space,&s->mu,&until);
-   pthread_mutex_unlock(&s->mu);
+  struct timespec until;
+  clock_gettime(CLOCK_REALTIME,&until);
+  until.tv_nsec+=10000000;
+  if (until.tv_nsec>=1000000000) {
+    ++until.tv_sec;
+    until.tv_nsec-=1000000000;
+  }
+  pthread_mutex_lock(&s->mu);
+  if (!s->abandoned && s->count==LM_SINK_QUEUE_CAP)
+    (void)pthread_cond_timedwait(&s->space,&s->mu,&until);
+  pthread_mutex_unlock(&s->mu);
 }
 
 void lm_sink_abandon(struct lm_sink *s)
 {
-   if(!s) return;
-   pthread_mutex_lock(&s->mu);s->abandoned=true;s->count=0;
-   pthread_cond_broadcast(&s->space);pthread_mutex_unlock(&s->mu);
-   liq_close(s->images);
+  if(!s) return;
+  pthread_mutex_lock(&s->mu);
+  s->abandoned=true;
+  s->count=0;
+  pthread_cond_broadcast(&s->space);
+  pthread_mutex_unlock(&s->mu);
+  liq_close(s->images);
 }
 uint64_t lm_sink_commit_id(struct lm_sink *s)
 {
-   if(!s) return 0;
-   pthread_mutex_lock(&s->mu);uint64_t serial=s->commit_id;pthread_mutex_unlock(&s->mu);return serial;
+  if(!s) return 0;
+  pthread_mutex_lock(&s->mu);
+  uint64_t serial=s->commit_id;
+  pthread_mutex_unlock(&s->mu);
+  return serial;
 }
 int64_t lm_sink_acquired_timestamp(struct lm_sink *s)
 {
-   if(!s) return 0;
-   pthread_mutex_lock(&s->mu);int64_t timestamp=s->front.ts_ns;pthread_mutex_unlock(&s->mu);return timestamp;
+  if(!s) return 0;
+  pthread_mutex_lock(&s->mu);
+  int64_t timestamp=s->front.ts_ns;
+  pthread_mutex_unlock(&s->mu);
+  return timestamp;
 }
 
 void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
                   int64_t timestamp_ns)
 {
-   uint8_t *dst;
-   if (!rgba) return;
-   dst = lm_sink_begin(s, w, h);
-   if (!dst) return;
-   memcpy(dst, rgba, (size_t)w * (size_t)h * 4u);
-   lm_sink_commit(s, w, h, timestamp_ns);
+  uint8_t *dst;
+  if (!rgba) return;
+  dst = lm_sink_begin(s, w, h);
+  if (!dst) return;
+  memcpy(dst, rgba, (size_t)w * (size_t)h * 4u);
+  lm_sink_commit(s, w, h, timestamp_ns);
 }
 
 bool lm_sink_take_at(struct lm_sink *s,int64_t expected_present_ns,const uint8_t **rgba,int *w,int *h)
 {
-   if (!s) return false;
-   pthread_mutex_lock(&s->mu);
-   bool have=s->count && !s->abandoned;
-   if (have && expected_present_ns>0) {
-      /* BufferQueueConsumer::acquireBuffer: a newer frame can retire an older
-       * timed frame only when the newer one is itself ready for this display.
-       * Timestamps outside the platform's one-second range are not schedules. */
-      const int64_t reasonable=1000000000;
-      while (s->count>1 && s->queued[s->head].timed) {
-         int64_t next=s->queued[(s->head+1)%LM_SINK_QUEUE_CAP].due_ns;
-         if (next<expected_present_ns-reasonable || next>expected_present_ns) break;
-         s->head=(s->head+1)%LM_SINK_QUEUE_CAP;--s->count;
-      }
-      const struct lm_sinkbuf *first=&s->queued[s->head];
-      if (first->timed && first->due_ns>expected_present_ns &&
-          (uint64_t)first->due_ns-(uint64_t)expected_present_ns<=1000000000u) have=false;
-   }
-   if (have) {
-      struct lm_sinkbuf t=s->front;
-      s->front=s->queued[s->head];s->queued[s->head]=t;
-      ++s->front_serial;
-      s->head=(s->head+1)%LM_SINK_QUEUE_CAP;--s->count;
-      pthread_cond_broadcast(&s->space);
-   }
-   pthread_mutex_unlock(&s->mu);
-   if (!have || !s->front.rgba) return false;
-   if (rgba) *rgba=s->front.rgba;
-   if (w) *w=s->front.w;
-   if (h) *h=s->front.h;
-   return true;
+  if (!s) return false;
+  pthread_mutex_lock(&s->mu);
+  bool have=s->count && !s->abandoned;
+  if (have && expected_present_ns>0) {
+    /* BufferQueueConsumer::acquireBuffer: a newer frame can retire an older
+     * timed frame only when the newer one is itself ready for this display.
+     * Timestamps outside the platform's one-second range are not schedules. */
+    const int64_t reasonable=1000000000;
+    while (s->count>1 && s->queued[s->head].timed) {
+      int64_t next=s->queued[(s->head+1)%LM_SINK_QUEUE_CAP].due_ns;
+      if (next<expected_present_ns-reasonable || next>expected_present_ns) break;
+      s->head=(s->head+1)%LM_SINK_QUEUE_CAP;
+      --s->count;
+    }
+    const struct lm_sinkbuf *first=&s->queued[s->head];
+    if (first->timed && first->due_ns>expected_present_ns &&
+        (uint64_t)first->due_ns-(uint64_t)expected_present_ns<=1000000000u) have=false;
+  }
+  if (have) {
+    struct lm_sinkbuf t=s->front;
+    s->front=s->queued[s->head];
+    s->queued[s->head]=t;
+    ++s->front_serial;
+    s->head=(s->head+1)%LM_SINK_QUEUE_CAP;
+    --s->count;
+    pthread_cond_broadcast(&s->space);
+  }
+  pthread_mutex_unlock(&s->mu);
+  if (!have || !s->front.rgba) return false;
+  if (rgba) *rgba=s->front.rgba;
+  if (w) *w=s->front.w;
+  if (h) *h=s->front.h;
+  return true;
 }
 bool lm_sink_take(struct lm_sink *s,const uint8_t **rgba,int *w,int *h)
 {
-   /* SurfaceTexture/GLConsumer supplies no expected display time. Its buffer
-    * timestamp is metadata; acquisition must not compare it to the clock. */
-   return lm_sink_take_at(s,0,rgba,w,h);
+  /* SurfaceTexture/GLConsumer supplies no expected display time. Its buffer
+   * timestamp is metadata; acquisition must not compare it to the clock. */
+  return lm_sink_take_at(s,0,rgba,w,h);
 }
 
 bool lm_sink_snapshot_argb(struct lm_sink *s,uint64_t *serial,uint32_t **pixels,int *w,int *h)
 {
- if(!s || !serial || !pixels || !w || !h) return false;
- pthread_mutex_lock(&s->mu);
- const struct lm_sinkbuf *front=&s->front;
- bool changed=front->rgba && front->w>0 && front->h>0 && *serial!=s->front_serial;
- if(changed) {
-  size_t count=(size_t)front->w*front->h;
-  uint32_t *dst=*pixels;
-  if(!dst || *w!=front->w || *h!=front->h) {
-   dst=malloc(count*sizeof *dst);
-   if(!dst) {pthread_mutex_unlock(&s->mu);return false;}
-   free(*pixels);*pixels=dst;
+  if(!s || !serial || !pixels || !w || !h) return false;
+  pthread_mutex_lock(&s->mu);
+  const struct lm_sinkbuf *front=&s->front;
+  bool changed=front->rgba && front->w>0 && front->h>0 && *serial!=s->front_serial;
+  if(changed) {
+    size_t count=(size_t)front->w*front->h;
+    uint32_t *dst=*pixels;
+    if(!dst || *w!=front->w || *h!=front->h) {
+      dst=malloc(count*sizeof *dst);
+      if(!dst) {
+        pthread_mutex_unlock(&s->mu);
+        return false;
+      }
+      free(*pixels);
+      *pixels=dst;
+    }
+    const uint8_t *src=front->rgba;
+    for(size_t i=0; i<count; ++i) dst[i]=((uint32_t)src[4*i+3]<<24)|((uint32_t)src[4*i]<<16)|((uint32_t)src[4*i+1]<<8)|src[4*i+2];
+    *w=front->w;
+    *h=front->h;
+    *serial=s->front_serial;
   }
-  const uint8_t *src=front->rgba;
-  for(size_t i=0;i<count;++i) dst[i]=((uint32_t)src[4*i+3]<<24)|((uint32_t)src[4*i]<<16)|((uint32_t)src[4*i+1]<<8)|src[4*i+2];
-  *w=front->w;*h=front->h;*serial=s->front_serial;
- }
- pthread_mutex_unlock(&s->mu);return changed;
+  pthread_mutex_unlock(&s->mu);
+  return changed;
 }
 
 bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
 {
-   /* The consumer's own buffer: what the last take() handed out. */
-   if (!s || !s->front.rgba || s->front.w <= 0 || s->front.h <= 0) return false;
-   if (rgba) *rgba = s->front.rgba;
-   if (w) *w = s->front.w;
-   if (h) *h = s->front.h;
-   return true;
+  /* The consumer's own buffer: what the last take() handed out. */
+  if (!s || !s->front.rgba || s->front.w <= 0 || s->front.h <= 0) return false;
+  if (rgba) *rgba = s->front.rgba;
+  if (w) *w = s->front.w;
+  if (h) *h = s->front.h;
+  return true;
 }
 
 int64_t lm_sink_timestamp(const struct lm_sink *s)
 {
-   if (!s) return 0;
-   pthread_mutex_lock((pthread_mutex_t *)&s->mu);
-   const int64_t ts = s->ts_ns;
-   pthread_mutex_unlock((pthread_mutex_t *)&s->mu);
-   return ts;
+  if (!s) return 0;
+  pthread_mutex_lock((pthread_mutex_t *)&s->mu);
+  const int64_t ts = s->ts_ns;
+  pthread_mutex_unlock((pthread_mutex_t *)&s->mu);
+  return ts;
 }
 
 /* ------------------------------------------------------------------------ *
@@ -780,92 +846,103 @@ int64_t lm_sink_timestamp(const struct lm_sink *s)
 #define LM_MAX_CSD  4
 
 struct lm_inbuf {
-   uint8_t *p;
-   size_t cap;
-   bool queued;
-   bool submitted;          /* distinguishes a caller lease from a decode job */
-   bool decoding;           /* the codec thread is reading it */
+  uint8_t *p;
+  size_t cap;
+  bool queued;
+  bool submitted;          /* distinguishes a caller lease from a decode job */
+  bool decoding;           /* the codec thread is reading it */
 };
 
 struct lm_outbuf {
-   uint8_t *yuv;            /* I420, planes packed w*h + 2*(w/2 * h/2) */
-   size_t cap, len;
-   int w, h;
-   int64_t pts_us;
-   int flags;
-   bool busy;               /* handed to the caller, not yet released */
-   bool ready;              /* holds a decoded picture */
-   bool rendering;          /* the codec thread is converting it */
+  uint8_t *yuv;            /* I420, planes packed w*h + 2*(w/2 * h/2) */
+  size_t cap, len;
+  int w, h;
+  int64_t pts_us;
+  int flags;
+  bool busy;               /* handed to the caller, not yet released */
+  bool ready;              /* holds a decoded picture */
+  bool rendering;          /* the codec thread is converting it */
 };
 
 struct lm_codec {
-   struct lm_render_event {int64_t pts_us,nano_time;} *rendered;
-   size_t rendered_count,rendered_head,rendered_capacity;
-   bool notify_rendered;
-   uint64_t render_generation;
-   int error;
-   bool video;
-   bool started;
-   ISVCDecoder *dec;        /* openh264, when libavcodec has no h264 */
-   void *vctx, *vframe;     /* libavcodec video (h264 or vp9) */
-   uint8_t *vpad;           /* input copy with the padding libavcodec reads */
-   size_t vpad_cap;
-   bool vcsd_pending;       /* csd-0/1 still to go in front of the next AU */
-   bool prepend_csd;        /* H.264 parameter sets belong on the first AU */
-   char mime[48];
+  struct lm_render_event {
+    int64_t pts_us,nano_time;
+  } *rendered;
+  size_t rendered_count,rendered_head,rendered_capacity;
+  bool notify_rendered;
+  uint64_t render_generation;
+  int error;
+  bool video;
+  bool started;
+  ISVCDecoder *dec;        /* openh264, when libavcodec has no h264 */
+  void *vctx, *vframe;     /* libavcodec video (h264 or vp9) */
+  uint8_t *vpad;           /* input copy with the padding libavcodec reads */
+  size_t vpad_cap;
+  bool vcsd_pending;       /* csd-0/1 still to go in front of the next AU */
+  bool prepend_csd;        /* H.264 parameter sets belong on the first AU */
+  char mime[48];
 
-   /* The codec thread (libavcodec only).  MediaCodec decodes on a thread of
-    * its own; doing it inside queueInputBuffer / releaseOutputBuffer put the
-    * whole H.264 decode and colour conversion of a background movie on
-    * whichever guest thread drove the player -- the frame pump, which is also
-    * where UE's game thread runs.  Everything below `mu` is shared with it;
-    * vctx/vframe/vpad are the thread's alone. */
-   pthread_t th;
-   bool th_on, th_stop;
-   pthread_mutex_t mu;
-   pthread_cond_t cv;
-   struct lm_job { int kind, idx, off, size, flags; int64_t pts;
-                   struct lm_sink *sink; unsigned epoch; int64_t surface_timestamp_ns; bool timed; } jobs[16];
-   int job_head, job_n;
-   unsigned epoch;          /* bumped by flush(): older work is discarded */
-   bool flush_decoder;      /* the thread owes avcodec_flush_buffers() */
-   bool draining, drained;  /* past END_OF_STREAM: pulling held-back pictures */
-   int pending_decodes;     /* queued or running, each may yield a picture */
+  /* The codec thread (libavcodec only).  MediaCodec decodes on a thread of
+   * its own; doing it inside queueInputBuffer / releaseOutputBuffer put the
+   * whole H.264 decode and colour conversion of a background movie on
+   * whichever guest thread drove the player -- the frame pump, which is also
+   * where UE's game thread runs.  Everything below `mu` is shared with it;
+   * vctx/vframe/vpad are the thread's alone. */
+  pthread_t th;
+  bool th_on, th_stop;
+  pthread_mutex_t mu;
+  pthread_cond_t cv;
+  struct lm_job {
+    int kind, idx, off, size, flags;
+    int64_t pts;
+    struct lm_sink *sink;
+    unsigned epoch;
+    int64_t surface_timestamp_ns;
+    bool timed;
+  } jobs[16];
+  int job_head, job_n;
+  unsigned epoch;          /* bumped by flush(): older work is discarded */
+  bool flush_decoder;      /* the thread owes avcodec_flush_buffers() */
+  bool draining, drained;  /* past END_OF_STREAM: pulling held-back pictures */
+  int pending_decodes;     /* queued or running, each may yield a picture */
 
-   /* audio */
-   void *actx, *aframe;
-   int rate, channels;
-   int aac_profile, aac_freq_idx, aac_chan_cfg;   /* from csd-0 */
-   bool aac_config;
+  /* audio */
+  void *actx, *aframe;
+  int rate, channels;
+  int aac_profile, aac_freq_idx, aac_chan_cfg;   /* from csd-0 */
+  bool aac_config;
 
-   struct lm_inbuf in[LM_IN_BUFS];
-   struct lm_outbuf out[LM_OUT_BUFS];
+  struct lm_inbuf in[LM_IN_BUFS];
+  struct lm_outbuf out[LM_OUT_BUFS];
 
-   struct { uint8_t *p; size_t len; } csd[LM_MAX_CSD];
-   int ncsd;
+  struct {
+    uint8_t *p;
+    size_t len;
+  } csd[LM_MAX_CSD];
+  int ncsd;
 
-   int width, height;
-   bool announced_format;   /* the one INFO_OUTPUT_FORMAT_CHANGED was handed out */
-   bool got_eos;            /* an input buffer carried END_OF_STREAM */
-   bool sent_eos;
+  int width, height;
+  bool announced_format;   /* the one INFO_OUTPUT_FORMAT_CHANGED was handed out */
+  bool got_eos;            /* an input buffer carried END_OF_STREAM */
+  bool sent_eos;
 
-   /* A decoder that cannot decode this stream at all.
-    *
-    * openh264 decodes Constrained Baseline; a title's startup movie is
-    * routinely Main or High with CABAC and B-frames, and the avcC's
-    * profile_compatibility byte cannot be trusted to say so (Blade & Soul's
-    * splash claims constraint_set1 and still carries B-frames).  There is no
-    * honest static test, so the test is the decode itself: every access unit
-    * comes back a bitstream error and no picture is ever produced.
-    *
-    * Reporting that matters more than it looks.  The old behaviour was to log
-    * each error and carry on, so the player kept "playing" a movie that would
-    * never show a frame — and an engine waiting on that movie waits for ever.
-    * That is the whole of Blade & Soul Revolution's boot: a white screen at a
-    * steady 21 fps, with nothing wrong anywhere the log was looking. */
-   int  dec_errors;         /* consecutive errors with nothing decoded yet */
-   bool produced_picture;   /* …until the first picture comes out */
-   bool undecodable;        /* give up: this decoder cannot read this stream */
+  /* A decoder that cannot decode this stream at all.
+   *
+   * openh264 decodes Constrained Baseline; a title's startup movie is
+   * routinely Main or High with CABAC and B-frames, and the avcC's
+   * profile_compatibility byte cannot be trusted to say so (Blade & Soul's
+   * splash claims constraint_set1 and still carries B-frames).  There is no
+   * honest static test, so the test is the decode itself: every access unit
+   * comes back a bitstream error and no picture is ever produced.
+   *
+   * Reporting that matters more than it looks.  The old behaviour was to log
+   * each error and carry on, so the player kept "playing" a movie that would
+   * never show a frame — and an engine waiting on that movie waits for ever.
+   * That is the whole of Blade & Soul Revolution's boot: a white screen at a
+   * steady 21 fps, with nothing wrong anywhere the log was looking. */
+  int  dec_errors;         /* consecutive errors with nothing decoded yet */
+  bool produced_picture;   /* …until the first picture comes out */
+  bool undecodable;        /* give up: this decoder cannot read this stream */
 };
 
 /* How many access units to let fail before calling it.  A stream that starts
@@ -876,42 +953,46 @@ struct lm_codec {
 
 static bool is_aac_mime(const char *mime)
 {
-   return !strcasecmp(mime, "audio/mp4a-latm") || !strcasecmp(mime, "audio/aac");
+  return !strcasecmp(mime, "audio/mp4a-latm") || !strcasecmp(mime, "audio/aac");
 }
 
 const int32_t *lm_aac_sample_rates(size_t *count)
 {
-   static const int32_t rates[]={7350,8000,11025,12000,16000,22050,24000,
-      32000,44100,48000,64000,88200,96000};
-   if(count) *count=sizeof rates/sizeof *rates;
-   return rates;
+  static const int32_t rates[]= {7350,8000,11025,12000,16000,22050,24000,
+                                 32000,44100,48000,64000,88200,96000
+                                };
+  if(count) *count=sizeof rates/sizeof *rates;
+  return rates;
 }
 
 bool lm_codec_supported(const char *mime)
 {
-   if (!mime) return false;
-   if (!strcasecmp(mime, "video/avc"))
-      return avcodec_h264_ready() || openh264_ready();
-   if (is_vp9_mime(mime)) return avcodec_vp9_ready();
-   if (is_aac_mime(mime)) return avcodec_aac_ready();
-   return false;
+  if (!mime) return false;
+  if (!strcasecmp(mime, "video/avc"))
+    return avcodec_h264_ready() || openh264_ready();
+  if (is_vp9_mime(mime)) return avcodec_vp9_ready();
+  if (is_aac_mime(mime)) return avcodec_aac_ready();
+  return false;
 }
 
 static struct lm_codec *aac_codec_new(void)
 {
-   struct lm_codec *c = calloc(1, sizeof *c);
-   if (!c) return NULL;
-   void *codec = av.find_decoder_by_name("aac");
-   c->actx = codec ? av.alloc_context3(codec) : NULL;
-   c->aframe = c->actx ? av.frame_alloc() : NULL;
-   if (!c->aframe || av.open2(c->actx, codec, NULL) < 0) {
-      fprintf(stderr, "[media] libavcodec could not open the AAC decoder\n");
-      if (c->aframe) av.frame_free(&c->aframe);
-      if (c->actx) { av.close(c->actx); av.free(c->actx); }
-      free(c);
-      return NULL;
-   }
-   return c;
+  struct lm_codec *c = calloc(1, sizeof *c);
+  if (!c) return NULL;
+  void *codec = av.find_decoder_by_name("aac");
+  c->actx = codec ? av.alloc_context3(codec) : NULL;
+  c->aframe = c->actx ? av.frame_alloc() : NULL;
+  if (!c->aframe || av.open2(c->actx, codec, NULL) < 0) {
+    fprintf(stderr, "[media] libavcodec could not open the AAC decoder\n");
+    if (c->aframe) av.frame_free(&c->aframe);
+    if (c->actx) {
+      av.close(c->actx);
+      av.free(c->actx);
+    }
+    free(c);
+    return NULL;
+  }
+  return c;
 }
 
 /* Opens a libavcodec video decoder into c.  prepend_csd is for H.264, whose
@@ -919,98 +1000,114 @@ static struct lm_codec *aac_codec_new(void)
  * alone; the codec-private bytes are not a picture. */
 static bool av_video_open(struct lm_codec *c, const char *decoder, bool prepend_csd)
 {
-   void *codec = av.find_decoder_by_name(decoder);
-   c->vctx = codec ? av.alloc_context3(codec) : NULL;
-   c->vframe = c->vctx ? av.frame_alloc() : NULL;
-   if (!c->vframe || av.open2(c->vctx, codec, NULL) < 0) {
-      fprintf(stderr, "[media] libavcodec could not open the %s decoder\n", decoder);
-      if (c->vframe) av.frame_free(&c->vframe);
-      if (c->vctx) { av.close(c->vctx); av.free(c->vctx); c->vctx = NULL; }
-      return false;
-   }
-   c->prepend_csd = prepend_csd;
-   pthread_mutex_init(&c->mu, NULL);
-   pthread_cond_init(&c->cv, NULL);
-   return true;
+  void *codec = av.find_decoder_by_name(decoder);
+  c->vctx = codec ? av.alloc_context3(codec) : NULL;
+  c->vframe = c->vctx ? av.frame_alloc() : NULL;
+  if (!c->vframe || av.open2(c->vctx, codec, NULL) < 0) {
+    fprintf(stderr, "[media] libavcodec could not open the %s decoder\n", decoder);
+    if (c->vframe) av.frame_free(&c->vframe);
+    if (c->vctx) {
+      av.close(c->vctx);
+      av.free(c->vctx);
+      c->vctx = NULL;
+    }
+    return false;
+  }
+  c->prepend_csd = prepend_csd;
+  pthread_mutex_init(&c->mu, NULL);
+  pthread_cond_init(&c->cv, NULL);
+  return true;
 }
 
 struct lm_codec *lm_codec_new(const char *mime)
 {
-   if (!lm_codec_supported(mime)) return NULL;
-   if (is_aac_mime(mime)) return aac_codec_new();
+  if (!lm_codec_supported(mime)) return NULL;
+  if (is_aac_mime(mime)) return aac_codec_new();
 
-   struct lm_codec *c = calloc(1, sizeof *c);
-   if (!c) return NULL;
-   c->video = true;
-   snprintf(c->mime, sizeof c->mime, "%s", mime ? mime : "video/avc");
+  struct lm_codec *c = calloc(1, sizeof *c);
+  if (!c) return NULL;
+  c->video = true;
+  snprintf(c->mime, sizeof c->mime, "%s", mime ? mime : "video/avc");
 
-   if (is_vp9_mime(mime)) {
-      if (!av_video_open(c, "vp9", false)) { free(c); return NULL; }
-      return c;
-   }
-
-   if (avcodec_h264_ready()) {
-      if (!av_video_open(c, "h264", true)) { free(c); return NULL; }
-      return c;
-   }
-
-   if (lm_WelsCreateDecoder(&c->dec) != 0 || !c->dec) {
-      fprintf(stderr, "[media] WelsCreateDecoder failed\n");
+  if (is_vp9_mime(mime)) {
+    if (!av_video_open(c, "vp9", false)) {
       free(c);
       return NULL;
-   }
-   struct SDecodingParam param;
-   memset(&param, 0, sizeof param);
-   param.eEcActiveIdc = LM_ERROR_CON_SLICE_COPY;
-   param.sVideoProperty.size = sizeof param.sVideoProperty;
-   if ((*c->dec)->Initialize(c->dec, &param) != 0) {
-      fprintf(stderr, "[media] openh264 Initialize failed\n");
-      lm_WelsDestroyDecoder(c->dec);
+    }
+    return c;
+  }
+
+  if (avcodec_h264_ready()) {
+    if (!av_video_open(c, "h264", true)) {
       free(c);
       return NULL;
-   }
-   return c;
+    }
+    return c;
+  }
+
+  if (lm_WelsCreateDecoder(&c->dec) != 0 || !c->dec) {
+    fprintf(stderr, "[media] WelsCreateDecoder failed\n");
+    free(c);
+    return NULL;
+  }
+  struct SDecodingParam param;
+  memset(&param, 0, sizeof param);
+  param.eEcActiveIdc = LM_ERROR_CON_SLICE_COPY;
+  param.sVideoProperty.size = sizeof param.sVideoProperty;
+  if ((*c->dec)->Initialize(c->dec, &param) != 0) {
+    fprintf(stderr, "[media] openh264 Initialize failed\n");
+    lm_WelsDestroyDecoder(c->dec);
+    free(c);
+    return NULL;
+  }
+  return c;
 }
 
 void lm_codec_free(struct lm_codec *c)
 {
-   if (!c) return;
-   if (c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      c->th_stop = true;
-      pthread_cond_broadcast(&c->cv);
-      pthread_mutex_unlock(&c->mu);
-      if (c->th_on) pthread_join(c->th, NULL);
-      for (int i = 0; i < c->job_n; ++i)
-         lm_sink_free(c->jobs[(c->job_head + i) % (int)(sizeof c->jobs / sizeof c->jobs[0])].sink);
-      pthread_cond_destroy(&c->cv);
-      pthread_mutex_destroy(&c->mu);
-   }
-   if (c->dec) {
-      (*c->dec)->Uninitialize(c->dec);
-      lm_WelsDestroyDecoder(c->dec);
-   }
-   if (c->actx) { av.close(c->actx); av.free(c->actx); }
-   if (c->aframe) av.frame_free(&c->aframe);
-   if (c->vctx) { av.close(c->vctx); av.free(c->vctx); }
-   if (c->vframe) av.frame_free(&c->vframe);
-   free(c->vpad);
-   for (int i = 0; i < LM_IN_BUFS; ++i) free(c->in[i].p);
-   for (int i = 0; i < LM_OUT_BUFS; ++i) free(c->out[i].yuv);
-   for (int i = 0; i < c->ncsd; ++i) free(c->csd[i].p);
-   free(c->rendered);
-   free(c);
+  if (!c) return;
+  if (c->vctx) {
+    pthread_mutex_lock(&c->mu);
+    c->th_stop = true;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+    if (c->th_on) pthread_join(c->th, NULL);
+    for (int i = 0; i < c->job_n; ++i)
+      lm_sink_free(c->jobs[(c->job_head + i) % (int)(sizeof c->jobs / sizeof c->jobs[0])].sink);
+    pthread_cond_destroy(&c->cv);
+    pthread_mutex_destroy(&c->mu);
+  }
+  if (c->dec) {
+    (*c->dec)->Uninitialize(c->dec);
+    lm_WelsDestroyDecoder(c->dec);
+  }
+  if (c->actx) {
+    av.close(c->actx);
+    av.free(c->actx);
+  }
+  if (c->aframe) av.frame_free(&c->aframe);
+  if (c->vctx) {
+    av.close(c->vctx);
+    av.free(c->vctx);
+  }
+  if (c->vframe) av.frame_free(&c->vframe);
+  free(c->vpad);
+  for (int i = 0; i < LM_IN_BUFS; ++i) free(c->in[i].p);
+  for (int i = 0; i < LM_OUT_BUFS; ++i) free(c->out[i].yuv);
+  for (int i = 0; i < c->ncsd; ++i) free(c->csd[i].p);
+  free(c->rendered);
+  free(c);
 }
 
 void lm_codec_add_csd(struct lm_codec *c, const uint8_t *data, size_t len)
 {
-   if (!c || !data || !len || c->ncsd >= LM_MAX_CSD) return;
-   uint8_t *p = malloc(len);
-   if (!p) return;
-   memcpy(p, data, len);
-   c->csd[c->ncsd].p = p;
-   c->csd[c->ncsd].len = len;
-   c->ncsd++;
+  if (!c || !data || !len || c->ncsd >= LM_MAX_CSD) return;
+  uint8_t *p = malloc(len);
+  if (!p) return;
+  memcpy(p, data, len);
+  c->csd[c->ncsd].p = p;
+  c->csd[c->ncsd].len = len;
+  c->ncsd++;
 }
 
 /* LUNARIA_TRACE_MEDIA=1 logs the codec's own state machine — which buffers the
@@ -1021,14 +1118,18 @@ void lm_codec_add_csd(struct lm_codec *c, const uint8_t *data, size_t len)
  * once instead of at the next frame: a player that gets one buffer back per
  * frame period decodes audio at two thirds of real time. */
 static atomic_bool g_media_wake;
-void lm_media_wake(void) { atomic_store_explicit(&g_media_wake, true, memory_order_release); }
-bool lm_media_take_wake(void) { return atomic_exchange_explicit(&g_media_wake, false, memory_order_acq_rel); }
+void lm_media_wake(void) {
+  atomic_store_explicit(&g_media_wake, true, memory_order_release);
+}
+bool lm_media_take_wake(void) {
+  return atomic_exchange_explicit(&g_media_wake, false, memory_order_acq_rel);
+}
 
 bool lm_media_trace(void)
 {
-   static int on = -1;
-   if (on < 0) on = getenv("LUNARIA_TRACE_MEDIA") != NULL;
-   return on == 1;
+  static int on = -1;
+  if (on < 0) on = getenv("LUNARIA_TRACE_MEDIA") != NULL;
+  return on == 1;
 }
 #define trace_media lm_media_trace
 
@@ -1036,49 +1137,49 @@ static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba);
 
 static struct lm_outbuf *free_outbuf(struct lm_codec *c)
 {
-   for (int i = 0; i < LM_OUT_BUFS; ++i)
-      if (!c->out[i].busy && !c->out[i].ready) return &c->out[i];
-   return NULL;
+  for (int i = 0; i < LM_OUT_BUFS; ++i)
+    if (!c->out[i].busy && !c->out[i].ready) return &c->out[i];
+  return NULL;
 }
 
 /* Copies one decoded I420 picture into a free output slot. */
 static bool keep_picture(struct lm_codec *c, uint8_t *const planes[3],
                          const int stride[3], int w, int h, int64_t pts_us)
 {
-   struct lm_outbuf *o = free_outbuf(c);
-   if (!o) {
-      /* dequeue_input() keeps this from happening; if it ever does, dropping
-       * the newest frame is what a full BufferQueue does. */
-      fprintf(stderr, "[media] output buffers full — dropping a frame\n");
-      return true;
-   }
-   int cw = (w + 1) / 2, ch = (h + 1) / 2;
-   size_t need = (size_t)w * (size_t)h + 2u * (size_t)cw * (size_t)ch;
-   if (need > o->cap) {
-      uint8_t *p = realloc(o->yuv, need);
-      if (!p) return false;
-      o->yuv = p;
-      o->cap = need;
-   }
-   for (int y = 0; y < h; ++y)
-      memcpy(o->yuv + (size_t)y * w, planes[0] + (size_t)y * stride[0], (size_t)w);
-   uint8_t *u = o->yuv + (size_t)w * h;
-   uint8_t *v = u + (size_t)cw * ch;
-   for (int y = 0; y < ch; ++y) {
-      memcpy(u + (size_t)y * cw, planes[1] + (size_t)y * stride[1], (size_t)cw);
-      memcpy(v + (size_t)y * cw, planes[2] + (size_t)y * stride[2], (size_t)cw);
-   }
-   if (c->width != w || c->height != h)
-      fprintf(stderr, "[media] %s picture %dx%d\n", c->mime, w, h);
-   o->len = need;
-   o->w = w;
-   o->h = h;
-   o->pts_us = pts_us;
-   o->flags = 0;
-   o->ready = true;
-   c->width = w;
-   c->height = h;
-   return true;
+  struct lm_outbuf *o = free_outbuf(c);
+  if (!o) {
+    /* dequeue_input() keeps this from happening; if it ever does, dropping
+     * the newest frame is what a full BufferQueue does. */
+    fprintf(stderr, "[media] output buffers full — dropping a frame\n");
+    return true;
+  }
+  int cw = (w + 1) / 2, ch = (h + 1) / 2;
+  size_t need = (size_t)w * (size_t)h + 2u * (size_t)cw * (size_t)ch;
+  if (need > o->cap) {
+    uint8_t *p = realloc(o->yuv, need);
+    if (!p) return false;
+    o->yuv = p;
+    o->cap = need;
+  }
+  for (int y = 0; y < h; ++y)
+    memcpy(o->yuv + (size_t)y * w, planes[0] + (size_t)y * stride[0], (size_t)w);
+  uint8_t *u = o->yuv + (size_t)w * h;
+  uint8_t *v = u + (size_t)cw * ch;
+  for (int y = 0; y < ch; ++y) {
+    memcpy(u + (size_t)y * cw, planes[1] + (size_t)y * stride[1], (size_t)cw);
+    memcpy(v + (size_t)y * cw, planes[2] + (size_t)y * stride[2], (size_t)cw);
+  }
+  if (c->width != w || c->height != h)
+    fprintf(stderr, "[media] %s picture %dx%d\n", c->mime, w, h);
+  o->len = need;
+  o->w = w;
+  o->h = h;
+  o->pts_us = pts_us;
+  o->flags = 0;
+  o->ready = true;
+  c->width = w;
+  c->height = h;
+  return true;
 }
 
 /* libavcodec h264, on the codec thread.  `data == NULL` drains a picture held
@@ -1087,139 +1188,153 @@ static bool keep_picture(struct lm_codec *c, uint8_t *const planes[3],
 static bool avcodec_decode_packet(struct lm_codec *c, const uint8_t *data,
                                   size_t len, int64_t pts_us, bool with_csd)
 {
-   enum { PAD = 64 };   /* FF_INPUT_BUFFER_PADDING_SIZE is 16 in lavc 55 */
-   unsigned char pkt[AVPKT_BYTES];
-   memset(pkt, 0, sizeof pkt);
-   av.init_packet(pkt);
-   uint8_t *pdata = NULL;
-   int32_t psize = 0;
-   if (data && len) {
-      /* The parameter sets travel with the first access unit: on their own
-       * they are a packet with no picture, which libavcodec rejects. */
-      size_t pre = 0;
-      if (with_csd && c->prepend_csd)
-         for (int i = 0; i < c->ncsd; ++i) pre += c->csd[i].len;
-      if (pre + len + PAD > c->vpad_cap) {
-         uint8_t *p = realloc(c->vpad, pre + len + PAD);
-         if (!p) return false;
-         c->vpad = p;
-         c->vpad_cap = pre + len + PAD;
+  enum { PAD = 64 };   /* FF_INPUT_BUFFER_PADDING_SIZE is 16 in lavc 55 */
+  unsigned char pkt[AVPKT_BYTES];
+  memset(pkt, 0, sizeof pkt);
+  av.init_packet(pkt);
+  uint8_t *pdata = NULL;
+  int32_t psize = 0;
+  if (data && len) {
+    /* The parameter sets travel with the first access unit: on their own
+     * they are a packet with no picture, which libavcodec rejects. */
+    size_t pre = 0;
+    if (with_csd && c->prepend_csd)
+      for (int i = 0; i < c->ncsd; ++i) pre += c->csd[i].len;
+    if (pre + len + PAD > c->vpad_cap) {
+      uint8_t *p = realloc(c->vpad, pre + len + PAD);
+      if (!p) return false;
+      c->vpad = p;
+      c->vpad_cap = pre + len + PAD;
+    }
+    size_t at = 0;
+    if (with_csd && c->prepend_csd)
+      for (int i = 0; i < c->ncsd; ++i) {
+        memcpy(c->vpad + at, c->csd[i].p, c->csd[i].len);
+        at += c->csd[i].len;
       }
-      size_t at = 0;
-      if (with_csd && c->prepend_csd)
-         for (int i = 0; i < c->ncsd; ++i) {
-            memcpy(c->vpad + at, c->csd[i].p, c->csd[i].len);
-            at += c->csd[i].len;
-         }
-      memcpy(c->vpad + at, data, len);
-      memset(c->vpad + at + len, 0, PAD);
-      pdata = c->vpad;
-      psize = (int32_t)(at + len);
-   }
-   memcpy(pkt + AVPKT_DATA_OFF, &pdata, sizeof pdata);
-   memcpy(pkt + AVPKT_SIZE_OFF, &psize, 4);
-   memcpy(pkt + AVPKT_PTS_OFF, &pts_us, 8);
-   memcpy(pkt + AVPKT_DTS_OFF, &pts_us, 8);
+    memcpy(c->vpad + at, data, len);
+    memset(c->vpad + at + len, 0, PAD);
+    pdata = c->vpad;
+    psize = (int32_t)(at + len);
+  }
+  memcpy(pkt + AVPKT_DATA_OFF, &pdata, sizeof pdata);
+  memcpy(pkt + AVPKT_SIZE_OFF, &psize, 4);
+  memcpy(pkt + AVPKT_PTS_OFF, &pts_us, 8);
+  memcpy(pkt + AVPKT_DTS_OFF, &pts_us, 8);
 
-   int got = 0;
-   int used = av.decode_video2(c->vctx, c->vframe, &got, pkt);
-   if (used < 0) {
-      static int warned;
-      if (warned++ < 8)
-         fprintf(stderr, "[media] libavcodec %s decode failed (%d) on %zu bytes\n",
-                 c->mime, used, len);
-      return false;
-   }
-   return got != 0;
+  int got = 0;
+  int used = av.decode_video2(c->vctx, c->vframe, &got, pkt);
+  if (used < 0) {
+    static int warned;
+    if (warned++ < 8)
+      fprintf(stderr, "[media] libavcodec %s decode failed (%d) on %zu bytes\n",
+              c->mime, used, len);
+    return false;
+  }
+  return got != 0;
 }
 
 /* Moves the picture in c->vframe into a free output slot.  Caller holds mu. */
 static bool avcodec_keep_frame(struct lm_codec *c)
 {
-   const uint8_t *f = (const uint8_t *)c->vframe;
-   uint8_t *planes[3];
-   int32_t ls[3], w, h, fmt;
-   memcpy(planes, f + AVFRAME_DATA_OFF, sizeof planes);
-   memcpy(ls, f + AVFRAME_LINESIZE_OFF, sizeof ls);
-   memcpy(&w, f + AVFRAME_WIDTH_OFF, 4);
-   memcpy(&h, f + AVFRAME_HEIGHT_OFF, 4);
-   memcpy(&fmt, f + AVFRAME_FORMAT_OFF, 4);
-   if (fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUVJ420P) {
-      static int warned;
-      if (warned++ < 4)
-         fprintf(stderr, "[media] %s pixel format %d is not 4:2:0 — "
-                 "this build converts only I420\n",
-                 c->mime, fmt);
-      return false;
-   }
-   if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || ls[0] < w ||
-       ls[1] < (w + 1) / 2 || ls[2] < (w + 1) / 2 ||
-       !planes[0] || !planes[1] || !planes[2]) {
-      fprintf(stderr, "[media] libavcodec AVFrame does not match the layout this "
-              "build assumes (%dx%d linesize %d/%d/%d) — refusing it\n",
-              w, h, ls[0], ls[1], ls[2]);
-      return false;
-   }
-   c->produced_picture = true;
-   int stride[3] = { ls[0], ls[1], ls[2] };
-   return keep_picture(c, planes, stride, w, h, av.frame_best_effort_ts(c->vframe));
+  const uint8_t *f = (const uint8_t *)c->vframe;
+  uint8_t *planes[3];
+  int32_t ls[3], w, h, fmt;
+  memcpy(planes, f + AVFRAME_DATA_OFF, sizeof planes);
+  memcpy(ls, f + AVFRAME_LINESIZE_OFF, sizeof ls);
+  memcpy(&w, f + AVFRAME_WIDTH_OFF, 4);
+  memcpy(&h, f + AVFRAME_HEIGHT_OFF, 4);
+  memcpy(&fmt, f + AVFRAME_FORMAT_OFF, 4);
+  if (fmt != AV_PIX_FMT_YUV420P && fmt != AV_PIX_FMT_YUVJ420P) {
+    static int warned;
+    if (warned++ < 4)
+      fprintf(stderr, "[media] %s pixel format %d is not 4:2:0 — "
+                      "this build converts only I420\n",
+              c->mime, fmt);
+    return false;
+  }
+  if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || ls[0] < w ||
+      ls[1] < (w + 1) / 2 || ls[2] < (w + 1) / 2 ||
+      !planes[0] || !planes[1] || !planes[2]) {
+    fprintf(stderr, "[media] libavcodec AVFrame does not match the layout this "
+                    "build assumes (%dx%d linesize %d/%d/%d) — refusing it\n",
+            w, h, ls[0], ls[1], ls[2]);
+    return false;
+  }
+  c->produced_picture = true;
+  int stride[3] = { ls[0], ls[1], ls[2] };
+  return keep_picture(c, planes, stride, w, h, av.frame_best_effort_ts(c->vframe));
 }
 
 
 static int64_t codec_render_clock(void)
 {
-   struct timespec now;clock_gettime(CLOCK_MONOTONIC,&now);
-   return (int64_t)now.tv_sec*1000000000+now.tv_nsec;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC,&now);
+  return (int64_t)now.tv_sec*1000000000+now.tv_nsec;
 }
 /* Video calls this with mu held. Reuse storage between pump batches. */
 static void codec_record_rendered(struct lm_codec *c,int64_t pts,int64_t nano_time)
 {
-   if(!c->notify_rendered) return;
-   if(c->rendered_count==c->rendered_capacity && c->rendered_head) {
-      size_t live=c->rendered_count-c->rendered_head;
-      memmove(c->rendered,c->rendered+c->rendered_head,live*sizeof *c->rendered);
-      c->rendered_count=live;c->rendered_head=0;
-   }
-   if(c->rendered_count==c->rendered_capacity) {
-      if(c->rendered_capacity>SIZE_MAX/2/sizeof *c->rendered) {c->error=1100;return;}
-      size_t capacity=c->rendered_capacity ? c->rendered_capacity*2 : 8;
-      struct lm_render_event *events=realloc(c->rendered,capacity*sizeof *events);
-      if(!events) {c->error=1100;return;}
-      c->rendered=events;c->rendered_capacity=capacity;
-   }
-   c->rendered[c->rendered_count++]=(struct lm_render_event){pts,nano_time};
+  if(!c->notify_rendered) return;
+  if(c->rendered_count==c->rendered_capacity && c->rendered_head) {
+    size_t live=c->rendered_count-c->rendered_head;
+    memmove(c->rendered,c->rendered+c->rendered_head,live*sizeof *c->rendered);
+    c->rendered_count=live;
+    c->rendered_head=0;
+  }
+  if(c->rendered_count==c->rendered_capacity) {
+    if(c->rendered_capacity>SIZE_MAX/2/sizeof *c->rendered) {
+      c->error=1100;
+      return;
+    }
+    size_t capacity=c->rendered_capacity ? c->rendered_capacity*2 : 8;
+    struct lm_render_event *events=realloc(c->rendered,capacity*sizeof *events);
+    if(!events) {
+      c->error=1100;
+      return;
+    }
+    c->rendered=events;
+    c->rendered_capacity=capacity;
+  }
+  c->rendered[c->rendered_count++]=(struct lm_render_event) {
+    pts,nano_time
+  };
 }
 void lm_codec_render_notifications(struct lm_codec *c,bool enabled)
 {
-   if(!c) return;
-   if(c->vctx) pthread_mutex_lock(&c->mu);
-   c->notify_rendered=enabled;++c->render_generation;c->rendered_count=c->rendered_head=0;
-   if(c->vctx) pthread_mutex_unlock(&c->mu);
+  if(!c) return;
+  if(c->vctx) pthread_mutex_lock(&c->mu);
+  c->notify_rendered=enabled;
+  ++c->render_generation;
+  c->rendered_count=c->rendered_head=0;
+  if(c->vctx) pthread_mutex_unlock(&c->mu);
 }
 bool lm_codec_dequeue_rendered(struct lm_codec *c,int64_t *pts_us,int64_t *nano_time)
 {
-   if(!c) return false;
-   if(c->vctx) pthread_mutex_lock(&c->mu);
-   bool available=c->rendered_head<c->rendered_count;
-   if(available) {
-      const struct lm_render_event *event=&c->rendered[c->rendered_head++];
-      *pts_us=event->pts_us;*nano_time=event->nano_time;
-      if(c->rendered_head==c->rendered_count) c->rendered_head=c->rendered_count=0;
-   }
-   if(c->vctx) pthread_mutex_unlock(&c->mu);
-   return available;
+  if(!c) return false;
+  if(c->vctx) pthread_mutex_lock(&c->mu);
+  bool available=c->rendered_head<c->rendered_count;
+  if(available) {
+    const struct lm_render_event *event=&c->rendered[c->rendered_head++];
+    *pts_us=event->pts_us;
+    *nano_time=event->nano_time;
+    if(c->rendered_head==c->rendered_count) c->rendered_head=c->rendered_count=0;
+  }
+  if(c->vctx) pthread_mutex_unlock(&c->mu);
+  return available;
 }
 
 enum { LM_JOB_DECODE = 1, LM_JOB_RENDER = 2 };
 
 static bool codec_job_push(struct lm_codec *c, const struct lm_job *j)
 {
-   if (c->job_n >= (int)(sizeof c->jobs / sizeof c->jobs[0])) return false;
-   c->jobs[(c->job_head + c->job_n) % (int)(sizeof c->jobs / sizeof c->jobs[0])] = *j;
-   lm_sink_ref(j->sink);
-   ++c->job_n;
-   pthread_cond_broadcast(&c->cv);
-   return true;
+  if (c->job_n >= (int)(sizeof c->jobs / sizeof c->jobs[0])) return false;
+  c->jobs[(c->job_head + c->job_n) % (int)(sizeof c->jobs / sizeof c->jobs[0])] = *j;
+  lm_sink_ref(j->sink);
+  ++c->job_n;
+  pthread_cond_broadcast(&c->cv);
+  return true;
 }
 
 /* A full ImageReader owns its buffers until the consumer releases them.
@@ -1227,128 +1342,138 @@ static bool codec_job_push(struct lm_codec *c, const struct lm_job *j)
  * a render or drop the frame. Cancellation is sampled under the codec lock,
  * independently of the sink's mutex, so flush/stop/free can finish. */
 static bool codec_commit_sink(struct lm_codec *c, struct lm_sink *sink,
-                               int w, int h, int64_t timestamp, unsigned epoch, bool timed)
+                              int w, int h, int64_t timestamp, unsigned epoch, bool timed)
 {
-   for (;;) {
-      pthread_mutex_lock(&c->mu);
-      const bool cancelled = c->th_stop || epoch != c->epoch;
-      pthread_mutex_unlock(&c->mu);
-      if (cancelled) return false;
-      if (sink_commit(sink,w,h,timestamp,timed)) return true;
-      if (sink->commit_status!=LIQ_WOULD_BLOCK) return false;
-      if (sink->images) {
-         int status=liq_wait_space(sink->images,10);
-         if (status!=LIQ_OK && status!=LIQ_WOULD_BLOCK) return false;
-      } else sink_wait_space(sink);
-   }
+  for (;;) {
+    pthread_mutex_lock(&c->mu);
+    const bool cancelled = c->th_stop || epoch != c->epoch;
+    pthread_mutex_unlock(&c->mu);
+    if (cancelled) return false;
+    if (sink_commit(sink,w,h,timestamp,timed)) return true;
+    if (sink->commit_status!=LIQ_WOULD_BLOCK) return false;
+    if (sink->images) {
+      int status=liq_wait_space(sink->images,10);
+      if (status!=LIQ_OK && status!=LIQ_WOULD_BLOCK) return false;
+    } else sink_wait_space(sink);
+  }
 }
 
 static void *codec_thread_main(void *arg)
 {
-   struct lm_codec *c = arg;
-   pthread_mutex_lock(&c->mu);
-   for (;;) {
-      /* Flush is work even when there are no queued packets.  Its signal
-       * must not send an idle decoder straight back to sleep. */
-      while (!c->th_stop && !c->flush_decoder && !c->job_n &&
-             !(c->draining && !c->drained && free_outbuf(c)))
-         pthread_cond_wait(&c->cv, &c->mu);
-      if (c->th_stop) break;
-      if (c->flush_decoder) {
-         c->flush_decoder = false;
-         pthread_mutex_unlock(&c->mu);
-         av.flush_buffers(c->vctx);
-         pthread_mutex_lock(&c->mu);
-         continue;
-      }
-      if (!c->job_n) {
-         /* Past END_OF_STREAM with a slot free: pull a held-back picture. */
-         const unsigned epoch = c->epoch;
-         pthread_mutex_unlock(&c->mu);
-         const bool got = avcodec_decode_packet(c, NULL, 0, 0, false);
-         pthread_mutex_lock(&c->mu);
-         if (epoch != c->epoch) continue;
-         if (!got || !avcodec_keep_frame(c)) c->drained = true;
-         pthread_cond_broadcast(&c->cv);
-         continue;
-      }
-      struct lm_job j = c->jobs[c->job_head];
-      c->job_head = (c->job_head + 1) % (int)(sizeof c->jobs / sizeof c->jobs[0]);
-      --c->job_n;
-      if (j.kind == LM_JOB_DECODE) {
-         const bool with_csd = c->vcsd_pending && j.epoch == c->epoch;
-         if (with_csd) c->vcsd_pending = false;
-         c->in[j.idx].decoding = true;
-         pthread_mutex_unlock(&c->mu);
-         struct timespec dt0; clock_gettime(CLOCK_MONOTONIC, &dt0);
-         const bool got = j.epoch == c->epoch &&
-            avcodec_decode_packet(c, c->in[j.idx].p + j.off, (size_t)j.size,
-                                  j.pts, with_csd);
-         {
-            static __thread uint64_t sum, n; static __thread time_t last;
-            struct timespec dt1; clock_gettime(CLOCK_MONOTONIC, &dt1);
-            sum += (uint64_t)((dt1.tv_sec - dt0.tv_sec) * 1000000000LL + (dt1.tv_nsec - dt0.tv_nsec)); ++n;
-            if (dt1.tv_sec != last && getenv("LUNARIA_TRACE_MEDIA_TIME")) {
-               if (last) fprintf(stderr, "[media-time] decode %.2f ms avg over %llu packets\n", sum / 1e6 / (double)n, (unsigned long long)n);
-               last = dt1.tv_sec; sum = n = 0;
-            }
-         }
-         pthread_mutex_lock(&c->mu);
-         c->in[j.idx].decoding = false;
-         c->in[j.idx].queued = false;
-         if (c->pending_decodes > 0) --c->pending_decodes;
-         if (got && j.epoch == c->epoch) (void)avcodec_keep_frame(c);
-         if ((j.flags & LM_BUFFER_FLAG_END_OF_STREAM) && j.epoch == c->epoch)
-            c->draining = true;
-      } else if (j.kind == LM_JOB_RENDER) {
-         struct lm_outbuf *o = &c->out[j.idx];
-         if (j.epoch == c->epoch && j.sink && o->len && o->w > 0 && o->h > 0) {
-            o->rendering = true;
-            const uint64_t render_generation=c->render_generation;
-            pthread_mutex_unlock(&c->mu);
-            uint8_t *rgba = lm_sink_begin(j.sink, o->w, o->h);
-            int64_t rendered_ns=0;
-            if (rgba) {
-               struct timespec rt0; clock_gettime(CLOCK_MONOTONIC, &rt0);
-               i420_to_rgba(o->yuv, o->w, o->h, rgba);
-               {
-                  static __thread uint64_t sum, n; static __thread time_t last;
-                  struct timespec rt1; clock_gettime(CLOCK_MONOTONIC, &rt1);
-                  sum += (uint64_t)((rt1.tv_sec - rt0.tv_sec) * 1000000000LL + (rt1.tv_nsec - rt0.tv_nsec)); ++n;
-                  if (rt1.tv_sec != last && getenv("LUNARIA_TRACE_MEDIA_TIME")) {
-                     if (last) fprintf(stderr, "[media-time] convert %.2f ms avg over %llu frames\n", sum / 1e6 / (double)n, (unsigned long long)n);
-                     last = rt1.tv_sec; sum = n = 0;
-                  }
-               }
-               /* releaseOutputBuffer(index, releaseTimeNs): the frame belongs on the
-                * screen at that time, not whenever the decoder was done with it.
-                * Showing it as soon as it was ready put frames on screen early by
-                * a varying amount, which is what judder looks like. */
-               if(codec_commit_sink(c, j.sink, o->w, o->h,
-                     j.surface_timestamp_ns, j.epoch,j.timed)) rendered_ns=codec_render_clock();
-            }
-            pthread_mutex_lock(&c->mu);
-            if(rendered_ns && j.epoch==c->epoch && render_generation==c->render_generation)
-               codec_record_rendered(c,o->pts_us,rendered_ns);
-            o->rendering = false;
-         }
-         o->busy = false;
-         o->ready = false;
-      }
-      lm_sink_free(j.sink);
-      lm_media_wake();
+  struct lm_codec *c = arg;
+  pthread_mutex_lock(&c->mu);
+  for (;;) {
+    /* Flush is work even when there are no queued packets.  Its signal
+     * must not send an idle decoder straight back to sleep. */
+    while (!c->th_stop && !c->flush_decoder && !c->job_n &&
+           !(c->draining && !c->drained && free_outbuf(c)))
+      pthread_cond_wait(&c->cv, &c->mu);
+    if (c->th_stop) break;
+    if (c->flush_decoder) {
+      c->flush_decoder = false;
+      pthread_mutex_unlock(&c->mu);
+      av.flush_buffers(c->vctx);
+      pthread_mutex_lock(&c->mu);
+      continue;
+    }
+    if (!c->job_n) {
+      /* Past END_OF_STREAM with a slot free: pull a held-back picture. */
+      const unsigned epoch = c->epoch;
+      pthread_mutex_unlock(&c->mu);
+      const bool got = avcodec_decode_packet(c, NULL, 0, 0, false);
+      pthread_mutex_lock(&c->mu);
+      if (epoch != c->epoch) continue;
+      if (!got || !avcodec_keep_frame(c)) c->drained = true;
       pthread_cond_broadcast(&c->cv);
-   }
-   pthread_mutex_unlock(&c->mu);
-   return NULL;
+      continue;
+    }
+    struct lm_job j = c->jobs[c->job_head];
+    c->job_head = (c->job_head + 1) % (int)(sizeof c->jobs / sizeof c->jobs[0]);
+    --c->job_n;
+    if (j.kind == LM_JOB_DECODE) {
+      const bool with_csd = c->vcsd_pending && j.epoch == c->epoch;
+      if (with_csd) c->vcsd_pending = false;
+      c->in[j.idx].decoding = true;
+      pthread_mutex_unlock(&c->mu);
+      struct timespec dt0;
+      clock_gettime(CLOCK_MONOTONIC, &dt0);
+      const bool got = j.epoch == c->epoch &&
+                       avcodec_decode_packet(c, c->in[j.idx].p + j.off, (size_t)j.size,
+                                             j.pts, with_csd);
+      {
+        static __thread uint64_t sum, n;
+        static __thread time_t last;
+        struct timespec dt1;
+        clock_gettime(CLOCK_MONOTONIC, &dt1);
+        sum += (uint64_t)((dt1.tv_sec - dt0.tv_sec) * 1000000000LL + (dt1.tv_nsec - dt0.tv_nsec));
+        ++n;
+        if (dt1.tv_sec != last && getenv("LUNARIA_TRACE_MEDIA_TIME")) {
+          if (last) fprintf(stderr, "[media-time] decode %.2f ms avg over %llu packets\n", sum / 1e6 / (double)n, (unsigned long long)n);
+          last = dt1.tv_sec;
+          sum = n = 0;
+        }
+      }
+      pthread_mutex_lock(&c->mu);
+      c->in[j.idx].decoding = false;
+      c->in[j.idx].queued = false;
+      if (c->pending_decodes > 0) --c->pending_decodes;
+      if (got && j.epoch == c->epoch) (void)avcodec_keep_frame(c);
+      if ((j.flags & LM_BUFFER_FLAG_END_OF_STREAM) && j.epoch == c->epoch)
+        c->draining = true;
+    } else if (j.kind == LM_JOB_RENDER) {
+      struct lm_outbuf *o = &c->out[j.idx];
+      if (j.epoch == c->epoch && j.sink && o->len && o->w > 0 && o->h > 0) {
+        o->rendering = true;
+        const uint64_t render_generation=c->render_generation;
+        pthread_mutex_unlock(&c->mu);
+        uint8_t *rgba = lm_sink_begin(j.sink, o->w, o->h);
+        int64_t rendered_ns=0;
+        if (rgba) {
+          struct timespec rt0;
+          clock_gettime(CLOCK_MONOTONIC, &rt0);
+          i420_to_rgba(o->yuv, o->w, o->h, rgba);
+          {
+            static __thread uint64_t sum, n;
+            static __thread time_t last;
+            struct timespec rt1;
+            clock_gettime(CLOCK_MONOTONIC, &rt1);
+            sum += (uint64_t)((rt1.tv_sec - rt0.tv_sec) * 1000000000LL + (rt1.tv_nsec - rt0.tv_nsec));
+            ++n;
+            if (rt1.tv_sec != last && getenv("LUNARIA_TRACE_MEDIA_TIME")) {
+              if (last) fprintf(stderr, "[media-time] convert %.2f ms avg over %llu frames\n", sum / 1e6 / (double)n, (unsigned long long)n);
+              last = rt1.tv_sec;
+              sum = n = 0;
+            }
+          }
+          /* releaseOutputBuffer(index, releaseTimeNs): the frame belongs on the
+           * screen at that time, not whenever the decoder was done with it.
+           * Showing it as soon as it was ready put frames on screen early by
+           * a varying amount, which is what judder looks like. */
+          if(codec_commit_sink(c, j.sink, o->w, o->h,
+                               j.surface_timestamp_ns, j.epoch,j.timed)) rendered_ns=codec_render_clock();
+        }
+        pthread_mutex_lock(&c->mu);
+        if(rendered_ns && j.epoch==c->epoch && render_generation==c->render_generation)
+          codec_record_rendered(c,o->pts_us,rendered_ns);
+        o->rendering = false;
+      }
+      o->busy = false;
+      o->ready = false;
+    }
+    lm_sink_free(j.sink);
+    lm_media_wake();
+    pthread_cond_broadcast(&c->cv);
+  }
+  pthread_mutex_unlock(&c->mu);
+  return NULL;
 }
 
 static bool codec_thread_ensure(struct lm_codec *c)
 {
-   if (c->th_on) return true;
-   if (pthread_create(&c->th, NULL, codec_thread_main, c) != 0) return false;
-   c->th_on = true;
-   return true;
+  if (c->th_on) return true;
+  if (pthread_create(&c->th, NULL, codec_thread_main, c) != 0) return false;
+  c->th_on = true;
+  return true;
 }
 
 /* Feeds one access unit and keeps whatever picture comes out.  Returns false
@@ -1356,49 +1481,49 @@ static bool codec_thread_ensure(struct lm_codec *c)
 static bool decode_au(struct lm_codec *c, const uint8_t *data, size_t len,
                       int64_t pts_us)
 {
-   unsigned char *planes[3] = { NULL, NULL, NULL };
-   struct SBufferInfo info;
-   memset(&info, 0, sizeof info);
-   info.uiInBsTimeStamp = (unsigned long long)pts_us;
+  unsigned char *planes[3] = { NULL, NULL, NULL };
+  struct SBufferInfo info;
+  memset(&info, 0, sizeof info);
+  info.uiInBsTimeStamp = (unsigned long long)pts_us;
 
-   int st = (*c->dec)->DecodeFrameNoDelay(c->dec, data, (int)len, planes, &info);
-   if (st != 0) {
-      static int warned;
-      if (warned++ < 8)
-         fprintf(stderr, "[media] openh264 decode state 0x%x (%zu bytes)\n",
-                 st, len);
-      /* A concealed or dropped picture is not a codec failure; the next AU
-       * usually recovers.  Only report it — unless nothing has ever decoded,
-       * in which case this is not a dropped frame, it is a stream the decoder
-       * cannot read.  See lm_codec::undecodable. */
-      if (!c->produced_picture && !c->undecodable &&
-          ++c->dec_errors >= LM_DECODE_GIVE_UP) {
-         c->undecodable = true;
-         fprintf(stderr,
-                 "[media] this H.264 stream is not decodable here: %d access "
-                 "units, no picture.  openh264 decodes Constrained Baseline, "
-                 "and Main/High with CABAC or B-frames is not that — reporting "
-                 "the stream unsupported so the caller stops waiting on it.\n",
-                 c->dec_errors);
-      }
-   }
-   if (info.iBufferStatus != 1) return true;   /* nothing came out this time */
-   c->produced_picture = true;
-   c->dec_errors = 0;
+  int st = (*c->dec)->DecodeFrameNoDelay(c->dec, data, (int)len, planes, &info);
+  if (st != 0) {
+    static int warned;
+    if (warned++ < 8)
+      fprintf(stderr, "[media] openh264 decode state 0x%x (%zu bytes)\n",
+              st, len);
+    /* A concealed or dropped picture is not a codec failure; the next AU
+     * usually recovers.  Only report it — unless nothing has ever decoded,
+     * in which case this is not a dropped frame, it is a stream the decoder
+     * cannot read.  See lm_codec::undecodable. */
+    if (!c->produced_picture && !c->undecodable &&
+        ++c->dec_errors >= LM_DECODE_GIVE_UP) {
+      c->undecodable = true;
+      fprintf(stderr,
+              "[media] this H.264 stream is not decodable here: %d access "
+              "units, no picture.  openh264 decodes Constrained Baseline, "
+              "and Main/High with CABAC or B-frames is not that — reporting "
+              "the stream unsupported so the caller stops waiting on it.\n",
+              c->dec_errors);
+    }
+  }
+  if (info.iBufferStatus != 1) return true;   /* nothing came out this time */
+  c->produced_picture = true;
+  c->dec_errors = 0;
 
-   const struct SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
-   int w = b->iWidth, h = b->iHeight;
-   if (w <= 0 || h <= 0 || w > 8192 || h > 8192 ||
-       b->iStride[0] < w || b->iStride[1] < w / 2 ||
-       !planes[0] || !planes[1] || !planes[2]) {
-      fprintf(stderr, "[media] openh264 handed back an unusable picture "
-              "(%dx%d stride %d/%d) — refusing it\n",
-              w, h, b->iStride[0], b->iStride[1]);
-      return false;
-   }
+  const struct SSysMEMBuffer *b = &info.UsrData.sSystemBuffer;
+  int w = b->iWidth, h = b->iHeight;
+  if (w <= 0 || h <= 0 || w > 8192 || h > 8192 ||
+      b->iStride[0] < w || b->iStride[1] < w / 2 ||
+      !planes[0] || !planes[1] || !planes[2]) {
+    fprintf(stderr, "[media] openh264 handed back an unusable picture "
+                    "(%dx%d stride %d/%d) — refusing it\n",
+            w, h, b->iStride[0], b->iStride[1]);
+    return false;
+  }
 
-   int stride[3] = { b->iStride[0], b->iStride[1], b->iStride[1] };
-   return keep_picture(c, planes, stride, w, h, (int64_t)info.uiOutYuvTimeStamp);
+  int stride[3] = { b->iStride[0], b->iStride[1], b->iStride[1] };
+  return keep_picture(c, planes, stride, w, h, (int64_t)info.uiOutYuvTimeStamp);
 }
 
 /* AAC frames arrive raw, with the configuration in csd-0 (an
@@ -1407,29 +1532,29 @@ static bool decode_au(struct lm_codec *c, const uint8_t *data, size_t len,
  * one instead of teaching the emulator where AVCodecContext keeps extradata. */
 static void aac_take_config(struct lm_codec *c, const uint8_t *asc, size_t len)
 {
-   if (len < 2) return;
-   c->aac_profile = (asc[0] >> 3) & 0x1f;              /* audioObjectType */
-   c->aac_freq_idx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
-   c->aac_chan_cfg = (asc[1] >> 3) & 0x0f;
-   c->aac_config = c->aac_profile >= 1 && c->aac_profile <= 4 &&
-                   c->aac_freq_idx <= 12 && c->aac_chan_cfg >= 1;
-   if (!c->aac_config)
-      fprintf(stderr, "[media] AAC csd-0 is not a usable AudioSpecificConfig "
-              "(objectType %d, freq idx %d, channels %d)\n",
-              c->aac_profile, c->aac_freq_idx, c->aac_chan_cfg);
+  if (len < 2) return;
+  c->aac_profile = (asc[0] >> 3) & 0x1f;              /* audioObjectType */
+  c->aac_freq_idx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
+  c->aac_chan_cfg = (asc[1] >> 3) & 0x0f;
+  c->aac_config = c->aac_profile >= 1 && c->aac_profile <= 4 &&
+                  c->aac_freq_idx <= 12 && c->aac_chan_cfg >= 1;
+  if (!c->aac_config)
+    fprintf(stderr, "[media] AAC csd-0 is not a usable AudioSpecificConfig "
+                    "(objectType %d, freq idx %d, channels %d)\n",
+            c->aac_profile, c->aac_freq_idx, c->aac_chan_cfg);
 }
 
 static void aac_write_adts(const struct lm_codec *c, uint8_t *h, size_t payload)
 {
-   size_t total = payload + 7;
-   h[0] = 0xff;
-   h[1] = 0xf1;                                   /* MPEG-4, no CRC */
-   h[2] = (uint8_t)(((c->aac_profile - 1) << 6) | (c->aac_freq_idx << 2) |
-                    ((c->aac_chan_cfg >> 2) & 1));
-   h[3] = (uint8_t)(((c->aac_chan_cfg & 3) << 6) | ((total >> 11) & 0x03));
-   h[4] = (uint8_t)((total >> 3) & 0xff);
-   h[5] = (uint8_t)(((total & 7) << 5) | 0x1f);
-   h[6] = 0xfc;
+  size_t total = payload + 7;
+  h[0] = 0xff;
+  h[1] = 0xf1;                                   /* MPEG-4, no CRC */
+  h[2] = (uint8_t)(((c->aac_profile - 1) << 6) | (c->aac_freq_idx << 2) |
+                   ((c->aac_chan_cfg >> 2) & 1));
+  h[3] = (uint8_t)(((c->aac_chan_cfg & 3) << 6) | ((total >> 11) & 0x03));
+  h[4] = (uint8_t)((total >> 3) & 0xff);
+  h[5] = (uint8_t)(((total & 7) << 5) | 0x1f);
+  h[6] = 0xfc;
 }
 
 /* Interleaved signed 16-bit, which is what MediaCodec hands back by default
@@ -1437,402 +1562,415 @@ static void aac_write_adts(const struct lm_codec *c, uint8_t *h, size_t payload)
 static size_t aac_pack_s16(int fmt, int channels, int nb, uint8_t *const *planes,
                            int16_t *dst)
 {
-   if (nb <= 0 || channels <= 0) return 0;
-   switch (fmt) {
-      case AV_SAMPLE_FMT_S16:
-         memcpy(dst, planes[0], (size_t)nb * channels * 2);
-         return (size_t)nb * channels * 2;
-      case AV_SAMPLE_FMT_S16P:
-         for (int i = 0; i < nb; ++i)
-            for (int ch = 0; ch < channels; ++ch)
-               dst[i * channels + ch] = ((const int16_t *)planes[ch])[i];
-         return (size_t)nb * channels * 2;
-      case AV_SAMPLE_FMT_FLT:
-         for (int i = 0; i < nb * channels; ++i) {
-            float v = ((const float *)planes[0])[i] * 32767.0f;
-            dst[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v);
-         }
-         return (size_t)nb * channels * 2;
-      case AV_SAMPLE_FMT_FLTP:
-         for (int i = 0; i < nb; ++i)
-            for (int ch = 0; ch < channels; ++ch) {
-               float v = ((const float *)planes[ch])[i] * 32767.0f;
-               dst[i * channels + ch] =
-                  (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v);
-            }
-         return (size_t)nb * channels * 2;
-      default:
-         return 0;
-   }
+  if (nb <= 0 || channels <= 0) return 0;
+  switch (fmt) {
+  case AV_SAMPLE_FMT_S16:
+    memcpy(dst, planes[0], (size_t)nb * channels * 2);
+    return (size_t)nb * channels * 2;
+  case AV_SAMPLE_FMT_S16P:
+    for (int i = 0; i < nb; ++i)
+      for (int ch = 0; ch < channels; ++ch)
+        dst[i * channels + ch] = ((const int16_t *)planes[ch])[i];
+    return (size_t)nb * channels * 2;
+  case AV_SAMPLE_FMT_FLT:
+    for (int i = 0; i < nb * channels; ++i) {
+      float v = ((const float *)planes[0])[i] * 32767.0f;
+      dst[i] = (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v);
+    }
+    return (size_t)nb * channels * 2;
+  case AV_SAMPLE_FMT_FLTP:
+    for (int i = 0; i < nb; ++i)
+      for (int ch = 0; ch < channels; ++ch) {
+        float v = ((const float *)planes[ch])[i] * 32767.0f;
+        dst[i * channels + ch] =
+          (int16_t)(v > 32767.f ? 32767.f : v < -32768.f ? -32768.f : v);
+      }
+    return (size_t)nb * channels * 2;
+  default:
+    return 0;
+  }
 }
 
 static bool decode_aac(struct lm_codec *c, const uint8_t *data, size_t len,
                        int64_t pts_us)
 {
-   if (!c->aac_config || !len) return true;
+  if (!c->aac_config || !len) return true;
 
-   /* One ADTS frame: header + payload, in a buffer libavcodec may read a
-    * little past (it wants FF_INPUT_BUFFER_PADDING_SIZE of slack). */
-   size_t total = len + 7;
-   uint8_t *buf = calloc(total + 64, 1);
-   if (!buf) return false;
-   aac_write_adts(c, buf, len);
-   memcpy(buf + 7, data, len);
+  /* One ADTS frame: header + payload, in a buffer libavcodec may read a
+   * little past (it wants FF_INPUT_BUFFER_PADDING_SIZE of slack). */
+  size_t total = len + 7;
+  uint8_t *buf = calloc(total + 64, 1);
+  if (!buf) return false;
+  aac_write_adts(c, buf, len);
+  memcpy(buf + 7, data, len);
 
-   unsigned char pkt[AVPKT_BYTES];
-   memset(pkt, 0, sizeof pkt);
-   av.init_packet(pkt);
-   uint8_t *pdata = buf;
-   int32_t psize = (int32_t)total;
-   memcpy(pkt + AVPKT_DATA_OFF, &pdata, sizeof pdata);
-   memcpy(pkt + AVPKT_SIZE_OFF, &psize, 4);
+  unsigned char pkt[AVPKT_BYTES];
+  memset(pkt, 0, sizeof pkt);
+  av.init_packet(pkt);
+  uint8_t *pdata = buf;
+  int32_t psize = (int32_t)total;
+  memcpy(pkt + AVPKT_DATA_OFF, &pdata, sizeof pdata);
+  memcpy(pkt + AVPKT_SIZE_OFF, &psize, 4);
 
-   int got = 0;
-   int used = av.decode_audio4(c->actx, c->aframe, &got, pkt);
-   if (used < 0 || !got) {
-      static int warned;
-      if (used < 0 && warned++ < 8)
-         fprintf(stderr, "[media] AAC decode failed (%d) on %zu bytes\n", used, len);
-      free(buf);
-      if(used<0) c->error=-1007; /* ERROR_MALFORMED */
-      return used>=0;
-   }
+  int got = 0;
+  int used = av.decode_audio4(c->actx, c->aframe, &got, pkt);
+  if (used < 0 || !got) {
+    static int warned;
+    if (used < 0 && warned++ < 8)
+      fprintf(stderr, "[media] AAC decode failed (%d) on %zu bytes\n", used, len);
+    free(buf);
+    if(used<0) c->error=-1007; /* ERROR_MALFORMED */
+    return used>=0;
+  }
 
-   uint8_t *planes[8];
-   int32_t nb, fmt;
-   memcpy(planes, (const uint8_t *)c->aframe + AVFRAME_DATA_OFF, sizeof planes);
-   memcpy(&nb, (const uint8_t *)c->aframe + AVFRAME_NB_SAMPLES_OFF, 4);
-   memcpy(&fmt, (const uint8_t *)c->aframe + AVFRAME_FORMAT_OFF, 4);
-   int ch = av.frame_channels(c->aframe);
-   int rate = av.frame_sample_rate(c->aframe);
-   if (nb <= 0 || nb > 65536 || ch <= 0 || ch > LM_AAC_MAX_CHANNELS || rate <= 0 || !planes[0]) {
-      fprintf(stderr, "[media] libavcodec AVFrame does not match the layout this "
-              "build assumes (%d samples, %d ch, %d Hz) — dropping audio\n",
-              nb, ch, rate);
+  uint8_t *planes[8];
+  int32_t nb, fmt;
+  memcpy(planes, (const uint8_t *)c->aframe + AVFRAME_DATA_OFF, sizeof planes);
+  memcpy(&nb, (const uint8_t *)c->aframe + AVFRAME_NB_SAMPLES_OFF, 4);
+  memcpy(&fmt, (const uint8_t *)c->aframe + AVFRAME_FORMAT_OFF, 4);
+  int ch = av.frame_channels(c->aframe);
+  int rate = av.frame_sample_rate(c->aframe);
+  if (nb <= 0 || nb > 65536 || ch <= 0 || ch > LM_AAC_MAX_CHANNELS || rate <= 0 || !planes[0]) {
+    fprintf(stderr, "[media] libavcodec AVFrame does not match the layout this "
+                    "build assumes (%d samples, %d ch, %d Hz) — dropping audio\n",
+            nb, ch, rate);
+    free(buf);
+    return false;
+  }
+
+  struct lm_outbuf *o = NULL;
+  for (int i = 0; i < LM_OUT_BUFS; ++i)
+    if (!c->out[i].busy && !c->out[i].ready) {
+      o = &c->out[i];
+      break;
+    }
+  if (!o) {
+    free(buf);
+    return true;
+  }
+
+  size_t need = (size_t)nb * ch * 2;
+  if (need > o->cap) {
+    uint8_t *p = realloc(o->yuv, need);
+    if (!p) {
       free(buf);
       return false;
-   }
-
-   struct lm_outbuf *o = NULL;
-   for (int i = 0; i < LM_OUT_BUFS; ++i)
-      if (!c->out[i].busy && !c->out[i].ready) { o = &c->out[i]; break; }
-   if (!o) { free(buf); return true; }
-
-   size_t need = (size_t)nb * ch * 2;
-   if (need > o->cap) {
-      uint8_t *p = realloc(o->yuv, need);
-      if (!p) { free(buf); return false; }
-      o->yuv = p;
-      o->cap = need;
-   }
-   o->len = aac_pack_s16(fmt, ch, nb, planes, (int16_t *)o->yuv);
-   if (!o->len) {
-      static int warned;
-      if (warned++ < 4)
-         fprintf(stderr, "[media] AAC sample format %d is not one this build "
-                 "converts\n", fmt);
-      free(buf);
-      return true;
-   }
-   o->w = o->h = 0;
-   o->pts_us = pts_us;
-   o->flags = 0;
-   o->ready = true;
-   if (c->rate != rate || c->channels != ch)
-      fprintf(stderr, "[media] AAC %d Hz, %d channel(s)\n", rate, ch);
-   c->rate = rate;
-   c->channels = ch;
-   free(buf);
-   return true;
+    }
+    o->yuv = p;
+    o->cap = need;
+  }
+  o->len = aac_pack_s16(fmt, ch, nb, planes, (int16_t *)o->yuv);
+  if (!o->len) {
+    static int warned;
+    if (warned++ < 4)
+      fprintf(stderr, "[media] AAC sample format %d is not one this build "
+                      "converts\n", fmt);
+    free(buf);
+    return true;
+  }
+  o->w = o->h = 0;
+  o->pts_us = pts_us;
+  o->flags = 0;
+  o->ready = true;
+  if (c->rate != rate || c->channels != ch)
+    fprintf(stderr, "[media] AAC %d Hz, %d channel(s)\n", rate, ch);
+  c->rate = rate;
+  c->channels = ch;
+  free(buf);
+  return true;
 }
 
 void lm_codec_audio_format(const struct lm_codec *c, int *rate, int *channels)
 {
-   if (rate) *rate = c ? c->rate : 0;
-   if (channels) *channels = c ? c->channels : 0;
+  if (rate) *rate = c ? c->rate : 0;
+  if (channels) *channels = c ? c->channels : 0;
 }
 
 bool lm_codec_undecodable(const struct lm_codec *c)
 {
-   return c && c->undecodable;
+  return c && c->undecodable;
 }
 
 int lm_codec_error(struct lm_codec *c)
 {
-   if(!c) return 0;
-   if(c->vctx) pthread_mutex_lock(&c->mu);
-   int error=c->error ? c->error : c->undecodable ? -1010 : 0;
-   if(c->vctx) pthread_mutex_unlock(&c->mu);
-   return error;
+  if(!c) return 0;
+  if(c->vctx) pthread_mutex_lock(&c->mu);
+  int error=c->error ? c->error : c->undecodable ? -1010 : 0;
+  if(c->vctx) pthread_mutex_unlock(&c->mu);
+  return error;
 }
 
 bool lm_codec_is_video(const struct lm_codec *c)
 {
-   return c && c->video;
+  return c && c->video;
 }
 bool lm_codec_image_reader_supported(const struct lm_codec *c)
 {
-   return c && c->vctx;
+  return c && c->vctx;
 }
 
 const char *lm_codec_mime(const struct lm_codec *c)
 {
-   if (!c || !c->video || !c->mime[0]) return NULL;
-   return c->mime;
+  if (!c || !c->video || !c->mime[0]) return NULL;
+  return c->mime;
 }
 
 bool lm_codec_start(struct lm_codec *c)
 {
-   if (!c) return false;
-   c->started = true;
-   /* configure() collected csd-0 / csd-1; the platform feeds them at start(),
-    * before any sample.  Doing it here means a caller that never queues its
-    * own codec-config buffer still gets a configured decoder. */
-   if (c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      c->vcsd_pending = c->ncsd > 0;
-      pthread_mutex_unlock(&c->mu);
-   }
-   else for (int i = 0; i < c->ncsd; ++i) {
+  if (!c) return false;
+  c->started = true;
+  /* configure() collected csd-0 / csd-1; the platform feeds them at start(),
+   * before any sample.  Doing it here means a caller that never queues its
+   * own codec-config buffer still gets a configured decoder. */
+  if (c->vctx) {
+    pthread_mutex_lock(&c->mu);
+    c->vcsd_pending = c->ncsd > 0;
+    pthread_mutex_unlock(&c->mu);
+  }
+  else for (int i = 0; i < c->ncsd; ++i) {
       if (c->video) (void)decode_au(c, c->csd[i].p, c->csd[i].len, 0);
       else if (i == 0) aac_take_config(c, c->csd[i].p, c->csd[i].len);
-   }
-   return true;
+    }
+  return true;
 }
 
 void lm_codec_stop(struct lm_codec *c)
 {
-   if (!c) return;
-   c->started = false;
-   lm_codec_flush(c);
+  if (!c) return;
+  c->started = false;
+  lm_codec_flush(c);
 }
 
 static void codec_flush_locked(struct lm_codec *c)
 {
-   c->rendered_count=c->rendered_head=0;
-   /* With a codec thread, an input buffer it is decoding and an output it
-    * is converting stay its own until it hands them back; everything else is
-    * returned now.  Queued-but-unstarted decodes are dropped below. */
-   int inflight = 0;
-   for (int i = 0; i < LM_IN_BUFS; ++i) {
-      if (c->in[i].decoding) { ++inflight; continue; }
-      c->in[i].queued = false;
-   }
-   if (c->vctx) c->pending_decodes = inflight;
-   for (int i = 0; i < LM_OUT_BUFS; ++i) {
-      if (c->out[i].rendering) continue;
-      c->out[i].busy = false;
-      c->out[i].ready = false;
-   }
-   c->got_eos = c->sent_eos = false;
-   /* MediaCodec.flush() discards every reference picture too: the next
-    * sample after a seek or a loop starts from its own keyframe.  The codec
-    * thread owns the context, so it does the flushing; everything it had
-    * queued or in hand belongs to the old epoch and is dropped. */
-   if (c->vctx) {
-      ++c->epoch;
-      for (int i = 0; i < c->job_n; ++i)
-         lm_sink_free(c->jobs[(c->job_head + i) % (int)(sizeof c->jobs / sizeof c->jobs[0])].sink);
-      c->job_n = 0;
-      c->flush_decoder = true;
-      c->draining = c->drained = false;
-      pthread_cond_broadcast(&c->cv);
-   }
+  c->rendered_count=c->rendered_head=0;
+  /* With a codec thread, an input buffer it is decoding and an output it
+   * is converting stay its own until it hands them back; everything else is
+   * returned now.  Queued-but-unstarted decodes are dropped below. */
+  int inflight = 0;
+  for (int i = 0; i < LM_IN_BUFS; ++i) {
+    if (c->in[i].decoding) {
+      ++inflight;
+      continue;
+    }
+    c->in[i].queued = false;
+  }
+  if (c->vctx) c->pending_decodes = inflight;
+  for (int i = 0; i < LM_OUT_BUFS; ++i) {
+    if (c->out[i].rendering) continue;
+    c->out[i].busy = false;
+    c->out[i].ready = false;
+  }
+  c->got_eos = c->sent_eos = false;
+  /* MediaCodec.flush() discards every reference picture too: the next
+   * sample after a seek or a loop starts from its own keyframe.  The codec
+   * thread owns the context, so it does the flushing; everything it had
+   * queued or in hand belongs to the old epoch and is dropped. */
+  if (c->vctx) {
+    ++c->epoch;
+    for (int i = 0; i < c->job_n; ++i)
+      lm_sink_free(c->jobs[(c->job_head + i) % (int)(sizeof c->jobs / sizeof c->jobs[0])].sink);
+    c->job_n = 0;
+    c->flush_decoder = true;
+    c->draining = c->drained = false;
+    pthread_cond_broadcast(&c->cv);
+  }
 }
 
 void lm_codec_flush(struct lm_codec *c)
 {
-   if (!c) return;
-   if (c->vctx) pthread_mutex_lock(&c->mu);
-   codec_flush_locked(c);
-   if(c->actx) av.flush_buffers(c->actx);
-   if (c->vctx) pthread_mutex_unlock(&c->mu);
+  if (!c) return;
+  if (c->vctx) pthread_mutex_lock(&c->mu);
+  codec_flush_locked(c);
+  if(c->actx) av.flush_buffers(c->actx);
+  if (c->vctx) pthread_mutex_unlock(&c->mu);
 }
 
 int lm_codec_dequeue_input(struct lm_codec *c)
 {
-   if (!c || !c->started) return -1;
-   if (c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      int free_out = -c->pending_decodes;
-      for(int i=0;i<LM_IN_BUFS;++i)
-         if(c->in[i].queued && !c->in[i].submitted) --free_out;
-      for (int i = 0; i < LM_OUT_BUFS; ++i)
-         if (!c->out[i].busy && !c->out[i].ready) free_out++;
-      int got = -1;
-      if (free_out > 0)
-         for (int i = 0; i < LM_IN_BUFS && got < 0; ++i) {
-            if (c->in[i].queued) continue;
-            if (!c->in[i].p) {
-               c->in[i].p = malloc(LM_IN_CAP);
-               if (!c->in[i].p) break;
-               c->in[i].cap = LM_IN_CAP;
-            }
-            c->in[i].queued = true;
-            c->in[i].submitted = false;
-            got = i;
-         }
-      pthread_mutex_unlock(&c->mu);
-      return got;
-   }
-   /* Back-pressure: with every output slot spoken for there is nowhere to put
-    * the next picture, so the input side has to wait. */
-   int free_out = 0;
-   for (int i = 0; i < LM_OUT_BUFS; ++i)
+  if (!c || !c->started) return -1;
+  if (c->vctx) {
+    pthread_mutex_lock(&c->mu);
+    int free_out = -c->pending_decodes;
+    for(int i=0; i<LM_IN_BUFS; ++i)
+      if(c->in[i].queued && !c->in[i].submitted) --free_out;
+    for (int i = 0; i < LM_OUT_BUFS; ++i)
       if (!c->out[i].busy && !c->out[i].ready) free_out++;
-   for(int i=0;i<LM_IN_BUFS;++i) if(c->in[i].queued) --free_out;
-   if (!free_out) return -1;
-
-   for (int i = 0; i < LM_IN_BUFS; ++i) {
-      if (c->in[i].queued) continue;
-      if (!c->in[i].p) {
-         c->in[i].p = malloc(LM_IN_CAP);
-         if (!c->in[i].p) return -1;
-         c->in[i].cap = LM_IN_CAP;
+    int got = -1;
+    if (free_out > 0)
+      for (int i = 0; i < LM_IN_BUFS && got < 0; ++i) {
+        if (c->in[i].queued) continue;
+        if (!c->in[i].p) {
+          c->in[i].p = malloc(LM_IN_CAP);
+          if (!c->in[i].p) break;
+          c->in[i].cap = LM_IN_CAP;
+        }
+        c->in[i].queued = true;
+        c->in[i].submitted = false;
+        got = i;
       }
-      c->in[i].queued = true;   /* held by the caller until queueInputBuffer */
-      c->in[i].submitted = false;
-      return i;
-   }
-   return -1;
+    pthread_mutex_unlock(&c->mu);
+    return got;
+  }
+  /* Back-pressure: with every output slot spoken for there is nowhere to put
+   * the next picture, so the input side has to wait. */
+  int free_out = 0;
+  for (int i = 0; i < LM_OUT_BUFS; ++i)
+    if (!c->out[i].busy && !c->out[i].ready) free_out++;
+  for(int i=0; i<LM_IN_BUFS; ++i) if(c->in[i].queued) --free_out;
+  if (!free_out) return -1;
+
+  for (int i = 0; i < LM_IN_BUFS; ++i) {
+    if (c->in[i].queued) continue;
+    if (!c->in[i].p) {
+      c->in[i].p = malloc(LM_IN_CAP);
+      if (!c->in[i].p) return -1;
+      c->in[i].cap = LM_IN_CAP;
+    }
+    c->in[i].queued = true;   /* held by the caller until queueInputBuffer */
+    c->in[i].submitted = false;
+    return i;
+  }
+  return -1;
 }
 
 uint8_t *lm_codec_input_buffer(struct lm_codec *c, int idx, size_t *cap)
 {
-   if (!c || idx < 0 || idx >= LM_IN_BUFS || !c->in[idx].p) return NULL;
-   if (cap) *cap = c->in[idx].cap;
-   return c->in[idx].p;
+  if (!c || idx < 0 || idx >= LM_IN_BUFS || !c->in[idx].p) return NULL;
+  if (cap) *cap = c->in[idx].cap;
+  return c->in[idx].p;
 }
 
 bool lm_codec_queue_input(struct lm_codec *c, int idx, int offset, int size,
                           int64_t pts_us, int flags)
 {
-   if (!c || idx < 0 || idx >= LM_IN_BUFS || !c->in[idx].p) return false;
-   if (offset < 0 || size < 0 ||
-       (size_t)offset + (size_t)size > c->in[idx].cap) return false;
+  if (!c || idx < 0 || idx >= LM_IN_BUFS || !c->in[idx].p) return false;
+  if (offset < 0 || size < 0 ||
+      (size_t)offset + (size_t)size > c->in[idx].cap) return false;
 
-   if (c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      c->in[idx].submitted = true;
-      if (flags & LM_BUFFER_FLAG_END_OF_STREAM) c->got_eos = true;
-      bool ok = false;
-      if ((size > 0 || (flags & LM_BUFFER_FLAG_END_OF_STREAM)) &&
-          codec_thread_ensure(c)) {
-         struct lm_job j = { LM_JOB_DECODE, idx, offset, size, flags, pts_us,
-                             NULL, c->epoch, 0, false };
-         ok = codec_job_push(c, &j);
-         if (ok) ++c->pending_decodes;
-      }
-      if (!ok) {
-         c->in[idx].queued = false;
-         if(size>0 || (flags&LM_BUFFER_FLAG_END_OF_STREAM)) c->error=1100;
-      }
-      pthread_mutex_unlock(&c->mu);
-      if (trace_media())
-         fprintf(stderr, "[media] queueInput idx=%d size=%d pts=%lld flags=0x%x\n",
-                 idx, size, (long long)pts_us, flags);
-      return true;
-   }
-   c->in[idx].queued = false;
-   if (flags & LM_BUFFER_FLAG_END_OF_STREAM) c->got_eos = true;
-   if (trace_media())
+  if (c->vctx) {
+    pthread_mutex_lock(&c->mu);
+    c->in[idx].submitted = true;
+    if (flags & LM_BUFFER_FLAG_END_OF_STREAM) c->got_eos = true;
+    bool ok = false;
+    if ((size > 0 || (flags & LM_BUFFER_FLAG_END_OF_STREAM)) &&
+        codec_thread_ensure(c)) {
+      struct lm_job j = { LM_JOB_DECODE, idx, offset, size, flags, pts_us,
+               NULL, c->epoch, 0, false
+      };
+      ok = codec_job_push(c, &j);
+      if (ok) ++c->pending_decodes;
+    }
+    if (!ok) {
+      c->in[idx].queued = false;
+      if(size>0 || (flags&LM_BUFFER_FLAG_END_OF_STREAM)) c->error=1100;
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (trace_media())
       fprintf(stderr, "[media] queueInput idx=%d size=%d pts=%lld flags=0x%x\n",
               idx, size, (long long)pts_us, flags);
-   if (size > 0) {
-      bool decoded=true;
-      if (c->video)
-         decoded=decode_au(c, c->in[idx].p + offset, (size_t)size, pts_us);
-      else if (flags & LM_BUFFER_FLAG_CODEC_CONFIG)
-         aac_take_config(c, c->in[idx].p + offset, (size_t)size);
-      else
-         decoded=decode_aac(c, c->in[idx].p + offset, (size_t)size, pts_us);
-      if(!decoded && !c->error) c->error=INT32_MIN;
-   }
-   lm_media_wake();
-   return true;
+    return true;
+  }
+  c->in[idx].queued = false;
+  if (flags & LM_BUFFER_FLAG_END_OF_STREAM) c->got_eos = true;
+  if (trace_media())
+    fprintf(stderr, "[media] queueInput idx=%d size=%d pts=%lld flags=0x%x\n",
+            idx, size, (long long)pts_us, flags);
+  if (size > 0) {
+    bool decoded=true;
+    if (c->video)
+      decoded=decode_au(c, c->in[idx].p + offset, (size_t)size, pts_us);
+    else if (flags & LM_BUFFER_FLAG_CODEC_CONFIG)
+      aac_take_config(c, c->in[idx].p + offset, (size_t)size);
+    else
+      decoded=decode_aac(c, c->in[idx].p + offset, (size_t)size, pts_us);
+    if(!decoded && !c->error) c->error=INT32_MIN;
+  }
+  lm_media_wake();
+  return true;
 }
 
 static int codec_dequeue_output_locked(struct lm_codec *c, int64_t *pts_us,
                                        int *size, int *flags)
 {
-   if (pts_us) *pts_us = 0;
-   if (size) *size = 0;
-   if (flags) *flags = 0;
-   if (!c || !c->started) return LM_INFO_TRY_AGAIN_LATER;
+  if (pts_us) *pts_us = 0;
+  if (size) *size = 0;
+  if (flags) *flags = 0;
+  if (!c || !c->started) return LM_INFO_TRY_AGAIN_LATER;
 
-   /* The format is known once the first picture has been decoded, and the
-    * platform reports it before handing that picture over. */
-   if ((c->video ? c->width : c->rate) > 0 && !c->announced_format) {
-      c->announced_format = true;
-      if (trace_media())
-         fprintf(stderr, "[media] dequeueOutput -> format changed %dx%d/%dHz\n",
-                 c->width, c->height, c->rate);
-      return LM_INFO_OUTPUT_FORMAT_CHANGED;
-   }
+  /* The format is known once the first picture has been decoded, and the
+   * platform reports it before handing that picture over. */
+  if ((c->video ? c->width : c->rate) > 0 && !c->announced_format) {
+    c->announced_format = true;
+    if (trace_media())
+      fprintf(stderr, "[media] dequeueOutput -> format changed %dx%d/%dHz\n",
+              c->width, c->height, c->rate);
+    return LM_INFO_OUTPUT_FORMAT_CHANGED;
+  }
 
-   for (int i = 0; i < LM_OUT_BUFS; ++i) {
-      if (!c->out[i].ready || c->out[i].busy) continue;
+  for (int i = 0; i < LM_OUT_BUFS; ++i) {
+    if (!c->out[i].ready || c->out[i].busy) continue;
+    c->out[i].busy = true;
+    c->out[i].ready = false;
+    if (pts_us) *pts_us = c->out[i].pts_us;
+    if (size) *size = (int)c->out[i].len;
+    if (flags) *flags = c->out[i].flags;
+    if (trace_media())
+      fprintf(stderr, "[media] dequeueOutput idx=%d size=%d pts=%lld\n",
+              i, (int)c->out[i].len, (long long)c->out[i].pts_us);
+    return i;
+  }
+
+  /* Pictures libavcodec holds back for B-frame reordering are pulled by the
+   * codec thread once it has seen END_OF_STREAM; the stream ends only when
+   * it has run out of them and nothing is still being decoded. */
+  if (c->vctx && c->got_eos && (c->pending_decodes || !c->drained))
+    return LM_INFO_TRY_AGAIN_LATER;
+
+  /* Everything queued has come out; only then does the stream end. */
+  if (c->got_eos && !c->sent_eos) {
+    for (int i = 0; i < LM_OUT_BUFS; ++i) {
+      if (c->out[i].busy) continue;
+      c->sent_eos = true;
       c->out[i].busy = true;
-      c->out[i].ready = false;
-      if (pts_us) *pts_us = c->out[i].pts_us;
-      if (size) *size = (int)c->out[i].len;
-      if (flags) *flags = c->out[i].flags;
-      if (trace_media())
-         fprintf(stderr, "[media] dequeueOutput idx=%d size=%d pts=%lld\n",
-                 i, (int)c->out[i].len, (long long)c->out[i].pts_us);
+      c->out[i].len = 0;
+      c->out[i].flags = LM_BUFFER_FLAG_END_OF_STREAM;
+      if (flags) *flags = LM_BUFFER_FLAG_END_OF_STREAM;
       return i;
-   }
-
-   /* Pictures libavcodec holds back for B-frame reordering are pulled by the
-    * codec thread once it has seen END_OF_STREAM; the stream ends only when
-    * it has run out of them and nothing is still being decoded. */
-   if (c->vctx && c->got_eos && (c->pending_decodes || !c->drained))
-      return LM_INFO_TRY_AGAIN_LATER;
-
-   /* Everything queued has come out; only then does the stream end. */
-   if (c->got_eos && !c->sent_eos) {
-      for (int i = 0; i < LM_OUT_BUFS; ++i) {
-         if (c->out[i].busy) continue;
-         c->sent_eos = true;
-         c->out[i].busy = true;
-         c->out[i].len = 0;
-         c->out[i].flags = LM_BUFFER_FLAG_END_OF_STREAM;
-         if (flags) *flags = LM_BUFFER_FLAG_END_OF_STREAM;
-         return i;
-      }
-   }
-   return LM_INFO_TRY_AGAIN_LATER;
+    }
+  }
+  return LM_INFO_TRY_AGAIN_LATER;
 }
 
 int lm_codec_dequeue_output(struct lm_codec *c, int64_t *pts_us, int *size,
                             int *flags)
 {
-   if (c && c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      int r = codec_dequeue_output_locked(c, pts_us, size, flags);
-      pthread_mutex_unlock(&c->mu);
-      return r;
-   }
-   return codec_dequeue_output_locked(c, pts_us, size, flags);
+  if (c && c->vctx) {
+    pthread_mutex_lock(&c->mu);
+    int r = codec_dequeue_output_locked(c, pts_us, size, flags);
+    pthread_mutex_unlock(&c->mu);
+    return r;
+  }
+  return codec_dequeue_output_locked(c, pts_us, size, flags);
 }
 
 void lm_codec_output_size(const struct lm_codec *c, int *w, int *h)
 {
-   if (w) *w = c ? c->width : 0;
-   if (h) *h = c ? c->height : 0;
+  if (w) *w = c ? c->width : 0;
+  if (h) *h = c ? c->height : 0;
 }
 
 const uint8_t *lm_codec_output_buffer(struct lm_codec *c, int idx, size_t *len)
 {
-   if (!c || idx < 0 || idx >= LM_OUT_BUFS || !c->out[idx].busy) return NULL;
-   if (len) *len = c->out[idx].len;
-   return c->out[idx].yuv;
+  if (!c || idx < 0 || idx >= LM_OUT_BUFS || !c->out[idx].busy) return NULL;
+  if (len) *len = c->out[idx].len;
+  return c->out[idx].yuv;
 }
 
 /* BT.601 limited range, the matrix H.264 streams default to. */
 static inline uint8_t clamp8(int v)
 {
-   return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
+  return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
 /* Chroma is shared by a 2x2 block, so its three products are computed once per
@@ -1848,141 +1986,148 @@ static inline uint8_t clamp8(int v)
 static int i420_row_sse2(const uint8_t *yr, const uint8_t *ur, const uint8_t *vr,
                          uint8_t *dst, int w)
 {
-   const __m128i zero = _mm_setzero_si128();
-   const __m128i c16 = _mm_set1_epi16(16), c128 = _mm_set1_epi16(128);
-   const __m128i k_y = _mm_set1_epi16(9535), k_vr = _mm_set1_epi16(13074),
-                 k_ug = _mm_set1_epi16(3203), k_vg = _mm_set1_epi16(6660),
-                 k_ub = _mm_set1_epi16(16525);
-   const __m128i alpha = _mm_set1_epi8((char)255);
-   int x = 0;
-   for (; x + 16 <= w; x += 16) {
-      const __m128i y = _mm_loadu_si128((const __m128i *)(yr + x));
-      const __m128i u8 = _mm_loadl_epi64((const __m128i *)(ur + x / 2));
-      const __m128i v8 = _mm_loadl_epi64((const __m128i *)(vr + x / 2));
-      const __m128i u = _mm_unpacklo_epi8(u8, u8), v = _mm_unpacklo_epi8(v8, v8);   /* each chroma twice */
-      __m128i out[2][4];
-      for (int half = 0; half < 2; ++half) {
-         const __m128i yy16 = half ? _mm_unpackhi_epi8(y, zero) : _mm_unpacklo_epi8(y, zero);
-         const __m128i uu16 = half ? _mm_unpackhi_epi8(u, zero) : _mm_unpacklo_epi8(u, zero);
-         const __m128i vv16 = half ? _mm_unpackhi_epi8(v, zero) : _mm_unpacklo_epi8(v, zero);
-         const __m128i yv = _mm_mulhi_epi16(_mm_slli_epi16(_mm_sub_epi16(yy16, c16), 7), k_y);
-         const __m128i ud = _mm_slli_epi16(_mm_sub_epi16(uu16, c128), 7);
-         const __m128i vd = _mm_slli_epi16(_mm_sub_epi16(vv16, c128), 7);
-         const __m128i r = _mm_srai_epi16(_mm_add_epi16(yv, _mm_mulhi_epi16(vd, k_vr)), 4);
-         const __m128i g = _mm_srai_epi16(_mm_sub_epi16(_mm_sub_epi16(yv, _mm_mulhi_epi16(ud, k_ug)),
-                                                        _mm_mulhi_epi16(vd, k_vg)), 4);
-         const __m128i b = _mm_srai_epi16(_mm_add_epi16(yv, _mm_mulhi_epi16(ud, k_ub)), 4);
-         out[half][0] = r; out[half][1] = g; out[half][2] = b;
-      }
-      const __m128i r8 = _mm_packus_epi16(out[0][0], out[1][0]);
-      const __m128i g8 = _mm_packus_epi16(out[0][1], out[1][1]);
-      const __m128i b8 = _mm_packus_epi16(out[0][2], out[1][2]);
-      const __m128i rg_lo = _mm_unpacklo_epi8(r8, g8), rg_hi = _mm_unpackhi_epi8(r8, g8);
-      const __m128i ba_lo = _mm_unpacklo_epi8(b8, alpha), ba_hi = _mm_unpackhi_epi8(b8, alpha);
-      uint8_t *d = dst + (size_t)x * 4;
-      _mm_storeu_si128((__m128i *)(d +  0), _mm_unpacklo_epi16(rg_lo, ba_lo));
-      _mm_storeu_si128((__m128i *)(d + 16), _mm_unpackhi_epi16(rg_lo, ba_lo));
-      _mm_storeu_si128((__m128i *)(d + 32), _mm_unpacklo_epi16(rg_hi, ba_hi));
-      _mm_storeu_si128((__m128i *)(d + 48), _mm_unpackhi_epi16(rg_hi, ba_hi));
-   }
-   return x;
+  const __m128i zero = _mm_setzero_si128();
+  const __m128i c16 = _mm_set1_epi16(16), c128 = _mm_set1_epi16(128);
+  const __m128i k_y = _mm_set1_epi16(9535), k_vr = _mm_set1_epi16(13074),
+                                            k_ug = _mm_set1_epi16(3203), k_vg = _mm_set1_epi16(6660),
+                                                                         k_ub = _mm_set1_epi16(16525);
+  const __m128i alpha = _mm_set1_epi8((char)255);
+  int x = 0;
+  for (; x + 16 <= w; x += 16) {
+    const __m128i y = _mm_loadu_si128((const __m128i *)(yr + x));
+    const __m128i u8 = _mm_loadl_epi64((const __m128i *)(ur + x / 2));
+    const __m128i v8 = _mm_loadl_epi64((const __m128i *)(vr + x / 2));
+    const __m128i u = _mm_unpacklo_epi8(u8, u8), v = _mm_unpacklo_epi8(v8, v8);   /* each chroma twice */
+    __m128i out[2][4];
+    for (int half = 0; half < 2; ++half) {
+      const __m128i yy16 = half ? _mm_unpackhi_epi8(y, zero) : _mm_unpacklo_epi8(y, zero);
+      const __m128i uu16 = half ? _mm_unpackhi_epi8(u, zero) : _mm_unpacklo_epi8(u, zero);
+      const __m128i vv16 = half ? _mm_unpackhi_epi8(v, zero) : _mm_unpacklo_epi8(v, zero);
+      const __m128i yv = _mm_mulhi_epi16(_mm_slli_epi16(_mm_sub_epi16(yy16, c16), 7), k_y);
+      const __m128i ud = _mm_slli_epi16(_mm_sub_epi16(uu16, c128), 7);
+      const __m128i vd = _mm_slli_epi16(_mm_sub_epi16(vv16, c128), 7);
+      const __m128i r = _mm_srai_epi16(_mm_add_epi16(yv, _mm_mulhi_epi16(vd, k_vr)), 4);
+      const __m128i g = _mm_srai_epi16(_mm_sub_epi16(_mm_sub_epi16(yv, _mm_mulhi_epi16(ud, k_ug)),
+                                       _mm_mulhi_epi16(vd, k_vg)), 4);
+      const __m128i b = _mm_srai_epi16(_mm_add_epi16(yv, _mm_mulhi_epi16(ud, k_ub)), 4);
+      out[half][0] = r;
+      out[half][1] = g;
+      out[half][2] = b;
+    }
+    const __m128i r8 = _mm_packus_epi16(out[0][0], out[1][0]);
+    const __m128i g8 = _mm_packus_epi16(out[0][1], out[1][1]);
+    const __m128i b8 = _mm_packus_epi16(out[0][2], out[1][2]);
+    const __m128i rg_lo = _mm_unpacklo_epi8(r8, g8), rg_hi = _mm_unpackhi_epi8(r8, g8);
+    const __m128i ba_lo = _mm_unpacklo_epi8(b8, alpha), ba_hi = _mm_unpackhi_epi8(b8, alpha);
+    uint8_t *d = dst + (size_t)x * 4;
+    _mm_storeu_si128((__m128i *)(d +  0), _mm_unpacklo_epi16(rg_lo, ba_lo));
+    _mm_storeu_si128((__m128i *)(d + 16), _mm_unpackhi_epi16(rg_lo, ba_lo));
+    _mm_storeu_si128((__m128i *)(d + 32), _mm_unpacklo_epi16(rg_hi, ba_hi));
+    _mm_storeu_si128((__m128i *)(d + 48), _mm_unpackhi_epi16(rg_hi, ba_hi));
+  }
+  return x;
 }
 #endif
 
 static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba)
 {
-   const int cw = (w + 1) / 2, ch = (h + 1) / 2;
-   const uint8_t *yp = yuv;
-   const uint8_t *up = yuv + (size_t)w * h;
-   const uint8_t *vp = up + (size_t)cw * ch;
-   int y;
+  const int cw = (w + 1) / 2, ch = (h + 1) / 2;
+  const uint8_t *yp = yuv;
+  const uint8_t *up = yuv + (size_t)w * h;
+  const uint8_t *vp = up + (size_t)cw * ch;
+  int y;
 
-   for (y = 0; y < h; ++y) {
-      const uint8_t *yr = yp + (size_t)y * w;
-      const uint8_t *ur = up + (size_t)(y / 2) * cw;
-      const uint8_t *vr = vp + (size_t)(y / 2) * cw;
-      uint8_t *dst = rgba + (size_t)y * w * 4;
-      int x = 0;
+  for (y = 0; y < h; ++y) {
+    const uint8_t *yr = yp + (size_t)y * w;
+    const uint8_t *ur = up + (size_t)(y / 2) * cw;
+    const uint8_t *vr = vp + (size_t)(y / 2) * cw;
+    uint8_t *dst = rgba + (size_t)y * w * 4;
+    int x = 0;
 #if defined(__SSE2__)
-      {
-         const int done = i420_row_sse2(yr, ur, vr, dst, w);
-         yr += done; ur += done / 2; vr += done / 2; dst += (size_t)done * 4; x = done;
-      }
+    {
+      const int done = i420_row_sse2(yr, ur, vr, dst, w);
+      yr += done;
+      ur += done / 2;
+      vr += done / 2;
+      dst += (size_t)done * 4;
+      x = done;
+    }
 #endif
-      for (; x + 1 < w; x += 2) {
-         const int d = *ur++ - 128;
-         const int e = *vr++ - 128;
-         const int r = 409 * e + 128;
-         const int g = -100 * d - 208 * e + 128;
-         const int b = 516 * d + 128;
-         int y298 = 298 * (*yr++ - 16);
-         dst[0] = clamp8((y298 + r) >> 8);
-         dst[1] = clamp8((y298 + g) >> 8);
-         dst[2] = clamp8((y298 + b) >> 8);
-         dst[3] = 255;
-         y298 = 298 * (*yr++ - 16);
-         dst[4] = clamp8((y298 + r) >> 8);
-         dst[5] = clamp8((y298 + g) >> 8);
-         dst[6] = clamp8((y298 + b) >> 8);
-         dst[7] = 255;
-         dst += 8;
-      }
-      if (x < w) {                      /* odd width: one trailing pixel */
-         const int d = *ur - 128, e = *vr - 128;
-         const int y298 = 298 * (*yr - 16);
-         dst[0] = clamp8((y298 + 409 * e + 128) >> 8);
-         dst[1] = clamp8((y298 - 100 * d - 208 * e + 128) >> 8);
-         dst[2] = clamp8((y298 + 516 * d + 128) >> 8);
-         dst[3] = 255;
-      }
-   }
+    for (; x + 1 < w; x += 2) {
+      const int d = *ur++ - 128;
+      const int e = *vr++ - 128;
+      const int r = 409 * e + 128;
+      const int g = -100 * d - 208 * e + 128;
+      const int b = 516 * d + 128;
+      int y298 = 298 * (*yr++ - 16);
+      dst[0] = clamp8((y298 + r) >> 8);
+      dst[1] = clamp8((y298 + g) >> 8);
+      dst[2] = clamp8((y298 + b) >> 8);
+      dst[3] = 255;
+      y298 = 298 * (*yr++ - 16);
+      dst[4] = clamp8((y298 + r) >> 8);
+      dst[5] = clamp8((y298 + g) >> 8);
+      dst[6] = clamp8((y298 + b) >> 8);
+      dst[7] = 255;
+      dst += 8;
+    }
+    if (x < w) {                      /* odd width: one trailing pixel */
+      const int d = *ur - 128, e = *vr - 128;
+      const int y298 = 298 * (*yr - 16);
+      dst[0] = clamp8((y298 + 409 * e + 128) >> 8);
+      dst[1] = clamp8((y298 - 100 * d - 208 * e + 128) >> 8);
+      dst[2] = clamp8((y298 + 516 * d + 128) >> 8);
+      dst[3] = 255;
+    }
+  }
 }
 
 static void codec_release_output(struct lm_codec *c, int idx, bool render,
-                                  struct lm_sink *sink, bool update_timestamp,
-                                  int64_t timestamp_ns)
+                                 struct lm_sink *sink, bool update_timestamp,
+                                 int64_t timestamp_ns)
 {
-   if (!c || idx < 0 || idx >= LM_OUT_BUFS) return;
-   if (render && sink && sink->images && !lm_codec_image_reader_supported(c)) {
-      c->error = -1010; /* ERROR_UNSUPPORTED: this decoder has no async renderer */
-      c->out[idx].busy = c->out[idx].ready = false;
-      return;
-   }
-   if (c->vctx) {
-      pthread_mutex_lock(&c->mu);
-      if (c->out[idx].busy) {
-         struct lm_job j = { .kind=LM_JOB_RENDER, .idx=idx, .sink=sink,
-            .epoch=c->epoch, .surface_timestamp_ns=update_timestamp
-               ? timestamp_ns : (int64_t)((uint64_t)c->out[idx].pts_us * 1000u),
-            .timed=update_timestamp };
-         if (!(render && sink && codec_thread_ensure(c) && codec_job_push(c, &j))) {
-            c->out[idx].busy = false;
-            c->out[idx].ready = false;
-            pthread_cond_broadcast(&c->cv);
-         }
+  if (!c || idx < 0 || idx >= LM_OUT_BUFS) return;
+  if (render && sink && sink->images && !lm_codec_image_reader_supported(c)) {
+    c->error = -1010; /* ERROR_UNSUPPORTED: this decoder has no async renderer */
+    c->out[idx].busy = c->out[idx].ready = false;
+    return;
+  }
+  if (c->vctx) {
+    pthread_mutex_lock(&c->mu);
+    if (c->out[idx].busy) {
+      struct lm_job j = { .kind=LM_JOB_RENDER, .idx=idx, .sink=sink,
+                                                           .epoch=c->epoch, .surface_timestamp_ns=update_timestamp
+                                                             ? timestamp_ns : (int64_t)((uint64_t)c->out[idx].pts_us * 1000u),
+        .timed=update_timestamp
+      };
+      if (!(render && sink && codec_thread_ensure(c) && codec_job_push(c, &j))) {
+        c->out[idx].busy = false;
+        c->out[idx].ready = false;
+        pthread_cond_broadcast(&c->cv);
       }
-      pthread_mutex_unlock(&c->mu);
-      if (trace_media())
-         fprintf(stderr, "[media] releaseOutput idx=%d render=%d sink=%p\n",
-                 idx, (int)render, (void *)sink);
-      return;
-   }
-   if (!c->out[idx].busy) return;
-   struct lm_outbuf *o = &c->out[idx];
-
-   if (render && sink && o->len && o->w > 0 && o->h > 0) {
-      uint8_t *rgba = lm_sink_begin(sink, o->w, o->h);
-      if (rgba) {
-         i420_to_rgba(o->yuv, o->w, o->h, rgba);
-         if(sink_commit(sink, o->w, o->h, update_timestamp
-               ? timestamp_ns : (int64_t)((uint64_t)o->pts_us * 1000u),update_timestamp)) codec_record_rendered(c,o->pts_us,codec_render_clock());
-      }
-   }
-   if (trace_media())
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (trace_media())
       fprintf(stderr, "[media] releaseOutput idx=%d render=%d sink=%p\n",
               idx, (int)render, (void *)sink);
-   o->busy = false;
-   o->ready = false;
+    return;
+  }
+  if (!c->out[idx].busy) return;
+  struct lm_outbuf *o = &c->out[idx];
+
+  if (render && sink && o->len && o->w > 0 && o->h > 0) {
+    uint8_t *rgba = lm_sink_begin(sink, o->w, o->h);
+    if (rgba) {
+      i420_to_rgba(o->yuv, o->w, o->h, rgba);
+      if(sink_commit(sink, o->w, o->h, update_timestamp
+                     ? timestamp_ns : (int64_t)((uint64_t)o->pts_us * 1000u),update_timestamp)) codec_record_rendered(c,o->pts_us,codec_render_clock());
+    }
+  }
+  if (trace_media())
+    fprintf(stderr, "[media] releaseOutput idx=%d render=%d sink=%p\n",
+            idx, (int)render, (void *)sink);
+  o->busy = false;
+  o->ready = false;
 }
 
 /* The Surface timestamp is independent of the media PTS reported by
@@ -1990,14 +2135,14 @@ static void codec_release_output(struct lm_codec *c, int idx, bool render,
 void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
                              struct lm_sink *sink)
 {
-   codec_release_output(c, idx, render, sink, false, 0);
-   lm_media_wake();
+  codec_release_output(c, idx, render, sink, false, 0);
+  lm_media_wake();
 }
 
 void lm_codec_release_output_at(struct lm_codec *c, int idx,
                                 struct lm_sink *sink, int64_t timestamp_ns)
 {
-   codec_release_output(c, idx, true, sink, true, timestamp_ns);
+  codec_release_output(c, idx, true, sink, true, timestamp_ns);
 }
 
 /* ------------------------------------------------------------------------ *
@@ -2013,602 +2158,639 @@ void lm_codec_release_output_at(struct lm_codec *c, int idx,
 #define LM_MP4_MAX_TRACKS 8
 
 struct lm_mp4_sample {
-   int64_t  offset;
-   uint32_t size;
-   int64_t  pts_us;
-   bool     sync;
+  int64_t  offset;
+  uint32_t size;
+  int64_t  pts_us;
+  bool     sync;
 };
 
 struct lm_mp4_track {
-   char     mime[32];
-   uint32_t timescale;
-   int64_t  duration_us;
-   int      width, height;
-   int      rate, channels;
-   uint8_t *csd;
-   size_t   csd_len;
-   int      nal_len;                 /* AVC length-prefix width, 0 = not AVC */
-   struct lm_mp4_sample *s;
-   int      ns;
+  char     mime[32];
+  uint32_t timescale;
+  int64_t  duration_us;
+  int      width, height;
+  int      rate, channels;
+  uint8_t *csd;
+  size_t   csd_len;
+  int      nal_len;                 /* AVC length-prefix width, 0 = not AVC */
+  struct lm_mp4_sample *s;
+  int      ns;
 };
 
 struct lm_mp4 {
-   int      fd;                      /* our own dup() */
-   int64_t  base;
-   struct lm_mp4_track t[LM_MP4_MAX_TRACKS];
-   int      nt;
-   uint8_t *buf;                     /* the sample handed to the last caller */
-   size_t   buf_cap;
+  int      fd;                      /* our own dup() */
+  int64_t  base;
+  struct lm_mp4_track t[LM_MP4_MAX_TRACKS];
+  int      nt;
+  uint8_t *buf;                     /* the sample handed to the last caller */
+  size_t   buf_cap;
 };
 
 static uint32_t rd32(const uint8_t *p) {
-   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-          ((uint32_t)p[2] << 8) | p[3];
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) | p[3];
 }
 static uint16_t rd16(const uint8_t *p) {
-   return (uint16_t)(((uint32_t)p[0] << 8) | p[1]);
+  return (uint16_t)(((uint32_t)p[0] << 8) | p[1]);
 }
 static uint64_t rd64(const uint8_t *p) {
-   return ((uint64_t)rd32(p) << 32) | rd32(p + 4);
+  return ((uint64_t)rd32(p) << 32) | rd32(p + 4);
 }
 
 /* Walks the children of one box body, calling `fn` per child. */
 struct lm_box_walk {
-   void (*fn)(void *ctx, const char *type, const uint8_t *body, size_t len);
-   void *ctx;
+  void (*fn)(void *ctx, const char *type, const uint8_t *body, size_t len);
+  void *ctx;
 };
 
 static void lm_box_children(const uint8_t *p, size_t len,
                             const struct lm_box_walk *w)
 {
-   size_t off = 0;
-   while (off + 8 <= len) {
-      uint64_t size = rd32(p + off);
-      char type[5] = { (char)p[off + 4], (char)p[off + 5],
-                       (char)p[off + 6], (char)p[off + 7], 0 };
-      size_t hdr = 8;
-      if (size == 1) {
-         if (off + 16 > len) return;
-         size = rd64(p + off + 8);
-         hdr = 16;
-      } else if (size == 0) {
-         size = len - off;
-      }
-      if (size < hdr || off + size > len) return;
-      w->fn(w->ctx, type, p + off + hdr, (size_t)size - hdr);
-      off += (size_t)size;
-   }
+  size_t off = 0;
+  while (off + 8 <= len) {
+    uint64_t size = rd32(p + off);
+    char type[5] = { (char)p[off + 4], (char)p[off + 5],
+                     (char)p[off + 6], (char)p[off + 7], 0
+                   };
+    size_t hdr = 8;
+    if (size == 1) {
+      if (off + 16 > len) return;
+      size = rd64(p + off + 8);
+      hdr = 16;
+    } else if (size == 0) {
+      size = len - off;
+    }
+    if (size < hdr || off + size > len) return;
+    w->fn(w->ctx, type, p + off + hdr, (size_t)size - hdr);
+    off += (size_t)size;
+  }
 }
 
 /* --- one track's sample tables, as read out of stbl ---------------------- */
 struct lm_stbl {
-   struct lm_mp4_track *tr;
-   /* stts */
-   const uint8_t *stts; uint32_t stts_n;
-   /* ctts */
-   const uint8_t *ctts; uint32_t ctts_n; int ctts_ver;
-   /* stss */
-   const uint8_t *stss; uint32_t stss_n;
-   /* stsz */
-   const uint8_t *stsz; uint32_t stsz_n; uint32_t stsz_fixed;
-   /* stsc */
-   const uint8_t *stsc; uint32_t stsc_n;
-   /* stco / co64 */
-   const uint8_t *stco; uint32_t stco_n; bool co64;
+  struct lm_mp4_track *tr;
+  /* stts */
+  const uint8_t *stts;
+  uint32_t stts_n;
+  /* ctts */
+  const uint8_t *ctts;
+  uint32_t ctts_n;
+  int ctts_ver;
+  /* stss */
+  const uint8_t *stss;
+  uint32_t stss_n;
+  /* stsz */
+  const uint8_t *stsz;
+  uint32_t stsz_n;
+  uint32_t stsz_fixed;
+  /* stsc */
+  const uint8_t *stsc;
+  uint32_t stsc_n;
+  /* stco / co64 */
+  const uint8_t *stco;
+  uint32_t stco_n;
+  bool co64;
 };
 
 static void lm_avcc_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
 {
-   if (len < 7) return;
-   tr->nal_len = (p[4] & 3) + 1;
-   size_t off = 5;
-   uint8_t *out = NULL;
-   size_t used = 0;
-   int nsets = p[off++] & 0x1f;                    /* SPS */
-   for (int round = 0; round < 2; ++round) {
-      for (int i = 0; i < nsets && off + 2 <= len; ++i) {
-         size_t n = rd16(p + off);
-         off += 2;
-         if (off + n > len) return;
-         uint8_t *grown = realloc(out, used + 4 + n);
-         if (!grown) { free(out); return; }
-         out = grown;
-         out[used] = 0; out[used + 1] = 0; out[used + 2] = 0; out[used + 3] = 1;
-         memcpy(out + used + 4, p + off, n);
-         used += 4 + n;
-         off += n;
+  if (len < 7) return;
+  tr->nal_len = (p[4] & 3) + 1;
+  size_t off = 5;
+  uint8_t *out = NULL;
+  size_t used = 0;
+  int nsets = p[off++] & 0x1f;                    /* SPS */
+  for (int round = 0; round < 2; ++round) {
+    for (int i = 0; i < nsets && off + 2 <= len; ++i) {
+      size_t n = rd16(p + off);
+      off += 2;
+      if (off + n > len) return;
+      uint8_t *grown = realloc(out, used + 4 + n);
+      if (!grown) {
+        free(out);
+        return;
       }
-      if (round == 0) {
-         if (off >= len) break;
-         nsets = p[off++];                          /* PPS */
-      }
-   }
-   free(tr->csd);
-   tr->csd = out;
-   tr->csd_len = used;
+      out = grown;
+      out[used] = 0;
+      out[used + 1] = 0;
+      out[used + 2] = 0;
+      out[used + 3] = 1;
+      memcpy(out + used + 4, p + off, n);
+      used += 4 + n;
+      off += n;
+    }
+    if (round == 0) {
+      if (off >= len) break;
+      nsets = p[off++];                          /* PPS */
+    }
+  }
+  free(tr->csd);
+  tr->csd = out;
+  tr->csd_len = used;
 }
 
 /* esds → AudioSpecificConfig (the DecoderSpecificInfo, tag 0x05). */
 static void lm_esds_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
 {
-   size_t off = 4;                                 /* version + flags */
-   while (off + 2 <= len) {
-      uint8_t tag = p[off++];
-      size_t size = 0;
-      for (int i = 0; i < 4 && off < len; ++i) {
-         uint8_t b = p[off++];
-         size = (size << 7) | (b & 0x7f);
-         if (!(b & 0x80)) break;
-      }
-      if (off + size > len) return;
-      if (tag == 0x03) {                           /* ES_Descriptor */
-         off += 3;                                 /* ES_ID + flags */
-         continue;
-      }
-      if (tag == 0x04) {                           /* DecoderConfigDescriptor */
-         off += 13;
-         continue;
-      }
-      if (tag == 0x05) {                           /* DecoderSpecificInfo */
-         uint8_t *csd = malloc(size ? size : 1);
-         if (!csd) return;
-         memcpy(csd, p + off, size);
-         free(tr->csd);
-         tr->csd = csd;
-         tr->csd_len = size;
-         return;
-      }
-      off += size;
-   }
+  size_t off = 4;                                 /* version + flags */
+  while (off + 2 <= len) {
+    uint8_t tag = p[off++];
+    size_t size = 0;
+    for (int i = 0; i < 4 && off < len; ++i) {
+      uint8_t b = p[off++];
+      size = (size << 7) | (b & 0x7f);
+      if (!(b & 0x80)) break;
+    }
+    if (off + size > len) return;
+    if (tag == 0x03) {                           /* ES_Descriptor */
+      off += 3;                                 /* ES_ID + flags */
+      continue;
+    }
+    if (tag == 0x04) {                           /* DecoderConfigDescriptor */
+      off += 13;
+      continue;
+    }
+    if (tag == 0x05) {                           /* DecoderSpecificInfo */
+      uint8_t *csd = malloc(size ? size : 1);
+      if (!csd) return;
+      memcpy(csd, p + off, size);
+      free(tr->csd);
+      tr->csd = csd;
+      tr->csd_len = size;
+      return;
+    }
+    off += size;
+  }
 }
 
 static void lm_stsd_child(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_mp4_track *tr = ctx;
-   if (!strcmp(type, "avcC")) lm_avcc_to_csd(tr, body, len);
-   else if (!strcmp(type, "esds")) lm_esds_to_csd(tr, body, len);
+  struct lm_mp4_track *tr = ctx;
+  if (!strcmp(type, "avcC")) lm_avcc_to_csd(tr, body, len);
+  else if (!strcmp(type, "esds")) lm_esds_to_csd(tr, body, len);
 }
 
 static void lm_stsd_entry(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_mp4_track *tr = ctx;
-   struct lm_box_walk w = { lm_stsd_child, tr };
-   if (!strcmp(type, "avc1") || !strcmp(type, "avc3")) {
-      snprintf(tr->mime, sizeof tr->mime, "video/avc");
-      if (len >= 32) {
-         tr->width  = rd16(body + 24);
-         tr->height = rd16(body + 26);
-      }
-      if (len > 78) lm_box_children(body + 78, len - 78, &w);
-   } else if (!strcmp(type, "hvc1") || !strcmp(type, "hev1")) {
-      snprintf(tr->mime, sizeof tr->mime, "video/hevc");
-      if (len >= 32) {
-         tr->width  = rd16(body + 24);
-         tr->height = rd16(body + 26);
-      }
-   } else if (!strcmp(type, "mp4a")) {
-      snprintf(tr->mime, sizeof tr->mime, "audio/mp4a-latm");
-      if (len >= 28) {
-         tr->channels = rd16(body + 16);
-         tr->rate     = rd16(body + 24);            /* 16.16, integer part */
-      }
-      if (len > 28) lm_box_children(body + 28, len - 28, &w);
-   }
+  struct lm_mp4_track *tr = ctx;
+  struct lm_box_walk w = { lm_stsd_child, tr };
+  if (!strcmp(type, "avc1") || !strcmp(type, "avc3")) {
+    snprintf(tr->mime, sizeof tr->mime, "video/avc");
+    if (len >= 32) {
+      tr->width  = rd16(body + 24);
+      tr->height = rd16(body + 26);
+    }
+    if (len > 78) lm_box_children(body + 78, len - 78, &w);
+  } else if (!strcmp(type, "hvc1") || !strcmp(type, "hev1")) {
+    snprintf(tr->mime, sizeof tr->mime, "video/hevc");
+    if (len >= 32) {
+      tr->width  = rd16(body + 24);
+      tr->height = rd16(body + 26);
+    }
+  } else if (!strcmp(type, "mp4a")) {
+    snprintf(tr->mime, sizeof tr->mime, "audio/mp4a-latm");
+    if (len >= 28) {
+      tr->channels = rd16(body + 16);
+      tr->rate     = rd16(body + 24);            /* 16.16, integer part */
+    }
+    if (len > 28) lm_box_children(body + 28, len - 28, &w);
+  }
 }
 
 static void lm_stbl_child(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_stbl *st = ctx;
-   if (!strcmp(type, "stsd")) {
-      if (len < 8) return;
-      struct lm_box_walk w = { lm_stsd_entry, st->tr };
-      lm_box_children(body + 8, len - 8, &w);
-   } else if (!strcmp(type, "stts") && len >= 8) {
-      st->stts = body + 8; st->stts_n = rd32(body + 4);
-      if (st->stts_n > (len - 8) / 8) st->stts_n = (uint32_t)(len - 8) / 8;
-   } else if (!strcmp(type, "ctts") && len >= 8) {
-      st->ctts = body + 8; st->ctts_n = rd32(body + 4); st->ctts_ver = body[0];
-      if (st->ctts_n > (len - 8) / 8) st->ctts_n = (uint32_t)(len - 8) / 8;
-   } else if (!strcmp(type, "stss") && len >= 8) {
-      st->stss = body + 8; st->stss_n = rd32(body + 4);
-      if (st->stss_n > (len - 8) / 4) st->stss_n = (uint32_t)(len - 8) / 4;
-   } else if (!strcmp(type, "stsz") && len >= 12) {
-      st->stsz_fixed = rd32(body + 4);
-      st->stsz_n = rd32(body + 8);
-      st->stsz = body + 12;
-      if (!st->stsz_fixed && st->stsz_n > (len - 12) / 4)
-         st->stsz_n = (uint32_t)(len - 12) / 4;
-   } else if (!strcmp(type, "stsc") && len >= 8) {
-      st->stsc = body + 8; st->stsc_n = rd32(body + 4);
-      if (st->stsc_n > (len - 8) / 12) st->stsc_n = (uint32_t)(len - 8) / 12;
-   } else if (!strcmp(type, "stco") && len >= 8) {
-      st->stco = body + 8; st->stco_n = rd32(body + 4); st->co64 = false;
-      if (st->stco_n > (len - 8) / 4) st->stco_n = (uint32_t)(len - 8) / 4;
-   } else if (!strcmp(type, "co64") && len >= 8) {
-      st->stco = body + 8; st->stco_n = rd32(body + 4); st->co64 = true;
-      if (st->stco_n > (len - 8) / 8) st->stco_n = (uint32_t)(len - 8) / 8;
-   }
+  struct lm_stbl *st = ctx;
+  if (!strcmp(type, "stsd")) {
+    if (len < 8) return;
+    struct lm_box_walk w = { lm_stsd_entry, st->tr };
+    lm_box_children(body + 8, len - 8, &w);
+  } else if (!strcmp(type, "stts") && len >= 8) {
+    st->stts = body + 8;
+    st->stts_n = rd32(body + 4);
+    if (st->stts_n > (len - 8) / 8) st->stts_n = (uint32_t)(len - 8) / 8;
+  } else if (!strcmp(type, "ctts") && len >= 8) {
+    st->ctts = body + 8;
+    st->ctts_n = rd32(body + 4);
+    st->ctts_ver = body[0];
+    if (st->ctts_n > (len - 8) / 8) st->ctts_n = (uint32_t)(len - 8) / 8;
+  } else if (!strcmp(type, "stss") && len >= 8) {
+    st->stss = body + 8;
+    st->stss_n = rd32(body + 4);
+    if (st->stss_n > (len - 8) / 4) st->stss_n = (uint32_t)(len - 8) / 4;
+  } else if (!strcmp(type, "stsz") && len >= 12) {
+    st->stsz_fixed = rd32(body + 4);
+    st->stsz_n = rd32(body + 8);
+    st->stsz = body + 12;
+    if (!st->stsz_fixed && st->stsz_n > (len - 12) / 4)
+      st->stsz_n = (uint32_t)(len - 12) / 4;
+  } else if (!strcmp(type, "stsc") && len >= 8) {
+    st->stsc = body + 8;
+    st->stsc_n = rd32(body + 4);
+    if (st->stsc_n > (len - 8) / 12) st->stsc_n = (uint32_t)(len - 8) / 12;
+  } else if (!strcmp(type, "stco") && len >= 8) {
+    st->stco = body + 8;
+    st->stco_n = rd32(body + 4);
+    st->co64 = false;
+    if (st->stco_n > (len - 8) / 4) st->stco_n = (uint32_t)(len - 8) / 4;
+  } else if (!strcmp(type, "co64") && len >= 8) {
+    st->stco = body + 8;
+    st->stco_n = rd32(body + 4);
+    st->co64 = true;
+    if (st->stco_n > (len - 8) / 8) st->stco_n = (uint32_t)(len - 8) / 8;
+  }
 }
 
 /* Flattens the chunk/size/time tables into one entry per sample. */
 static void lm_stbl_build(struct lm_stbl *st)
 {
-   struct lm_mp4_track *tr = st->tr;
-   uint32_t n = st->stsz_fixed ? 0 : st->stsz_n;
-   if (st->stsz_fixed) {
-      /* Every sample the same size: the count comes from the time table. */
-      for (uint32_t i = 0; i < st->stts_n; ++i)
-         n += rd32(st->stts + i * 8);
-   }
-   if (!n || !st->stco_n || !st->stsc_n) return;
-   struct lm_mp4_sample *s = calloc(n, sizeof *s);
-   if (!s) return;
+  struct lm_mp4_track *tr = st->tr;
+  uint32_t n = st->stsz_fixed ? 0 : st->stsz_n;
+  if (st->stsz_fixed) {
+    /* Every sample the same size: the count comes from the time table. */
+    for (uint32_t i = 0; i < st->stts_n; ++i)
+      n += rd32(st->stts + i * 8);
+  }
+  if (!n || !st->stco_n || !st->stsc_n) return;
+  struct lm_mp4_sample *s = calloc(n, sizeof *s);
+  if (!s) return;
 
-   /* offsets: walk chunks, taking samples-per-chunk from stsc */
-   uint32_t sample = 0, entry = 0;
-   for (uint32_t chunk = 0; chunk < st->stco_n && sample < n; ++chunk) {
-      while (entry + 1 < st->stsc_n &&
-             rd32(st->stsc + (entry + 1) * 12) <= chunk + 1)
-         ++entry;
-      uint32_t per = rd32(st->stsc + entry * 12 + 4);
-      int64_t off = st->co64 ? (int64_t)rd64(st->stco + chunk * 8)
-                            : (int64_t)rd32(st->stco + chunk * 4);
-      for (uint32_t k = 0; k < per && sample < n; ++k) {
-         uint32_t size = st->stsz_fixed ? st->stsz_fixed
-                                        : rd32(st->stsz + sample * 4);
-         s[sample].offset = off;
-         s[sample].size   = size;
-         off += size;
-         ++sample;
-      }
-   }
-   uint32_t count = sample;
+  /* offsets: walk chunks, taking samples-per-chunk from stsc */
+  uint32_t sample = 0, entry = 0;
+  for (uint32_t chunk = 0; chunk < st->stco_n && sample < n; ++chunk) {
+    while (entry + 1 < st->stsc_n &&
+           rd32(st->stsc + (entry + 1) * 12) <= chunk + 1)
+      ++entry;
+    uint32_t per = rd32(st->stsc + entry * 12 + 4);
+    int64_t off = st->co64 ? (int64_t)rd64(st->stco + chunk * 8)
+                  : (int64_t)rd32(st->stco + chunk * 4);
+    for (uint32_t k = 0; k < per && sample < n; ++k) {
+      uint32_t size = st->stsz_fixed ? st->stsz_fixed
+                      : rd32(st->stsz + sample * 4);
+      s[sample].offset = off;
+      s[sample].size   = size;
+      off += size;
+      ++sample;
+    }
+  }
+  uint32_t count = sample;
 
-   /* decode times from stts, shifted by the ctts composition offset */
-   uint32_t ts = tr->timescale ? tr->timescale : 1000;
-   int64_t dts = 0;
-   sample = 0;
-   for (uint32_t i = 0; i < st->stts_n && sample < count; ++i) {
-      uint32_t cnt = rd32(st->stts + i * 8);
-      uint32_t delta = rd32(st->stts + i * 8 + 4);
+  /* decode times from stts, shifted by the ctts composition offset */
+  uint32_t ts = tr->timescale ? tr->timescale : 1000;
+  int64_t dts = 0;
+  sample = 0;
+  for (uint32_t i = 0; i < st->stts_n && sample < count; ++i) {
+    uint32_t cnt = rd32(st->stts + i * 8);
+    uint32_t delta = rd32(st->stts + i * 8 + 4);
+    for (uint32_t k = 0; k < cnt && sample < count; ++k) {
+      s[sample].pts_us = (int64_t)((double)dts * 1000000.0 / (double)ts);
+      dts += delta;
+      ++sample;
+    }
+  }
+  if (st->ctts) {
+    sample = 0;
+    for (uint32_t i = 0; i < st->ctts_n && sample < count; ++i) {
+      uint32_t cnt = rd32(st->ctts + i * 8);
+      int64_t coff = st->ctts_ver ? (int32_t)rd32(st->ctts + i * 8 + 4)
+                     : (int64_t)rd32(st->ctts + i * 8 + 4);
       for (uint32_t k = 0; k < cnt && sample < count; ++k) {
-         s[sample].pts_us = (int64_t)((double)dts * 1000000.0 / (double)ts);
-         dts += delta;
-         ++sample;
+        s[sample].pts_us += (int64_t)((double)coff * 1000000.0 / (double)ts);
+        ++sample;
       }
-   }
-   if (st->ctts) {
-      sample = 0;
-      for (uint32_t i = 0; i < st->ctts_n && sample < count; ++i) {
-         uint32_t cnt = rd32(st->ctts + i * 8);
-         int64_t coff = st->ctts_ver ? (int32_t)rd32(st->ctts + i * 8 + 4)
-                                     : (int64_t)rd32(st->ctts + i * 8 + 4);
-         for (uint32_t k = 0; k < cnt && sample < count; ++k) {
-            s[sample].pts_us += (int64_t)((double)coff * 1000000.0 / (double)ts);
-            ++sample;
-         }
-      }
-   }
+    }
+  }
 
-   /* stss lists the sync samples; without it every sample is one */
-   if (st->stss) {
-      for (uint32_t i = 0; i < st->stss_n; ++i) {
-         uint32_t idx = rd32(st->stss + i * 4);
-         if (idx >= 1 && idx <= count) s[idx - 1].sync = true;
-      }
-   } else {
-      for (uint32_t i = 0; i < count; ++i) s[i].sync = true;
-   }
+  /* stss lists the sync samples; without it every sample is one */
+  if (st->stss) {
+    for (uint32_t i = 0; i < st->stss_n; ++i) {
+      uint32_t idx = rd32(st->stss + i * 4);
+      if (idx >= 1 && idx <= count) s[idx - 1].sync = true;
+    }
+  } else {
+    for (uint32_t i = 0; i < count; ++i) s[i].sync = true;
+  }
 
-   tr->s = s;
-   tr->ns = (int)count;
+  tr->s = s;
+  tr->ns = (int)count;
 }
 
 struct lm_trak_ctx {
-   struct lm_mp4_track *tr;
-   bool wanted;                       /* a handler type we can decode */
+  struct lm_mp4_track *tr;
+  bool wanted;                       /* a handler type we can decode */
 };
 
 static void lm_minf_child(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_trak_ctx *tc = ctx;
-   if (strcmp(type, "stbl")) return;
-   struct lm_stbl st = { .tr = tc->tr };
-   struct lm_box_walk w = { lm_stbl_child, &st };
-   lm_box_children(body, len, &w);
-   lm_stbl_build(&st);
+  struct lm_trak_ctx *tc = ctx;
+  if (strcmp(type, "stbl")) return;
+  struct lm_stbl st = { .tr = tc->tr };
+  struct lm_box_walk w = { lm_stbl_child, &st };
+  lm_box_children(body, len, &w);
+  lm_stbl_build(&st);
 }
 
 static void lm_mdia_child(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_trak_ctx *tc = ctx;
-   if (!strcmp(type, "mdhd") && len >= 20) {
-      if (body[0] == 1 && len >= 32) {
-         tc->tr->timescale = rd32(body + 20);
-         uint64_t dur = rd64(body + 24);
-         if (tc->tr->timescale)
-            tc->tr->duration_us =
-               (int64_t)((double)dur * 1000000.0 / (double)tc->tr->timescale);
-      } else {
-         tc->tr->timescale = rd32(body + 12);
-         uint32_t dur = rd32(body + 16);
-         if (tc->tr->timescale)
-            tc->tr->duration_us =
-               (int64_t)((double)dur * 1000000.0 / (double)tc->tr->timescale);
-      }
-   } else if (!strcmp(type, "hdlr") && len >= 12) {
-      tc->wanted = !memcmp(body + 8, "vide", 4) || !memcmp(body + 8, "soun", 4);
-   } else if (!strcmp(type, "minf")) {
-      struct lm_box_walk w = { lm_minf_child, tc };
-      lm_box_children(body, len, &w);
-   }
+  struct lm_trak_ctx *tc = ctx;
+  if (!strcmp(type, "mdhd") && len >= 20) {
+    if (body[0] == 1 && len >= 32) {
+      tc->tr->timescale = rd32(body + 20);
+      uint64_t dur = rd64(body + 24);
+      if (tc->tr->timescale)
+        tc->tr->duration_us =
+          (int64_t)((double)dur * 1000000.0 / (double)tc->tr->timescale);
+    } else {
+      tc->tr->timescale = rd32(body + 12);
+      uint32_t dur = rd32(body + 16);
+      if (tc->tr->timescale)
+        tc->tr->duration_us =
+          (int64_t)((double)dur * 1000000.0 / (double)tc->tr->timescale);
+    }
+  } else if (!strcmp(type, "hdlr") && len >= 12) {
+    tc->wanted = !memcmp(body + 8, "vide", 4) || !memcmp(body + 8, "soun", 4);
+  } else if (!strcmp(type, "minf")) {
+    struct lm_box_walk w = { lm_minf_child, tc };
+    lm_box_children(body, len, &w);
+  }
 }
 
 static void lm_trak_child(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_trak_ctx *tc = ctx;
-   if (!strcmp(type, "mdia")) {
-      struct lm_box_walk w = { lm_mdia_child, tc };
-      lm_box_children(body, len, &w);
-   }
+  struct lm_trak_ctx *tc = ctx;
+  if (!strcmp(type, "mdia")) {
+    struct lm_box_walk w = { lm_mdia_child, tc };
+    lm_box_children(body, len, &w);
+  }
 }
 
 static void lm_moov_child(void *ctx, const char *type, const uint8_t *body,
                           size_t len)
 {
-   struct lm_mp4 *m = ctx;
-   if (strcmp(type, "trak") || m->nt >= LM_MP4_MAX_TRACKS) return;
-   struct lm_trak_ctx tc = { .tr = &m->t[m->nt] };
-   struct lm_box_walk w = { lm_trak_child, &tc };
-   lm_box_children(body, len, &w);
-   if (tc.wanted && tc.tr->mime[0] && tc.tr->ns > 0) {
-      ++m->nt;
-   } else {
-      free(tc.tr->csd);
-      free(tc.tr->s);
-      memset(tc.tr, 0, sizeof *tc.tr);
-   }
+  struct lm_mp4 *m = ctx;
+  if (strcmp(type, "trak") || m->nt >= LM_MP4_MAX_TRACKS) return;
+  struct lm_trak_ctx tc = { .tr = &m->t[m->nt] };
+  struct lm_box_walk w = { lm_trak_child, &tc };
+  lm_box_children(body, len, &w);
+  if (tc.wanted && tc.tr->mime[0] && tc.tr->ns > 0) {
+    ++m->nt;
+  } else {
+    free(tc.tr->csd);
+    free(tc.tr->s);
+    memset(tc.tr, 0, sizeof *tc.tr);
+  }
 }
 
 static bool lm_read_at(int fd, int64_t off, void *dst, size_t len)
 {
-   size_t done = 0;
-   while (done < len) {
-      ssize_t n = luna_file_pread(fd, (char *)dst + done, len - done, off + (int64_t)done);
-      if (n <= 0) return false;
-      done += (size_t)n;
-   }
-   return true;
+  size_t done = 0;
+  while (done < len) {
+    ssize_t n = luna_file_pread(fd, (char *)dst + done, len - done, off + (int64_t)done);
+    if (n <= 0) return false;
+    done += (size_t)n;
+  }
+  return true;
 }
 
 struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length)
 {
-   if (fd < 0) return NULL;
-   int64_t end = length > 0 ? offset + length : INT64_MAX;
+  if (fd < 0) return NULL;
+  int64_t end = length > 0 ? offset + length : INT64_MAX;
 
-   /* Find moov by walking the top-level boxes; mdat is skipped, not read. */
-   uint8_t *moov = NULL;
-   size_t moov_len = 0;
-   for (int64_t pos = offset; pos + 8 <= end; ) {
-      uint8_t hdr[16];
-      if (!lm_read_at(fd, pos, hdr, 8)) break;
-      uint64_t size = rd32(hdr);
-      size_t hlen = 8;
-      if (size == 1) {
-         if (!lm_read_at(fd, pos, hdr, 16)) break;
-         size = rd64(hdr + 8);
-         hlen = 16;
+  /* Find moov by walking the top-level boxes; mdat is skipped, not read. */
+  uint8_t *moov = NULL;
+  size_t moov_len = 0;
+  for (int64_t pos = offset; pos + 8 <= end; ) {
+    uint8_t hdr[16];
+    if (!lm_read_at(fd, pos, hdr, 8)) break;
+    uint64_t size = rd32(hdr);
+    size_t hlen = 8;
+    if (size == 1) {
+      if (!lm_read_at(fd, pos, hdr, 16)) break;
+      size = rd64(hdr + 8);
+      hlen = 16;
+    }
+    if (size < hlen) break;
+    if (!memcmp(hdr + 4, "moov", 4)) {
+      moov_len = (size_t)(size - hlen);
+      if (moov_len > 64u * 1024u * 1024u) break;
+      moov = malloc(moov_len ? moov_len : 1);
+      if (!moov) break;
+      if (!lm_read_at(fd, pos + (int64_t)hlen, moov, moov_len)) {
+        free(moov);
+        moov = NULL;
       }
-      if (size < hlen) break;
-      if (!memcmp(hdr + 4, "moov", 4)) {
-         moov_len = (size_t)(size - hlen);
-         if (moov_len > 64u * 1024u * 1024u) break;
-         moov = malloc(moov_len ? moov_len : 1);
-         if (!moov) break;
-         if (!lm_read_at(fd, pos + (int64_t)hlen, moov, moov_len)) {
-            free(moov);
-            moov = NULL;
-         }
-         break;
-      }
-      pos += (int64_t)size;
-   }
-   if (!moov) {
-      if (trace_media()) fprintf(stderr, "[media] mp4: no moov box\n");
-      return NULL;
-   }
+      break;
+    }
+    pos += (int64_t)size;
+  }
+  if (!moov) {
+    if (trace_media()) fprintf(stderr, "[media] mp4: no moov box\n");
+    return NULL;
+  }
 
-   struct lm_mp4 *m = calloc(1, sizeof *m);
-   if (!m) { free(moov); return NULL; }
-   m->fd = dup(fd);
-   m->base = offset;
-   struct lm_box_walk w = { lm_moov_child, m };
-   lm_box_children(moov, moov_len, &w);
-   free(moov);
+  struct lm_mp4 *m = calloc(1, sizeof *m);
+  if (!m) {
+    free(moov);
+    return NULL;
+  }
+  m->fd = dup(fd);
+  m->base = offset;
+  struct lm_box_walk w = { lm_moov_child, m };
+  lm_box_children(moov, moov_len, &w);
+  free(moov);
 
-   if (!m->nt) { lm_mp4_free(m); return NULL; }
-   if (trace_media()) {
-      fprintf(stderr, "[media] mp4: %d track(s)\n", m->nt);
-      for (int i = 0; i < m->nt; ++i)
-         fprintf(stderr, "[media]   #%d %s %dx%d %d samples %lldus csd=%zu\n",
-                 i, m->t[i].mime, m->t[i].width, m->t[i].height, m->t[i].ns,
-                 (long long)m->t[i].duration_us, m->t[i].csd_len);
-   }
-   return m;
+  if (!m->nt) {
+    lm_mp4_free(m);
+    return NULL;
+  }
+  if (trace_media()) {
+    fprintf(stderr, "[media] mp4: %d track(s)\n", m->nt);
+    for (int i = 0; i < m->nt; ++i)
+      fprintf(stderr, "[media]   #%d %s %dx%d %d samples %lldus csd=%zu\n",
+              i, m->t[i].mime, m->t[i].width, m->t[i].height, m->t[i].ns,
+              (long long)m->t[i].duration_us, m->t[i].csd_len);
+  }
+  return m;
 }
 
 void lm_mp4_free(struct lm_mp4 *m)
 {
-   if (!m) return;
-   for (int i = 0; i < LM_MP4_MAX_TRACKS; ++i) {
-      free(m->t[i].csd);
-      free(m->t[i].s);
-   }
-   if (m->fd >= 0) close(m->fd);
-   free(m->buf);
-   free(m);
+  if (!m) return;
+  for (int i = 0; i < LM_MP4_MAX_TRACKS; ++i) {
+    free(m->t[i].csd);
+    free(m->t[i].s);
+  }
+  if (m->fd >= 0) close(m->fd);
+  free(m->buf);
+  free(m);
 }
 
-int lm_mp4_tracks(const struct lm_mp4 *m) { return m ? m->nt : 0; }
+int lm_mp4_tracks(const struct lm_mp4 *m) {
+  return m ? m->nt : 0;
+}
 
 static const struct lm_mp4_track *track_of(const struct lm_mp4 *m, int t)
 {
-   if (!m || t < 0 || t >= m->nt) return NULL;
-   return &m->t[t];
+  if (!m || t < 0 || t >= m->nt) return NULL;
+  return &m->t[t];
 }
 
 const char *lm_mp4_mime(const struct lm_mp4 *m, int t)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   return tr ? tr->mime : NULL;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  return tr ? tr->mime : NULL;
 }
 
 int64_t lm_mp4_duration_us(const struct lm_mp4 *m, int t)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   return tr ? tr->duration_us : 0;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  return tr ? tr->duration_us : 0;
 }
 
 void lm_mp4_video_size(const struct lm_mp4 *m, int t, int *w, int *h)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   if (w) *w = tr ? tr->width : 0;
-   if (h) *h = tr ? tr->height : 0;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  if (w) *w = tr ? tr->width : 0;
+  if (h) *h = tr ? tr->height : 0;
 }
 
 void lm_mp4_audio_format(const struct lm_mp4 *m, int t, int *rate, int *channels)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   if (rate) *rate = tr ? tr->rate : 0;
-   if (channels) *channels = tr ? tr->channels : 0;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  if (rate) *rate = tr ? tr->rate : 0;
+  if (channels) *channels = tr ? tr->channels : 0;
 }
 
 const uint8_t *lm_mp4_csd(const struct lm_mp4 *m, int t, size_t *len)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   if (len) *len = tr ? tr->csd_len : 0;
-   return tr ? tr->csd : NULL;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  if (len) *len = tr ? tr->csd_len : 0;
+  return tr ? tr->csd : NULL;
 }
 
 int lm_mp4_samples(const struct lm_mp4 *m, int t)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   return tr ? tr->ns : 0;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  return tr ? tr->ns : 0;
 }
 
 const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
                              int64_t *pts_us, bool *sync)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   if (!tr || i < 0 || i >= tr->ns) return NULL;
-   const struct lm_mp4_sample *s = &tr->s[i];
-   if (pts_us) *pts_us = s->pts_us;
-   if (sync) *sync = s->sync;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  if (!tr || i < 0 || i >= tr->ns) return NULL;
+  const struct lm_mp4_sample *s = &tr->s[i];
+  if (pts_us) *pts_us = s->pts_us;
+  if (sync) *sync = s->sync;
 
-   size_t need = s->size;
-   if (need > m->buf_cap) {
-      uint8_t *grown = realloc(m->buf, need);
-      if (!grown) return NULL;
-      m->buf = grown;
-      m->buf_cap = need;
-   }
-   /* stco/co64 count from the start of the MP4, not of the file holding it:
-    * a movie inside an OBB zip is handed over as (fd, offset, length), the
-    * same DataSource window stagefright reads through. */
-   if (!lm_read_at(m->fd, m->base + s->offset, m->buf, need)) return NULL;
+  size_t need = s->size;
+  if (need > m->buf_cap) {
+    uint8_t *grown = realloc(m->buf, need);
+    if (!grown) return NULL;
+    m->buf = grown;
+    m->buf_cap = need;
+  }
+  /* stco/co64 count from the start of the MP4, not of the file holding it:
+   * a movie inside an OBB zip is handed over as (fd, offset, length), the
+   * same DataSource window stagefright reads through. */
+  if (!lm_read_at(m->fd, m->base + s->offset, m->buf, need)) return NULL;
 
-   /* AVC in MP4 prefixes each NAL with its length; a decoder wants Annex-B
-    * start codes.  The 4-byte case is a rewrite in place; narrower prefixes
-    * change the size, so those are expanded into the same buffer only when it
-    * is big enough to hold the growth. */
-   if (tr->nal_len > 0 && tr->nal_len <= 4) {
-      int nl = tr->nal_len;
-      if (nl == 4) {
-         size_t off = 0;
-         while (off + 4 <= need) {
-            uint32_t n = rd32(m->buf + off);
-            m->buf[off] = 0; m->buf[off + 1] = 0;
-            m->buf[off + 2] = 0; m->buf[off + 3] = 1;
-            if (n > need - off - 4) break;
-            off += 4 + n;
-         }
-      } else {
-         /* count NALs to size the expansion */
-         size_t off = 0, nnal = 0;
-         while (off + (size_t)nl <= need) {
-            uint32_t n = 0;
-            for (int k = 0; k < nl; ++k) n = (n << 8) | m->buf[off + k];
-            ++nnal;
-            if (n > need - off - (size_t)nl) break;
-            off += (size_t)nl + n;
-         }
-         size_t grow = need + nnal * (size_t)(4 - nl);
-         if (grow > m->buf_cap) {
-            uint8_t *grown = realloc(m->buf, grow);
-            if (!grown) return NULL;
-            m->buf = grown;
-            m->buf_cap = grow;
-         }
-         /* rewrite from the back so the moves do not overlap destructively */
-         size_t src = need, dst = grow;
-         /* walk forward once to record the NAL starts */
-         size_t starts[512];
-         size_t sizes[512];
-         size_t count = 0;
-         off = 0;
-         while (off + (size_t)nl <= need && count < 512) {
-            uint32_t n = 0;
-            for (int k = 0; k < nl; ++k) n = (n << 8) | m->buf[off + k];
-            if (n > need - off - (size_t)nl) break;
-            starts[count] = off + (size_t)nl;
-            sizes[count] = n;
-            ++count;
-            off += (size_t)nl + n;
-         }
-         for (size_t k = count; k-- > 0; ) {
-            dst -= sizes[k];
-            memmove(m->buf + dst, m->buf + starts[k], sizes[k]);
-            dst -= 4;
-            m->buf[dst] = 0; m->buf[dst + 1] = 0;
-            m->buf[dst + 2] = 0; m->buf[dst + 3] = 1;
-         }
-         (void)src;
-         need = grow - dst;
-         if (dst) memmove(m->buf, m->buf + dst, need);
+  /* AVC in MP4 prefixes each NAL with its length; a decoder wants Annex-B
+   * start codes.  The 4-byte case is a rewrite in place; narrower prefixes
+   * change the size, so those are expanded into the same buffer only when it
+   * is big enough to hold the growth. */
+  if (tr->nal_len > 0 && tr->nal_len <= 4) {
+    int nl = tr->nal_len;
+    if (nl == 4) {
+      size_t off = 0;
+      while (off + 4 <= need) {
+        uint32_t n = rd32(m->buf + off);
+        m->buf[off] = 0;
+        m->buf[off + 1] = 0;
+        m->buf[off + 2] = 0;
+        m->buf[off + 3] = 1;
+        if (n > need - off - 4) break;
+        off += 4 + n;
       }
-   }
-   if (len) *len = need;
-   return m->buf;
+    } else {
+      /* count NALs to size the expansion */
+      size_t off = 0, nnal = 0;
+      while (off + (size_t)nl <= need) {
+        uint32_t n = 0;
+        for (int k = 0; k < nl; ++k) n = (n << 8) | m->buf[off + k];
+        ++nnal;
+        if (n > need - off - (size_t)nl) break;
+        off += (size_t)nl + n;
+      }
+      size_t grow = need + nnal * (size_t)(4 - nl);
+      if (grow > m->buf_cap) {
+        uint8_t *grown = realloc(m->buf, grow);
+        if (!grown) return NULL;
+        m->buf = grown;
+        m->buf_cap = grow;
+      }
+      /* rewrite from the back so the moves do not overlap destructively */
+      size_t src = need, dst = grow;
+      /* walk forward once to record the NAL starts */
+      size_t starts[512];
+      size_t sizes[512];
+      size_t count = 0;
+      off = 0;
+      while (off + (size_t)nl <= need && count < 512) {
+        uint32_t n = 0;
+        for (int k = 0; k < nl; ++k) n = (n << 8) | m->buf[off + k];
+        if (n > need - off - (size_t)nl) break;
+        starts[count] = off + (size_t)nl;
+        sizes[count] = n;
+        ++count;
+        off += (size_t)nl + n;
+      }
+      for (size_t k = count; k-- > 0; ) {
+        dst -= sizes[k];
+        memmove(m->buf + dst, m->buf + starts[k], sizes[k]);
+        dst -= 4;
+        m->buf[dst] = 0;
+        m->buf[dst + 1] = 0;
+        m->buf[dst + 2] = 0;
+        m->buf[dst + 3] = 1;
+      }
+      (void)src;
+      need = grow - dst;
+      if (dst) memmove(m->buf, m->buf + dst, need);
+    }
+  }
+  if (len) *len = need;
+  return m->buf;
 }
 
 int lm_mp4_sync_sample_at(const struct lm_mp4 *m, int t, int64_t us)
 {
-   const struct lm_mp4_track *tr = track_of(m, t);
-   if (!tr || tr->ns <= 0) return 0;
-   int best = 0;
-   for (int i = 0; i < tr->ns; ++i) {
-      if (!tr->s[i].sync) continue;
-      if (tr->s[i].pts_us <= us) best = i;
-      else break;
-   }
-   return best;
+  const struct lm_mp4_track *tr = track_of(m, t);
+  if (!tr || tr->ns <= 0) return 0;
+  int best = 0;
+  for (int i = 0; i < tr->ns; ++i) {
+    if (!tr->s[i].sync) continue;
+    if (tr->s[i].pts_us <= us) best = i;
+    else break;
+  }
+  return best;
 }
 
 /* Java AudioTrack owned PCM queues and mixer timeline. */
 struct luna_audio_track {
-    struct luna_audio_track *next;
-    struct luna_pcm_queue pcm;
-    unsigned capacity, queued;
-    uint64_t played;
-    uint64_t clock_ns;  /* when the playback head was last advanced */
-    int playing, logged;
-    float volume;
+  struct luna_audio_track *next;
+  struct luna_pcm_queue pcm;
+  unsigned capacity, queued;
+  uint64_t played;
+  uint64_t clock_ns;  /* when the playback head was last advanced */
+  int playing, logged;
+  float volume;
 };
 static pthread_mutex_t tracks_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct luna_audio_track *tracks;
@@ -2616,181 +2798,207 @@ static pthread_cond_t tracks_changed=PTHREAD_COND_INITIALIZER;
 
 static uint64_t now_ns(void)
 {
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC,&ts);
+  return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
 }
 
 static void clear_locked(struct luna_audio_track *t)
 {
-    for (unsigned n=0; n<t->pcm.count; ++n)
-        free((void *)t->pcm.buffers[(t->pcm.head+n)%LUNA_PCM_BUFFERS].data);
-    luna_pcm_clear(&t->pcm);
-    t->queued=0;
+  for (unsigned n=0; n<t->pcm.count; ++n)
+    free((void *)t->pcm.buffers[(t->pcm.head+n)%LUNA_PCM_BUFFERS].data);
+  luna_pcm_clear(&t->pcm);
+  t->queued=0;
 }
 
 struct luna_audio_track *luna_at_create(unsigned rate, unsigned channels, unsigned capacity)
 {
-    if (!rate || !channels || !capacity) return NULL;
-    struct luna_audio_track *t=calloc(1,sizeof *t);
-    if (!t) return NULL;
-    t->pcm.rate=rate; t->pcm.channels=channels; t->pcm.capacity=LUNA_PCM_BUFFERS;
-    t->capacity=capacity; t->volume=1.0f;
-    pthread_mutex_lock(&tracks_mutex);
-    t->next=tracks; tracks=t;
-    pthread_mutex_unlock(&tracks_mutex);
-    return t;
+  if (!rate || !channels || !capacity) return NULL;
+  struct luna_audio_track *t=calloc(1,sizeof *t);
+  if (!t) return NULL;
+  t->pcm.rate=rate;
+  t->pcm.channels=channels;
+  t->pcm.capacity=LUNA_PCM_BUFFERS;
+  t->capacity=capacity;
+  t->volume=1.0f;
+  pthread_mutex_lock(&tracks_mutex);
+  t->next=tracks;
+  tracks=t;
+  pthread_mutex_unlock(&tracks_mutex);
+  return t;
 }
 
 void luna_at_destroy(void *track)
 {
-    struct luna_audio_track *t=track;
-    if (!t) return;
-    pthread_mutex_lock(&tracks_mutex);
-    struct luna_audio_track **p=&tracks;
-    while (*p && *p!=t) p=&(*p)->next;
-    if (*p) *p=t->next;
-    clear_locked(t);
-    pthread_mutex_unlock(&tracks_mutex);
-    free(t);
+  struct luna_audio_track *t=track;
+  if (!t) return;
+  pthread_mutex_lock(&tracks_mutex);
+  struct luna_audio_track **p=&tracks;
+  while (*p && *p!=t) p=&(*p)->next;
+  if (*p) *p=t->next;
+  clear_locked(t);
+  pthread_mutex_unlock(&tracks_mutex);
+  free(t);
 }
 void luna_at_play(struct luna_audio_track *t, int playing)
 {
-    if (!t) return;
-    pthread_mutex_lock(&tracks_mutex); t->playing=playing; t->clock_ns=now_ns();
-    pthread_cond_broadcast(&tracks_changed);
-    pthread_mutex_unlock(&tracks_mutex);
+  if (!t) return;
+  pthread_mutex_lock(&tracks_mutex);
+  t->playing=playing;
+  t->clock_ns=now_ns();
+  pthread_cond_broadcast(&tracks_changed);
+  pthread_mutex_unlock(&tracks_mutex);
 }
 void luna_at_flush(struct luna_audio_track *t)
 {
-    if (!t) return;
-    pthread_mutex_lock(&tracks_mutex); clear_locked(t);
-    pthread_cond_broadcast(&tracks_changed);
-    pthread_mutex_unlock(&tracks_mutex);
+  if (!t) return;
+  pthread_mutex_lock(&tracks_mutex);
+  clear_locked(t);
+  pthread_cond_broadcast(&tracks_changed);
+  pthread_mutex_unlock(&tracks_mutex);
 }
 void luna_at_volume(struct luna_audio_track *t, float volume)
 {
-    if (!t) return;
-    pthread_mutex_lock(&tracks_mutex);
-    t->volume=isfinite(volume) ? fmaxf(0.0f,fminf(1.0f,volume)) : 0.0f;
-    pthread_mutex_unlock(&tracks_mutex);
+  if (!t) return;
+  pthread_mutex_lock(&tracks_mutex);
+  t->volume=isfinite(volume) ? fmaxf(0.0f,fminf(1.0f,volume)) : 0.0f;
+  pthread_mutex_unlock(&tracks_mutex);
 }
 unsigned luna_at_space(struct luna_audio_track *t)
 {
-    if (!t) return 0;
-    pthread_mutex_lock(&tracks_mutex);
-    unsigned n=t->pcm.count==LUNA_PCM_BUFFERS ? 0 : t->capacity-t->queued;
-    pthread_mutex_unlock(&tracks_mutex);
-    return n;
+  if (!t) return 0;
+  pthread_mutex_lock(&tracks_mutex);
+  unsigned n=t->pcm.count==LUNA_PCM_BUFFERS ? 0 : t->capacity-t->queued;
+  pthread_mutex_unlock(&tracks_mutex);
+  return n;
 }
 unsigned luna_at_write(struct luna_audio_track *t, const int16_t *data, unsigned frames)
 {
-    if (!t || !data || !frames) return 0;
-    pthread_mutex_lock(&tracks_mutex);
-    unsigned n=t->capacity-t->queued;
-    if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
-        static uint64_t asked, took, calls, last_ns; const uint64_t now=now_ns();
-        asked+=frames; ++calls; if (n<frames) took+=n; else took+=frames;
-        if (now-last_ns>=1000000000ull) {
-            if (last_ns) fprintf(stderr,"[audio-write] %llu frames offered, %llu fit (queued %u of %u), %llu calls in %.2f s\n",(unsigned long long)asked,(unsigned long long)took,t->queued,t->capacity,(unsigned long long)calls,(now-last_ns)/1e9);
-            last_ns=now; asked=took=calls=0;
-        }
+  if (!t || !data || !frames) return 0;
+  pthread_mutex_lock(&tracks_mutex);
+  unsigned n=t->capacity-t->queued;
+  if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
+    static uint64_t asked, took, calls, last_ns;
+    const uint64_t now=now_ns();
+    asked+=frames;
+    ++calls;
+    if (n<frames) took+=n;
+    else took+=frames;
+    if (now-last_ns>=1000000000ull) {
+      if (last_ns) fprintf(stderr,"[audio-write] %llu frames offered, %llu fit (queued %u of %u), %llu calls in %.2f s\n",(unsigned long long)asked,(unsigned long long)took,t->queued,t->capacity,(unsigned long long)calls,(now-last_ns)/1e9);
+      last_ns=now;
+      asked=took=calls=0;
     }
-    if (n>frames) n=frames;
-    if (t->pcm.count==LUNA_PCM_BUFFERS) n=0;
-    unsigned bytes=n*t->pcm.channels*sizeof(int16_t);
-    int16_t *copy=n ? malloc(bytes) : NULL;
-    if (copy) {
-        memcpy(copy,data,bytes);
-        if (luna_pcm_enqueue(&t->pcm,copy,bytes)) { free(copy); n=0; }
-        else {
-            t->queued+=n;
-            if (!t->logged) {
-                unsigned peak=0;
-                for (unsigned i=0; i<n*t->pcm.channels; ++i) {
-                    unsigned value=(unsigned)(data[i]<0 ? -(int)data[i] : data[i]);
-                    if (value>peak) peak=value;
-                }
-                if (peak) {
-                    t->logged=1;
-                    fprintf(stderr,"[audiotrack] PCM queued: %u Hz, %u channels, %u frames, peak=%u\n",
-                            t->pcm.rate,t->pcm.channels,n,peak);
-                }
-            }
+  }
+  if (n>frames) n=frames;
+  if (t->pcm.count==LUNA_PCM_BUFFERS) n=0;
+  unsigned bytes=n*t->pcm.channels*sizeof(int16_t);
+  int16_t *copy=n ? malloc(bytes) : NULL;
+  if (copy) {
+    memcpy(copy,data,bytes);
+    if (luna_pcm_enqueue(&t->pcm,copy,bytes)) {
+      free(copy);
+      n=0;
+    }
+    else {
+      t->queued+=n;
+      if (!t->logged) {
+        unsigned peak=0;
+        for (unsigned i=0; i<n*t->pcm.channels; ++i) {
+          unsigned value=(unsigned)(data[i]<0 ? -(int)data[i] : data[i]);
+          if (value>peak) peak=value;
         }
-    } else n=0;
-    pthread_mutex_unlock(&tracks_mutex);
-    return n;
+        if (peak) {
+          t->logged=1;
+          fprintf(stderr,"[audiotrack] PCM queued: %u Hz, %u channels, %u frames, peak=%u\n",
+                  t->pcm.rate,t->pcm.channels,n,peak);
+        }
+      }
+    }
+  } else n=0;
+  pthread_mutex_unlock(&tracks_mutex);
+  return n;
 }
 uint64_t luna_at_played(struct luna_audio_track *t)
 {
-    if (!t) return 0;
-    pthread_mutex_lock(&tracks_mutex); uint64_t n=t->played;
-    pthread_mutex_unlock(&tracks_mutex); return n;
+  if (!t) return 0;
+  pthread_mutex_lock(&tracks_mutex);
+  uint64_t n=t->played;
+  pthread_mutex_unlock(&tracks_mutex);
+  return n;
 }
 int luna_at_active(void)
 {
-    pthread_mutex_lock(&tracks_mutex);
-    int active=0;
-    for (struct luna_audio_track *t=tracks; t; t=t->next)
-        if (t->playing && t->pcm.count) { active=1; break; }
-    pthread_mutex_unlock(&tracks_mutex); return active;
+  pthread_mutex_lock(&tracks_mutex);
+  int active=0;
+  for (struct luna_audio_track *t=tracks; t; t=t->next)
+    if (t->playing && t->pcm.count) {
+      active=1;
+      break;
+    }
+  pthread_mutex_unlock(&tracks_mutex);
+  return active;
 }
 unsigned luna_at_mix(int32_t *mix, unsigned frames, unsigned rate, unsigned channels)
 {
-    if (!mix || frames>256 || !channels || channels>2) return 0;
-    pthread_mutex_lock(&tracks_mutex);
-    unsigned produced=0;
-    for (struct luna_audio_track *t=tracks; t; t=t->next) {
-        if (!t->playing) continue;
-        struct luna_pcm_queue preview=t->pcm;
-        int32_t samples[256*2]={0};
-        unsigned n=luna_pcm_mix(&preview,samples,frames,rate,channels);
-        for (unsigned i=0; i<n*channels; ++i)
-            mix[i]+=(int32_t)(samples[i]*t->volume);
-        if (n>produced) produced=n;
-    }
-    pthread_mutex_unlock(&tracks_mutex); return produced;
+  if (!mix || frames>256 || !channels || channels>2) return 0;
+  pthread_mutex_lock(&tracks_mutex);
+  unsigned produced=0;
+  for (struct luna_audio_track *t=tracks; t; t=t->next) {
+    if (!t->playing) continue;
+    struct luna_pcm_queue preview=t->pcm;
+    int32_t samples[256*2]= {0};
+    unsigned n=luna_pcm_mix(&preview,samples,frames,rate,channels);
+    for (unsigned i=0; i<n*channels; ++i)
+      mix[i]+=(int32_t)(samples[i]*t->volume);
+    if (n>produced) produced=n;
+  }
+  pthread_mutex_unlock(&tracks_mutex);
+  return produced;
 }
 /* Move one track's playback head forward by `frames` output frames at `rate`. */
 static void advance_locked(struct luna_audio_track *t, unsigned frames,
                            unsigned rate, unsigned channels)
 {
-    unsigned head=t->pcm.head, old_count=t->pcm.count;
-    unsigned old_position=old_count ? t->pcm.buffers[head].position : 0;
-    luna_pcm_mix(&t->pcm,NULL,frames,rate,channels);
-    unsigned retired=old_count-t->pcm.count;
-    unsigned consumed=0;
-    for (unsigned n=0; n<retired; ++n) {
-        struct luna_pcm_buffer *b=&t->pcm.buffers[(head+n)%LUNA_PCM_BUFFERS];
-        consumed+=b->frames;
-        free((void *)b->data); b->data=NULL;
-    }
-    unsigned new_position=t->pcm.count ? t->pcm.buffers[t->pcm.head].position : 0;
-    consumed+=new_position;
-    consumed-=old_position;
-    t->queued-=consumed;
-    t->played+=consumed;
+  unsigned head=t->pcm.head, old_count=t->pcm.count;
+  unsigned old_position=old_count ? t->pcm.buffers[head].position : 0;
+  luna_pcm_mix(&t->pcm,NULL,frames,rate,channels);
+  unsigned retired=old_count-t->pcm.count;
+  unsigned consumed=0;
+  for (unsigned n=0; n<retired; ++n) {
+    struct luna_pcm_buffer *b=&t->pcm.buffers[(head+n)%LUNA_PCM_BUFFERS];
+    consumed+=b->frames;
+    free((void *)b->data);
+    b->data=NULL;
+  }
+  unsigned new_position=t->pcm.count ? t->pcm.buffers[t->pcm.head].position : 0;
+  consumed+=new_position;
+  consumed-=old_position;
+  t->queued-=consumed;
+  t->played+=consumed;
 }
 
 void luna_at_advance(unsigned frames, unsigned rate, unsigned channels)
 {
-    pthread_mutex_lock(&tracks_mutex);
-    const uint64_t now=now_ns();
-    if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
-        static uint64_t sum, last_ns, calls;
-        sum+=frames; ++calls;
-        if (now-last_ns>=1000000000ull) {
-            if (last_ns) fprintf(stderr,"[audio-clock] %llu output frames in %.2f s (%.0f/s at %u Hz, %llu calls)\n",(unsigned long long)sum,(now-last_ns)/1e9,sum*1e9/(double)(now-last_ns),rate,(unsigned long long)calls);
-            last_ns=now; sum=calls=0;
-        }
+  pthread_mutex_lock(&tracks_mutex);
+  const uint64_t now=now_ns();
+  if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
+    static uint64_t sum, last_ns, calls;
+    sum+=frames;
+    ++calls;
+    if (now-last_ns>=1000000000ull) {
+      if (last_ns) fprintf(stderr,"[audio-clock] %llu output frames in %.2f s (%.0f/s at %u Hz, %llu calls)\n",(unsigned long long)sum,(now-last_ns)/1e9,sum*1e9/(double)(now-last_ns),rate,(unsigned long long)calls);
+      last_ns=now;
+      sum=calls=0;
     }
-    for (struct luna_audio_track *t=tracks; t; t=t->next) {
-        if (!t->playing) continue;
-        advance_locked(t,frames,rate,channels);
-        t->clock_ns=now;
-    }
-    pthread_cond_broadcast(&tracks_changed);
-    pthread_mutex_unlock(&tracks_mutex);
+  }
+  for (struct luna_audio_track *t=tracks; t; t=t->next) {
+    if (!t->playing) continue;
+    advance_locked(t,frames,rate,channels);
+    t->clock_ns=now;
+  }
+  pthread_cond_broadcast(&tracks_changed);
+  pthread_mutex_unlock(&tracks_mutex);
 }
 
 /* A blocking write() waits for the device to drain the track.  On a device
@@ -2802,20 +3010,24 @@ void luna_at_advance(unsigned frames, unsigned rate, unsigned channels)
  * time itself. */
 void luna_at_wait_space(struct luna_audio_track *t)
 {
-    if (!t) return;
-    enum { POLL_NS=10000000, STALL_NS=30000000 };
-    pthread_mutex_lock(&tracks_mutex);
-    while (t->playing && (t->queued==t->capacity || t->pcm.count==LUNA_PCM_BUFFERS)) {
-        struct timespec until; clock_gettime(CLOCK_REALTIME,&until);
-        until.tv_nsec+=POLL_NS;
-        if (until.tv_nsec>=1000000000L) { until.tv_nsec-=1000000000L; ++until.tv_sec; }
-        if (pthread_cond_timedwait(&tracks_changed,&tracks_mutex,&until)==0) continue;
-        const uint64_t now=now_ns();
-        if (now-t->clock_ns<STALL_NS) continue;
-        uint64_t frames=(now-t->clock_ns)*t->pcm.rate/1000000000ull;
-        if (frames>t->queued) frames=t->queued;
-        t->clock_ns=now;
-        if (frames) advance_locked(t,(unsigned)frames,t->pcm.rate,t->pcm.channels);
+  if (!t) return;
+  enum { POLL_NS=10000000, STALL_NS=30000000 };
+  pthread_mutex_lock(&tracks_mutex);
+  while (t->playing && (t->queued==t->capacity || t->pcm.count==LUNA_PCM_BUFFERS)) {
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME,&until);
+    until.tv_nsec+=POLL_NS;
+    if (until.tv_nsec>=1000000000L) {
+      until.tv_nsec-=1000000000L;
+      ++until.tv_sec;
     }
-    pthread_mutex_unlock(&tracks_mutex);
+    if (pthread_cond_timedwait(&tracks_changed,&tracks_mutex,&until)==0) continue;
+    const uint64_t now=now_ns();
+    if (now-t->clock_ns<STALL_NS) continue;
+    uint64_t frames=(now-t->clock_ns)*t->pcm.rate/1000000000ull;
+    if (frames>t->queued) frames=t->queued;
+    t->clock_ns=now;
+    if (frames) advance_locked(t,(unsigned)frames,t->pcm.rate,t->pcm.channels);
+  }
+  pthread_mutex_unlock(&tracks_mutex);
 }

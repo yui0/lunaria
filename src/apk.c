@@ -1,5 +1,15 @@
-/* MPL-2.0. In-process APK installer/launcher. No shell or external extractor.
- * The archive remains byte-for-byte intact; inst/ is the Android installed view. */
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+/*
+ * In-process APK installer/launcher. No shell or external extractor.
+ * * The archive remains byte-for-byte intact; inst/ is the Android installed view.
+ */
 #ifndef _FILE_OFFSET_BITS
 #define _FILE_OFFSET_BITS 64
 #endif
@@ -34,1191 +44,1291 @@ extern char **environ;
 #define APK_MAX_MANIFEST (16u*1024u*1024u)
 static int apk_error(const char *format, ...)
 {
-   va_list ap;
-   va_start(ap, format);
-   fprintf(stderr, "[apk] ");
-   vfprintf(stderr, format, ap);
-   fputc('\n', stderr);
-   va_end(ap);
-   return -1;
+  va_list ap;
+  va_start(ap, format);
+  fprintf(stderr, "[apk] ");
+  vfprintf(stderr, format, ap);
+  fputc('\n', stderr);
+  va_end(ap);
+  return -1;
 }
 static int path_join(char *out, size_t cap, const char *first, const char *second)
 {
-   int n = snprintf(out, cap, "%s%s%s", first, *first && first[strlen(first) -1] != '/' ? "/" : "", second);
-   return n < 0 || (size_t)n >= cap ? apk_error("path too long") : 0;
+  int n = snprintf(out, cap, "%s%s%s", first, *first && first[strlen(first) -1] != '/' ? "/" : "", second);
+  return n < 0 || (size_t)n >= cap ? apk_error("path too long") : 0;
 }
 static bool exists(const char *path)
 {
-   return luna_file_accessat(LUNA_AT_FDCWD, path, 0, 0) == 0;
+  return luna_file_accessat(LUNA_AT_FDCWD, path, 0, 0) == 0;
 }
 static bool directory(const char *path)
 {
-   luna_file_info st;
-   return !luna_file_infoat(LUNA_AT_FDCWD, path, &st, 0) && (st.mode & 0170000) == 0040000;
+  luna_file_info st;
+  return !luna_file_infoat(LUNA_AT_FDCWD, path, &st, 0) && (st.mode & 0170000) == 0040000;
 }
 static int mkdirs(const char *path)
 {
-   char p[APK_PATH];
-   if (strlen(path) >= sizeof p)
-      return -1;
-   strcpy(p, path);
-   char *begin = p + 1;
+  char p[APK_PATH];
+  if (strlen(path) >= sizeof p)
+    return -1;
+  strcpy(p, path);
+  char *begin = p + 1;
 #ifdef _WIN32
-   if (p[0] == '/' && p[1] == '/') {
-      char *server = strchr(p + 2, '/');
-      char *share = server ? strchr(server + 1, '/') : NULL;
-      if (!share)
-         return directory(p) ? 0 : apk_error("cannot access share: %s", p);
-      begin = share + 1;
-   }
+  if (p[0] == '/' && p[1] == '/') {
+    char *server = strchr(p + 2, '/');
+    char *share = server ? strchr(server + 1, '/') : NULL;
+    if (!share)
+      return directory(p) ? 0 : apk_error("cannot access share: %s", p);
+    begin = share + 1;
+  }
 #endif
-   for (char *s = begin;; s++) {
-      if (*s != '/' && *s)
-         continue;
-      char c = *s;
-      *s = 0;
-      if (*p && !(strlen(p) == 2 && p[1] == ':') && !directory(p) && luna_file_mkdir(p, 0700)) {
-         int error = errno;
-         /* Another launcher may have created the directory after our check. */
-         if (error != EEXIST || !directory(p)) {
-            luna_file_info info;
-            if (error == EEXIST && !luna_file_infoat(LUNA_AT_FDCWD, p, &info, LUNA_AT_NOFOLLOW) &&
-                (info.mode & 0170000) == 0120000)
-               return apk_error("cannot access directory symlink %s: target is unavailable or is not a directory; check the target drive", p);
-            return apk_error("cannot create %s: %s", p, strerror(error));
-         }
+  for (char *s = begin;; s++) {
+    if (*s != '/' && *s)
+      continue;
+    char c = *s;
+    *s = 0;
+    if (*p && !(strlen(p) == 2 && p[1] == ':') && !directory(p) && luna_file_mkdir(p, 0700)) {
+      int error = errno;
+      /* Another launcher may have created the directory after our check. */
+      if (error != EEXIST || !directory(p)) {
+        luna_file_info info;
+        if (error == EEXIST && !luna_file_infoat(LUNA_AT_FDCWD, p, &info, LUNA_AT_NOFOLLOW) &&
+            (info.mode & 0170000) == 0120000)
+          return apk_error("cannot access directory symlink %s: target is unavailable or is not a directory; check the target drive", p);
+        return apk_error("cannot create %s: %s", p, strerror(error));
       }
-      *s = c;
-      if (!c)
-         break;
-   }
-   return 0;
+    }
+    *s = c;
+    if (!c)
+      break;
+  }
+  return 0;
 }
 static FILE *open_file(const char *path, const char *mode)
 {
-   int fd = luna_file_open(path, *mode == 'r' ? O_RDONLY : O_WRONLY | O_CREAT | O_TRUNC, 0600);
-   if (fd < 0)
-      return NULL;
-   FILE *f = fdopen(fd, mode);
-   if (!f)
-      luna_fd_close(fd);
-   return f;
+  int fd = luna_file_open(path, *mode == 'r' ? O_RDONLY : O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return NULL;
+  FILE *f = fdopen(fd, mode);
+  if (!f)
+    luna_fd_close(fd);
+  return f;
 }
 static int seek_file(FILE *f, uint64_t at)
 {
-   if (at > INT64_MAX)
-      return -1;
+  if (at > INT64_MAX)
+    return -1;
 #ifdef _WIN32
-   return _fseeki64(f, (int64_t)at, SEEK_SET);
+  return _fseeki64(f, (int64_t)at, SEEK_SET);
 #else
-   return fseeko(f, (off_t)at, SEEK_SET);
+  return fseeko(f, (off_t)at, SEEK_SET);
 #endif
 }
 static uint16_t le16(const unsigned char *p)
 {
-   return (uint16_t)(p[0] | (p[1] << 8));
+  return (uint16_t)(p[0] | (p[1] << 8));
 }
 static uint32_t le32(const unsigned char *p)
 {
-   return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 static uint64_t le64(const unsigned char *p)
 {
-   return le32(p) | ((uint64_t)le32(p + 4) << 32);
+  return le32(p) | ((uint64_t)le32(p + 4) << 32);
 }
 struct zip_entry {
-   char *name;
-   uint64_t offset, compressed, size;
-   uint32_t crc, attrs;
-   uint16_t method, flags;
+  char *name;
+  uint64_t offset, compressed, size;
+  uint32_t crc, attrs;
+  uint16_t method, flags;
 };
 struct zip {
-   FILE *f;
-   struct zip_entry *entries;
-   size_t count;
-   uint64_t size, origin;
+  FILE *f;
+  struct zip_entry *entries;
+  size_t count;
+  uint64_t size, origin;
 };
 static int zip_seek(struct zip *z, uint64_t offset)
 {
-   if (offset > z->size || offset > UINT64_MAX - z->origin) return -1;
-   return seek_file(z->f, z->origin + offset);
+  if (offset > z->size || offset > UINT64_MAX - z->origin) return -1;
+  return seek_file(z->f, z->origin + offset);
 }
 static void zip_close(struct zip *z)
 {
-   if (z->f)
-      fclose(z->f);
-   for (size_t i = 0; i < z->count; i++)
-      free(z->entries[i].name);
-   free(z->entries);
-   memset(z, 0, sizeof *z);
+  if (z->f)
+    fclose(z->f);
+  for (size_t i = 0; i < z->count; i++)
+    free(z->entries[i].name);
+  free(z->entries);
+  memset(z, 0, sizeof *z);
 }
 /* Index a bounded ZIP view, including a stored APK inside an XAPK. */
 static int zip_index(struct zip *z, const char *path)
 {
-   if (z->size < 22) goto fail;
-   size_t tail = (size_t)(z->size < 65557 ? z->size : 65557);
-   unsigned char *buf = malloc(tail);
-   if (!buf)
-      goto fail;
-   if (zip_seek(z, z->size - tail) || fread(buf, 1, tail, z->f) != tail) {
+  if (z->size < 22) goto fail;
+  size_t tail = (size_t)(z->size < 65557 ? z->size : 65557);
+  unsigned char *buf = malloc(tail);
+  if (!buf)
+    goto fail;
+  if (zip_seek(z, z->size - tail) || fread(buf, 1, tail, z->f) != tail) {
+    free(buf);
+    goto fail;
+  }
+  size_t end = tail - 22;
+  for (;;) {
+    if (le32(buf + end) == 0x06054b50 && end + 22 + le16(buf + end + 20) == tail)
+      break;
+    if (!end) {
       free(buf);
       goto fail;
-   }
-   size_t end = tail - 22;
-   for (;;) {
-      if (le32(buf + end) == 0x06054b50 && end + 22 + le16(buf + end + 20) == tail)
-         break;
-      if (!end) {
-         free(buf);
-         goto fail;
-      }
-      end--;
-   }
-   if (le16(buf + end + 4) || le16(buf + end + 6)) {
-      free(buf);
+    }
+    end--;
+  }
+  if (le16(buf + end + 4) || le16(buf + end + 6)) {
+    free(buf);
+    goto fail;
+  }
+  uint64_t count = le16(buf + end + 10), cd = le32(buf + end + 16), cd_size = le32(buf + end + 12), eocd = z->size - tail + end;
+  free(buf);
+  if (count == 65535 || cd == UINT32_MAX || cd_size == UINT32_MAX) {
+    unsigned char loc[20], rec[56];
+    if (eocd < 20 || zip_seek(z, eocd - 20) || fread(loc, 1, 20, z->f) != 20 || le32(loc) != 0x07064b50 || le32(loc + 4) || le32(loc + 16) != 1)
       goto fail;
-   }
-   uint64_t count = le16(buf + end + 10), cd = le32(buf + end + 16), cd_size = le32(buf + end + 12), eocd = z->size - tail + end;
-   free(buf);
-   if (count == 65535 || cd == UINT32_MAX || cd_size == UINT32_MAX) {
-      unsigned char loc[20], rec[56];
-      if (eocd < 20 || zip_seek(z, eocd - 20) || fread(loc, 1, 20, z->f) != 20 || le32(loc) != 0x07064b50 || le32(loc + 4) || le32(loc + 16) != 1)
-         goto fail;
-      if (zip_seek(z, le64(loc + 8)) || fread(rec, 1, 56, z->f) != 56 || le32(rec) != 0x06064b50 || le32(rec + 16) || le32(rec + 20))
-         goto fail;
-      count = le64(rec + 32);
-      cd_size = le64(rec + 40);
-      cd = le64(rec + 48);
-   }
-   if (count > 1000000 || cd > z->size || cd_size > z->size - cd || count > SIZE_MAX / sizeof(*z->entries))
+    if (zip_seek(z, le64(loc + 8)) || fread(rec, 1, 56, z->f) != 56 || le32(rec) != 0x06064b50 || le32(rec + 16) || le32(rec + 20))
       goto fail;
-   z->entries = calloc((size_t)count, sizeof(*z->entries));
-   if (!z->entries)
+    count = le64(rec + 32);
+    cd_size = le64(rec + 40);
+    cd = le64(rec + 48);
+  }
+  if (count > 1000000 || cd > z->size || cd_size > z->size - cd || count > SIZE_MAX / sizeof(*z->entries))
+    goto fail;
+  z->entries = calloc((size_t)count, sizeof(*z->entries));
+  if (!z->entries)
+    goto fail;
+  uint64_t pos = cd;
+  for (uint64_t i = 0; i < count; i++) {
+    unsigned char h[46];
+    if (pos > cd + cd_size || cd + cd_size - pos < 46 || zip_seek(z, pos) || fread(h, 1, 46, z->f) != 46 || le32(h) != 0x02014b50)
       goto fail;
-   uint64_t pos = cd;
-   for (uint64_t i = 0; i < count; i++) {
-      unsigned char h[46];
-      if (pos > cd + cd_size || cd + cd_size - pos < 46 || zip_seek(z, pos) || fread(h, 1, 46, z->f) != 46 || le32(h) != 0x02014b50)
-         goto fail;
-      size_t nl = le16(h + 28), xl = le16(h + 30), cl = le16(h + 32);
-      if (!nl || nl >= APK_PATH || 46 + nl + xl + cl > cd + cd_size - pos)
-         goto fail;
-      struct zip_entry *e = z->entries + z->count++;
-      e->name = malloc(nl + 1);
-      unsigned char *extra = malloc(xl ? xl : 1);
-      if (!e->name || !extra) {
-         free(extra);
-         goto fail;
-      }
-      if (fread(e->name, 1, nl, z->f) != nl || fread(extra, 1, xl, z->f) != xl) {
-         free(extra);
-         goto fail;
-      }
-      e->name[nl] = 0;
-      if (memchr(e->name, 0, nl)) {
-         free(extra);
-         goto fail;
-      }
-      e->flags = le16(h + 8);
-      e->method = le16(h + 10);
-      e->crc = le32(h + 16);
-      e->compressed = le32(h + 20);
-      e->size = le32(h + 24);
-      e->attrs = le32(h + 38);
-      e->offset = le32(h + 42);
-      if (le16(h + 34)) {
-         free(extra);
-         goto fail;
-      }
-      bool have64 = false;
-      for (size_t k = 0; k + 4 <= xl;) {
-         size_t len = le16(extra + k + 2);
-         if (len > xl - k - 4) {
-            free(extra);
-            goto fail;
-         }
-         if (le16(extra + k) == 1) {
-            size_t at = k + 4, limit = at + len;
-            have64 = true;
-#define ZIP64_FIELD(field) if(e->field==UINT32_MAX){if(limit-at<8){free(extra);goto fail;}e->field=le64(extra+at);at+=8;}
-            ZIP64_FIELD(size) ZIP64_FIELD(compressed) ZIP64_FIELD(offset)
-#undef ZIP64_FIELD
-         }
-         k += 4 + len;
-      }
+    size_t nl = le16(h + 28), xl = le16(h + 30), cl = le16(h + 32);
+    if (!nl || nl >= APK_PATH || 46 + nl + xl + cl > cd + cd_size - pos)
+      goto fail;
+    struct zip_entry *e = z->entries + z->count++;
+    e->name = malloc(nl + 1);
+    unsigned char *extra = malloc(xl ? xl : 1);
+    if (!e->name || !extra) {
       free(extra);
-      if (!have64 && (e->size == UINT32_MAX || e->compressed == UINT32_MAX || e->offset == UINT32_MAX))
-         goto fail;
-      if (e->offset > z->size || e->compressed > z->size - e->offset)
-         goto fail;
-      pos += 46 + nl + xl + cl;
-   }
-   return 0;
+      goto fail;
+    }
+    if (fread(e->name, 1, nl, z->f) != nl || fread(extra, 1, xl, z->f) != xl) {
+      free(extra);
+      goto fail;
+    }
+    e->name[nl] = 0;
+    if (memchr(e->name, 0, nl)) {
+      free(extra);
+      goto fail;
+    }
+    e->flags = le16(h + 8);
+    e->method = le16(h + 10);
+    e->crc = le32(h + 16);
+    e->compressed = le32(h + 20);
+    e->size = le32(h + 24);
+    e->attrs = le32(h + 38);
+    e->offset = le32(h + 42);
+    if (le16(h + 34)) {
+      free(extra);
+      goto fail;
+    }
+    bool have64 = false;
+    for (size_t k = 0; k + 4 <= xl;) {
+      size_t len = le16(extra + k + 2);
+      if (len > xl - k - 4) {
+        free(extra);
+        goto fail;
+      }
+      if (le16(extra + k) == 1) {
+        size_t at = k + 4, limit = at + len;
+        have64 = true;
+#define ZIP64_FIELD(field) if(e->field==UINT32_MAX){if(limit-at<8){free(extra);goto fail;}e->field=le64(extra+at);at+=8;}
+        ZIP64_FIELD(size) ZIP64_FIELD(compressed) ZIP64_FIELD(offset)
+#undef ZIP64_FIELD
+      }
+      k += 4 + len;
+    }
+    free(extra);
+    if (!have64 && (e->size == UINT32_MAX || e->compressed == UINT32_MAX || e->offset == UINT32_MAX))
+      goto fail;
+    if (e->offset > z->size || e->compressed > z->size - e->offset)
+      goto fail;
+    pos += 46 + nl + xl + cl;
+  }
+  return 0;
 fail:
-   zip_close(z);
-   return apk_error("invalid or truncated ZIP: %s", path);
+  zip_close(z);
+  return apk_error("invalid or truncated ZIP: %s", path);
 }
 static int zip_open_range(struct zip *z, const char *path,
                           uint64_t origin, uint64_t size)
 {
-   memset(z, 0, sizeof *z);
-   luna_file_info st;
-   if (luna_file_infoat(LUNA_AT_FDCWD, path, &st, 0) || st.size < 22 ||
-       origin > (uint64_t)st.size || size > (uint64_t)st.size - origin)
-      return apk_error("not a ZIP: %s", path);
-   z->origin = origin;
-   z->size = size ? size : (uint64_t)st.size - origin;
-   z->f = open_file(path, "rb");
-   if (!z->f) return apk_error("cannot open %s", path);
-   return zip_index(z, path);
+  memset(z, 0, sizeof *z);
+  luna_file_info st;
+  if (luna_file_infoat(LUNA_AT_FDCWD, path, &st, 0) || st.size < 22 ||
+      origin > (uint64_t)st.size || size > (uint64_t)st.size - origin)
+    return apk_error("not a ZIP: %s", path);
+  z->origin = origin;
+  z->size = size ? size : (uint64_t)st.size - origin;
+  z->f = open_file(path, "rb");
+  if (!z->f) return apk_error("cannot open %s", path);
+  return zip_index(z, path);
 }
 static int zip_open(struct zip *z, const char *path)
 {
-   return zip_open_range(z, path, 0, 0);
+  return zip_open_range(z, path, 0, 0);
 }
 static struct zip_entry *zip_find(struct zip *z, const char *name)
 {
-   for (size_t i = 0; i < z->count; i++)
-      if (!strcmp(z->entries[i].name, name))
-         return z->entries + i;
-   return NULL;
+  for (size_t i = 0; i < z->count; i++)
+    if (!strcmp(z->entries[i].name, name))
+      return z->entries + i;
+  return NULL;
 }
 /* ZIP paths must stay under the installed tree on all three platforms. */
 static bool entry_safe(const char *name)
 {
-   if (!*name || *name == '/' || strchr(name, '\\') || strchr(name, ':'))
+  if (!*name || *name == '/' || strchr(name, '\\') || strchr(name, ':'))
+    return false;
+  const char *p = name;
+  while (*p) {
+    const char *e = strchr(p, '/');
+    size_t n = e ? (size_t)(e - p) : strlen(p);
+    if (!n || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.'))
       return false;
-   const char *p = name;
-   while (*p) {
-      const char *e = strchr(p, '/');
-      size_t n = e ? (size_t)(e - p) : strlen(p);
-      if (!n || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.'))
-         return false;
-      for (size_t i = 0; i < n; i++)
-         if ((unsigned char)p[i] < 32)
-            return false;
+    for (size_t i = 0; i < n; i++)
+      if ((unsigned char)p[i] < 32)
+        return false;
 #ifdef _WIN32
-      if (p[n - 1] == '.' || p[n - 1] == ' ')
-         return false;
-      char part[16];
-      size_t b = 0;
-      while (b < n && p[b] != '.' && b < sizeof(part) -1) {
-         part[b] = (char)toupper((unsigned char)p[b]);
-         b++;
-      }
-      part[b] = 0;
-      if (!strcmp(part, "CON") || !strcmp(part, "PRN") || !strcmp(part, "AUX") || !strcmp(part, "NUL") ||
-          (b == 4 && (!strncmp(part, "COM", 3) || !strncmp(part, "LPT", 3)) && part[3] >= '1' && part[3] <= '9'))
-         return false;
+    if (p[n - 1] == '.' || p[n - 1] == ' ')
+      return false;
+    char part[16];
+    size_t b = 0;
+    while (b < n && p[b] != '.' && b < sizeof(part) -1) {
+      part[b] = (char)toupper((unsigned char)p[b]);
+      b++;
+    }
+    part[b] = 0;
+    if (!strcmp(part, "CON") || !strcmp(part, "PRN") || !strcmp(part, "AUX") || !strcmp(part, "NUL") ||
+        (b == 4 && (!strncmp(part, "COM", 3) || !strncmp(part, "LPT", 3)) && part[3] >= '1' && part[3] <= '9'))
+      return false;
 #endif
-      if (!e)
-         break;
-      p = e + 1;
-   }
-   return true;
+    if (!e)
+      break;
+    p = e + 1;
+  }
+  return true;
 }
 /* Output is streamed: APK/OBB files can be larger than addressable memory. */
 struct extraction_progress {
-   uint64_t bytes, total, last_report;
-   size_t files, count;
-   const char *name;
+  uint64_t bytes, total, last_report;
+  size_t files, count;
+  const char *name;
 };
 /* Report within a large entry as well as between entries. Newlines also keep
  * redirected logs readable; throttle output to twice a second. */
 static void extraction_report(struct extraction_progress *p, bool force)
 {
-   luna_launcher_progress(NULL, p->name, p->bytes, p->total);
-   uint64_t now = luna_os_monotonic_ns();
-   if (!force && now - p->last_report < UINT64_C(500000000))
-      return;
-   p->last_report = now;
-   unsigned percent = p->total ? (unsigned)(100.0L * p->bytes / p->total) : 100;
-   fprintf(stderr, "[apk] %3u%%  %.1f / %.1f MiB  (%zu/%zu files)  %s\n",
-           percent, (double)p->bytes / 1048576, (double)p->total / 1048576,
-           p->files, p->count, p->name ? p->name : "");
-   fflush(stderr);
+  luna_launcher_progress(NULL, p->name, p->bytes, p->total);
+  uint64_t now = luna_os_monotonic_ns();
+  if (!force && now - p->last_report < UINT64_C(500000000))
+    return;
+  p->last_report = now;
+  unsigned percent = p->total ? (unsigned)(100.0L * p->bytes / p->total) : 100;
+  fprintf(stderr, "[apk] %3u%%  %.1f / %.1f MiB  (%zu/%zu files)  %s\n",
+          percent, (double)p->bytes / 1048576, (double)p->total / 1048576,
+          p->files, p->count, p->name ? p->name : "");
+  fflush(stderr);
 }
 static int zip_read(struct zip *z, const struct zip_entry *e, FILE *out, unsigned char *memory, size_t capacity, struct extraction_progress *progress)
 {
-   if (e->flags & 1 || !(e->method == 0 || e->method == 8))
-      return apk_error("unsupported ZIP entry: %s", e->name);
-   unsigned char h[30];
-   if (zip_seek(z, e->offset) || fread(h, 1, 30, z->f) != 30 || le32(h) != 0x04034b50)
-      return -1;
-   uint64_t at = e->offset + 30 + le16(h + 26) + le16(h + 28);
-   if (at > z->size || e->compressed > z->size - at || zip_seek(z, at))
-      return -1;
-   if (memory && e->size > capacity)
-      return -1;
-   unsigned char in[65536], decoded[65536];
-   uint64_t left = e->compressed, total = 0;
-   uLong crc = crc32(0, NULL, 0);
-   z_stream stream = {0};
-   bool ended = e->method == 0;
-   int status = 0;
-   if (e->method == 8 && inflateInit2(&stream, -MAX_WBITS) != Z_OK)
-      return -1;
-   while (left) {
-      if (luna_launcher_cancelled()) { if (e->method == 8) inflateEnd(&stream); return apk_error("installation cancelled"); }
-      size_t n = (size_t)(left > sizeof in ? sizeof in : left);
-      if (fread(in, 1, n, z->f) != n) {
-         status = -1;
-         break;
-      }
-      left -= n;
-      stream.next_in = in;
-      stream.avail_in = (uInt)n;
-      do {
-         size_t got = n;
-         const unsigned char *data = in;
-         if (e->method == 8) {
-            stream.next_out = decoded;
-            stream.avail_out = sizeof decoded;
-            int r = inflate(&stream, Z_NO_FLUSH);
-            got = sizeof decoded - stream.avail_out;
-            data = decoded;
-            if (r == Z_STREAM_END) {
-               ended = true;
-               if (left || stream.avail_in) {
-                  status = -1;
-                  break;
-               }
-            } else if (r == Z_BUF_ERROR && !stream.avail_in && !got)
-               break;
-            else if (r != Z_OK) {
-               status = -1;
-               break;
-            }
-         }
-         if (total > e->size || got > e->size - total) {
-            status = -1;
-            break;
-         }
-         crc = crc32(crc, data, (uInt)got);
-         if (out && fwrite(data, 1, got, out) != got) {
-            status = -1;
-            break;
-         }
-         if (memory)
-            memcpy(memory + (size_t)total, data, got);
-         total += got;
-         if (progress) {
-            progress->bytes += got;
-            extraction_report(progress, false);
-         }
-         if (e->method == 0 || ended)
-            break;
-      } while (stream.avail_in || stream.avail_out == 0);
-      if (status || ended && e->method == 8)
-         break;
-   }
-   if (e->method == 8) {
-      /* Empty deflate streams still have compressed input. */inflateEnd(&stream);
-   }
-   if (!ended || total != e->size || crc != e->crc)
+  if (e->flags & 1 || !(e->method == 0 || e->method == 8))
+    return apk_error("unsupported ZIP entry: %s", e->name);
+  unsigned char h[30];
+  if (zip_seek(z, e->offset) || fread(h, 1, 30, z->f) != 30 || le32(h) != 0x04034b50)
+    return -1;
+  uint64_t at = e->offset + 30 + le16(h + 26) + le16(h + 28);
+  if (at > z->size || e->compressed > z->size - at || zip_seek(z, at))
+    return -1;
+  if (memory && e->size > capacity)
+    return -1;
+  unsigned char in[65536], decoded[65536];
+  uint64_t left = e->compressed, total = 0;
+  uLong crc = crc32(0, NULL, 0);
+  z_stream stream = {0};
+  bool ended = e->method == 0;
+  int status = 0;
+  if (e->method == 8 && inflateInit2(&stream, -MAX_WBITS) != Z_OK)
+    return -1;
+  while (left) {
+    if (luna_launcher_cancelled()) {
+      if (e->method == 8) inflateEnd(&stream);
+      return apk_error("installation cancelled");
+    }
+    size_t n = (size_t)(left > sizeof in ? sizeof in : left);
+    if (fread(in, 1, n, z->f) != n) {
       status = -1;
-   return status ? apk_error("corrupt ZIP entry: %s", e->name) : 0;
+      break;
+    }
+    left -= n;
+    stream.next_in = in;
+    stream.avail_in = (uInt)n;
+    do {
+      size_t got = n;
+      const unsigned char *data = in;
+      if (e->method == 8) {
+        stream.next_out = decoded;
+        stream.avail_out = sizeof decoded;
+        int r = inflate(&stream, Z_NO_FLUSH);
+        got = sizeof decoded - stream.avail_out;
+        data = decoded;
+        if (r == Z_STREAM_END) {
+          ended = true;
+          if (left || stream.avail_in) {
+            status = -1;
+            break;
+          }
+        } else if (r == Z_BUF_ERROR && !stream.avail_in && !got)
+          break;
+        else if (r != Z_OK) {
+          status = -1;
+          break;
+        }
+      }
+      if (total > e->size || got > e->size - total) {
+        status = -1;
+        break;
+      }
+      crc = crc32(crc, data, (uInt)got);
+      if (out && fwrite(data, 1, got, out) != got) {
+        status = -1;
+        break;
+      }
+      if (memory)
+        memcpy(memory + (size_t)total, data, got);
+      total += got;
+      if (progress) {
+        progress->bytes += got;
+        extraction_report(progress, false);
+      }
+      if (e->method == 0 || ended)
+        break;
+    } while (stream.avail_in || stream.avail_out == 0);
+    if (status || ended && e->method == 8)
+      break;
+  }
+  if (e->method == 8) {
+    /* Empty deflate streams still have compressed input. */inflateEnd(&stream);
+  }
+  if (!ended || total != e->size || crc != e->crc)
+    status = -1;
+  return status ? apk_error("corrupt ZIP entry: %s", e->name) : 0;
 }
 static unsigned char *zip_memory_limit(struct zip *z, const char *name, size_t *size, size_t limit)
 {
-   struct zip_entry *e = zip_find(z, name);
-   if (!e || e->size > limit || e->size >= SIZE_MAX)
-      return NULL;
-   unsigned char *data = malloc((size_t)e->size + 1);
-   if (!data)
-      return NULL;
-   if (zip_read(z, e, NULL, data, (size_t)e->size, NULL)) {
-      free(data);
-      return NULL;
-   }
-   data[e->size] = 0;
-   *size = (size_t)e->size;
-   return data;
+  struct zip_entry *e = zip_find(z, name);
+  if (!e || e->size > limit || e->size >= SIZE_MAX)
+    return NULL;
+  unsigned char *data = malloc((size_t)e->size + 1);
+  if (!data)
+    return NULL;
+  if (zip_read(z, e, NULL, data, (size_t)e->size, NULL)) {
+    free(data);
+    return NULL;
+  }
+  data[e->size] = 0;
+  *size = (size_t)e->size;
+  return data;
 }
 static unsigned char *zip_memory(struct zip *z, const char *name, size_t *size)
 {
-   return zip_memory_limit(z, name, size, APK_MAX_MANIFEST);
+  return zip_memory_limit(z, name, size, APK_MAX_MANIFEST);
 }
 static int zip_extract(struct zip *z, const char *root, bool overwrite)
 {
-   if (mkdirs(root))
+  if (mkdirs(root))
+    return -1;
+  struct extraction_progress progress = {.count = z->count};
+  for (size_t i = 0; i < z->count; i++) {
+    if (UINT64_MAX - progress.total < z->entries[i].size)
+      return apk_error("archive expanded size is too large");
+    progress.total += z->entries[i].size;
+  }
+  luna_launcher_progress(overwrite ? "Extracting archive" : "Checking installed files", root, 0, progress.total);
+  fprintf(stderr, "[apk] %s: %s (%.1f MiB, %zu files)\n",
+          overwrite ? "Extracting" : "Checking cached files / restoring missing files",
+          root, (double)progress.total / 1048576, progress.count);
+  extraction_report(&progress, true);
+  for (size_t i = 0; i < z->count; i++) {
+    if (luna_launcher_cancelled()) return apk_error("installation cancelled");
+    struct zip_entry *e = z->entries + i;
+    progress.name = e->name;
+    char path[APK_PATH];
+    if (!entry_safe(e->name) || ((e->attrs >> 16) & 0170000) == 0120000)
+      return apk_error("invalid archive path: %s", e->name);
+    if (path_join(path, sizeof path, root, e->name))
       return -1;
-   struct extraction_progress progress = {.count = z->count};
-   for (size_t i = 0; i < z->count; i++) {
-      if (UINT64_MAX - progress.total < z->entries[i].size)
-         return apk_error("archive expanded size is too large");
-      progress.total += z->entries[i].size;
-   }
-   luna_launcher_progress(overwrite ? "Extracting archive" : "Checking installed files", root, 0, progress.total);
-   fprintf(stderr, "[apk] %s: %s (%.1f MiB, %zu files)\n",
-           overwrite ? "Extracting" : "Checking cached files / restoring missing files",
-           root, (double)progress.total / 1048576, progress.count);
-   extraction_report(&progress, true);
-   for (size_t i = 0; i < z->count; i++) {
-      if (luna_launcher_cancelled()) return apk_error("installation cancelled");
-      struct zip_entry *e = z->entries + i;
-      progress.name = e->name;
-      char path[APK_PATH];
-      if (!entry_safe(e->name) || ((e->attrs >> 16) & 0170000) == 0120000)
-         return apk_error("invalid archive path: %s", e->name);
-      if (path_join(path, sizeof path, root, e->name))
-         return -1;
-      if (e->name[strlen(e->name) -1] == '/') {
-         if (mkdirs(path))
-            return -1;
-         progress.files++;
-         extraction_report(&progress, false);
-         continue;
-      }
-      if (!overwrite && exists(path)) {
-         progress.bytes += e->size;
-         progress.files++;
-         extraction_report(&progress, false);
-         continue;
-      }
-      char *slash = strrchr(path, '/');
-      if (slash) {
-         *slash = 0;
-         if (mkdirs(path))
-            return -1;
-         *slash = '/';
-      }
-      FILE *f = open_file(path, "wb");
-      if (!f)
-         return apk_error("cannot write %s", path);
-      int r = zip_read(z, e, f, NULL, 0, &progress);
-      if (fclose(f))
-         r = -1;
-      if (r) {
-         luna_file_unlinkat(LUNA_AT_FDCWD, path, 0);
-         return -1;
-      }
+    if (e->name[strlen(e->name) -1] == '/') {
+      if (mkdirs(path))
+        return -1;
       progress.files++;
       extraction_report(&progress, false);
-   }
-   progress.name = "done";
-   extraction_report(&progress, true);
-   return 0;
+      continue;
+    }
+    if (!overwrite && exists(path)) {
+      progress.bytes += e->size;
+      progress.files++;
+      extraction_report(&progress, false);
+      continue;
+    }
+    char *slash = strrchr(path, '/');
+    if (slash) {
+      *slash = 0;
+      if (mkdirs(path))
+        return -1;
+      *slash = '/';
+    }
+    FILE *f = open_file(path, "wb");
+    if (!f)
+      return apk_error("cannot write %s", path);
+    int r = zip_read(z, e, f, NULL, 0, &progress);
+    if (fclose(f))
+      r = -1;
+    if (r) {
+      luna_file_unlinkat(LUNA_AT_FDCWD, path, 0);
+      return -1;
+    }
+    progress.files++;
+    extraction_report(&progress, false);
+  }
+  progress.name = "done";
+  extraction_report(&progress, true);
+  return 0;
 }
 /* A growable NUL-terminated string.  Manifest metadata has no useful fixed
  * bound: Google Play services alone declares hundreds of components, and one
  * service carries dozens of actions.  A string never appended to reads as "". */
-struct text { char *s; size_t n, cap; };
-static const char *text_get(const struct text *t) { return t->s ? t->s : ""; }
-static void text_free(struct text *t) { free(t->s); *t = (struct text){0}; }
-static void text_reset(struct text *t) { t->n = 0; if (t->s) t->s[0] = 0; }
+struct text {
+  char *s;
+  size_t n, cap;
+};
+static const char *text_get(const struct text *t) {
+  return t->s ? t->s : "";
+}
+static void text_free(struct text *t) {
+  free(t->s);
+  *t = (struct text) {
+    0
+  };
+}
+static void text_reset(struct text *t) {
+  t->n = 0;
+  if (t->s) t->s[0] = 0;
+}
 static int text_append(struct text *t, const char *value, const char *separator)
 {
-   const size_t s = t->n ? strlen(separator) : 0, b = strlen(value);
-   if (t->n + s + b + 1 > t->cap) {
-      size_t cap = t->cap ? t->cap : 256;
-      while (cap < t->n + s + b + 1) cap *= 2;
-      char *grown = realloc(t->s, cap);
-      if (!grown) return apk_error("manifest metadata: out of memory");
-      t->s = grown;
-      t->cap = cap;
-   }
-   if (s) memcpy(t->s + t->n, separator, s);
-   memcpy(t->s + t->n + s, value, b + 1);
-   t->n += s + b;
-   return 0;
+  const size_t s = t->n ? strlen(separator) : 0, b = strlen(value);
+  if (t->n + s + b + 1 > t->cap) {
+    size_t cap = t->cap ? t->cap : 256;
+    while (cap < t->n + s + b + 1) cap *= 2;
+    char *grown = realloc(t->s, cap);
+    if (!grown) return apk_error("manifest metadata: out of memory");
+    t->s = grown;
+    t->cap = cap;
+  }
+  if (s) memcpy(t->s + t->n, separator, s);
+  memcpy(t->s + t->n + s, value, b + 1);
+  t->n += s + b;
+  return 0;
 }
 /* Formats one record and appends it, separated from the previous one. */
 static int text_add_row(struct text *t, const char *separator, const char *format, ...)
 {
-   va_list ap, copy;
-   va_start(ap, format);
-   va_copy(copy, ap);
-   const int need = vsnprintf(NULL, 0, format, copy);
-   va_end(copy);
-   char *row = need >= 0 ? malloc((size_t)need + 1) : NULL;
-   if (!row) { va_end(ap); return apk_error("manifest metadata: out of memory"); }
-   vsnprintf(row, (size_t)need + 1, format, ap);
-   va_end(ap);
-   const int result = text_append(t, row, separator);
-   free(row);
-   return result;
+  va_list ap, copy;
+  va_start(ap, format);
+  va_copy(copy, ap);
+  const int need = vsnprintf(NULL, 0, format, copy);
+  va_end(copy);
+  char *row = need >= 0 ? malloc((size_t)need + 1) : NULL;
+  if (!row) {
+    va_end(ap);
+    return apk_error("manifest metadata: out of memory");
+  }
+  vsnprintf(row, (size_t)need + 1, format, ap);
+  va_end(ap);
+  const int result = text_append(t, row, separator);
+  free(row);
+  return result;
 }
 
 struct manifest {
-   char version_name[256], version_code[32];
-   char package[256], split[256], activity[512], application[512], application_process[512], activity_process[512];
-   char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
-   char cleartext[8], network_security[32];
-   struct text receivers, receiver_filters, services, activities, activity_filters;
-   struct text providers, permissions, query_actions, query_packages;
-   struct text libraries, service_metadata;
+  char version_name[256], version_code[32];
+  char package[256], split[256], activity[512], application[512], application_process[512], activity_process[512];
+  char orientation[32], theme[32], min_sdk[32], target_sdk[32], config_changes[32];
+  char cleartext[8], network_security[32];
+  struct text receivers, receiver_filters, services, activities, activity_filters;
+  struct text providers, permissions, query_actions, query_packages;
+  struct text libraries, service_metadata;
 };
 static void manifest_clear(struct manifest *m)
 {
-   text_free(&m->receivers); text_free(&m->services); text_free(&m->activities);
-   text_free(&m->receiver_filters); text_free(&m->activity_filters); text_free(&m->providers); text_free(&m->permissions);
-   text_free(&m->query_actions); text_free(&m->query_packages); text_free(&m->libraries);
-   text_free(&m->service_metadata);
-   memset(m, 0, sizeof *m);
+  text_free(&m->receivers);
+  text_free(&m->services);
+  text_free(&m->activities);
+  text_free(&m->receiver_filters);
+  text_free(&m->activity_filters);
+  text_free(&m->providers);
+  text_free(&m->permissions);
+  text_free(&m->query_actions);
+  text_free(&m->query_packages);
+  text_free(&m->libraries);
+  text_free(&m->service_metadata);
+  memset(m, 0, sizeof *m);
 }
 static void manifest_free(struct manifest *m)
 {
-   if (m) manifest_clear(m);
-   free(m);
+  if (m) manifest_clear(m);
+  free(m);
 }
 struct axml {
-   char **strings;
-   size_t count;
+  char **strings;
+  size_t count;
 };
 static void axml_free(struct axml *x)
 {
-   for (size_t i = 0; i < x->count; i++)
-      free(x->strings[i]);
-   free(x->strings);
-   memset(x, 0, sizeof *x);
+  for (size_t i = 0; i < x->count; i++)
+    free(x->strings[i]);
+  free(x->strings);
+  memset(x, 0, sizeof *x);
 }
 static const char *axml_string(const struct axml *x, uint32_t i)
 {
-   return i < x->count ? x->strings[i] : "";
+  return i < x->count ? x->strings[i] : "";
 }
 static int pool_len(const unsigned char *p, size_t n, size_t *at, bool utf8, uint32_t *value)
 {
-   if (utf8) {
+  if (utf8) {
+    if (*at >= n)
+      return -1;
+    *value = p[(*at)++];
+    if (*value & 0x80) {
       if (*at >= n)
-         return -1;
-      *value = p[(*at)++];
-      if (*value & 0x80) {
-         if (*at >= n)
-            return -1;
-         *value = ((*value & 0x7f) << 8) | p[(*at)++];
-      }
-   } else {
+        return -1;
+      *value = ((*value & 0x7f) << 8) | p[(*at)++];
+    }
+  } else {
+    if (n - *at < 2)
+      return -1;
+    *value = le16(p + *at);
+    *at += 2;
+    if (*value & 0x8000) {
       if (n - *at < 2)
-         return -1;
-      *value = le16(p + *at);
+        return -1;
+      *value = ((*value & 0x7fff) << 16) | le16(p + *at);
       *at += 2;
-      if (*value & 0x8000) {
-         if (n - *at < 2)
-            return -1;
-         *value = ((*value & 0x7fff) << 16) | le16(p + *at);
-         *at += 2;
-      }
-   }
-   return 0;
+    }
+  }
+  return 0;
 }
 /* Decode one string without materializing the pool. Large resource tables
  * can have hundreds of thousands of strings; registry lookup needs only a few. */
 static char *axml_pool_string(const unsigned char *p, size_t n, uint32_t index)
 {
-   if (n < 28) return NULL;
-   size_t header = le16(p + 2), count = le32(p + 8), base = le32(p + 20);
-   bool utf8 = (le32(p + 16) & 256) != 0;
-   if (header < 28 || header > n || count > (n - header) / 4 || index >= count || base > n) return NULL;
-   size_t off = le32(p + header + (size_t)index * 4);
-   if (off > n - base) return NULL;
-   size_t at = base + off;
-   uint32_t len, unused;
-   if ((utf8 && pool_len(p,n,&at,true,&unused)) || pool_len(p,n,&at,utf8,&len)) return NULL;
-   if (utf8) {
-      if (len > n - at || n - at - len < 1 || p[at + len]) return NULL;
-      char *value = malloc((size_t)len + 1);
-      if (value) { memcpy(value,p + at,len); value[len] = 0; }
-      return value;
-   }
-   if (len > (n - at) / 2 || n - at - (size_t)len * 2 < 2 || le16(p + at + len*2)) return NULL;
-   uint16_t *units = malloc(((size_t)len + 1) * 2);
-   char *value = malloc((size_t)len * 3 + 1);
-   if (!units || !value) { free(units);free(value);return NULL; }
-   for (uint32_t i = 0; i < len; ++i) units[i] = le16(p + at + (size_t)i * 2);
-   value[jcs_utf16_to_wtf8(units,len,value)] = 0;
-   free(units);
-   return value;
+  if (n < 28) return NULL;
+  size_t header = le16(p + 2), count = le32(p + 8), base = le32(p + 20);
+  bool utf8 = (le32(p + 16) & 256) != 0;
+  if (header < 28 || header > n || count > (n - header) / 4 || index >= count || base > n) return NULL;
+  size_t off = le32(p + header + (size_t)index * 4);
+  if (off > n - base) return NULL;
+  size_t at = base + off;
+  uint32_t len, unused;
+  if ((utf8 && pool_len(p,n,&at,true,&unused)) || pool_len(p,n,&at,utf8,&len)) return NULL;
+  if (utf8) {
+    if (len > n - at || n - at - len < 1 || p[at + len]) return NULL;
+    char *value = malloc((size_t)len + 1);
+    if (value) {
+      memcpy(value,p + at,len);
+      value[len] = 0;
+    }
+    return value;
+  }
+  if (len > (n - at) / 2 || n - at - (size_t)len * 2 < 2 || le16(p + at + len*2)) return NULL;
+  uint16_t *units = malloc(((size_t)len + 1) * 2);
+  char *value = malloc((size_t)len * 3 + 1);
+  if (!units || !value) {
+    free(units);
+    free(value);
+    return NULL;
+  }
+  for (uint32_t i = 0; i < len; ++i) units[i] = le16(p + at + (size_t)i * 2);
+  value[jcs_utf16_to_wtf8(units,len,value)] = 0;
+  free(units);
+  return value;
 }
 static int axml_pool(struct axml *x, const unsigned char *p, size_t n)
 {
-   if (n < 28) return -1;
-   size_t header = le16(p + 2), count = le32(p + 8);
-   if (count > 1000000 || header < 28 || header > n || count > (n - header) / 4) return -1;
-   axml_free(x);
-   x->strings = calloc(count ? count : 1,sizeof *x->strings);
-   if (!x->strings) return -1;
-   x->count = count;
-   for (uint32_t i = 0; i < count; ++i) {
-      x->strings[i] = axml_pool_string(p,n,i);
-      if (!x->strings[i]) return -1;
-   }
-   return 0;
+  if (n < 28) return -1;
+  size_t header = le16(p + 2), count = le32(p + 8);
+  if (count > 1000000 || header < 28 || header > n || count > (n - header) / 4) return -1;
+  axml_free(x);
+  x->strings = calloc(count ? count : 1,sizeof *x->strings);
+  if (!x->strings) return -1;
+  x->count = count;
+  for (uint32_t i = 0; i < count; ++i) {
+    x->strings[i] = axml_pool_string(p,n,i);
+    if (!x->strings[i]) return -1;
+  }
+  return 0;
 }
 static int copy_text(char *out, size_t cap, const char *value)
 {
-   if (strlen(value) >= cap)
-      return apk_error("manifest value too long");
-   strcpy(out, value);
-   return 0;
+  if (strlen(value) >= cap)
+    return apk_error("manifest value too long");
+  strcpy(out, value);
+  return 0;
 }
 static int class_name(char *out, size_t cap, const char *pkg, const char *name)
 {
-   if (!*name) {
-      *out = 0;
-      return 0;
-   }
-   int n = snprintf(out, cap, "%s%s%s", name[0] == '.' || !strchr(name, '.') ? pkg : "", name[0] != '.' && !strchr(name, '.') ? "." : "", name);
-   return n < 0 || (size_t)n >= cap ? -1 : 0;
+  if (!*name) {
+    *out = 0;
+    return 0;
+  }
+  int n = snprintf(out, cap, "%s%s%s", name[0] == '.' || !strchr(name, '.') ? pkg : "", name[0] != '.' && !strchr(name, '.') ? "." : "", name);
+  return n < 0 || (size_t)n >= cap ? -1 : 0;
 }
 struct attr {
-   const char *key, *text;
-   uint8_t type;
-   uint32_t value;
+  const char *key, *text;
+  uint8_t type;
+  uint32_t value;
 };
 static const struct attr *attribute(const struct attr *a, size_t n, const char *key)
 {
-   for (size_t i = 0; i < n; i++)
-      if (!strcmp(a[i].key, key))
-         return a + i;
-   return NULL;
+  for (size_t i = 0; i < n; i++)
+    if (!strcmp(a[i].key, key))
+      return a + i;
+  return NULL;
 }
 static const char *attr_text(const struct attr *a, size_t n, const char *key)
 {
-   const struct attr *v = attribute(a, n, key);
-   return v ? v->text : "";
+  const struct attr *v = attribute(a, n, key);
+  return v ? v->text : "";
 }
 static int attr_number(char *out, size_t cap, const struct attr *a, size_t n, const char *key)
 {
-   const struct attr *v = attribute(a, n, key);
-   if (!v) {
-      *out = 0;
-      return 0;
-   }
-   if (v->type == 3)
-      return copy_text(out, cap, v->text);
-   return snprintf(out, cap, "%" PRIu32, v->value) < 0 ? -1 : 0;
+  const struct attr *v = attribute(a, n, key);
+  if (!v) {
+    *out = 0;
+    return 0;
+  }
+  if (v->type == 3)
+    return copy_text(out, cap, v->text);
+  return snprintf(out, cap, "%" PRIu32, v->value) < 0 ? -1 : 0;
 }
 static bool package_valid(const char *s)
 {
-   if (!*s || strlen(s) > 255 || s[0] == '.' || s[strlen(s) -1] == '.')
+  if (!*s || strlen(s) > 255 || s[0] == '.' || s[strlen(s) -1] == '.')
+    return false;
+  for (const char *p = s; *p; p++)
+    if (!(isalnum((unsigned char) * p) || *p == '_' || *p == '.') || (*p == '.' && p[1] == '.'))
       return false;
-   for (const char *p = s; *p; p++)
-      if (!(isalnum((unsigned char) * p) || *p == '_' || *p == '.') || (*p == '.' && p[1] == '.'))
-         return false;
-   return true;
+  return true;
 }
 /* Bundle manifests may retain textual booleans; their string-pool index
  * is not the boolean value. Compiled APK booleans use the typed value. */
 static int attr_boolean(const struct attr *v)
 {
-   if (v->type == 3)
-      return !strcmp(v->text, "true") || !strcmp(v->text, "1");
-   return v->value != 0;
+  if (v->type == 3)
+    return !strcmp(v->text, "true") || !strcmp(v->text, "1");
+  return v->value != 0;
 }
-struct registered_value { uint8_t type; uint32_t data; };
+struct registered_value {
+  uint8_t type;
+  uint32_t data;
+};
 struct manifest_resources {
-   struct zip *zip;
-   unsigned char *table;
-   size_t size, pool_size;
-   const unsigned char *pool;
-   struct axml values;
+  struct zip *zip;
+  unsigned char *table;
+  size_t size, pool_size;
+  const unsigned char *pool;
+  struct axml values;
 };
 static const char *manifest_resource_string(struct manifest_resources *,uint32_t);
 static bool manifest_resource_value(struct manifest_resources *,uint32_t,struct registered_value *);
 static bool manifest_string_attribute(const char *key)
 {
-   static const char *const names[]={"name","process","permission","authorities",
-      "targetActivity","parentActivityName","targetPackage","versionName"};
-   for(size_t i=0;i<sizeof names/sizeof *names;++i)if(!strcmp(key,names[i]))return true;
-   return false;
+  static const char *const names[]= {"name","process","permission","authorities",
+                                     "targetActivity","parentActivityName","targetPackage","versionName"
+                                    };
+  for(size_t i=0; i<sizeof names/sizeof *names; ++i)if(!strcmp(key,names[i]))return true;
+  return false;
 }
 static bool manifest_boolean_attribute(const char *key)
 {
-   static const char *const names[]={"enabled","exported","directBootAware","grantUriPermissions",
-      "multiprocess","debuggable","allowBackup","supportsRtl","usesCleartextTraffic"};
-   for(size_t i=0;i<sizeof names/sizeof *names;++i)if(!strcmp(key,names[i]))return true;
-   return false;
+  static const char *const names[]= {"enabled","exported","directBootAware","grantUriPermissions",
+                                     "multiprocess","debuggable","allowBackup","supportsRtl","usesCleartextTraffic"
+                                    };
+  for(size_t i=0; i<sizeof names/sizeof *names; ++i)if(!strcmp(key,names[i]))return true;
+  return false;
 }
 static int parse_manifest_events(const unsigned char *data, size_t size, struct manifest *m, struct axml x, struct zip *zip)
 {
-   struct manifest_resources resources={.zip=zip};
-   manifest_clear(m);
-   int result = -1, depth = 0, activity_depth = -1, provider_depth = -1, queries_depth = -1, intent_depth = -1;
-   struct text provider = {0}, filter_actions = {0}, filter_categories = {0}, filter_specs = {0}, service_actions = {0}, receiver_actions = {0};
-   char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", changes[32] = "";
-   bool main = false, launcher = false, activity_launch = false;
-   int activity_enabled = 1, filter_data = 0, filter_priority = 0;
-   int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
-   bool receiver_filter = false;
-   int service_depth = -1, service_enabled = 1, service_exported = -1, application_depth=-1;
-   char service[512] = "", service_process[512] = "";
-   char receiver[512] = "", permission[512] = "", process[512] = "";
-   char app_permission[512] = "", app_process[512] = "";
-   char provider_process[512] = "", activity_process[512] = "";
-   int provider_enabled=1,provider_order=0,provider_grant=0,provider_multi=0;
-   for (size_t at = 0; at < size;) {
-      if (size - at < 8)
-         goto done;
-      const unsigned char *p = data + at;
-      uint16_t kind = le16(p), header = le16(p + 2);
-      uint32_t len = le32(p + 4);
-      if (len < 8 || header < 8||header>len || len > size - at)
-         goto done;
-      if (kind == 1) {
-         if (axml_pool(&x, p, len))
+  struct manifest_resources resources= {.zip=zip};
+  manifest_clear(m);
+  int result = -1, depth = 0, activity_depth = -1, provider_depth = -1, queries_depth = -1, intent_depth = -1;
+  struct text provider = {0}, filter_actions = {0}, filter_categories = {0}, filter_specs = {0}, service_actions = {0}, receiver_actions = {0};
+  char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", changes[32] = "";
+  bool main = false, launcher = false, activity_launch = false;
+  int activity_enabled = 1, filter_data = 0, filter_priority = 0;
+  int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
+  bool receiver_filter = false;
+  int service_depth = -1, service_enabled = 1, service_exported = -1, application_depth=-1;
+  char service[512] = "", service_process[512] = "";
+  char receiver[512] = "", permission[512] = "", process[512] = "";
+  char app_permission[512] = "", app_process[512] = "";
+  char provider_process[512] = "", activity_process[512] = "";
+  int provider_enabled=1,provider_order=0,provider_grant=0,provider_multi=0;
+  for (size_t at = 0; at < size;) {
+    if (size - at < 8)
+      goto done;
+    const unsigned char *p = data + at;
+    uint16_t kind = le16(p), header = le16(p + 2);
+    uint32_t len = le32(p + 4);
+    if (len < 8 || header < 8||header>len || len > size - at)
+      goto done;
+    if (kind == 1) {
+      if (axml_pool(&x, p, len))
+        goto done;
+    } else if (kind == 0x102) {
+      if (len < 36 || header < 16)
+        goto done;
+      depth++;
+      uint32_t name = le32(p + 20);
+      if (name >= x.count)
+        goto done;
+      const char *tag = axml_string(&x, name);
+      size_t start = 16 + le16(p + 24), stride = le16(p + 26), count = le16(p + 28);
+      if (stride < 20 || count > 1024 || start > len || count > (len - start) / stride)
+        goto done;
+      struct attr a[1024];
+      char numbers[1024][32];
+      for (size_t i = 0; i < count; i++) {
+        const unsigned char *v = p + start + i * stride;
+        uint32_t key = le32(v + 4), raw = le32(v + 8), value = le32(v + 16);
+        uint8_t type = v[15];
+        if (key >= x.count || le16(v + 12) < 8)
+          goto done;
+        a[i] = (struct attr) {
+          axml_string(&x, key), "", type, value
+        };
+        if (type == 3) {
+          if (value >= x.count)
             goto done;
-      } else if (kind == 0x102) {
-         if (len < 36 || header < 16)
-            goto done;
-         depth++;
-         uint32_t name = le32(p + 20);
-         if (name >= x.count)
-            goto done;
-         const char *tag = axml_string(&x, name);
-         size_t start = 16 + le16(p + 24), stride = le16(p + 26), count = le16(p + 28);
-         if (stride < 20 || count > 1024 || start > len || count > (len - start) / stride)
-            goto done;
-         struct attr a[1024];
-         char numbers[1024][32];
-         for (size_t i = 0; i < count; i++) {
-            const unsigned char *v = p + start + i * stride;
-            uint32_t key = le32(v + 4), raw = le32(v + 8), value = le32(v + 16);
-            uint8_t type = v[15];
-            if (key >= x.count || le16(v + 12) < 8)
-               goto done;
-            a[i] = (struct attr) {
-               axml_string(&x, key), "", type, value
-            };
-            if (type == 3) {
-               if (value >= x.count)
-                  goto done;
-               a[i].text = axml_string(&x, value);
-            } else if (raw < x.count)
-               a[i].text = axml_string(&x, raw);
-            else {
-               snprintf(numbers[i], sizeof numbers[i], "%" PRIu32, value);
-               a[i].text = numbers[i];
-            }
-         }
-         for(size_t i=0;zip && i<count;++i) {
-            if(a[i].type!=1)continue;
-            if(manifest_string_attribute(a[i].key)) {
-               a[i].text=manifest_resource_string(&resources,a[i].value);
-               if(!a[i].text)goto done;
-            } else if(manifest_boolean_attribute(a[i].key)) {
-               struct registered_value value;
-               if(!manifest_resource_value(&resources,a[i].value,&value) || value.type<16 || value.type>31)goto done;
-               a[i].type=value.type;a[i].value=value.data;
-               snprintf(numbers[i],sizeof numbers[i],"%" PRIu32,value.data);
-               a[i].text=numbers[i];
-            }
-         }
-         if (!strcmp(tag, "manifest")) {
-            if (copy_text(m->package, sizeof m->package, attr_text(a, count, "package")) || copy_text(m->split, sizeof m->split, attr_text(a, count, "split")))
-               goto done;
-            if (copy_text(m->version_name, sizeof m->version_name, attr_text(a,count,"versionName")) ||
-                attr_number(m->version_code, sizeof m->version_code, a,count,"versionCode")) goto done;
-         } else if (!strcmp(tag, "application")) {
-            application_depth=depth;
-            if (class_name(m->application, sizeof m->application, m->package, attr_text(a, count, "name")) || attr_number(app_theme, sizeof app_theme, a, count, "theme"))
-               goto done;
-            const struct attr *v = attribute(a, count, "enabled");
-            if (v) app_enabled = attr_boolean(v);
-            v = attribute(a, count, "usesCleartextTraffic");
-            if (v) snprintf(m->cleartext, sizeof m->cleartext, "%d", attr_boolean(v));
-            if (attr_number(m->network_security, sizeof m->network_security, a, count, "networkSecurityConfig")) goto done;
-            v = attribute(a, count, "directBootAware");
-            if (v) app_boot = attr_boolean(v);
-            if (copy_text(app_permission, sizeof app_permission, attr_text(a, count, "permission")) ||
-                copy_text(app_process, sizeof app_process, attr_text(a, count, "process"))) goto done;
-            if (*app_process == ':') {
-               int n=snprintf(m->application_process,sizeof m->application_process,"%s%s",m->package,app_process);
-               if(n<0 || (size_t)n>=sizeof m->application_process)goto done;
-            } else if(copy_text(m->application_process,sizeof m->application_process,*app_process ? app_process : m->package))goto done;
-         } else if (!strcmp(tag, "receiver")) {
-            if (class_name(receiver, sizeof receiver, m->package, attr_text(a, count, "name"))) goto done;
-            const struct attr *v = attribute(a, count, "enabled");
-            enabled = v ? attr_boolean(v) : 1;
-            v = attribute(a, count, "exported");
-            exported = v ? attr_boolean(v) : -1;
-            v = attribute(a, count, "directBootAware");
-            boot = v ? attr_boolean(v) : app_boot;
-            v = attribute(a, count, "permission");
-            if (copy_text(permission, sizeof permission, v ? v->text : app_permission)) goto done;
-            v = attribute(a, count, "process");
-            const char *proc = v && *v->text ? v->text : app_process;
-            if (!*proc) proc = m->package;
-            if (*proc == ':') {
-               int n = snprintf(process, sizeof process, "%s%s", m->package, proc);
-               if (n < 0 || (size_t)n >= sizeof process) goto done;
-            } else if (copy_text(process, sizeof process, proc)) goto done;
-            receiver_depth = depth;
-            receiver_filter = false;
-            text_reset(&receiver_actions);
-         } else if (!strcmp(tag, "service")) {
-            if (class_name(service, sizeof service, m->package, attr_text(a, count, "name"))) goto done;
-            const struct attr *v = attribute(a, count, "enabled");
-            service_enabled = v ? attr_boolean(v) : 1;
-            v = attribute(a, count, "exported");
-            service_exported = v ? attr_boolean(v) : -1;
-            v = attribute(a, count, "process");
-            const char *proc = v && *v->text ? v->text : app_process;
-            if (!*proc) proc = m->package;
-            if (*proc == ':') {
-               int n = snprintf(service_process, sizeof service_process, "%s%s", m->package, proc);
-               if (n < 0 || (size_t)n >= sizeof service_process) goto done;
-            } else if (copy_text(service_process, sizeof service_process, proc)) goto done;
-            text_reset(&service_actions);
-            service_depth = depth;
-         } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
-            receiver_filter = true;
-            intent_depth = depth;
-            const struct attr *priority = attribute(a,count,"priority");
-            filter_priority=priority ? (int)strtol(priority->text,NULL,0) : 0;
-            filter_data=0;
-            text_reset(&filter_actions);text_reset(&filter_categories);text_reset(&filter_specs);
-         } else if (!strcmp(tag, "activity") || !strcmp(tag, "activity-alias")) {
-            const struct attr *pv=attribute(a,count,"process");
-            const char *proc=pv && *pv->text ? pv->text : m->application_process;
-            if(*proc==':'){
-               int n=snprintf(activity_process,sizeof activity_process,"%s%s",m->package,proc);
-               if(n<0 || (size_t)n>=sizeof activity_process)goto done;
-            } else if(copy_text(activity_process,sizeof activity_process,proc))goto done;
-            if (attr_number(changes, sizeof changes, a, count, "configChanges")) goto done;
-            if (copy_text(activity, sizeof activity, attr_text(a, count, "name")) || copy_text(target, sizeof target, attr_text(a, count, "targetActivity")) || attr_number(orient, sizeof orient, a, count, "screenOrientation") || attr_number(theme, sizeof theme, a, count, "theme"))
-               goto done;
-            const struct attr *av = attribute(a, count, "enabled");
-            activity_enabled = app_enabled && (!av || attr_boolean(av));
-            activity_depth = depth;
-            activity_launch = false;
-         } else if (!strcmp(tag, "intent-filter") && activity_depth >= 0) {
-            intent_depth = depth;
-            main = launcher = false;
-            const struct attr *priority = attribute(a, count, "priority");
-            filter_priority = priority ? (int)strtol(priority->text, NULL, 0) : 0;
-            filter_data = 0;
-            text_reset(&filter_actions); text_reset(&filter_categories); text_reset(&filter_specs);
-         } else if (!strcmp(tag, "action")) {
-            const char *v = attr_text(a, count, "name");
-            if (queries_depth >= 0 && text_append(&m->query_actions, v, ","))
-               goto done;
-            if (service_depth >= 0 && text_append(&service_actions, v, ","))
-               goto done;
-            if (receiver_depth >= 0 && text_append(&receiver_actions, v, ","))
-               goto done;
-            if (intent_depth >= 0 && text_append(&filter_actions, v, ",")) goto done;
-            if (intent_depth >= 0 && !strcmp(v, "android.intent.action.MAIN"))
-               main = true;
-         } else if (!strcmp(tag, "category") && intent_depth >= 0) {
-            const char *v = attr_text(a, count, "name");
-            if (text_append(&filter_categories, v, ",")) goto done;
-            if (!strcmp(v, "android.intent.category.LAUNCHER")) launcher = true;
-         } else if (!strcmp(tag, "data") && intent_depth >= 0) {
-            filter_data = 1;
-            /* One <data> element: its attributes as "key=value,..." with the
-             * separators percent-escaped; elements are joined by ';'. */
-            static const char *const keys[] = { "scheme", "host", "port", "path", "pathPrefix", "pathSuffix",
-                                                "pathPattern", "pathAdvancedPattern", "mimeType" };
-            struct text spec = {0};
-            for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
-               const struct attr *v = attribute(a, count, keys[k]);
-               if (!v || !*v->text) continue;
-               char item[1024], *w = item;
-               w += snprintf(w, sizeof item, "%s=", keys[k]);
-               for (const char *c = v->text; *c && (size_t)(w - item) + 4 < sizeof item; c++) {
-                  if (*c == '%' || *c == ',' || *c == ';' || *c == '|' || *c == '\n' || *c == '=')
-                     w += snprintf(w, 4, "%%%02X", (unsigned char)*c);
-                  else
-                     *w++ = *c;
-               }
-               *w = 0;
-               if (text_append(&spec, item, ",")) { text_free(&spec); goto done; }
-            }
-            if (*text_get(&spec) && text_append(&filter_specs, text_get(&spec), ";")) { text_free(&spec); goto done; }
-            text_free(&spec);
-         } else if (!strcmp(tag, "queries"))
-            queries_depth = depth;
-         else if (!strcmp(tag, "package") && queries_depth >= 0) {
-            if (text_append(&m->query_packages, attr_text(a, count, "name"), ","))
-               goto done;
-         } else if (!strcmp(tag, "provider") && queries_depth < 0) {
-            /* A <provider> inside <queries> only declares visibility of another
-             * app's provider (by authority); it is not a component of this one. */
-            const struct attr *pv=attribute(a,count,"process");
-            const char *proc=pv && *pv->text ? pv->text : m->application_process;
-            if(*proc==':'){
-               int n=snprintf(provider_process,sizeof provider_process,"%s%s",m->package,proc);
-               if(n<0 || (size_t)n>=sizeof provider_process)goto done;
-            } else if(copy_text(provider_process,sizeof provider_process,proc))goto done;
-            pv=attribute(a,count,"enabled");provider_enabled=app_enabled && (!pv || attr_boolean(pv));
-            pv=attribute(a,count,"grantUriPermissions");provider_grant=pv && attr_boolean(pv);
-            pv=attribute(a,count,"multiprocess");provider_multi=pv && attr_boolean(pv);
-            pv=attribute(a,count,"initOrder");
-            provider_order=pv ? (int32_t)(pv->type==3 ? strtol(pv->text,NULL,10) : pv->value) : 0;
-            char qualified[512];
-            if (class_name(qualified, sizeof qualified, m->package, attr_text(a, count, "name")))
-               goto done;
-            text_reset(&provider);
-            if (text_add_row(&provider, "", "%s|%s|", qualified, attr_text(a, count, "authorities")))
-               goto done;
-            provider_depth = depth;
-         } else if (!strcmp(tag, "meta-data") && service_depth >= 0) {
-            const struct attr *v = attribute(a, count, "resource");
-            if (v && text_add_row(&m->service_metadata, "\n", "%s|%s|%" PRIu32,
-                                  service, attr_text(a, count, "name"), v->value)) goto done;
-         } else if (!strcmp(tag, "meta-data") && provider_depth >= 0) {
-            const struct attr *v = attribute(a, count, "resource");
-            if (!v)
-               v = attribute(a, count, "value");
-            if (v) {
-               const size_t l = provider.n;
-               if (l && provider.s[l - 1] != '|' && text_append(&provider, ",", ""))
-                  goto done;
-               if (text_add_row(&provider, "", "%s~%s", attr_text(a, count, "name"), v->text))
-                  goto done;
-            }
-         } else if (!strcmp(tag, "uses-permission")) {
-            if (text_append(&m->permissions, attr_text(a, count, "name"), ","))
-               goto done;
-         } else if (!strcmp(tag,"uses-library") && application_depth>=0 && depth==application_depth+1) {
-            const char *name=attr_text(a,count,"name");
-            if(!*name || strchr(name,'\n') || strchr(name,'\r') || text_append(&m->libraries,name,"\n"))goto done;
-         } else if (!strcmp(tag, "uses-sdk")) {
-            if (attr_number(m->min_sdk, sizeof m->min_sdk, a, count, "minSdkVersion") || attr_number(m->target_sdk, sizeof m->target_sdk, a, count, "targetSdkVersion"))
-               goto done;
-         }
-      } else if (kind == 0x103) {
-         if(depth==application_depth)application_depth=-1;
-         if (len < 24 || depth <= 0)
-            goto done;
-         if (depth == intent_depth) {
-            char component[512];
-            if (class_name(component, sizeof component, m->package, receiver_depth>=0 ? receiver : activity)) goto done;
-            if (text_add_row(receiver_depth>=0 ? &m->receiver_filters : &m->activity_filters, "\n", "%s|%s|%s|%d|%d|%s", component,
-                             text_get(&filter_actions), text_get(&filter_categories), filter_data, filter_priority,
-                             text_get(&filter_specs)))
-               goto done;
-            if(receiver_depth<0)activity_launch |= main && launcher && !filter_data;
-            intent_depth = -1;
-         }
-         if (depth == activity_depth) {
-            char component[512], target_class[512] = "";
-            if (class_name(component, sizeof component, m->package, activity) ||
-                (*target && class_name(target_class, sizeof target_class, m->package, target))) goto done;
-            if (text_add_row(&m->activities, "\n", "%s|%s|%d", component, target_class, activity_enabled))
-               goto done;
-            if (activity_launch && activity_enabled && !*m->activity) {
-               if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
-                   copy_text(m->activity_process,sizeof m->activity_process,activity_process)) goto done;
-               if (class_name(m->activity, sizeof m->activity, m->package, *target ? target : activity) || copy_text(m->orientation, sizeof m->orientation, orient) || copy_text(m->theme, sizeof m->theme, *theme ? theme : app_theme))
-                  goto done;
-            }
-            activity_depth = -1;
-         }
-         if (depth == receiver_depth) {
-            if (text_add_row(&m->receivers, ";", "%s|%d|%d|%d|%d|%s|%s|%s", receiver,
-                             enabled, app_enabled, exported < 0 ? receiver_filter : exported,
-                             boot, permission, process, text_get(&receiver_actions)))
-               goto done;
-            receiver_depth = -1;
-         }
-         if (depth == service_depth) {
-            if (text_add_row(&m->services, ";", "%s|%d|%d|%s|%s", service, service_enabled && app_enabled,
-                             service_exported, text_get(&service_actions), service_process))
-               goto done;
-            service_depth = -1;
-         }
-         if (depth == provider_depth) {
-            if(text_add_row(&provider,"","|%s|%d|%d|%d|%d",provider_process,
-                            provider_enabled,provider_order,provider_grant,provider_multi))goto done;
-            if(!m->providers.n && text_append(&m->providers,"!2\n",""))goto done;
-            if (text_append(&m->providers, text_get(&provider),
-                            !strcmp(text_get(&m->providers),"!2\n") ? "" : "\n"))goto done;
-            provider_depth = -1;
-         }
-         if (depth == queries_depth)
-            queries_depth = -1;
-         depth--;
+          a[i].text = axml_string(&x, value);
+        } else if (raw < x.count)
+          a[i].text = axml_string(&x, raw);
+        else {
+          snprintf(numbers[i], sizeof numbers[i], "%" PRIu32, value);
+          a[i].text = numbers[i];
+        }
       }
-      at += len;
-   }
-   if (!depth && package_valid(m->package))
-      result = 0;
+      for(size_t i=0; zip && i<count; ++i) {
+        if(a[i].type!=1)continue;
+        if(manifest_string_attribute(a[i].key)) {
+          a[i].text=manifest_resource_string(&resources,a[i].value);
+          if(!a[i].text)goto done;
+        } else if(manifest_boolean_attribute(a[i].key)) {
+          struct registered_value value;
+          if(!manifest_resource_value(&resources,a[i].value,&value) || value.type<16 || value.type>31)goto done;
+          a[i].type=value.type;
+          a[i].value=value.data;
+          snprintf(numbers[i],sizeof numbers[i],"%" PRIu32,value.data);
+          a[i].text=numbers[i];
+        }
+      }
+      if (!strcmp(tag, "manifest")) {
+        if (copy_text(m->package, sizeof m->package, attr_text(a, count, "package")) || copy_text(m->split, sizeof m->split, attr_text(a, count, "split")))
+          goto done;
+        if (copy_text(m->version_name, sizeof m->version_name, attr_text(a,count,"versionName")) ||
+            attr_number(m->version_code, sizeof m->version_code, a,count,"versionCode")) goto done;
+      } else if (!strcmp(tag, "application")) {
+        application_depth=depth;
+        if (class_name(m->application, sizeof m->application, m->package, attr_text(a, count, "name")) || attr_number(app_theme, sizeof app_theme, a, count, "theme"))
+          goto done;
+        const struct attr *v = attribute(a, count, "enabled");
+        if (v) app_enabled = attr_boolean(v);
+        v = attribute(a, count, "usesCleartextTraffic");
+        if (v) snprintf(m->cleartext, sizeof m->cleartext, "%d", attr_boolean(v));
+        if (attr_number(m->network_security, sizeof m->network_security, a, count, "networkSecurityConfig")) goto done;
+        v = attribute(a, count, "directBootAware");
+        if (v) app_boot = attr_boolean(v);
+        if (copy_text(app_permission, sizeof app_permission, attr_text(a, count, "permission")) ||
+            copy_text(app_process, sizeof app_process, attr_text(a, count, "process"))) goto done;
+        if (*app_process == ':') {
+          int n=snprintf(m->application_process,sizeof m->application_process,"%s%s",m->package,app_process);
+          if(n<0 || (size_t)n>=sizeof m->application_process)goto done;
+        } else if(copy_text(m->application_process,sizeof m->application_process,*app_process ? app_process : m->package))goto done;
+      } else if (!strcmp(tag, "receiver")) {
+        if (class_name(receiver, sizeof receiver, m->package, attr_text(a, count, "name"))) goto done;
+        const struct attr *v = attribute(a, count, "enabled");
+        enabled = v ? attr_boolean(v) : 1;
+        v = attribute(a, count, "exported");
+        exported = v ? attr_boolean(v) : -1;
+        v = attribute(a, count, "directBootAware");
+        boot = v ? attr_boolean(v) : app_boot;
+        v = attribute(a, count, "permission");
+        if (copy_text(permission, sizeof permission, v ? v->text : app_permission)) goto done;
+        v = attribute(a, count, "process");
+        const char *proc = v && *v->text ? v->text : app_process;
+        if (!*proc) proc = m->package;
+        if (*proc == ':') {
+          int n = snprintf(process, sizeof process, "%s%s", m->package, proc);
+          if (n < 0 || (size_t)n >= sizeof process) goto done;
+        } else if (copy_text(process, sizeof process, proc)) goto done;
+        receiver_depth = depth;
+        receiver_filter = false;
+        text_reset(&receiver_actions);
+      } else if (!strcmp(tag, "service")) {
+        if (class_name(service, sizeof service, m->package, attr_text(a, count, "name"))) goto done;
+        const struct attr *v = attribute(a, count, "enabled");
+        service_enabled = v ? attr_boolean(v) : 1;
+        v = attribute(a, count, "exported");
+        service_exported = v ? attr_boolean(v) : -1;
+        v = attribute(a, count, "process");
+        const char *proc = v && *v->text ? v->text : app_process;
+        if (!*proc) proc = m->package;
+        if (*proc == ':') {
+          int n = snprintf(service_process, sizeof service_process, "%s%s", m->package, proc);
+          if (n < 0 || (size_t)n >= sizeof service_process) goto done;
+        } else if (copy_text(service_process, sizeof service_process, proc)) goto done;
+        text_reset(&service_actions);
+        service_depth = depth;
+      } else if (!strcmp(tag, "intent-filter") && receiver_depth >= 0) {
+        receiver_filter = true;
+        intent_depth = depth;
+        const struct attr *priority = attribute(a,count,"priority");
+        filter_priority=priority ? (int)strtol(priority->text,NULL,0) : 0;
+        filter_data=0;
+        text_reset(&filter_actions);
+        text_reset(&filter_categories);
+        text_reset(&filter_specs);
+      } else if (!strcmp(tag, "activity") || !strcmp(tag, "activity-alias")) {
+        const struct attr *pv=attribute(a,count,"process");
+        const char *proc=pv && *pv->text ? pv->text : m->application_process;
+        if(*proc==':') {
+          int n=snprintf(activity_process,sizeof activity_process,"%s%s",m->package,proc);
+          if(n<0 || (size_t)n>=sizeof activity_process)goto done;
+        } else if(copy_text(activity_process,sizeof activity_process,proc))goto done;
+        if (attr_number(changes, sizeof changes, a, count, "configChanges")) goto done;
+        if (copy_text(activity, sizeof activity, attr_text(a, count, "name")) || copy_text(target, sizeof target, attr_text(a, count, "targetActivity")) || attr_number(orient, sizeof orient, a, count, "screenOrientation") || attr_number(theme, sizeof theme, a, count, "theme"))
+          goto done;
+        const struct attr *av = attribute(a, count, "enabled");
+        activity_enabled = app_enabled && (!av || attr_boolean(av));
+        activity_depth = depth;
+        activity_launch = false;
+      } else if (!strcmp(tag, "intent-filter") && activity_depth >= 0) {
+        intent_depth = depth;
+        main = launcher = false;
+        const struct attr *priority = attribute(a, count, "priority");
+        filter_priority = priority ? (int)strtol(priority->text, NULL, 0) : 0;
+        filter_data = 0;
+        text_reset(&filter_actions);
+        text_reset(&filter_categories);
+        text_reset(&filter_specs);
+      } else if (!strcmp(tag, "action")) {
+        const char *v = attr_text(a, count, "name");
+        if (queries_depth >= 0 && text_append(&m->query_actions, v, ","))
+          goto done;
+        if (service_depth >= 0 && text_append(&service_actions, v, ","))
+          goto done;
+        if (receiver_depth >= 0 && text_append(&receiver_actions, v, ","))
+          goto done;
+        if (intent_depth >= 0 && text_append(&filter_actions, v, ",")) goto done;
+        if (intent_depth >= 0 && !strcmp(v, "android.intent.action.MAIN"))
+          main = true;
+      } else if (!strcmp(tag, "category") && intent_depth >= 0) {
+        const char *v = attr_text(a, count, "name");
+        if (text_append(&filter_categories, v, ",")) goto done;
+        if (!strcmp(v, "android.intent.category.LAUNCHER")) launcher = true;
+      } else if (!strcmp(tag, "data") && intent_depth >= 0) {
+        filter_data = 1;
+        /* One <data> element: its attributes as "key=value,..." with the
+         * separators percent-escaped; elements are joined by ';'. */
+        static const char *const keys[] = { "scheme", "host", "port", "path", "pathPrefix", "pathSuffix",
+                                            "pathPattern", "pathAdvancedPattern", "mimeType"
+                                          };
+        struct text spec = {0};
+        for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++) {
+          const struct attr *v = attribute(a, count, keys[k]);
+          if (!v || !*v->text) continue;
+          char item[1024], *w = item;
+          w += snprintf(w, sizeof item, "%s=", keys[k]);
+          for (const char *c = v->text; *c && (size_t)(w - item) + 4 < sizeof item; c++) {
+            if (*c == '%' || *c == ',' || *c == ';' || *c == '|' || *c == '\n' || *c == '=')
+              w += snprintf(w, 4, "%%%02X", (unsigned char)*c);
+            else
+              *w++ = *c;
+          }
+          *w = 0;
+          if (text_append(&spec, item, ",")) {
+            text_free(&spec);
+            goto done;
+          }
+        }
+        if (*text_get(&spec) && text_append(&filter_specs, text_get(&spec), ";")) {
+          text_free(&spec);
+          goto done;
+        }
+        text_free(&spec);
+      } else if (!strcmp(tag, "queries"))
+        queries_depth = depth;
+      else if (!strcmp(tag, "package") && queries_depth >= 0) {
+        if (text_append(&m->query_packages, attr_text(a, count, "name"), ","))
+          goto done;
+      } else if (!strcmp(tag, "provider") && queries_depth < 0) {
+        /* A <provider> inside <queries> only declares visibility of another
+         * app's provider (by authority); it is not a component of this one. */
+        const struct attr *pv=attribute(a,count,"process");
+        const char *proc=pv && *pv->text ? pv->text : m->application_process;
+        if(*proc==':') {
+          int n=snprintf(provider_process,sizeof provider_process,"%s%s",m->package,proc);
+          if(n<0 || (size_t)n>=sizeof provider_process)goto done;
+        } else if(copy_text(provider_process,sizeof provider_process,proc))goto done;
+        pv=attribute(a,count,"enabled");
+        provider_enabled=app_enabled && (!pv || attr_boolean(pv));
+        pv=attribute(a,count,"grantUriPermissions");
+        provider_grant=pv && attr_boolean(pv);
+        pv=attribute(a,count,"multiprocess");
+        provider_multi=pv && attr_boolean(pv);
+        pv=attribute(a,count,"initOrder");
+        provider_order=pv ? (int32_t)(pv->type==3 ? strtol(pv->text,NULL,10) : pv->value) : 0;
+        char qualified[512];
+        if (class_name(qualified, sizeof qualified, m->package, attr_text(a, count, "name")))
+          goto done;
+        text_reset(&provider);
+        if (text_add_row(&provider, "", "%s|%s|", qualified, attr_text(a, count, "authorities")))
+          goto done;
+        provider_depth = depth;
+      } else if (!strcmp(tag, "meta-data") && service_depth >= 0) {
+        const struct attr *v = attribute(a, count, "resource");
+        if (v && text_add_row(&m->service_metadata, "\n", "%s|%s|%" PRIu32,
+                              service, attr_text(a, count, "name"), v->value)) goto done;
+      } else if (!strcmp(tag, "meta-data") && provider_depth >= 0) {
+        const struct attr *v = attribute(a, count, "resource");
+        if (!v)
+          v = attribute(a, count, "value");
+        if (v) {
+          const size_t l = provider.n;
+          if (l && provider.s[l - 1] != '|' && text_append(&provider, ",", ""))
+            goto done;
+          if (text_add_row(&provider, "", "%s~%s", attr_text(a, count, "name"), v->text))
+            goto done;
+        }
+      } else if (!strcmp(tag, "uses-permission")) {
+        if (text_append(&m->permissions, attr_text(a, count, "name"), ","))
+          goto done;
+      } else if (!strcmp(tag,"uses-library") && application_depth>=0 && depth==application_depth+1) {
+        const char *name=attr_text(a,count,"name");
+        if(!*name || strchr(name,'\n') || strchr(name,'\r') || text_append(&m->libraries,name,"\n"))goto done;
+      } else if (!strcmp(tag, "uses-sdk")) {
+        if (attr_number(m->min_sdk, sizeof m->min_sdk, a, count, "minSdkVersion") || attr_number(m->target_sdk, sizeof m->target_sdk, a, count, "targetSdkVersion"))
+          goto done;
+      }
+    } else if (kind == 0x103) {
+      if(depth==application_depth)application_depth=-1;
+      if (len < 24 || depth <= 0)
+        goto done;
+      if (depth == intent_depth) {
+        char component[512];
+        if (class_name(component, sizeof component, m->package, receiver_depth>=0 ? receiver : activity)) goto done;
+        if (text_add_row(receiver_depth>=0 ? &m->receiver_filters : &m->activity_filters, "\n", "%s|%s|%s|%d|%d|%s", component,
+                         text_get(&filter_actions), text_get(&filter_categories), filter_data, filter_priority,
+                         text_get(&filter_specs)))
+          goto done;
+        if(receiver_depth<0)activity_launch |= main && launcher && !filter_data;
+        intent_depth = -1;
+      }
+      if (depth == activity_depth) {
+        char component[512], target_class[512] = "";
+        if (class_name(component, sizeof component, m->package, activity) ||
+            (*target && class_name(target_class, sizeof target_class, m->package, target))) goto done;
+        if (text_add_row(&m->activities, "\n", "%s|%s|%d", component, target_class, activity_enabled))
+          goto done;
+        if (activity_launch && activity_enabled && !*m->activity) {
+          if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
+              copy_text(m->activity_process,sizeof m->activity_process,activity_process)) goto done;
+          if (class_name(m->activity, sizeof m->activity, m->package, *target ? target : activity) || copy_text(m->orientation, sizeof m->orientation, orient) || copy_text(m->theme, sizeof m->theme, *theme ? theme : app_theme))
+            goto done;
+        }
+        activity_depth = -1;
+      }
+      if (depth == receiver_depth) {
+        if (text_add_row(&m->receivers, ";", "%s|%d|%d|%d|%d|%s|%s|%s", receiver,
+                         enabled, app_enabled, exported < 0 ? receiver_filter : exported,
+                         boot, permission, process, text_get(&receiver_actions)))
+          goto done;
+        receiver_depth = -1;
+      }
+      if (depth == service_depth) {
+        if (text_add_row(&m->services, ";", "%s|%d|%d|%s|%s", service, service_enabled && app_enabled,
+                         service_exported, text_get(&service_actions), service_process))
+          goto done;
+        service_depth = -1;
+      }
+      if (depth == provider_depth) {
+        if(text_add_row(&provider,"","|%s|%d|%d|%d|%d",provider_process,
+                        provider_enabled,provider_order,provider_grant,provider_multi))goto done;
+        if(!m->providers.n && text_append(&m->providers,"!2\n",""))goto done;
+        if (text_append(&m->providers, text_get(&provider),
+                        !strcmp(text_get(&m->providers),"!2\n") ? "" : "\n"))goto done;
+        provider_depth = -1;
+      }
+      if (depth == queries_depth)
+        queries_depth = -1;
+      depth--;
+    }
+    at += len;
+  }
+  if (!depth && package_valid(m->package))
+    result = 0;
 done:
-   text_free(&provider); text_free(&filter_actions); text_free(&filter_categories); text_free(&filter_specs); text_free(&service_actions); text_free(&receiver_actions);
-   axml_free(&resources.values);free(resources.table);
-   axml_free(&x);
-   return result ? apk_error("invalid Android manifest") : 0;
+  text_free(&provider);
+  text_free(&filter_actions);
+  text_free(&filter_categories);
+  text_free(&filter_specs);
+  text_free(&service_actions);
+  text_free(&receiver_actions);
+  axml_free(&resources.values);
+  free(resources.table);
+  axml_free(&x);
+  return result ? apk_error("invalid Android manifest") : 0;
 }
 /* App Bundle manifests use the XmlNode protobuf rather than APK AXML.
  * Translate element events into the same bounded parser used for APKs. */
-struct pb { const unsigned char *p; size_t n; };
-struct pb_field { unsigned number, wire; uint64_t value; struct pb bytes; };
+struct pb {
+  const unsigned char *p;
+  size_t n;
+};
+struct pb_field {
+  unsigned number, wire;
+  uint64_t value;
+  struct pb bytes;
+};
 static int pb_varint(struct pb *p, uint64_t *v)
 {
-   *v = 0;
-   for (unsigned shift = 0; shift < 70; shift += 7) {
-      if (!p->n) return -1;
-      unsigned c = *p->p++; p->n--;
-      if (shift == 63 && c > 1) return -1;
-      *v |= (uint64_t)(c & 127) << shift;
-      if (!(c & 128)) return 0;
-   }
-   return -1;
+  *v = 0;
+  for (unsigned shift = 0; shift < 70; shift += 7) {
+    if (!p->n) return -1;
+    unsigned c = *p->p++;
+    p->n--;
+    if (shift == 63 && c > 1) return -1;
+    *v |= (uint64_t)(c & 127) << shift;
+    if (!(c & 128)) return 0;
+  }
+  return -1;
 }
 static int pb_next(struct pb *p, struct pb_field *f)
 {
-   uint64_t key, len;
-   memset(f, 0, sizeof *f);
-   if (pb_varint(p, &key) || !(key >> 3) || key >> 3 > 0x1fffffff) return -1;
-   f->number = key >> 3; f->wire = key & 7;
-   if (f->wire == 0) return pb_varint(p, &f->value);
-   if (f->wire == 2) {
-      if (pb_varint(p, &len) || len > p->n) return -1;
-   } else if (f->wire == 1) len = 8;
-   else if (f->wire == 5) len = 4;
-   else return -1;
-   if (len > p->n) return -1;
-   f->bytes = (struct pb){p->p, (size_t)len};
-   p->p += len; p->n -= len;
-   return 0;
+  uint64_t key, len;
+  memset(f, 0, sizeof *f);
+  if (pb_varint(p, &key) || !(key >> 3) || key >> 3 > 0x1fffffff) return -1;
+  f->number = key >> 3;
+  f->wire = key & 7;
+  if (f->wire == 0) return pb_varint(p, &f->value);
+  if (f->wire == 2) {
+    if (pb_varint(p, &len) || len > p->n) return -1;
+  } else if (f->wire == 1) len = 8;
+  else if (f->wire == 5) len = 4;
+  else return -1;
+  if (len > p->n) return -1;
+  f->bytes = (struct pb) {
+    p->p, (size_t)len
+  };
+  p->p += len;
+  p->n -= len;
+  return 0;
 }
-struct bundle_xml { struct axml strings; unsigned char *events; size_t size, cap; };
+struct bundle_xml {
+  struct axml strings;
+  unsigned char *events;
+  size_t size, cap;
+};
 static int bundle_string(struct bundle_xml *b, struct pb p, uint32_t *index)
 {
-   if (p.n > APK_MAX_MANIFEST || memchr(p.p, 0, p.n) || b->strings.count >= 65535) return -1;
-   char *s = malloc(p.n + 1);
-   if (!s) return -1;
-   memcpy(s, p.p, p.n); s[p.n] = 0;
-   char **strings = realloc(b->strings.strings, (b->strings.count + 1) * sizeof(*strings));
-   if (!strings) { free(s); return -1; }
-   b->strings.strings = strings;
-   *index = b->strings.count;
-   strings[b->strings.count++] = s;
-   return 0;
+  if (p.n > APK_MAX_MANIFEST || memchr(p.p, 0, p.n) || b->strings.count >= 65535) return -1;
+  char *s = malloc(p.n + 1);
+  if (!s) return -1;
+  memcpy(s, p.p, p.n);
+  s[p.n] = 0;
+  char **strings = realloc(b->strings.strings, (b->strings.count + 1) * sizeof(*strings));
+  if (!strings) {
+    free(s);
+    return -1;
+  }
+  b->strings.strings = strings;
+  *index = b->strings.count;
+  strings[b->strings.count++] = s;
+  return 0;
 }
 static void put32(unsigned char *p, uint32_t v)
 {
-   for (unsigned i = 0; i < 4; i++) p[i] = v >> (8 * i);
+  for (unsigned i = 0; i < 4; i++) p[i] = v >> (8 * i);
 }
 static int bundle_event(struct bundle_xml *b, const unsigned char *p, size_t n)
 {
-   if (n > APK_MAX_MANIFEST - b->size) return -1;
-   if (b->size + n > b->cap) {
-      size_t cap = (b->size + n) * 2;
-      unsigned char *events = realloc(b->events, cap);
-      if (!events) return -1;
-      b->events = events; b->cap = cap;
-   }
-   memcpy(b->events + b->size, p, n); b->size += n;
-   return 0;
+  if (n > APK_MAX_MANIFEST - b->size) return -1;
+  if (b->size + n > b->cap) {
+    size_t cap = (b->size + n) * 2;
+    unsigned char *events = realloc(b->events, cap);
+    if (!events) return -1;
+    b->events = events;
+    b->cap = cap;
+  }
+  memcpy(b->events + b->size, p, n);
+  b->size += n;
+  return 0;
 }
 static int bundle_node(struct bundle_xml *b, struct pb node, unsigned depth)
 {
-   if (depth > 128) return -1;
-   struct pb_field f;
-   struct pb element = {0};
-   while (node.n) {
-      if (pb_next(&node, &f)) return -1;
-      if (f.number == 1 && f.wire == 2) element = f.bytes;
-   }
-   if (!element.p) return 0; /* Text and source positions. */
-   struct pb scan = element;
-   uint32_t name = UINT32_MAX;
-   unsigned char start[36 + 1024 * 20] = {0};
-   size_t count = 0;
-   while (scan.n) {
-      if (pb_next(&scan, &f)) return -1;
-      if (f.number == 3 && f.wire == 2) {
-         if (bundle_string(b, f.bytes, &name)) return -1;
-      } else if (f.number == 4 && f.wire == 2) {
-         if (count >= 1024) return -1;
-         struct pb attr = f.bytes, key = {0}, text = {(const unsigned char *)"", 0}, item = {0};
-         while (attr.n) {
-            struct pb_field a;
-            if (pb_next(&attr, &a)) return -1;
-            if (a.wire != 2) continue;
-            if (a.number == 2) key = a.bytes;
-            if (a.number == 3) text = a.bytes;
-            if (a.number == 6) item = a.bytes;
-         }
-         if (!key.p) return -1;
-         uint32_t ki, vi;
-         if (bundle_string(b, key, &ki) || bundle_string(b, text, &vi)) return -1;
-         unsigned char *a = start + 36 + count++ * 20;
-         put32(a, UINT32_MAX); put32(a + 4, ki); put32(a + 8, vi);
-         a[12] = 8; a[15] = 3; put32(a + 16, vi);
-         /* Compiled references and enum/integer primitives override raw text. */
-         while (item.n) {
-            struct pb_field v;
-            if (pb_next(&item, &v)) return -1;
-            if (v.wire != 2 || (v.number != 1 && v.number != 7)) continue;
-            struct pb value = v.bytes;
-            while (value.n) {
-               struct pb_field number;
-               if (pb_next(&value, &number)) return -1;
-               if (number.wire == 0 && ((v.number == 1 && number.number == 2) ||
-                   (v.number == 7 && (number.number == 6 || number.number == 7 || number.number == 8)))) {
-                  a[15] = v.number == 1 ? 1 : 0x10;
-                  put32(a + 16, (uint32_t)number.value);
-               }
-            }
-         }
+  if (depth > 128) return -1;
+  struct pb_field f;
+  struct pb element = {0};
+  while (node.n) {
+    if (pb_next(&node, &f)) return -1;
+    if (f.number == 1 && f.wire == 2) element = f.bytes;
+  }
+  if (!element.p) return 0; /* Text and source positions. */
+  struct pb scan = element;
+  uint32_t name = UINT32_MAX;
+  unsigned char start[36 + 1024 * 20] = {0};
+  size_t count = 0;
+  while (scan.n) {
+    if (pb_next(&scan, &f)) return -1;
+    if (f.number == 3 && f.wire == 2) {
+      if (bundle_string(b, f.bytes, &name)) return -1;
+    } else if (f.number == 4 && f.wire == 2) {
+      if (count >= 1024) return -1;
+      struct pb attr = f.bytes, key = {0}, text = {(const unsigned char *)"", 0}, item = {0};
+      while (attr.n) {
+        struct pb_field a;
+        if (pb_next(&attr, &a)) return -1;
+        if (a.wire != 2) continue;
+        if (a.number == 2) key = a.bytes;
+        if (a.number == 3) text = a.bytes;
+        if (a.number == 6) item = a.bytes;
       }
-   }
-   if (name == UINT32_MAX) return -1;
-   start[0] = 2; start[1] = 1; start[2] = 16;
-   put32(start + 4, 36 + count * 20); put32(start + 20, name);
-   start[24] = start[26] = 20; start[28] = count; start[29] = count >> 8;
-   if (bundle_event(b, start, 36 + count * 20)) return -1;
-   scan = element;
-   while (scan.n) {
-      if (pb_next(&scan, &f)) return -1;
-      if (f.number == 5 && f.wire == 2 && bundle_node(b, f.bytes, depth + 1)) return -1;
-   }
-   unsigned char end[24] = {3, 1, 16, 0, 24};
-   put32(end + 20, name);
-   return bundle_event(b, end, sizeof end);
+      if (!key.p) return -1;
+      uint32_t ki, vi;
+      if (bundle_string(b, key, &ki) || bundle_string(b, text, &vi)) return -1;
+      unsigned char *a = start + 36 + count++ * 20;
+      put32(a, UINT32_MAX);
+      put32(a + 4, ki);
+      put32(a + 8, vi);
+      a[12] = 8;
+      a[15] = 3;
+      put32(a + 16, vi);
+      /* Compiled references and enum/integer primitives override raw text. */
+      while (item.n) {
+        struct pb_field v;
+        if (pb_next(&item, &v)) return -1;
+        if (v.wire != 2 || (v.number != 1 && v.number != 7)) continue;
+        struct pb value = v.bytes;
+        while (value.n) {
+          struct pb_field number;
+          if (pb_next(&value, &number)) return -1;
+          if (number.wire == 0 && ((v.number == 1 && number.number == 2) ||
+                                   (v.number == 7 && (number.number == 6 || number.number == 7 || number.number == 8)))) {
+            a[15] = v.number == 1 ? 1 : 0x10;
+            put32(a + 16, (uint32_t)number.value);
+          }
+        }
+      }
+    }
+  }
+  if (name == UINT32_MAX) return -1;
+  start[0] = 2;
+  start[1] = 1;
+  start[2] = 16;
+  put32(start + 4, 36 + count * 20);
+  put32(start + 20, name);
+  start[24] = start[26] = 20;
+  start[28] = count;
+  start[29] = count >> 8;
+  if (bundle_event(b, start, 36 + count * 20)) return -1;
+  scan = element;
+  while (scan.n) {
+    if (pb_next(&scan, &f)) return -1;
+    if (f.number == 5 && f.wire == 2 && bundle_node(b, f.bytes, depth + 1)) return -1;
+  }
+  unsigned char end[24] = {3, 1, 16, 0, 24};
+  put32(end + 20, name);
+  return bundle_event(b, end, sizeof end);
 }
 static int parse_manifest_with_zip(const unsigned char *data, size_t size, struct manifest *m, struct zip *zip)
 {
-   if (size < 8 || le32(data) != 0x00080003 || le32(data + 4) < 8 || le32(data + 4) > size)
-      return apk_error("APK needs a binary AndroidManifest.xml");
-   return parse_manifest_events(data + 8, le32(data + 4) - 8, m, (struct axml){0}, zip);
+  if (size < 8 || le32(data) != 0x00080003 || le32(data + 4) < 8 || le32(data + 4) > size)
+    return apk_error("APK needs a binary AndroidManifest.xml");
+  return parse_manifest_events(data + 8, le32(data + 4) - 8, m, (struct axml) {
+    0
+  }, zip);
 }
 static int parse_manifest(const unsigned char *data,size_t size,struct manifest *m)
-{ return parse_manifest_with_zip(data,size,m,NULL); }
+{
+  return parse_manifest_with_zip(data,size,m,NULL);
+}
 static int parse_bundle_manifest(const unsigned char *data, size_t size, struct manifest *m)
 {
-   struct bundle_xml b = {0};
-   int r = bundle_node(&b, (struct pb){data, size}, 0);
-   if (!r) r = parse_manifest_events(b.events, b.size, m, b.strings, NULL);
-   else { axml_free(&b.strings); apk_error("invalid Bundle manifest"); }
-   free(b.events);
-   return r;
+  struct bundle_xml b = {0};
+  int r = bundle_node(&b, (struct pb) {
+    data, size
+  }, 0);
+  if (!r) r = parse_manifest_events(b.events, b.size, m, b.strings, NULL);
+  else {
+    axml_free(&b.strings);
+    apk_error("invalid Bundle manifest");
+  }
+  free(b.events);
+  return r;
 }
 static int manifest_zip(struct zip *z, struct manifest *m)
 {
-   size_t n = 0;
-   unsigned char *data = zip_memory(z, "AndroidManifest.xml", &n);
-   bool bundle = !data && zip_find(z, "BundleConfig.pb");
-   if (bundle) data = zip_memory(z, "base/manifest/AndroidManifest.xml", &n);
-   if (!data)
-      return apk_error("missing APK manifest");
-   int r = bundle ? parse_bundle_manifest(data, n, m) : parse_manifest_with_zip(data, n, m, z);
-   free(data);
-   return r;
+  size_t n = 0;
+  unsigned char *data = zip_memory(z, "AndroidManifest.xml", &n);
+  bool bundle = !data && zip_find(z, "BundleConfig.pb");
+  if (bundle) data = zip_memory(z, "base/manifest/AndroidManifest.xml", &n);
+  if (!data)
+    return apk_error("missing APK manifest");
+  int r = bundle ? parse_bundle_manifest(data, n, m) : parse_manifest_with_zip(data, n, m, z);
+  free(data);
+  return r;
 }
 
 int luna_apk_package_version(const char *apk, const char *package, int *code,
-                              char *name, size_t cap, int *target_sdk)
+                             char *name, size_t cap, int *target_sdk)
 {
-   struct zip zip = {0};
-   struct manifest *m = calloc(1, sizeof *m);
-   int result = -1;
-   if (!apk || !package || !code || !name || !cap || !target_sdk || !m ||
-       zip_open(&zip, apk) || manifest_zip(&zip,m) || strcmp(package,m->package)) goto done;
-   char *end = NULL;
-   errno = 0;
-   unsigned long long value = *m->version_code ? strtoull(m->version_code,&end,10) : 0;
-   if (errno || value > UINT32_MAX || (end && *end) || copy_text(name,cap,m->version_name)) goto done;
-   *code = (int32_t)(uint32_t)value;
-   *target_sdk = *m->target_sdk ? atoi(m->target_sdk) : *m->min_sdk ? atoi(m->min_sdk) : 1;
-   result = 1;
+  struct zip zip = {0};
+  struct manifest *m = calloc(1, sizeof *m);
+  int result = -1;
+  if (!apk || !package || !code || !name || !cap || !target_sdk || !m ||
+      zip_open(&zip, apk) || manifest_zip(&zip,m) || strcmp(package,m->package)) goto done;
+  char *end = NULL;
+  errno = 0;
+  unsigned long long value = *m->version_code ? strtoull(m->version_code,&end,10) : 0;
+  if (errno || value > UINT32_MAX || (end && *end) || copy_text(name,cap,m->version_name)) goto done;
+  *code = (int32_t)(uint32_t)value;
+  *target_sdk = *m->target_sdk ? atoi(m->target_sdk) : *m->min_sdk ? atoi(m->min_sdk) : 1;
+  result = 1;
 done:
-   manifest_free(m); zip_close(&zip);
-   return result;
+  manifest_free(m);
+  zip_close(&zip);
+  return result;
 }
 /* MPL-2.0. RegisteredServicesCache metadata from installed, unmodified APKs.
  * Included by apk.c so ZIP, binary XML and string-pool readers are shared. */
@@ -1227,420 +1337,490 @@ done:
  * default resource, with the best supported SDK qualifier. Resource aliases,
  * sparse/16-bit offsets and compact entries use the Android table formats. */
 static bool registered_resource(const unsigned char *table, size_t size, uint32_t id,
-                                  unsigned sdk, struct registered_value *out)
+                                unsigned sdk, struct registered_value *out)
 {
-   int best = -1;
-   if (size < 12 || le16(table) != 2 || le32(table + 4) > size) return false;
-   size = le32(table + 4);
-   for (size_t at = le16(table + 2); at + 8 <= size;) {
-      const unsigned char *pkg = table + at;
-      size_t length = le32(pkg + 4), header = le16(pkg + 2);
-      if (length < header || header < 8 || length > size - at) return false;
-      if (le16(pkg) == 0x200 && header >= 284 && le32(pkg + 8) == (id >> 24)) {
-         unsigned type_offset = header >= 288 ? le32(pkg + 284) : 0;
-         for (size_t pos = header; pos + 8 <= length;) {
-            const unsigned char *type = pkg + pos;
-            size_t n = le32(type + 4), h = le16(type + 2);
-            if (h < 8 || n < h || n > length - pos) return false;
-            if (le16(type) == 0x201 && h >= 48 && type[8] + type_offset == ((id >> 16) & 255)) {
-               uint32_t count = le32(type + 12), start = le32(type + 16), config = le32(type + 20);
-               if (config < 28 || config > h - 20 || start < h || start > n) return false;
-               bool match = true;
-               for (unsigned k = 4; k < config; ++k)
-                  if ((k < 24 || k >= 28) && type[20 + k]) match = false;
-               unsigned version = le16(type + 44);
-               if (le16(type + 46) || version > sdk) match = false;
-               uint32_t index = id & 65535, offset = UINT32_MAX;
-               if (match && (int)version >= best) {
-                  if (type[9] & 1) {
-                     if (count > (start - h) / 4) return false;
-                     for (uint32_t k = 0; k < count; ++k)
-                        if (le16(type + h + 4*k) == index) { offset = (uint32_t)le16(type + h + 4*k + 2) * 4; break; }
-                  } else if (index < count) {
-                     unsigned width = (type[9] & 2) ? 2 : 4;
-                     if (count > (start - h) / width) return false;
-                     offset = width == 2 ? le16(type + h + index*2) : le32(type + h + index*4);
-                     if (width == 2) offset = offset == 65535 ? UINT32_MAX : offset * 4;
-                  }
-                  if (offset != UINT32_MAX) {
-                     if (offset > n - start || n - start - offset < 8) return false;
-                     const unsigned char *entry = type + start + offset;
-                     size_t remaining = n - start - offset;
-                     uint16_t flags = le16(entry + 2), entry_size = le16(entry);
-                     if (!(flags & 1)) {
-                        if (flags & 8) { out->type = flags >> 8; out->data = le32(entry + 4); }
-                        else {
-                           if (entry_size < 8 || entry_size > remaining || remaining - entry_size < 8) return false;
-                           out->type = entry[entry_size + 3]; out->data = le32(entry + entry_size + 4);
-                        }
-                        best = (int)version;
-                     }
-                  }
-               }
+  int best = -1;
+  if (size < 12 || le16(table) != 2 || le32(table + 4) > size) return false;
+  size = le32(table + 4);
+  for (size_t at = le16(table + 2); at + 8 <= size;) {
+    const unsigned char *pkg = table + at;
+    size_t length = le32(pkg + 4), header = le16(pkg + 2);
+    if (length < header || header < 8 || length > size - at) return false;
+    if (le16(pkg) == 0x200 && header >= 284 && le32(pkg + 8) == (id >> 24)) {
+      unsigned type_offset = header >= 288 ? le32(pkg + 284) : 0;
+      for (size_t pos = header; pos + 8 <= length;) {
+        const unsigned char *type = pkg + pos;
+        size_t n = le32(type + 4), h = le16(type + 2);
+        if (h < 8 || n < h || n > length - pos) return false;
+        if (le16(type) == 0x201 && h >= 48 && type[8] + type_offset == ((id >> 16) & 255)) {
+          uint32_t count = le32(type + 12), start = le32(type + 16), config = le32(type + 20);
+          if (config < 28 || config > h - 20 || start < h || start > n) return false;
+          bool match = true;
+          for (unsigned k = 4; k < config; ++k)
+            if ((k < 24 || k >= 28) && type[20 + k]) match = false;
+          unsigned version = le16(type + 44);
+          if (le16(type + 46) || version > sdk) match = false;
+          uint32_t index = id & 65535, offset = UINT32_MAX;
+          if (match && (int)version >= best) {
+            if (type[9] & 1) {
+              if (count > (start - h) / 4) return false;
+              for (uint32_t k = 0; k < count; ++k)
+                if (le16(type + h + 4*k) == index) {
+                  offset = (uint32_t)le16(type + h + 4*k + 2) * 4;
+                  break;
+                }
+            } else if (index < count) {
+              unsigned width = (type[9] & 2) ? 2 : 4;
+              if (count > (start - h) / width) return false;
+              offset = width == 2 ? le16(type + h + index*2) : le32(type + h + index*4);
+              if (width == 2) offset = offset == 65535 ? UINT32_MAX : offset * 4;
             }
-            pos += n;
-         }
+            if (offset != UINT32_MAX) {
+              if (offset > n - start || n - start - offset < 8) return false;
+              const unsigned char *entry = type + start + offset;
+              size_t remaining = n - start - offset;
+              uint16_t flags = le16(entry + 2), entry_size = le16(entry);
+              if (!(flags & 1)) {
+                if (flags & 8) {
+                  out->type = flags >> 8;
+                  out->data = le32(entry + 4);
+                }
+                else {
+                  if (entry_size < 8 || entry_size > remaining || remaining - entry_size < 8) return false;
+                  out->type = entry[entry_size + 3];
+                  out->data = le32(entry + entry_size + 4);
+                }
+                best = (int)version;
+              }
+            }
+          }
+        }
+        pos += n;
       }
-      at += length;
-   }
-   return best >= 0;
+    }
+    at += length;
+  }
+  return best >= 0;
 }
 static char *registered_string(const unsigned char *table, size_t size,
-                                const unsigned char *pool, size_t pool_size, uint32_t id, unsigned sdk)
+                               const unsigned char *pool, size_t pool_size, uint32_t id, unsigned sdk)
 {
-   for (unsigned depth = 0; depth < 32; ++depth) {
-      struct registered_value value;
-      if (!registered_resource(table, size, id, sdk, &value)) return NULL;
-      if (value.type == 3) return axml_pool_string(pool, pool_size, value.data);
-      if (value.type != 1 || value.data == id) return NULL;
-      id = value.data;
-   }
-   return NULL;
+  for (unsigned depth = 0; depth < 32; ++depth) {
+    struct registered_value value;
+    if (!registered_resource(table, size, id, sdk, &value)) return NULL;
+    if (value.type == 3) return axml_pool_string(pool, pool_size, value.data);
+    if (value.type != 1 || value.data == id) return NULL;
+    id = value.data;
+  }
+  return NULL;
 }
 /* Android resolves string references in component identities before resolving
  * classes or normalizing private process names. Load the table only on demand. */
 static bool manifest_resource_value(struct manifest_resources *r,uint32_t id,struct registered_value *out)
 {
-   if(!r->table) {
-      r->table=zip_memory_limit(r->zip,"resources.arsc",&r->size,512u*1024u*1024u);
-      if(!r->table || r->size<12 || le16(r->table)!=2 || le32(r->table+4)>r->size)return false;
-      r->size=le32(r->table+4);
-      for(size_t at=le16(r->table+2);at+8<=r->size;) {
-         size_t n=le32(r->table+at+4),h=le16(r->table+at+2);
-         if(n<h || h<8 || n>r->size-at)return false;
-         if(le16(r->table+at)==1){r->pool=r->table+at;r->pool_size=n;break;}
-         at+=n;
+  if(!r->table) {
+    r->table=zip_memory_limit(r->zip,"resources.arsc",&r->size,512u*1024u*1024u);
+    if(!r->table || r->size<12 || le16(r->table)!=2 || le32(r->table+4)>r->size)return false;
+    r->size=le32(r->table+4);
+    for(size_t at=le16(r->table+2); at+8<=r->size;) {
+      size_t n=le32(r->table+at+4),h=le16(r->table+at+2);
+      if(n<h || h<8 || n>r->size-at)return false;
+      if(le16(r->table+at)==1) {
+        r->pool=r->table+at;
+        r->pool_size=n;
+        break;
       }
-   }
-   if(!r->pool)return false;
-   for(unsigned depth=0;depth<32;++depth) {
-      if(!registered_resource(r->table,r->size,id,(unsigned)lunaria_sdk_int(),out))return false;
-      if(out->type!=1)return true;
-      if(out->data==id)return false;
-      id=out->data;
-   }
-   return false;
+      at+=n;
+    }
+  }
+  if(!r->pool)return false;
+  for(unsigned depth=0; depth<32; ++depth) {
+    if(!registered_resource(r->table,r->size,id,(unsigned)lunaria_sdk_int(),out))return false;
+    if(out->type!=1)return true;
+    if(out->data==id)return false;
+    id=out->data;
+  }
+  return false;
 }
 static const char *manifest_resource_string(struct manifest_resources *r,uint32_t id)
 {
-   struct registered_value v;
-   if(!manifest_resource_value(r,id,&v) || v.type!=3)return NULL;
-   char *value=axml_pool_string(r->pool,r->pool_size,v.data);
-   if(!value)return NULL;
-   char **values=realloc(r->values.strings,(r->values.count+1)*sizeof *values);
-   if(!values){free(value);return NULL;}
-   r->values.strings=values;r->values.strings[r->values.count++]=value;
-   return value;
+  struct registered_value v;
+  if(!manifest_resource_value(r,id,&v) || v.type!=3)return NULL;
+  char *value=axml_pool_string(r->pool,r->pool_size,v.data);
+  if(!value)return NULL;
+  char **values=realloc(r->values.strings,(r->values.count+1)*sizeof *values);
+  if(!values) {
+    free(value);
+    return NULL;
+  }
+  r->values.strings=values;
+  r->values.strings[r->values.count++]=value;
+  return value;
 }
 
 static char *registered_xml_attribute(const unsigned char *xml, size_t size, const char *attribute,
                                       const unsigned char *table, size_t table_size,
                                       const unsigned char *global, size_t pool_size, unsigned sdk)
 {
-   struct axml pool = {0};
-   char *result = NULL;
-   if (size < 8 || le16(xml) != 3 || le32(xml + 4) > size) return NULL;
-   size = le32(xml + 4);
-   for (size_t at = le16(xml + 2); at + 8 <= size;) {
-      const unsigned char *p = xml + at;
-      size_t n = le32(p + 4), h = le16(p + 2);
-      if (n < h || h < 8 || n > size - at) break;
-      if (le16(p) == 1 && axml_pool(&pool, p, n)) break;
-      if (le16(p) == 0x102) {
-         if (n < 36 || h < 16) break;
-         size_t start = 16 + le16(p + 24), stride = le16(p + 26), count = le16(p + 28);
-         if (start > n || stride < 20 || count > (n - start) / stride) break;
-         for (size_t i = 0; i < count; ++i) {
-            const unsigned char *a = p + start + i*stride;
-            if (strcmp(axml_string(&pool, le32(a + 4)), attribute)) continue;
-            uint32_t value = le32(a + 16);
-            if (a[15] == 3 && value < pool.count) result = strdup(axml_string(&pool, value));
-            else if (a[15] == 1) result = registered_string(table, table_size, global, pool_size, value, sdk);
-            break;
-         }
-         break; /* Registered service attributes belong to the document root. */
+  struct axml pool = {0};
+  char *result = NULL;
+  if (size < 8 || le16(xml) != 3 || le32(xml + 4) > size) return NULL;
+  size = le32(xml + 4);
+  for (size_t at = le16(xml + 2); at + 8 <= size;) {
+    const unsigned char *p = xml + at;
+    size_t n = le32(p + 4), h = le16(p + 2);
+    if (n < h || h < 8 || n > size - at) break;
+    if (le16(p) == 1 && axml_pool(&pool, p, n)) break;
+    if (le16(p) == 0x102) {
+      if (n < 36 || h < 16) break;
+      size_t start = 16 + le16(p + 24), stride = le16(p + 26), count = le16(p + 28);
+      if (start > n || stride < 20 || count > (n - start) / stride) break;
+      for (size_t i = 0; i < count; ++i) {
+        const unsigned char *a = p + start + i*stride;
+        if (strcmp(axml_string(&pool, le32(a + 4)), attribute)) continue;
+        uint32_t value = le32(a + 16);
+        if (a[15] == 3 && value < pool.count) result = strdup(axml_string(&pool, value));
+        else if (a[15] == 1) result = registered_string(table, table_size, global, pool_size, value, sdk);
+        break;
       }
-      at += n;
-   }
-   axml_free(&pool);
-   return result;
+      break; /* Registered service attributes belong to the document root. */
+    }
+    at += n;
+  }
+  axml_free(&pool);
+  return result;
 }
 static bool registered_service_enabled(const struct manifest *m, const char *component, const char *action)
 {
-   char *copy = strdup(text_get(&m->services)), *scan = copy, *row;
-   bool found = false;
-   while (copy && (row = luna_strsep(&scan, ";"))) {
-      char *name = luna_strsep(&row, "|"), *enabled = luna_strsep(&row, "|");
-      (void)luna_strsep(&row, "|");
-      char *actions = luna_strsep(&row, "|"), *item;
-      if (!name || !enabled || !atoi(enabled) || strcmp(name, component)) continue;
-      while (actions && (item = luna_strsep(&actions, ","))) if (!strcmp(item, action)) found = true;
-   }
-   free(copy);
-   return found;
+  char *copy = strdup(text_get(&m->services)), *scan = copy, *row;
+  bool found = false;
+  while (copy && (row = luna_strsep(&scan, ";"))) {
+    char *name = luna_strsep(&row, "|"), *enabled = luna_strsep(&row, "|");
+    (void)luna_strsep(&row, "|");
+    char *actions = luna_strsep(&row, "|"), *item;
+    if (!name || !enabled || !atoi(enabled) || strcmp(name, component)) continue;
+    while (actions && (item = luna_strsep(&actions, ","))) if (!strcmp(item, action)) found = true;
+  }
+  free(copy);
+  return found;
 }
-struct registered_entry { struct registered_entry *next; char *name, *value; };
+struct registered_entry {
+  struct registered_entry *next;
+  char *name, *value;
+};
 struct registered_cache {
-   struct registered_cache *next;
-   char *path, *action, *metadata, *attribute;
-   int64_t size;
-   luna_file_time modified;
-   bool loaded;
-   unsigned sdk;
-   struct registered_entry *entries;
+  struct registered_cache *next;
+  char *path, *action, *metadata, *attribute;
+  int64_t size;
+  luna_file_time modified;
+  bool loaded;
+  unsigned sdk;
+  struct registered_entry *entries;
 };
 static pthread_mutex_t registered_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct registered_cache *registered_caches;
 static void registered_entries_free(struct registered_entry *e)
-{ while (e) { struct registered_entry *next = e->next; free(e->name); free(e->value); free(e); e = next; } }
+{
+  while (e) {
+    struct registered_entry *next = e->next;
+    free(e->name);
+    free(e->value);
+    free(e);
+    e = next;
+  }
+}
 static int registered_load(struct registered_cache *cache)
 {
-   struct zip zip = {0};
-   struct manifest *manifest = calloc(1, sizeof *manifest);
-   unsigned char *table = NULL;
-   size_t size = 0;
-   const unsigned char *pool = NULL;
-   size_t pool_size = 0;
-   char *rows = NULL;
-   int status = -1;
-   const char *stage = "manifest";
-   if (!manifest || zip_open(&zip, cache->path) || manifest_zip(&zip, manifest)) goto done;
-   stage = "resource table";
-   if (!manifest->service_metadata.n) { status = 0; goto done; }
-   table = zip_memory_limit(&zip, "resources.arsc", &size, 512u*1024u*1024u);
-   if (!table || size < 12 || le16(table) != 2 || le32(table + 4) > size) goto done;
-   for (size_t at = le16(table + 2); at + 8 <= size;) {
-      size_t n = le32(table + at + 4), h = le16(table + at + 2);
-      if (n < h || h < 8 || n > size - at) goto done;
-      if (le16(table + at) == 1) { pool = table + at; pool_size = n; break; }
-      at += n;
-   }
-   rows = strdup(text_get(&manifest->service_metadata));
-   if (!rows) goto done;
-   char *scan = rows, *row;
-   while ((row = luna_strsep(&scan, "\n"))) {
-      char *name = luna_strsep(&row, "|"), *key = luna_strsep(&row, "|");
-      if (!name || !key || !row || strcmp(key, cache->metadata) ||
-          !registered_service_enabled(manifest, name, cache->action)) continue;
-      uint32_t id = (uint32_t)strtoul(row, NULL, 10);
-      char *path = registered_string(table, size, pool, pool_size, id, cache->sdk);
-      if (getenv("LUNARIA_TRACE_REGISTERED")) fprintf(stderr,"[registered] %s resource %08x -> %s\n",name,id,path ? path : "(absent)");
-      size_t xml_size = 0;
-      unsigned char *xml = path ? zip_memory(&zip, path, &xml_size) : NULL;
-      free(path);
-      char *value = xml ? registered_xml_attribute(xml, xml_size, cache->attribute, table, size, pool, pool_size, cache->sdk) : NULL;
-      free(xml);
-      if (!value) continue;
-      struct registered_entry *entry = calloc(1, sizeof *entry);
-      if (!entry) { free(value); goto done; }
-      entry->name = strdup(name); entry->value = value;
-      if (!entry->name) { free(value); free(entry); goto done; }
-      entry->next = cache->entries; cache->entries = entry;
-   }
-   status = 0;
+  struct zip zip = {0};
+  struct manifest *manifest = calloc(1, sizeof *manifest);
+  unsigned char *table = NULL;
+  size_t size = 0;
+  const unsigned char *pool = NULL;
+  size_t pool_size = 0;
+  char *rows = NULL;
+  int status = -1;
+  const char *stage = "manifest";
+  if (!manifest || zip_open(&zip, cache->path) || manifest_zip(&zip, manifest)) goto done;
+  stage = "resource table";
+  if (!manifest->service_metadata.n) {
+    status = 0;
+    goto done;
+  }
+  table = zip_memory_limit(&zip, "resources.arsc", &size, 512u*1024u*1024u);
+  if (!table || size < 12 || le16(table) != 2 || le32(table + 4) > size) goto done;
+  for (size_t at = le16(table + 2); at + 8 <= size;) {
+    size_t n = le32(table + at + 4), h = le16(table + at + 2);
+    if (n < h || h < 8 || n > size - at) goto done;
+    if (le16(table + at) == 1) {
+      pool = table + at;
+      pool_size = n;
+      break;
+    }
+    at += n;
+  }
+  rows = strdup(text_get(&manifest->service_metadata));
+  if (!rows) goto done;
+  char *scan = rows, *row;
+  while ((row = luna_strsep(&scan, "\n"))) {
+    char *name = luna_strsep(&row, "|"), *key = luna_strsep(&row, "|");
+    if (!name || !key || !row || strcmp(key, cache->metadata) ||
+        !registered_service_enabled(manifest, name, cache->action)) continue;
+    uint32_t id = (uint32_t)strtoul(row, NULL, 10);
+    char *path = registered_string(table, size, pool, pool_size, id, cache->sdk);
+    if (getenv("LUNARIA_TRACE_REGISTERED")) fprintf(stderr,"[registered] %s resource %08x -> %s\n",name,id,path ? path : "(absent)");
+    size_t xml_size = 0;
+    unsigned char *xml = path ? zip_memory(&zip, path, &xml_size) : NULL;
+    free(path);
+    char *value = xml ? registered_xml_attribute(xml, xml_size, cache->attribute, table, size, pool, pool_size, cache->sdk) : NULL;
+    free(xml);
+    if (!value) continue;
+    struct registered_entry *entry = calloc(1, sizeof *entry);
+    if (!entry) {
+      free(value);
+      goto done;
+    }
+    entry->name = strdup(name);
+    entry->value = value;
+    if (!entry->name) {
+      free(value);
+      free(entry);
+      goto done;
+    }
+    entry->next = cache->entries;
+    cache->entries = entry;
+  }
+  status = 0;
 done:
-   if (status && getenv("LUNARIA_TRACE_REGISTERED")) fprintf(stderr,"[registered] %s: cannot read %s\n",cache->path,stage);
-   if (status) { registered_entries_free(cache->entries); cache->entries = NULL; }
-   free(rows); free(table); manifest_free(manifest); zip_close(&zip);
-   return status;
+  if (status && getenv("LUNARIA_TRACE_REGISTERED")) fprintf(stderr,"[registered] %s: cannot read %s\n",cache->path,stage);
+  if (status) {
+    registered_entries_free(cache->entries);
+    cache->entries = NULL;
+  }
+  free(rows);
+  free(table);
+  manifest_free(manifest);
+  zip_close(&zip);
+  return status;
 }
 int luna_apk_service_manifest(const char *apk, char **services, char **providers, char *process, size_t cap)
 {
-   struct zip zip = {0};
-   struct manifest *manifest = calloc(1, sizeof *manifest);
-   int result = -1;
-   if (services) *services = NULL;
-   if (providers) *providers = NULL;
-   if (!apk || !services || !process || !cap || !manifest) goto done;
-   if (zip_open(&zip, apk) || manifest_zip(&zip, manifest)) goto done;
-   if (copy_text(process, cap, manifest->application_process)) goto done;
-   *services = strdup(text_get(&manifest->services));
-   if (providers) *providers = strdup(text_get(&manifest->providers));
-   if (*services && (!providers || *providers)) result = 0;
-   else { free(*services); *services = NULL; if(providers){free(*providers);*providers=NULL;} }
+  struct zip zip = {0};
+  struct manifest *manifest = calloc(1, sizeof *manifest);
+  int result = -1;
+  if (services) *services = NULL;
+  if (providers) *providers = NULL;
+  if (!apk || !services || !process || !cap || !manifest) goto done;
+  if (zip_open(&zip, apk) || manifest_zip(&zip, manifest)) goto done;
+  if (copy_text(process, cap, manifest->application_process)) goto done;
+  *services = strdup(text_get(&manifest->services));
+  if (providers) *providers = strdup(text_get(&manifest->providers));
+  if (*services && (!providers || *providers)) result = 0;
+  else {
+    free(*services);
+    *services = NULL;
+    if(providers) {
+      free(*providers);
+      *providers=NULL;
+    }
+  }
 done:
-   manifest_free(manifest);
-   zip_close(&zip);
-   return result;
+  manifest_free(manifest);
+  zip_close(&zip);
+  return result;
 }
 
 /* System registered-service lookup, independent of the calling application's
  * package visibility. Non-exported authenticators can be bound by system UID. */
 int luna_apk_find_registered_service(const char *apk, const char *action, const char *metadata,
-                                    const char *attribute, const char *value, unsigned sdk,
-                                    char *component, size_t cap)
+                                     const char *attribute, const char *value, unsigned sdk,
+                                     char *component, size_t cap)
 {
-   luna_file_info info;
-   if (!apk || !action || !metadata || !attribute || !value || !component || !cap ||
-       luna_file_infoat(LUNA_AT_FDCWD, apk, &info, 0)) return -1;
-   pthread_mutex_lock(&registered_lock);
-   struct registered_cache *cache = registered_caches;
-   while (cache && (strcmp(cache->path, apk) || strcmp(cache->action, action) ||
-          strcmp(cache->metadata, metadata) || strcmp(cache->attribute, attribute))) cache = cache->next;
-   int result = -1;
-   if (!cache) {
-      cache = calloc(1, sizeof *cache);
-      if (!cache) goto done;
-      cache->path = strdup(apk); cache->action = strdup(action);
-      cache->metadata = strdup(metadata); cache->attribute = strdup(attribute);
-      if (!cache->path || !cache->action || !cache->metadata || !cache->attribute) {
-         free(cache->path); free(cache->action); free(cache->metadata); free(cache->attribute); free(cache); goto done;
-      }
-      cache->next = registered_caches; registered_caches = cache;
+  luna_file_info info;
+  if (!apk || !action || !metadata || !attribute || !value || !component || !cap ||
+      luna_file_infoat(LUNA_AT_FDCWD, apk, &info, 0)) return -1;
+  pthread_mutex_lock(&registered_lock);
+  struct registered_cache *cache = registered_caches;
+  while (cache && (strcmp(cache->path, apk) || strcmp(cache->action, action) ||
+                   strcmp(cache->metadata, metadata) || strcmp(cache->attribute, attribute))) cache = cache->next;
+  int result = -1;
+  if (!cache) {
+    cache = calloc(1, sizeof *cache);
+    if (!cache) goto done;
+    cache->path = strdup(apk);
+    cache->action = strdup(action);
+    cache->metadata = strdup(metadata);
+    cache->attribute = strdup(attribute);
+    if (!cache->path || !cache->action || !cache->metadata || !cache->attribute) {
+      free(cache->path);
+      free(cache->action);
+      free(cache->metadata);
+      free(cache->attribute);
+      free(cache);
+      goto done;
+    }
+    cache->next = registered_caches;
+    registered_caches = cache;
 
-   }
-   if (!cache->loaded || cache->size != info.size ||
-       cache->modified.seconds != info.modified.seconds || cache->modified.nanoseconds != info.modified.nanoseconds || cache->sdk != sdk) {
-      registered_entries_free(cache->entries); cache->entries = NULL;
-      cache->sdk = sdk; cache->loaded = false;
-      if (registered_load(cache)) goto done;
-      cache->size = info.size; cache->modified = info.modified; cache->loaded = true;
-   }
-   result = 0;
-   for (struct registered_entry *entry = cache->entries; entry; entry = entry->next)
-      if (!strcmp(entry->value, value)) { result = copy_text(component, cap, entry->name) ? -1 : 1; break; }
+  }
+  if (!cache->loaded || cache->size != info.size ||
+      cache->modified.seconds != info.modified.seconds || cache->modified.nanoseconds != info.modified.nanoseconds || cache->sdk != sdk) {
+    registered_entries_free(cache->entries);
+    cache->entries = NULL;
+    cache->sdk = sdk;
+    cache->loaded = false;
+    if (registered_load(cache)) goto done;
+    cache->size = info.size;
+    cache->modified = info.modified;
+    cache->loaded = true;
+  }
+  result = 0;
+  for (struct registered_entry *entry = cache->entries; entry; entry = entry->next)
+    if (!strcmp(entry->value, value)) {
+      result = copy_text(component, cap, entry->name) ? -1 : 1;
+      break;
+    }
 done:
-   pthread_mutex_unlock(&registered_lock);
-   return result;
+  pthread_mutex_unlock(&registered_lock);
+  return result;
 }
 
 static int env_set(const char *key, const char *value, bool overwrite)
 {
-   return luna_os_setenv(key, value, overwrite);
+  return luna_os_setenv(key, value, overwrite);
 }
 static int env_default(const char *key, const char *value)
 {
-   const char *old = getenv(key);
-   return old && *old ? 0 : env_set(key, value, true);
+  const char *old = getenv(key);
+  return old && *old ? 0 : env_set(key, value, true);
 }
 static const char *env_value(const char *key, const char *fallback)
 {
-   const char *v = getenv(key);
-   return v && *v ? v : fallback;
+  const char *v = getenv(key);
+  return v && *v ? v : fallback;
 }
 static bool env_true(const char *key)
 {
-   const char *s = getenv(key);
-   return s && *s && strcmp(s, "0");
+  const char *s = getenv(key);
+  return s && *s && strcmp(s, "0");
 }
 static char *apk_getcwd(char *out, size_t cap)
 {
 #ifdef _WIN32
-   DWORD n = GetCurrentDirectoryW(0, NULL);
-   wchar_t *wide = n ? malloc((size_t)n * sizeof *wide) : NULL;
-   if (!wide)
-      return NULL;
-   DWORD got = GetCurrentDirectoryW(n, wide);
-   int bytes = got && got < n ? WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, (int)cap, NULL, NULL) : 0;
-   free(wide);
-   if (!bytes)
-      return NULL;
-   for (char *p = out; *p; p++)
-      if (*p == '\\')
-         *p = '/';
-   return out;
+  DWORD n = GetCurrentDirectoryW(0, NULL);
+  wchar_t *wide = n ? malloc((size_t)n * sizeof *wide) : NULL;
+  if (!wide)
+    return NULL;
+  DWORD got = GetCurrentDirectoryW(n, wide);
+  int bytes = got && got < n ? WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, (int)cap, NULL, NULL) : 0;
+  free(wide);
+  if (!bytes)
+    return NULL;
+  for (char *p = out; *p; p++)
+    if (*p == '\\')
+      *p = '/';
+  return out;
 #else
-   return getcwd(out, cap);
+  return getcwd(out, cap);
 #endif
 }
 static int absolute_path(const char *path, char *out, size_t cap)
 {
-   if (luna_file_realpath(path, out, cap))
-      return 0;
+  if (luna_file_realpath(path, out, cap))
+    return 0;
 #ifdef _WIN32
-   int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
-   wchar_t *input = n ? malloc((size_t)n * sizeof *input) : NULL;
-   if (!input)
-      return -1;
-   if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, input, n)) {
-      free(input);
-      return -1;
-   }
-   DWORD size = GetFullPathNameW(input, 0, NULL, NULL);
-   wchar_t *full = size ? malloc((size_t)size * sizeof *full) : NULL;
-   DWORD count = full ? GetFullPathNameW(input, size, full, NULL) : 0;
-   int bytes = count && count < size ? WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)cap, NULL, NULL) : 0;
-   free(input);
-   free(full);
-   if (!bytes)
-      return -1;
-   for (char *p = out; *p; p++)
-      if (*p == '\\')
-         *p = '/';
-   return 0;
+  int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+  wchar_t *input = n ? malloc((size_t)n * sizeof *input) : NULL;
+  if (!input)
+    return -1;
+  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, input, n)) {
+    free(input);
+    return -1;
+  }
+  DWORD size = GetFullPathNameW(input, 0, NULL, NULL);
+  wchar_t *full = size ? malloc((size_t)size * sizeof *full) : NULL;
+  DWORD count = full ? GetFullPathNameW(input, size, full, NULL) : 0;
+  int bytes = count && count < size ? WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)cap, NULL, NULL) : 0;
+  free(input);
+  free(full);
+  if (!bytes)
+    return -1;
+  for (char *p = out; *p; p++)
+    if (*p == '\\')
+      *p = '/';
+  return 0;
 #else
-   if (path[0] == '/')
-      return copy_text(out, cap, path);
-   char cwd[APK_PATH];
-   if (!apk_getcwd(cwd, sizeof cwd))
-      return -1;
-   return path_join(out, cap, cwd, path);
+  if (path[0] == '/')
+    return copy_text(out, cap, path);
+  char cwd[APK_PATH];
+  if (!apk_getcwd(cwd, sizeof cwd))
+    return -1;
+  return path_join(out, cap, cwd, path);
 #endif
 }
 static char *trim(char *s)
 {
-   while (isspace((unsigned char) * s))
-      s++;
-   size_t n = strlen(s);
-   while (n && isspace((unsigned char)s[n - 1]))
-      s[--n] = 0;
-   return s;
+  while (isspace((unsigned char) * s))
+    s++;
+  size_t n = strlen(s);
+  while (n && isspace((unsigned char)s[n - 1]))
+    s[--n] = 0;
+  return s;
 }
 static int config_load(const char *path, const char *package)
 {
-   FILE *f = open_file(path, "rb");
-   if (!f) {
-      if (errno == ENOENT)
-         return 0;
-      return apk_error("cannot read config %s", path);
-   }
-   char line[APK_META];
-   bool match = !package, section = false;
-   int result = 0;
-   while (fgets(line, sizeof line, f)) {
-      if (!strchr(line, '\n') && !feof(f)) {
-         result = apk_error("config line too long");
-         break;
-      }
-      char *p = trim(line);
-      size_t n = strlen(p);
-      if (!*p || *p == '#')
-         continue;
-      if (*p == '[' && n >= 2 && p[n - 1] == ']') {
-         p[n - 1] = 0;
-         section = true;
-         match = package && !strcmp(trim(p + 1), package);
-         continue;
-      }
-      if (!match || (!package && section))
-         continue;
-      char *eq = strchr(p, '=');
-      if (!eq)
-         continue;
-      *eq = 0;
-      char *key = trim(p), *value = trim(eq + 1);
-      if (strncmp(key, "LUNARIA_", 8))
-         continue;
-      bool valid = true;
-      for (const char *k = key; *k; k++)
-         if (!(isalnum((unsigned char) * k) || *k == '_'))
-            valid = false;
-      if (!valid)
-         continue;
-      n = strlen(value);
-      if (n >= 2 && ((value[0] == '"' && value[n - 1] == '"') || (value[0] == '\'' && value[n - 1] == '\''))) {
-         value[n - 1] = 0;
-         value++;
-      }
-      if (env_default(key, value)) {
-         result = -1;
-         break;
-      }
-   }
-   if (ferror(f))
+  FILE *f = open_file(path, "rb");
+  if (!f) {
+    if (errno == ENOENT)
+      return 0;
+    return apk_error("cannot read config %s", path);
+  }
+  char line[APK_META];
+  bool match = !package, section = false;
+  int result = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (!strchr(line, '\n') && !feof(f)) {
+      result = apk_error("config line too long");
+      break;
+    }
+    char *p = trim(line);
+    size_t n = strlen(p);
+    if (!*p || *p == '#')
+      continue;
+    if (*p == '[' && n >= 2 && p[n - 1] == ']') {
+      p[n - 1] = 0;
+      section = true;
+      match = package && !strcmp(trim(p + 1), package);
+      continue;
+    }
+    if (!match || (!package && section))
+      continue;
+    char *eq = strchr(p, '=');
+    if (!eq)
+      continue;
+    *eq = 0;
+    char *key = trim(p), *value = trim(eq + 1);
+    if (strncmp(key, "LUNARIA_", 8))
+      continue;
+    bool valid = true;
+    for (const char *k = key; *k; k++)
+      if (!(isalnum((unsigned char) * k) || *k == '_'))
+        valid = false;
+    if (!valid)
+      continue;
+    n = strlen(value);
+    if (n >= 2 && ((value[0] == '"' && value[n - 1] == '"') || (value[0] == '\'' && value[n - 1] == '\''))) {
+      value[n - 1] = 0;
+      value++;
+    }
+    if (env_default(key, value)) {
       result = -1;
-   fclose(f);
-   return result;
+      break;
+    }
+  }
+  if (ferror(f))
+    result = -1;
+  fclose(f);
+  return result;
 }
 static bool suffix(const char *s, const char *ext);
 
@@ -1650,617 +1830,640 @@ static bool suffix(const char *s, const char *ext);
 static int launcher_display_metadata(const char *path, bool container,
                                      const char *conf)
 {
-   struct zip outer = {0}, candidate = {0};
-   struct manifest *m = calloc(1, sizeof *m);
-   int result = -1;
-   if (!m || zip_open(&outer, path)) goto done;
-   if (!container) {
-      if (manifest_zip(&outer, m)) goto done;
-   } else {
-      bool found = false;
-      for (size_t i = 0; i < outer.count; ++i) {
-         const struct zip_entry *e = outer.entries + i;
-         if (!suffix(e->name, ".apk")) continue;
-         if (e->flags & 1) goto done;
-         if (e->method == 0) {
-            unsigned char h[30];
-            if (zip_seek(&outer, e->offset) || fread(h, 1, sizeof h, outer.f) != sizeof h ||
-                le32(h) != 0x04034b50) goto done;
-            uint64_t at = e->offset + sizeof h + le16(h + 26) + le16(h + 28);
-            if (at > outer.size || e->size > outer.size - at ||
-                zip_open_range(&candidate, path, at, e->size)) goto done;
-         } else {
-            candidate.f = tmpfile();
-            if (!candidate.f || zip_read(&outer, e, candidate.f, NULL, 0, NULL) ||
-                fflush(candidate.f)) goto done;
-            candidate.size = e->size;
-            if (zip_index(&candidate, e->name)) goto done;
-         }
-         manifest_clear(m);
-         int parsed = manifest_zip(&candidate, m);
-         zip_close(&candidate);
-         if (parsed) goto done;
-         if (!*m->split) { found = true; break; }
+  struct zip outer = {0}, candidate = {0};
+  struct manifest *m = calloc(1, sizeof *m);
+  int result = -1;
+  if (!m || zip_open(&outer, path)) goto done;
+  if (!container) {
+    if (manifest_zip(&outer, m)) goto done;
+  } else {
+    bool found = false;
+    for (size_t i = 0; i < outer.count; ++i) {
+      const struct zip_entry *e = outer.entries + i;
+      if (!suffix(e->name, ".apk")) continue;
+      if (e->flags & 1) goto done;
+      if (e->method == 0) {
+        unsigned char h[30];
+        if (zip_seek(&outer, e->offset) || fread(h, 1, sizeof h, outer.f) != sizeof h ||
+            le32(h) != 0x04034b50) goto done;
+        uint64_t at = e->offset + sizeof h + le16(h + 26) + le16(h + 28);
+        if (at > outer.size || e->size > outer.size - at ||
+            zip_open_range(&candidate, path, at, e->size)) goto done;
+      } else {
+        candidate.f = tmpfile();
+        if (!candidate.f || zip_read(&outer, e, candidate.f, NULL, 0, NULL) ||
+            fflush(candidate.f)) goto done;
+        candidate.size = e->size;
+        if (zip_index(&candidate, e->name)) goto done;
       }
-      if (!found) { apk_error("container has no base APK"); goto done; }
-   }
-   if (config_load(conf, m->package)) goto done;
-   if (*m->orientation) result = env_set("ANDROID_SCREEN_ORIENTATION", m->orientation, true);
-   else { luna_os_unsetenv("ANDROID_SCREEN_ORIENTATION"); result = 0; }
+      manifest_clear(m);
+      int parsed = manifest_zip(&candidate, m);
+      zip_close(&candidate);
+      if (parsed) goto done;
+      if (!*m->split) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      apk_error("container has no base APK");
+      goto done;
+    }
+  }
+  if (config_load(conf, m->package)) goto done;
+  if (*m->orientation) result = env_set("ANDROID_SCREEN_ORIENTATION", m->orientation, true);
+  else {
+    luna_os_unsetenv("ANDROID_SCREEN_ORIENTATION");
+    result = 0;
+  }
 done:
-   zip_close(&candidate);
-   zip_close(&outer);
-   manifest_free(m);
-   return result;
+  zip_close(&candidate);
+  zip_close(&outer);
+  manifest_free(m);
+  return result;
 }
 
 static int copy_file(const char *source, const char *target)
 {
-   if (!strcmp(source, target))
-      return 0;
-   FILE *in = open_file(source, "rb");
-   if (!in)
-      return -1;
-   FILE *out = open_file(target, "wb");
-   if (!out) {
-      fclose(in);
-      return -1;
-   }
-   char buf[65536];
-   size_t n;
-   int r = 0;
-   luna_file_info info;
-   struct extraction_progress progress = {.count = 1, .name = target};
-   bool have_info = !luna_file_infoat(LUNA_AT_FDCWD, source, &info, 0);
-   bool report = have_info && info.size >= 32 * 1048576;
-   if (report) {
-      progress.total = info.size;
-      fprintf(stderr, "[apk] Copying: %s -> %s\n", source, target);
-      extraction_report(&progress, true);
-   }
-   while ((n = fread(buf, 1, sizeof buf, in))) {
-      if (luna_launcher_cancelled()) { r = -1; break; }
-      if (fwrite(buf, 1, n, out) != n) {
-         r = -1;
-         break;
-      }
-      if (report) {
-         progress.bytes += n;
-         extraction_report(&progress, false);
-      }
-   }
-   if (ferror(in))
+  if (!strcmp(source, target))
+    return 0;
+  FILE *in = open_file(source, "rb");
+  if (!in)
+    return -1;
+  FILE *out = open_file(target, "wb");
+  if (!out) {
+    fclose(in);
+    return -1;
+  }
+  char buf[65536];
+  size_t n;
+  int r = 0;
+  luna_file_info info;
+  struct extraction_progress progress = {.count = 1, .name = target};
+  bool have_info = !luna_file_infoat(LUNA_AT_FDCWD, source, &info, 0);
+  bool report = have_info && info.size >= 32 * 1048576;
+  if (report) {
+    progress.total = info.size;
+    fprintf(stderr, "[apk] Copying: %s -> %s\n", source, target);
+    extraction_report(&progress, true);
+  }
+  while ((n = fread(buf, 1, sizeof buf, in))) {
+    if (luna_launcher_cancelled()) {
       r = -1;
-   fclose(in);
-   if (fclose(out))
+      break;
+    }
+    if (fwrite(buf, 1, n, out) != n) {
       r = -1;
-   /* A package cache is another view of the installed archive. Recreating it
-    * must not turn an unchanged APK into an apparent package update. */
-   if (!r && have_info) {
-      const luna_file_time times[2] = {info.accessed, info.modified};
-      if (luna_file_timesat(LUNA_AT_FDCWD, target, times, 0)) r = -1;
-   }
-   if (r)
-      luna_file_unlinkat(LUNA_AT_FDCWD, target, 0);
-   else if (report) {
-      progress.files = 1;
-      extraction_report(&progress, true);
-   }
-   return r;
+      break;
+    }
+    if (report) {
+      progress.bytes += n;
+      extraction_report(&progress, false);
+    }
+  }
+  if (ferror(in))
+    r = -1;
+  fclose(in);
+  if (fclose(out))
+    r = -1;
+  /* A package cache is another view of the installed archive. Recreating it
+   * must not turn an unchanged APK into an apparent package update. */
+  if (!r && have_info) {
+    const luna_file_time times[2] = {info.accessed, info.modified};
+    if (luna_file_timesat(LUNA_AT_FDCWD, target, times, 0)) r = -1;
+  }
+  if (r)
+    luna_file_unlinkat(LUNA_AT_FDCWD, target, 0);
+  else if (report) {
+    progress.files = 1;
+    extraction_report(&progress, true);
+  }
+  return r;
 }
 static int materialize(const char *source, const char *target)
 {
-   if (exists(target)) {
-      luna_file_info original, cached;
-      if (luna_file_infoat(LUNA_AT_FDCWD, source, &original, 0) ||
-          luna_file_infoat(LUNA_AT_FDCWD, target, &cached, 0)) return -1;
-      if (original.size != cached.size) return apk_error("cached file size differs from source: %s", target);
-      if (original.modified.seconds != cached.modified.seconds ||
-          original.modified.nanoseconds != cached.modified.nanoseconds) {
-         const luna_file_time times[2] = {original.accessed, original.modified};
-         return luna_file_timesat(LUNA_AT_FDCWD, target, times, 0);
-      }
-      return 0;
-   }
-   if (!luna_file_link(source, target))
-      return 0;
-   return copy_file(source, target);
+  if (exists(target)) {
+    luna_file_info original, cached;
+    if (luna_file_infoat(LUNA_AT_FDCWD, source, &original, 0) ||
+        luna_file_infoat(LUNA_AT_FDCWD, target, &cached, 0)) return -1;
+    if (original.size != cached.size) return apk_error("cached file size differs from source: %s", target);
+    if (original.modified.seconds != cached.modified.seconds ||
+        original.modified.nanoseconds != cached.modified.nanoseconds) {
+      const luna_file_time times[2] = {original.accessed, original.modified};
+      return luna_file_timesat(LUNA_AT_FDCWD, target, times, 0);
+    }
+    return 0;
+  }
+  if (!luna_file_link(source, target))
+    return 0;
+  return copy_file(source, target);
 }
 /* The optional Google system packages use Android's ordinary source paths.
  * Keep the original archive too: a component host needs all of its splits. */
-static const struct { const char *package, *path; } google_packages[] = {
-   {"com.google.android.gms", "system/product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk"},
-   {"com.android.vending", "system/product/priv-app/Phonesky/Phonesky.apk"},
-   {"com.google.android.gsf", "system/product/priv-app/GoogleServicesFramework/GoogleServicesFramework.apk"},
+static const struct {
+  const char *package, *path;
+} google_packages[] = {
+  {"com.google.android.gms", "system/product/priv-app/PrebuiltGmsCore/PrebuiltGmsCore.apk"},
+  {"com.android.vending", "system/product/priv-app/Phonesky/Phonesky.apk"},
+  {"com.google.android.gsf", "system/product/priv-app/GoogleServicesFramework/GoogleServicesFramework.apk"},
 };
 static const char *google_package_path(const char *package)
 {
-   for (size_t i = 0; i < sizeof google_packages / sizeof google_packages[0]; ++i)
-      if (!strcmp(package, google_packages[i].package)) return google_packages[i].path;
-   return NULL;
+  for (size_t i = 0; i < sizeof google_packages / sizeof google_packages[0]; ++i)
+    if (!strcmp(package, google_packages[i].package)) return google_packages[i].path;
+  return NULL;
 }
 static int system_archive_path(const char *root, const char *package, char *out, size_t cap)
 {
-   char rel[512];
-   if (!root || !*root || !package || !package_valid(package)) return -1;
-   if (snprintf(rel, sizeof rel, "system/packages/%s.apk", package) >= (int)sizeof rel) return -1;
-   return path_join(out, cap, root, rel);
+  char rel[512];
+  if (!root || !*root || !package || !package_valid(package)) return -1;
+  if (snprintf(rel, sizeof rel, "system/packages/%s.apk", package) >= (int)sizeof rel) return -1;
+  return path_join(out, cap, root, rel);
 }
 int luna_apk_system_archive(const char *package, char *out, size_t cap)
 {
-   const char *root = getenv("LUNARIA_DATA_ROOT");
-   if (!system_archive_path(root, package, out, cap) && exists(out)) return 0;
-   const char *rel = package ? google_package_path(package) : NULL;
-   return rel && root && !path_join(out, cap, root, rel) && exists(out) ? 0 : -1;
+  const char *root = getenv("LUNARIA_DATA_ROOT");
+  if (!system_archive_path(root, package, out, cap) && exists(out)) return 0;
+  const char *rel = package ? google_package_path(package) : NULL;
+  return rel && root && !path_join(out, cap, root, rel) && exists(out) ? 0 : -1;
 }
 static int system_publish_file(const char *source, const char *target, bool link)
 {
-   char dir[APK_PATH], temp[APK_PATH], actual[APK_PATH];
-   if (luna_file_realpath(target, actual, sizeof actual) && !strcmp(source, actual)) return 0;
-   if (copy_text(dir, sizeof dir, target)) return -1;
-   char *slash = strrchr(dir, '/');
-   if (!slash) return -1;
-   *slash = 0;
-   if (mkdirs(dir) || snprintf(temp, sizeof temp, "%s/.install-XXXXXX", dir) >= (int)sizeof temp) return -1;
-   int fd = luna_file_mkstemp(temp);
-   if (fd < 0) return -1;
-   luna_fd_close(fd);
-   int result;
-   if (link && !luna_file_unlink(temp) && !luna_file_link(source, temp)) result = 0;
-   else result = copy_file(source, temp);
-   if (!result) result = luna_file_rename(temp, target);
-   if (result) luna_file_unlink(temp);
-   return result;
+  char dir[APK_PATH], temp[APK_PATH], actual[APK_PATH];
+  if (luna_file_realpath(target, actual, sizeof actual) && !strcmp(source, actual)) return 0;
+  if (copy_text(dir, sizeof dir, target)) return -1;
+  char *slash = strrchr(dir, '/');
+  if (!slash) return -1;
+  *slash = 0;
+  if (mkdirs(dir) || snprintf(temp, sizeof temp, "%s/.install-XXXXXX", dir) >= (int)sizeof temp) return -1;
+  int fd = luna_file_mkstemp(temp);
+  if (fd < 0) return -1;
+  luna_fd_close(fd);
+  int result;
+  if (link && !luna_file_unlink(temp) && !luna_file_link(source, temp)) result = 0;
+  else result = copy_file(source, temp);
+  if (!result) result = luna_file_rename(temp, target);
+  if (result) luna_file_unlink(temp);
+  return result;
 }
 static int google_package_install(const char *root, const char *package,
-                                   const char *archive, const char *base, bool container)
+                                  const char *archive, const char *base, bool container)
 {
-   const char *rel = google_package_path(package);
-   char original[APK_PATH], installed[APK_PATH];
-   if (!rel) return apk_error("select a Google Play services, Play Store, or Google Services Framework APK/XAPK");
-   if (system_archive_path(root, package, original, sizeof original) ||
-       path_join(installed, sizeof installed, root, rel) ||
-       system_publish_file(archive, original, false) ||
-       system_publish_file(container ? base : original, installed, !container))
-      return apk_error("cannot install system package %s: %s", package, strerror(errno));
-   fprintf(stderr, "[apk] system package installed: %s in %s\n", package, root);
-   printf("system_package=%s\nsystem_archive=%s\n", package, original);
-   return 0;
+  const char *rel = google_package_path(package);
+  char original[APK_PATH], installed[APK_PATH];
+  if (!rel) return apk_error("select a Google Play services, Play Store, or Google Services Framework APK/XAPK");
+  if (system_archive_path(root, package, original, sizeof original) ||
+      path_join(installed, sizeof installed, root, rel) ||
+      system_publish_file(archive, original, false) ||
+      system_publish_file(container ? base : original, installed, !container))
+    return apk_error("cannot install system package %s: %s", package, strerror(errno));
+  fprintf(stderr, "[apk] system package installed: %s in %s\n", package, root);
+  printf("system_package=%s\nsystem_archive=%s\n", package, original);
+  return 0;
 }
 
 int luna_apk_google_profile_list(char (*names)[65], int max)
 {
-   if (max < 1) return 0;
-   snprintf(names[0], 65, "default");
-   int n = 1;
-   const char *root = getenv("LUNARIA_DATA_ROOT");
-   char dir[APK_PATH], path[APK_PATH];
-   if (!root || path_join(dir, sizeof dir, root, "system/gms")) return n;
-   luna_directory *d = luna_directory_open(dir);
-   if (!d) return n;
-   luna_directory_entry *entry;
-   while (n < max && (entry = luna_directory_read(d))) {
-      if (!luna_google_profile_valid(entry->d_name) || !strcmp(entry->d_name, "default")) continue;
-      if (!path_join(path, sizeof path, dir, entry->d_name) && directory(path))
-         copy_text(names[n++], 65, entry->d_name);
-   }
-   luna_directory_close(d);
-   return n;
+  if (max < 1) return 0;
+  snprintf(names[0], 65, "default");
+  int n = 1;
+  const char *root = getenv("LUNARIA_DATA_ROOT");
+  char dir[APK_PATH], path[APK_PATH];
+  if (!root || path_join(dir, sizeof dir, root, "system/gms")) return n;
+  luna_directory *d = luna_directory_open(dir);
+  if (!d) return n;
+  luna_directory_entry *entry;
+  while (n < max && (entry = luna_directory_read(d))) {
+    if (!luna_google_profile_valid(entry->d_name) || !strcmp(entry->d_name, "default")) continue;
+    if (!path_join(path, sizeof path, dir, entry->d_name) && directory(path))
+      copy_text(names[n++], 65, entry->d_name);
+  }
+  luna_directory_close(d);
+  return n;
 }
 int luna_apk_google_profile_accounts(const char *profile)
 {
-   char dir[APK_PATH], path[APK_PATH], line[8192];
-   if (luna_google_accounts_directory(getenv("LUNARIA_DATA_ROOT"), profile, dir, sizeof dir) ||
-       path_join(path, sizeof path, dir, "accounts.tsv")) return 0;
-   FILE *f = fopen(path, "rb");
-   if (!f) return 0;
-   int n = 0;
-   while (fgets(line, sizeof line, f)) {
-      if (strncmp(line, "A\t", 2)) continue;
-      const char *type = strchr(line + 2, '\t');
-      if (type && !strncmp(type + 1, "com.google\t", 11)) ++n;
-   }
-   fclose(f);
-   return n;
+  char dir[APK_PATH], path[APK_PATH], line[8192];
+  if (luna_google_accounts_directory(getenv("LUNARIA_DATA_ROOT"), profile, dir, sizeof dir) ||
+      path_join(path, sizeof path, dir, "accounts.tsv")) return 0;
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  int n = 0;
+  while (fgets(line, sizeof line, f)) {
+    if (strncmp(line, "A\t", 2)) continue;
+    const char *type = strchr(line + 2, '\t');
+    if (type && !strncmp(type + 1, "com.google\t", 11)) ++n;
+  }
+  fclose(f);
+  return n;
 }
 int luna_apk_google_profile_create(char *out, size_t cap)
 {
-   const char *root = getenv("LUNARIA_DATA_ROOT");
-   char parent[APK_PATH], dir[APK_PATH], id[65];
-   if (!root || cap < 6 || path_join(parent, sizeof parent, root, "system/gms") || mkdirs(parent)) return -1;
-   for (int k = 2; k < 10000; ++k) {
-      snprintf(id, sizeof id, "gms-%d", k);
-      if (strlen(id) >= cap) return -1;
-      bool occupied = false;
-      for (size_t i = 0; i < sizeof google_packages / sizeof google_packages[0]; ++i) {
-         char rel[512];
-         snprintf(rel, sizeof rel, "profiles/%s/%s", google_packages[i].package, id);
-         if (path_join(dir, sizeof dir, root, rel)) return -1;
-         if (exists(dir)) occupied = true;
-      }
-      if (occupied) continue;
-      if (path_join(dir, sizeof dir, parent, id)) return -1;
-      if (!luna_file_mkdir(dir, 0700)) return copy_text(out, cap, id);
-      if (errno != EEXIST) return -1;
-   }
-   return -1;
+  const char *root = getenv("LUNARIA_DATA_ROOT");
+  char parent[APK_PATH], dir[APK_PATH], id[65];
+  if (!root || cap < 6 || path_join(parent, sizeof parent, root, "system/gms") || mkdirs(parent)) return -1;
+  for (int k = 2; k < 10000; ++k) {
+    snprintf(id, sizeof id, "gms-%d", k);
+    if (strlen(id) >= cap) return -1;
+    bool occupied = false;
+    for (size_t i = 0; i < sizeof google_packages / sizeof google_packages[0]; ++i) {
+      char rel[512];
+      snprintf(rel, sizeof rel, "profiles/%s/%s", google_packages[i].package, id);
+      if (path_join(dir, sizeof dir, root, rel)) return -1;
+      if (exists(dir)) occupied = true;
+    }
+    if (occupied) continue;
+    if (path_join(dir, sizeof dir, parent, id)) return -1;
+    if (!luna_file_mkdir(dir, 0700)) return copy_text(out, cap, id);
+    if (errno != EEXIST) return -1;
+  }
+  return -1;
 }
 /* Separate processes must not open the same environment's sign-in flow twice.
  * Component hosts keep running normally: only the explicit account UI locks. */
 static int google_sign_in_lock = -1;
 static int google_sign_in_enter(const char *root, const char *profile)
 {
-   char dir[APK_PATH], path[APK_PATH];
-   if (google_sign_in_lock >= 0) return 0;
-   if (luna_google_accounts_directory(root, profile, dir, sizeof dir) || mkdirs(dir) ||
-       path_join(path, sizeof path, dir, "signin.lock")) return -1;
-   int fd = luna_file_open(path, O_RDWR | O_CREAT | LUNA_FILE_CLOEXEC, 0600);
-   if (fd < 0) return -1;
-   if (luna_file_lock(fd, 0, 1, 0, 1, 0)) {
-      luna_fd_close(fd);
-      return apk_error("Google sign-in is already open for environment %s", profile);
-   }
-   google_sign_in_lock = fd;
-   return 0;
+  char dir[APK_PATH], path[APK_PATH];
+  if (google_sign_in_lock >= 0) return 0;
+  if (luna_google_accounts_directory(root, profile, dir, sizeof dir) || mkdirs(dir) ||
+      path_join(path, sizeof path, dir, "signin.lock")) return -1;
+  int fd = luna_file_open(path, O_RDWR | O_CREAT | LUNA_FILE_CLOEXEC, 0600);
+  if (fd < 0) return -1;
+  if (luna_file_lock(fd, 0, 1, 0, 1, 0)) {
+    luna_fd_close(fd);
+    return apk_error("Google sign-in is already open for environment %s", profile);
+  }
+  google_sign_in_lock = fd;
+  return 0;
 }
 
 static bool profile_valid(const char *s)
 {
-   size_t n = strlen(s);
-   if (!n || n > 64 || !(isalnum((unsigned char)s[0]) || s[0] == '_'))
+  size_t n = strlen(s);
+  if (!n || n > 64 || !(isalnum((unsigned char)s[0]) || s[0] == '_'))
+    return false;
+  for (size_t i = 0; i < n; i++)
+    if (!(isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '.' || s[i] == '-'))
       return false;
-   for (size_t i = 0; i < n; i++)
-      if (!(isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '.' || s[i] == '-'))
-         return false;
-   return true;
+  return true;
 }
 static int profiles_list(const char *root, const char *package)
 {
-   puts("default");
-   char dir[APK_PATH], relative[512];
-   snprintf(relative, sizeof relative, "profiles/%s", package);
-   if (path_join(dir, sizeof dir, root, relative))
-      return -1;
-   luna_directory *d = luna_directory_open(dir);
-   if (!d)
-      return errno == ENOENT ? 0 : -1;
-   luna_directory_entry *e;
-   while ((e = luna_directory_read(d))) {
-      char path[APK_PATH];
-      if (profile_valid(e->d_name) && !path_join(path, sizeof path, dir, e->d_name) && directory(path))
-         puts(e->d_name);
-   }
-   return luna_directory_close(d);
+  puts("default");
+  char dir[APK_PATH], relative[512];
+  snprintf(relative, sizeof relative, "profiles/%s", package);
+  if (path_join(dir, sizeof dir, root, relative))
+    return -1;
+  luna_directory *d = luna_directory_open(dir);
+  if (!d)
+    return errno == ENOENT ? 0 : -1;
+  luna_directory_entry *e;
+  while ((e = luna_directory_read(d))) {
+    char path[APK_PATH];
+    if (profile_valid(e->d_name) && !path_join(path, sizeof path, dir, e->d_name) && directory(path))
+      puts(e->d_name);
+  }
+  return luna_directory_close(d);
 }
 static int profiles_choose(const char *root, const char *package, char *choice, size_t capacity)
 {
-   char dir[APK_PATH], relative[512];
-   snprintf(relative, sizeof relative, "profiles/%s", package);
-   if (path_join(dir, sizeof dir, root, relative)) return -1;
-   char **names = calloc(1, sizeof *names);
-   if (!names) return -1;
-   size_t count = 1;
-   names[0] = strdup("default");
-   int result = -1;
-   if (!names[0]) goto done;
-   luna_directory *d = luna_directory_open(dir);
-   if (!d && errno != ENOENT) goto done;
-   if (d) {
-      luna_directory_entry *entry;
-      while ((entry = luna_directory_read(d))) {
-         char path[APK_PATH];
-         if (!profile_valid(entry->d_name) || !strcmp(entry->d_name, "default")) continue;
-         if (path_join(path, sizeof path, dir, entry->d_name)) { luna_directory_close(d); goto done; }
-         if (!directory(path)) continue;
-         char **grown = realloc(names, (count+1)*sizeof *names);
-         if (!grown) { luna_directory_close(d); goto done; }
-         names= grown;
-         names[count] = strdup(entry->d_name);
-         if (!names[count]) { luna_directory_close(d); goto done; }
-         ++count;
+  char dir[APK_PATH], relative[512];
+  snprintf(relative, sizeof relative, "profiles/%s", package);
+  if (path_join(dir, sizeof dir, root, relative)) return -1;
+  char **names = calloc(1, sizeof *names);
+  if (!names) return -1;
+  size_t count = 1;
+  names[0] = strdup("default");
+  int result = -1;
+  if (!names[0]) goto done;
+  luna_directory *d = luna_directory_open(dir);
+  if (!d && errno != ENOENT) goto done;
+  if (d) {
+    luna_directory_entry *entry;
+    while ((entry = luna_directory_read(d))) {
+      char path[APK_PATH];
+      if (!profile_valid(entry->d_name) || !strcmp(entry->d_name, "default")) continue;
+      if (path_join(path, sizeof path, dir, entry->d_name)) {
+        luna_directory_close(d);
+        goto done;
       }
-      if (luna_directory_close(d)) goto done;
-   }
-   if (count == 1) {
-      result = copy_text(choice, capacity, names[0]);
-      goto done;
-   }
-   result = luna_launcher_choose(package, (const char *const *)names,
-                                 (const char *const *)names, count, choice, capacity);
-   if (result) apk_error("profile selection requires the launch window; use --profile NAME for a headless run");
+      if (!directory(path)) continue;
+      char **grown = realloc(names, (count+1)*sizeof *names);
+      if (!grown) {
+        luna_directory_close(d);
+        goto done;
+      }
+      names= grown;
+      names[count] = strdup(entry->d_name);
+      if (!names[count]) {
+        luna_directory_close(d);
+        goto done;
+      }
+      ++count;
+    }
+    if (luna_directory_close(d)) goto done;
+  }
+  if (count == 1) {
+    result = copy_text(choice, capacity, names[0]);
+    goto done;
+  }
+  result = luna_launcher_choose(package, (const char *const *)names,
+                                (const char *const *)names, count, choice, capacity);
+  if (result) apk_error("profile selection requires the launch window; use --profile NAME for a headless run");
 done:
-   for (size_t i=0; i<count; ++i) free(names[i]);
-   free(names);
-   return result;
+  for (size_t i=0; i<count; ++i) free(names[i]);
+  free(names);
+  return result;
 }
 static int profile_storage(const char *root, const char *package, const char *profile)
 {
-   if (!profile_valid(profile) || !package_valid(package))
-      return apk_error("invalid profile or package name");
-   char relative[512], common[APK_PATH], private_dir[APK_PATH], path[APK_PATH];
-   char google_root[APK_PATH];
-   const char *storage_root = root, *storage_profile = profile;
-   if (google_package_path(package) && strcmp(profile, "default")) {
-      if (luna_google_environment_root(root, profile, google_root, sizeof google_root)) return -1;
-      storage_root = google_root;
-      storage_profile = "default";
-   }
-   snprintf(relative, sizeof relative, "data/%s", package);
-   if (path_join(common, sizeof common, storage_root, relative))
+  if (!profile_valid(profile) || !package_valid(package))
+    return apk_error("invalid profile or package name");
+  char relative[512], common[APK_PATH], private_dir[APK_PATH], path[APK_PATH];
+  char google_root[APK_PATH];
+  const char *storage_root = root, *storage_profile = profile;
+  if (google_package_path(package) && strcmp(profile, "default")) {
+    if (luna_google_environment_root(root, profile, google_root, sizeof google_root)) return -1;
+    storage_root = google_root;
+    storage_profile = "default";
+  }
+  snprintf(relative, sizeof relative, "data/%s", package);
+  if (path_join(common, sizeof common, storage_root, relative))
+    return -1;
+  if (!strcmp(storage_profile, "default")) {
+    if (copy_text(private_dir, sizeof private_dir, common))
       return -1;
-   if (!strcmp(storage_profile, "default")) {
-      if (copy_text(private_dir, sizeof private_dir, common))
-         return -1;
-   } else {
-      snprintf(relative, sizeof relative, "profiles/%s/%s", package, profile);
-      if (path_join(private_dir, sizeof private_dir, root, relative))
-         return -1;
-   }
-   static const struct {
-      const char *key, *subdir;
-   } dirs[] = {
-      {"ANDROID_EXTERNAL_FILES_DIR", "external/files"}, {"ANDROID_EXTERNAL_CACHE_DIR", "external/cache"},
-      {"ANDROID_EXTERNAL_STORAGE_DIR", "external/storage"}, {"ANDROID_FILES_DIR", "files"},
-      {"ANDROID_CACHE_DIR", "cache"}, {"ANDROID_CODE_CACHE_DIR", "code_cache"},
-      {"ANDROID_DATABASES_DIR", "databases"}, {"ANDROID_NO_BACKUP_DIR", "no_backup"},
-      {"ANDROID_PREFS_DIR", "shared_prefs"},
-   };
-   /* Profiles separate private app state. External storage belongs to the
-    * installed app across profiles, without game-specific resource lists. */
-   for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++)
-      if (path_join(path, sizeof path,
-                    !strncmp(dirs[i].subdir, "external/", 9) ? common : private_dir,
-                    dirs[i].subdir) || mkdirs(path) || env_set(dirs[i].key, path, true))
-         return -1;
-   if (path_join(path, sizeof path, common, "obb") || mkdirs(path) || env_set("ANDROID_EXTERNAL_OBB_DIR", path, true))
+  } else {
+    snprintf(relative, sizeof relative, "profiles/%s/%s", package, profile);
+    if (path_join(private_dir, sizeof private_dir, root, relative))
       return -1;
-   /* Like the app directories above, the device filesystem belongs to the
-    * selected profile. exec retains the previous launch's environment. */
-   if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path))
+  }
+  static const struct {
+    const char *key, *subdir;
+  } dirs[] = {
+    {"ANDROID_EXTERNAL_FILES_DIR", "external/files"}, {"ANDROID_EXTERNAL_CACHE_DIR", "external/cache"},
+    {"ANDROID_EXTERNAL_STORAGE_DIR", "external/storage"}, {"ANDROID_FILES_DIR", "files"},
+    {"ANDROID_CACHE_DIR", "cache"}, {"ANDROID_CODE_CACHE_DIR", "code_cache"},
+    {"ANDROID_DATABASES_DIR", "databases"}, {"ANDROID_NO_BACKUP_DIR", "no_backup"},
+    {"ANDROID_PREFS_DIR", "shared_prefs"},
+  };
+  /* Profiles separate private app state. External storage belongs to the
+   * installed app across profiles, without game-specific resource lists. */
+  for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++)
+    if (path_join(path, sizeof path,
+                  !strncmp(dirs[i].subdir, "external/", 9) ? common : private_dir,
+                  dirs[i].subdir) || mkdirs(path) || env_set(dirs[i].key, path, true))
       return -1;
-   return env_set("LUNARIA_PROFILE", profile, true);
+  if (path_join(path, sizeof path, common, "obb") || mkdirs(path) || env_set("ANDROID_EXTERNAL_OBB_DIR", path, true))
+    return -1;
+  /* Like the app directories above, the device filesystem belongs to the
+   * selected profile. exec retains the previous launch's environment. */
+  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path))
+    return -1;
+  return env_set("LUNARIA_PROFILE", profile, true);
 }
 static bool suffix(const char *s, const char *ext)
 {
-   size_t n = strlen(s), k = strlen(ext);
-   return n >= k && !strcasecmp(s + n - k, ext);
+  size_t n = strlen(s), k = strlen(ext);
+  return n >= k && !strcasecmp(s + n - k, ext);
 }
 /* Driver discovery is host runtime state, shared by APKs and direct modules.
  * Keep explicit driver selection intact and resolve bundled Resources too. */
 static int host_driver_defaults(void)
 {
 #ifdef __APPLE__
-   char exedir[APK_PATH], path[APK_PATH], resources[APK_PATH];
-   if (luna_os_executable_path(exedir, sizeof exedir)) return 0;
-   char *slash = strrchr(exedir, '/');
-   if (!slash) return 0;
-   *slash = 0;
-   if (!path_join(resources, sizeof resources, exedir, "../Resources") &&
-       directory(resources))
-      (void)luna_file_realpath(resources, exedir, sizeof exedir);
-   static const char *driver_manifests[] = {
-      "lib/moltenvk_icd.json", ".deps/lib/moltenvk_icd.json"
-   };
-   for (size_t i = 0; i < sizeof driver_manifests / sizeof driver_manifests[0]; i++)
-      if (!path_join(path, sizeof path, exedir, driver_manifests[i]) && exists(path))
-         return env_default("VK_ICD_FILENAMES", path);
+  char exedir[APK_PATH], path[APK_PATH], resources[APK_PATH];
+  if (luna_os_executable_path(exedir, sizeof exedir)) return 0;
+  char *slash = strrchr(exedir, '/');
+  if (!slash) return 0;
+  *slash = 0;
+  if (!path_join(resources, sizeof resources, exedir, "../Resources") &&
+      directory(resources))
+    (void)luna_file_realpath(resources, exedir, sizeof exedir);
+  static const char *driver_manifests[] = {
+    "lib/moltenvk_icd.json", ".deps/lib/moltenvk_icd.json"
+  };
+  for (size_t i = 0; i < sizeof driver_manifests / sizeof driver_manifests[0]; i++)
+    if (!path_join(path, sizeof path, exedir, driver_manifests[i]) && exists(path))
+      return env_default("VK_ICD_FILENAMES", path);
 #endif
-   return 0;
+  return 0;
 }
 
 static int font_defaults(const char *exedir)
 {
-   static const struct {
-      const char *key, *file;
-   } faces[] = {
-      {"LUNA_FONT_REGULAR", "Inter-Regular.ttf"}, {"LUNA_FONT_BOLD", "Inter-Bold.ttf"},
-      {"LUNA_FONT_ICONS", "LunaSymbols-Solid.otf"}, {"LUNA_FONT_BRANDS", "LunaSymbols-Brands.otf"},
-   };
-   char fonts[APK_PATH], path[APK_PATH];
-   if (path_join(fonts, sizeof fonts, exedir, "fonts"))
-      return -1;
-   for (size_t i = 0; i < sizeof faces / sizeof faces[0]; i++)
-      if (!path_join(path, sizeof path, fonts, faces[i].file) && exists(path))
-         env_default(faces[i].key, path);
-   static const char *cjk[] = {"NotoSansCJKjp-Regular.otf", "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.ttc"};
-   for (size_t i = 0; i < sizeof cjk / sizeof cjk[0]; i++)
-      if (!path_join(path, sizeof path, fonts, cjk[i]) && exists(path)) {
-         env_default("LUNA_FONT_CJK", path);
-         break;
-      }
-   if (!path_join(path, sizeof path, exedir, "syslib-arm64") && directory(path))
-      env_default("LUNARIA_SYSLIB_DIR", path);
-   return host_driver_defaults();
+  static const struct {
+    const char *key, *file;
+  } faces[] = {
+    {"LUNA_FONT_REGULAR", "Inter-Regular.ttf"}, {"LUNA_FONT_BOLD", "Inter-Bold.ttf"},
+    {"LUNA_FONT_ICONS", "LunaSymbols-Solid.otf"}, {"LUNA_FONT_BRANDS", "LunaSymbols-Brands.otf"},
+  };
+  char fonts[APK_PATH], path[APK_PATH];
+  if (path_join(fonts, sizeof fonts, exedir, "fonts"))
+    return -1;
+  for (size_t i = 0; i < sizeof faces / sizeof faces[0]; i++)
+    if (!path_join(path, sizeof path, fonts, faces[i].file) && exists(path))
+      env_default(faces[i].key, path);
+  static const char *cjk[] = {"NotoSansCJKjp-Regular.otf", "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Regular.ttc"};
+  for (size_t i = 0; i < sizeof cjk / sizeof cjk[0]; i++)
+    if (!path_join(path, sizeof path, fonts, cjk[i]) && exists(path)) {
+      env_default("LUNA_FONT_CJK", path);
+      break;
+    }
+  if (!path_join(path, sizeof path, exedir, "syslib-arm64") && directory(path))
+    env_default("LUNARIA_SYSLIB_DIR", path);
+  return host_driver_defaults();
 }
 static int keymap_resolve(const char *exedir)
 {
-   const char *key = getenv("LUNARIA_KEYMAP");
-   if (!key || !*key || !strcmp(key, "off"))
-      return 0;
-   char path[APK_PATH];
-   if (!strcmp(key, "genshin") || !strcmp(key, "crossworlds")) {
-      char relative[128];
-      snprintf(relative, sizeof relative, "keymaps/%s.conf", key);
-      if (path_join(path, sizeof path, exedir, relative))
-         return -1;
-   } else if (absolute_path(key, path, sizeof path))
+  const char *key = getenv("LUNARIA_KEYMAP");
+  if (!key || !*key || !strcmp(key, "off"))
+    return 0;
+  char path[APK_PATH];
+  if (!strcmp(key, "genshin") || !strcmp(key, "crossworlds")) {
+    char relative[128];
+    snprintf(relative, sizeof relative, "keymaps/%s.conf", key);
+    if (path_join(path, sizeof path, exedir, relative))
       return -1;
-   if (!exists(path))
-      return apk_error("cannot read keymap: %s", path);
-   return env_set("LUNARIA_KEYMAP", path, true);
+  } else if (absolute_path(key, path, sizeof path))
+    return -1;
+  if (!exists(path))
+    return apk_error("cannot read keymap: %s", path);
+  return env_set("LUNARIA_KEYMAP", path, true);
 }
 static int managed_setup(const char *inst)
 {
-   char managed[APK_PATH];
-   if (path_join(managed, sizeof managed, inst, "assets/bin/Data/Managed"))
+  char managed[APK_PATH];
+  if (path_join(managed, sizeof managed, inst, "assets/bin/Data/Managed"))
+    return -1;
+  if (!directory(managed))
+    return 0;
+  static const char *versions[] = {"1.0", "2.0", "4.0", "net_4_x-linux"};
+  for (unsigned i = 0; i < sizeof versions / sizeof versions[0]; i++) {
+    char relative[128], targetdir[APK_PATH];
+    snprintf(relative, sizeof relative, "mono/%s", versions[i]);
+    if (path_join(targetdir, sizeof targetdir, managed, relative) || mkdirs(targetdir))
       return -1;
-   if (!directory(managed))
-      return 0;
-   static const char *versions[] = {"1.0", "2.0", "4.0", "net_4_x-linux"};
-   for (unsigned i = 0; i < sizeof versions / sizeof versions[0]; i++) {
-      char relative[128], targetdir[APK_PATH];
-      snprintf(relative, sizeof relative, "mono/%s", versions[i]);
-      if (path_join(targetdir, sizeof targetdir, managed, relative) || mkdirs(targetdir))
-         return -1;
-      luna_directory *d = luna_directory_open(managed);
-      if (!d)
-         return -1;
-      luna_directory_entry *e;
-      int r = 0;
-      while ((e = luna_directory_read(d)))
-         if (suffix(e->d_name, ".dll")) {
-            char source[APK_PATH], target[APK_PATH];
-            if (path_join(source, sizeof source, managed, e->d_name) || path_join(target, sizeof target, targetdir, e->d_name) || materialize(source, target)) {
-               r = -1;
-               break;
-            }
-         }
-      luna_directory_close(d);
-      if (r)
-         return -1;
-   }
-   char cfg[APK_PATH], dir[APK_PATH];
-   if (path_join(dir, sizeof dir, inst, "mono-etc/mono") || mkdirs(dir) || path_join(cfg, sizeof cfg, dir, "config"))
+    luna_directory *d = luna_directory_open(managed);
+    if (!d)
       return -1;
-   if (!exists(cfg)) {
-      FILE *f = open_file(cfg, "wb");
-      if (!f)
-         return -1;
-      int r = fputs("<configuration></configuration>\n", f) < 0 ? -1 : 0;
-      if (fclose(f))
-         r = -1;
-      if (r)
-         return -1;
-   }
-   char mono[APK_PATH];
-   if (path_join(mono, sizeof mono, managed, "mono/2.0"))
+    luna_directory_entry *e;
+    int r = 0;
+    while ((e = luna_directory_read(d)))
+      if (suffix(e->d_name, ".dll")) {
+        char source[APK_PATH], target[APK_PATH];
+        if (path_join(source, sizeof source, managed, e->d_name) || path_join(target, sizeof target, targetdir, e->d_name) || materialize(source, target)) {
+          r = -1;
+          break;
+        }
+      }
+    luna_directory_close(d);
+    if (r)
       return -1;
-   char search[APK_PATH * 2];
-   snprintf(search, sizeof search, "%s:%s", managed, mono);
-   env_set("MONO_PATH", search, true);
-   env_set("MONO_CONFIG", cfg, true);
-   if (path_join(dir, sizeof dir, inst, "mono-etc"))
+  }
+  char cfg[APK_PATH], dir[APK_PATH];
+  if (path_join(dir, sizeof dir, inst, "mono-etc/mono") || mkdirs(dir) || path_join(cfg, sizeof cfg, dir, "config"))
+    return -1;
+  if (!exists(cfg)) {
+    FILE *f = open_file(cfg, "wb");
+    if (!f)
       return -1;
-   env_set("MONO_CFG_DIR", dir, true);
-   if (path_join(cfg, sizeof cfg, managed, "mono/config"))
+    int r = fputs("<configuration></configuration>\n", f) < 0 ? -1 : 0;
+    if (fclose(f))
+      r = -1;
+    if (r)
       return -1;
-   if (!exists(cfg)) {
-      FILE *f = open_file(cfg, "wb");
-      if (!f)
-         return -1;
-      fputs("<configuration/>\n", f);
-      if (fclose(f))
-         return -1;
-   }
-   return 0;
+  }
+  char mono[APK_PATH];
+  if (path_join(mono, sizeof mono, managed, "mono/2.0"))
+    return -1;
+  char search[APK_PATH * 2];
+  snprintf(search, sizeof search, "%s:%s", managed, mono);
+  env_set("MONO_PATH", search, true);
+  env_set("MONO_CONFIG", cfg, true);
+  if (path_join(dir, sizeof dir, inst, "mono-etc"))
+    return -1;
+  env_set("MONO_CFG_DIR", dir, true);
+  if (path_join(cfg, sizeof cfg, managed, "mono/config"))
+    return -1;
+  if (!exists(cfg)) {
+    FILE *f = open_file(cfg, "wb");
+    if (!f)
+      return -1;
+    fputs("<configuration/>\n", f);
+    if (fclose(f))
+      return -1;
+  }
+  return 0;
 }
 static int compare_names(const void *a, const void *b)
 {
-   return strcmp(*(const char *const *)a, *(const char *const *)b);
+  return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 static uint64_t hash_bytes(uint64_t h, const void *bytes, size_t n)
 {
-   const unsigned char *p = bytes;
-   for (size_t i = 0; i < n; i++) {
-      h ^= p[i];
-      h *= UINT64_C(1099511628211);
-   }
-   return h;
+  const unsigned char *p = bytes;
+  for (size_t i = 0; i < n; i++) {
+    h ^= p[i];
+    h *= UINT64_C(1099511628211);
+  }
+  return h;
 }
 static int obb_find(const char *dir, const char *pkg, const char *kind, char *out, size_t cap)
 {
-   luna_directory *d = luna_directory_open(dir);
-   if (!d)
-      return errno == ENOENT ? 0 : -1;
-   char ending[300];
-   snprintf(ending, sizeof ending, ".%s.obb", pkg);
-   luna_directory_entry *e;
-   int r = 0;
-   while ((e = luna_directory_read(d)))
-      if (!strncmp(e->d_name, kind, strlen(kind)) && suffix(e->d_name, ending)) {
-         r = path_join(out, cap, dir, e->d_name);
-         break;
-      }
-   luna_directory_close(d);
-   return r;
+  luna_directory *d = luna_directory_open(dir);
+  if (!d)
+    return errno == ENOENT ? 0 : -1;
+  char ending[300];
+  snprintf(ending, sizeof ending, ".%s.obb", pkg);
+  luna_directory_entry *e;
+  int r = 0;
+  while ((e = luna_directory_read(d)))
+    if (!strncmp(e->d_name, kind, strlen(kind)) && suffix(e->d_name, ending)) {
+      r = path_join(out, cap, dir, e->d_name);
+      break;
+    }
+  luna_directory_close(d);
+  return r;
 }
 static int obb_alias(const char *source, const char *dir, const char *name)
 {
-   char path[APK_PATH];
-   if (path_join(path, sizeof path, dir, name) || mkdirs(dir))
-      return -1;
-   luna_file_info a, b;
-   if (!luna_file_infoat(LUNA_AT_FDCWD, source, &a, 0) && !luna_file_infoat(LUNA_AT_FDCWD, path, &b, 0) && a.inode == b.inode && a.device == b.device)
-      return 0;
-   /* A cache may have been evicted; replace a dangling alias as well. */
-   if (!luna_file_infoat(LUNA_AT_FDCWD, path, &b, LUNA_AT_NOFOLLOW) &&
-       luna_file_unlinkat(LUNA_AT_FDCWD, path, 0))
-      return -1;
-   /* Expansion archives are immutable package resources. Prefer sharing the
-    * original over copying gigabytes into every guest-visible OBB alias. */
-   if (!luna_file_link(source, path) || !luna_file_symlink(source, path))
-      return 0;
-   return copy_file(source, path);
+  char path[APK_PATH];
+  if (path_join(path, sizeof path, dir, name) || mkdirs(dir))
+    return -1;
+  luna_file_info a, b;
+  if (!luna_file_infoat(LUNA_AT_FDCWD, source, &a, 0) && !luna_file_infoat(LUNA_AT_FDCWD, path, &b, 0) && a.inode == b.inode && a.device == b.device)
+    return 0;
+  /* A cache may have been evicted; replace a dangling alias as well. */
+  if (!luna_file_infoat(LUNA_AT_FDCWD, path, &b, LUNA_AT_NOFOLLOW) &&
+      luna_file_unlinkat(LUNA_AT_FDCWD, path, 0))
+    return -1;
+  /* Expansion archives are immutable package resources. Prefer sharing the
+   * original over copying gigabytes into every guest-visible OBB alias. */
+  if (!luna_file_link(source, path) || !luna_file_symlink(source, path))
+    return 0;
+  return copy_file(source, path);
 }
 static int obb_setup(const char *input, const char *container, const char *inst, const char *package)
 {
-   char beside[APK_PATH];
-   if (copy_text(beside, sizeof beside, input))
-      return -1;
-   char *slash = strrchr(beside, '/');
-   if (slash)
-      * slash = 0;
-   else
-      strcpy(beside, ".");
-   const char *kinds[] = {"main.", "patch."}, *keys[] = {"ANDROID_OBB_MAIN", "ANDROID_OBB_PATCH"};
-   for (unsigned i = 0; i < 2; i++) {
-      char source[APK_PATH] = "", packed[APK_PATH];
-      if (!*env_value(keys[i], "")) {
-         if (obb_find(beside, package, kinds[i], source, sizeof source))
-            return -1;
-         if (!*source && container && *container) {
-            if (obb_find(container, package, kinds[i], source, sizeof source))
-               return -1;
-            char relative[512], d[APK_PATH];
-            snprintf(relative, sizeof relative, "Android/obb/%s", package);
-            if (!*source && (!path_join(d, sizeof d, container, relative)) && obb_find(d, package, kinds[i], source, sizeof source))
-               return -1;
-         }
-         if (!*source) {
-            if (path_join(packed, sizeof packed, inst, i ? "assets/patch.obb.png" : "assets/main.obb.png"))
-               return -1;
-            if (exists(packed))
-               strcpy(source, packed);
-         }
-         if (*source && env_set(keys[i], source, true))
-            return -1;
+  char beside[APK_PATH];
+  if (copy_text(beside, sizeof beside, input))
+    return -1;
+  char *slash = strrchr(beside, '/');
+  if (slash)
+    * slash = 0;
+  else
+    strcpy(beside, ".");
+  const char *kinds[] = {"main.", "patch."}, *keys[] = {"ANDROID_OBB_MAIN", "ANDROID_OBB_PATCH"};
+  for (unsigned i = 0; i < 2; i++) {
+    char source[APK_PATH] = "", packed[APK_PATH];
+    if (!*env_value(keys[i], "")) {
+      if (obb_find(beside, package, kinds[i], source, sizeof source))
+        return -1;
+      if (!*source && container && *container) {
+        if (obb_find(container, package, kinds[i], source, sizeof source))
+          return -1;
+        char relative[512], d[APK_PATH];
+        snprintf(relative, sizeof relative, "Android/obb/%s", package);
+        if (!*source && (!path_join(d, sizeof d, container, relative)) && obb_find(d, package, kinds[i], source, sizeof source))
+          return -1;
       }
-      const char *file = env_value(keys[i], "");
-      if (!*file)
-         continue;
-      char name[512], external[APK_PATH], relative[512];
-      snprintf(name, sizeof name, "%s1.%s.obb", kinds[i], package);
-      if (obb_alias(file, getenv("ANDROID_EXTERNAL_OBB_DIR"), name))
-         return -1;
-      snprintf(relative, sizeof relative, "Android/obb/%s", package);
-      if (path_join(external, sizeof external, getenv("ANDROID_EXTERNAL_FILES_DIR"), relative) || obb_alias(file, external, name))
-         return -1;
-      const char *base = strrchr(file, '/');
-      base = base ? base + 1 : file;
-      if (obb_alias(file, getenv("ANDROID_EXTERNAL_OBB_DIR"), base) || obb_alias(file, external, base))
-         return -1;
-   }
-   return 0;
+      if (!*source) {
+        if (path_join(packed, sizeof packed, inst, i ? "assets/patch.obb.png" : "assets/main.obb.png"))
+          return -1;
+        if (exists(packed))
+          strcpy(source, packed);
+      }
+      if (*source && env_set(keys[i], source, true))
+        return -1;
+    }
+    const char *file = env_value(keys[i], "");
+    if (!*file)
+      continue;
+    char name[512], external[APK_PATH], relative[512];
+    snprintf(name, sizeof name, "%s1.%s.obb", kinds[i], package);
+    if (obb_alias(file, getenv("ANDROID_EXTERNAL_OBB_DIR"), name))
+      return -1;
+    snprintf(relative, sizeof relative, "Android/obb/%s", package);
+    if (path_join(external, sizeof external, getenv("ANDROID_EXTERNAL_FILES_DIR"), relative) || obb_alias(file, external, name))
+      return -1;
+    const char *base = strrchr(file, '/');
+    base = base ? base + 1 : file;
+    if (obb_alias(file, getenv("ANDROID_EXTERNAL_OBB_DIR"), base) || obb_alias(file, external, base))
+      return -1;
+  }
+  return 0;
 }
 static void apk_help(void)
 {
-   puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.aab|APP.xapk|APP.apks\n"
-        "       lunaria [--list-profiles | --choose-profile | --prepare-profile | --install-only] APP.apk\n"
-        "       lunaria --install-system APP.apk\n"
-        "       lunaria --google-services [--data-root DIR]\n"
-        "       lunaria MODULE.so\n\n"
-        "APK archives are installed once in cache/packages; application data persists in data/.\n"
-        "Environment settings override lunaria.conf; command-line options override both.");
+  puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.aab|APP.xapk|APP.apks\n"
+       "       lunaria [--list-profiles | --choose-profile | --prepare-profile | --install-only] APP.apk\n"
+       "       lunaria --install-system APP.apk\n"
+       "       lunaria --google-services [--data-root DIR]\n"
+       "       lunaria MODULE.so\n\n"
+       "APK archives are installed once in cache/packages; application data persists in data/.\n"
+       "Environment settings override lunaria.conf; command-line options override both.");
 }
 /* ---- lunaria.conf: where it lives, and its common (outside any [package]) part */
 
@@ -2270,64 +2473,64 @@ static void apk_help(void)
  * Support, next to nothing else of ours. */
 static int conf_default_path(char *out, size_t cap)
 {
-   const char *given = getenv("LUNARIA_CONF");
-   char cwd[APK_PATH];
-   if (given && *given)
-      return absolute_path(given, out, cap);
+  const char *given = getenv("LUNARIA_CONF");
+  char cwd[APK_PATH];
+  if (given && *given)
+    return absolute_path(given, out, cap);
 #ifdef __APPLE__
-   char exe[APK_PATH];
-   const char *home = getenv("HOME");
-   if (home && *home && !luna_os_executable_path(exe, sizeof exe) && strstr(exe, ".app/Contents/")) {
-      char dir[APK_PATH];
-      if (path_join(dir, sizeof dir, home, "Library/Application Support/Lunaria") || mkdirs(dir))
-         return -1;
-      return path_join(out, cap, dir, "lunaria.conf");
-   }
-#endif
-   if (!apk_getcwd(cwd, sizeof cwd))
+  char exe[APK_PATH];
+  const char *home = getenv("HOME");
+  if (home && *home && !luna_os_executable_path(exe, sizeof exe) && strstr(exe, ".app/Contents/")) {
+    char dir[APK_PATH];
+    if (path_join(dir, sizeof dir, home, "Library/Application Support/Lunaria") || mkdirs(dir))
       return -1;
-   return path_join(out, cap, cwd, "lunaria.conf");
+    return path_join(out, cap, dir, "lunaria.conf");
+  }
+#endif
+  if (!apk_getcwd(cwd, sizeof cwd))
+    return -1;
+  return path_join(out, cap, cwd, "lunaria.conf");
 }
 
 /* The line's key when it is an active `LUNARIA_*=value` line, else NULL. */
 static char *conf_line_key(char *line, char **value)
 {
-   char *p = trim(line);
-   if (*p == '#' || *p == '[' || !*p)
-      return NULL;
-   char *eq = strchr(p, '=');
-   if (!eq)
-      return NULL;
-   *eq = 0;
-   *value = trim(eq + 1);
-   return trim(p);
+  char *p = trim(line);
+  if (*p == '#' || *p == '[' || !*p)
+    return NULL;
+  char *eq = strchr(p, '=');
+  if (!eq)
+    return NULL;
+  *eq = 0;
+  *value = trim(eq + 1);
+  return trim(p);
 }
 
 /* The value of `key` in the common part of the file, or "" */
 static void conf_get(const char *path, const char *key, char *out, size_t cap)
 {
-   out[0] = 0;
-   FILE *f = open_file(path, "rb");
-   if (!f)
-      return;
-   char line[APK_META];
-   while (fgets(line, sizeof line, f)) {
-      char *p = trim(line), *value = NULL;
-      if (*p == '[')
-         break;
-      char *k = conf_line_key(line, &value);
-      if (k && !strcmp(k, key)) {
-         size_t n = strlen(value);
-         if (n >= 2 && ((value[0] == '"' && value[n - 1] == '"') || (value[0] == '\'' && value[n - 1] == '\''))) {
-            value[n - 1] = 0;
-            value++;
-         }
-         if (strlen(value) < cap)
-            strcpy(out, value);
-         break;
+  out[0] = 0;
+  FILE *f = open_file(path, "rb");
+  if (!f)
+    return;
+  char line[APK_META];
+  while (fgets(line, sizeof line, f)) {
+    char *p = trim(line), *value = NULL;
+    if (*p == '[')
+      break;
+    char *k = conf_line_key(line, &value);
+    if (k && !strcmp(k, key)) {
+      size_t n = strlen(value);
+      if (n >= 2 && ((value[0] == '"' && value[n - 1] == '"') || (value[0] == '\'' && value[n - 1] == '\''))) {
+        value[n - 1] = 0;
+        value++;
       }
-   }
-   fclose(f);
+      if (strlen(value) < cap)
+        strcpy(out, value);
+      break;
+    }
+  }
+  fclose(f);
 }
 
 /* Sets (or, with an empty value, removes) `key` in the common part, keeping
@@ -2335,91 +2538,92 @@ static void conf_get(const char *path, const char *key, char *out, size_t cap)
  * whole, so an interrupted write leaves the old one. */
 static int conf_set(const char *path, const char *key, const char *value)
 {
-   char **lines = NULL;
-   size_t n = 0, cap = 0;
-   int result = -1;
-   FILE *f = open_file(path, "rb");
-   if (f) {
-      char line[APK_META];
-      while (fgets(line, sizeof line, f)) {
-         size_t len = strlen(line);
-         while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
-            line[--len] = 0;
-         if (n == cap) {
-            char **grown = realloc(lines, (cap = cap ? cap * 2 : 64) * sizeof *lines);
-            if (!grown)
-               goto done;
-            lines = grown;
-         }
-         if (!(lines[n] = strdup(line)))
-            goto done;
-         n++;
-      }
-      fclose(f);
-      f = NULL;
-   }
-   size_t section = n, found = n;
-   for (size_t i = 0; i < n && section == n; i++) {
-      char copy[APK_META];
-      snprintf(copy, sizeof copy, "%s", lines[i]);
-      char *t = trim(copy), *v = NULL;
-      if (*t == '[') {
-         section = i;
-         break;
-      }
-      char *k = conf_line_key(copy, &v);
-      if (k && !strcmp(k, key))
-         found = i;
-   }
-   char text[APK_META];
-   snprintf(text, sizeof text, "%s=%s", key, value);
-   if (found < n) {
-      free(lines[found]);
-      if (*value) {
-         lines[found] = strdup(text);
-      } else {
-         memmove(lines + found, lines + found + 1, (n - found - 1) * sizeof *lines);
-         n--;
-         lines[n] = NULL;
-         goto write;
-      }
-      if (!lines[found])
-         goto done;
-   } else if (*value) {
+  char **lines = NULL;
+  size_t n = 0, cap = 0;
+  int result = -1;
+  FILE *f = open_file(path, "rb");
+  if (f) {
+    char line[APK_META];
+    while (fgets(line, sizeof line, f)) {
+      size_t len = strlen(line);
+      while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+        line[--len] = 0;
       if (n == cap) {
-         char **grown = realloc(lines, (cap = cap ? cap * 2 : 64) * sizeof *lines);
-         if (!grown)
-            goto done;
-         lines = grown;
+        char **grown = realloc(lines, (cap = cap ? cap * 2 : 64) * sizeof *lines);
+        if (!grown)
+          goto done;
+        lines = grown;
       }
-      memmove(lines + section + 1, lines + section, (n - section) * sizeof *lines);
-      if (!(lines[section] = strdup(text)))
-         goto done;
+      if (!(lines[n] = strdup(line)))
+        goto done;
       n++;
-   }
-write:;
-   char temp[APK_PATH];
-   if (snprintf(temp, sizeof temp, "%s.tmp", path) >= (int)sizeof temp)
+    }
+    fclose(f);
+    f = NULL;
+  }
+  size_t section = n, found = n;
+  for (size_t i = 0; i < n && section == n; i++) {
+    char copy[APK_META];
+    snprintf(copy, sizeof copy, "%s", lines[i]);
+    char *t = trim(copy), *v = NULL;
+    if (*t == '[') {
+      section = i;
+      break;
+    }
+    char *k = conf_line_key(copy, &v);
+    if (k && !strcmp(k, key))
+      found = i;
+  }
+  char text[APK_META];
+  snprintf(text, sizeof text, "%s=%s", key, value);
+  if (found < n) {
+    free(lines[found]);
+    if (*value) {
+      lines[found] = strdup(text);
+    } else {
+      memmove(lines + found, lines + found + 1, (n - found - 1) * sizeof *lines);
+      n--;
+      lines[n] = NULL;
+      goto write;
+    }
+    if (!lines[found])
       goto done;
-   FILE *out = open_file(temp, "wb");
-   if (!out)
+  } else if (*value) {
+    if (n == cap) {
+      char **grown = realloc(lines, (cap = cap ? cap * 2 : 64) * sizeof *lines);
+      if (!grown)
+        goto done;
+      lines = grown;
+    }
+    memmove(lines + section + 1, lines + section, (n - section) * sizeof *lines);
+    if (!(lines[section] = strdup(text)))
       goto done;
-   for (size_t i = 0; i < n; i++)
-      fprintf(out, "%s\n", lines[i]);
-   if (fclose(out) || luna_file_rename(temp, path)) {
-      remove(temp);
-      goto done;
-   }
-   result = 0;
+    n++;
+  }
+write:
+  ;
+  char temp[APK_PATH];
+  if (snprintf(temp, sizeof temp, "%s.tmp", path) >= (int)sizeof temp)
+    goto done;
+  FILE *out = open_file(temp, "wb");
+  if (!out)
+    goto done;
+  for (size_t i = 0; i < n; i++)
+    fprintf(out, "%s\n", lines[i]);
+  if (fclose(out) || luna_file_rename(temp, path)) {
+    remove(temp);
+    goto done;
+  }
+  result = 0;
 done:
-   if (f)
-      fclose(f);
-   for (size_t i = 0; i < n; i++)
-      free(lines[i]);
-   free(lines);
-   if (result)
-      apk_error("cannot save %s: %s", path, strerror(errno));
-   return result;
+  if (f)
+    fclose(f);
+  for (size_t i = 0; i < n; i++)
+    free(lines[i]);
+  free(lines);
+  if (result)
+    apk_error("cannot save %s: %s", path, strerror(errno));
+  return result;
 }
 
 /* No application on the command line: ask which to open and how this
@@ -2429,53 +2633,56 @@ done:
  * earlier one downloaded. */
 static int launcher_ask(int *argc, const char ***argv)
 {
-   static const char *const devices[] = {"", "pixel6", "pixel7", "galaxys21", "lunaria", NULL};
-   static const struct { const char *key, *label, *hint; int folder, compact; } fields[] = {
-      {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0},
-      {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0},
-      {"LUNARIA_DEVICE", "Device", "", 0, 1},
-      {"LUNARIA_WIDTH", "Width (px)", "", 0, 1},
-      {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1},
-   };
-   static luna_launcher_setting settings[sizeof fields / sizeof fields[0]];
-   static char chosen[APK_PATH], conf[APK_PATH], before[sizeof fields / sizeof fields[0]][1024];
-   static const char *synthesized[3];
-   if (conf_default_path(conf, sizeof conf))
+  static const char *const devices[] = {"", "pixel6", "pixel7", "galaxys21", "lunaria", NULL};
+  static const struct {
+    const char *key, *label, *hint;
+    int folder, compact;
+  } fields[] = {
+    {"LUNARIA_DATA_ROOT", "Data folder", "Where the app's files live. Keep it set: a different folder starts from nothing.", 1, 0},
+    {"LUNARIA_CACHE_DIR", "Package cache folder", "Empty: cache/packages inside the data folder.", 1, 0},
+    {"LUNARIA_DEVICE", "Device", "", 0, 1},
+    {"LUNARIA_WIDTH", "Width (px)", "", 0, 1},
+    {"LUNARIA_HEIGHT", "Height (px)", "", 0, 1},
+  };
+  static luna_launcher_setting settings[sizeof fields / sizeof fields[0]];
+  static char chosen[APK_PATH], conf[APK_PATH], before[sizeof fields / sizeof fields[0]][1024];
+  static const char *synthesized[3];
+  if (conf_default_path(conf, sizeof conf))
+    return -1;
+  for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+    settings[i].key = fields[i].key;
+    settings[i].label = fields[i].label;
+    settings[i].hint = fields[i].hint;
+    settings[i].folder = fields[i].folder;
+    settings[i].compact = fields[i].compact;
+    settings[i].choices = !strcmp(fields[i].key, "LUNARIA_DEVICE") ? devices : NULL;
+    const char *env = getenv(fields[i].key);
+    if (env && *env && strlen(env) < sizeof settings[i].value)
+      strcpy(settings[i].value, env);
+    else
+      conf_get(conf, fields[i].key, settings[i].value, sizeof settings[i].value);
+    strcpy(before[i], settings[i].value);
+  }
+  if (luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]) != 0)
+    return 1;
+  for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+    if (!strcmp(before[i], settings[i].value))
+      continue;
+    if (conf_set(conf, fields[i].key, settings[i].value))
       return -1;
-   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
-      settings[i].key = fields[i].key;
-      settings[i].label = fields[i].label;
-      settings[i].hint = fields[i].hint;
-      settings[i].folder = fields[i].folder;
-      settings[i].compact = fields[i].compact;
-      settings[i].choices = !strcmp(fields[i].key, "LUNARIA_DEVICE") ? devices : NULL;
-      const char *env = getenv(fields[i].key);
-      if (env && *env && strlen(env) < sizeof settings[i].value)
-         strcpy(settings[i].value, env);
-      else
-         conf_get(conf, fields[i].key, settings[i].value, sizeof settings[i].value);
-      strcpy(before[i], settings[i].value);
-   }
-   if (luna_launcher_pick(chosen, sizeof chosen, settings, sizeof fields / sizeof fields[0]) != 0)
-      return 1;
-   for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
-      if (!strcmp(before[i], settings[i].value))
-         continue;
-      if (conf_set(conf, fields[i].key, settings[i].value))
-         return -1;
-      if (*settings[i].value && env_set(fields[i].key, settings[i].value, true))
-         return -1;
-      if (!*settings[i].value && luna_os_unsetenv(fields[i].key))
-         return apk_error("cannot clear %s: %s", fields[i].key, strerror(errno));
-   }
-   if (env_set("LUNARIA_CONF", conf, true))
+    if (*settings[i].value && env_set(fields[i].key, settings[i].value, true))
       return -1;
-   synthesized[0] = *argc > 0 ? (*argv)[0] : "lunaria";
-   synthesized[1] = chosen;
-   synthesized[2] = NULL;
-   *argc = 2;
-   *argv = synthesized;
-   return 0;
+    if (!*settings[i].value && luna_os_unsetenv(fields[i].key))
+      return apk_error("cannot clear %s: %s", fields[i].key, strerror(errno));
+  }
+  if (env_set("LUNARIA_CONF", conf, true))
+    return -1;
+  synthesized[0] = *argc > 0 ? (*argv)[0] : "lunaria";
+  synthesized[1] = chosen;
+  synthesized[2] = NULL;
+  *argc = 2;
+  *argv = synthesized;
+  return 0;
 }
 
 /* 0: enter the loader, 1: command completed, -1: failure. */
@@ -2484,441 +2691,443 @@ static int restart_environment_remember(void);
 static int restart_environment_option(const char *key, const char *value);
 static int apk_prepare_inner(int *argc, const char ***argv)
 {
-   if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32") ||
-                      !strcmp((*argv)[1], "--service-process-arm64") || !strcmp((*argv)[1], "--service-process-arm32")))
-      return 0;
-   if (restart_environment_remember()) return apk_error("cannot retain the launch environment");
-   if (*argc < 2) {
-      /* Started with nothing to run (a double-clicked app, a launcher icon).
-       * Without a display there is nobody to ask. */
-      const int asked = launcher_ask(argc, argv);
-      if (asked) {
-         luna_launcher_end(0);
-         if (asked > 0)
-            apk_help();
-         return asked > 0 ? 1 : -1;
+  if (*argc >= 2 && (!strcmp((*argv)[1], "--apk-process-arm64") || !strcmp((*argv)[1], "--apk-process-arm32") ||
+                     !strcmp((*argv)[1], "--service-process-arm64") || !strcmp((*argv)[1], "--service-process-arm32")))
+    return 0;
+  if (restart_environment_remember()) return apk_error("cannot retain the launch environment");
+  if (*argc < 2) {
+    /* Started with nothing to run (a double-clicked app, a launcher icon).
+     * Without a display there is nobody to ask. */
+    const int asked = launcher_ask(argc, argv);
+    if (asked) {
+      luna_launcher_end(0);
+      if (asked > 0)
+        apk_help();
+      return asked > 0 ? 1 : -1;
+    }
+  }
+  restart_remember(*argc, *argv);
+  bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
+  bool system_install = false, google_setup = false;
+  /* --service-host: prepare this package exactly as for a launch, then run it as a
+   * headless component host (control socket on fd 3) instead of its launcher. */
+  bool service_host = false;
+  bool launch_ui_ready = false;
+  int at = 1;
+  for (; at < *argc; at++) {
+    const char *arg = (*argv)[at];
+    if (!strcmp(arg, "--")) {
+      at++;
+      break;
+    }
+    if (*arg != '-')
+      break;
+    if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) {
+      apk_help();
+      return 1;
+    }
+    if (!strcmp(arg, "--list-profiles")) {
+      list = true;
+      continue;
+    }
+    if (!strcmp(arg, "--prepare-profile")) {
+      prepare = true;
+      continue;
+    }
+    if (!strcmp(arg, "--service-host")) {
+      service_host = true;
+      continue;
+    }
+    if (!strcmp(arg, "--install-only")) {
+      install = true;
+      continue;
+    }
+    if (!strcmp(arg, "--install-system") || !strcmp(arg, "--google-services")) {
+      install = system_install = true;
+      google_setup = !strcmp(arg, "--google-services");
+      continue;
+    }
+    if (!strcmp(arg, "--choose-profile")) {
+      choose = true;
+      profile_requested = false;
+      continue;
+    }
+    const char *key = NULL, *value = NULL;
+    static const struct {
+      const char *option, *key;
+    } options[] = {
+      {"--config", "LUNARIA_CONF"}, {"--data-root", "LUNARIA_DATA_ROOT"}, {"--profile", "LUNARIA_PROFILE"},
+    };
+    for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
+      size_t n = strlen(options[i].option);
+      if (!strcmp(arg, options[i].option)) {
+        if (++at >= *argc)
+          return apk_error("%s requires a value", arg);
+        key = options[i].key;
+        value = (*argv)[at];
+        break;
       }
-   }
-   restart_remember(*argc, *argv);
-   bool list = false, prepare = false, install = false, choose = false, profile_requested = false;
-   bool system_install = false, google_setup = false;
-   /* --service-host: prepare this package exactly as for a launch, then run it as a
-    * headless component host (control socket on fd 3) instead of its launcher. */
-   bool service_host = false;
-   bool launch_ui_ready = false;
-   int at = 1;
-   for (; at < *argc; at++) {
-      const char *arg = (*argv)[at];
-      if (!strcmp(arg, "--")) {
-         at++;
-         break;
+      if (!strncmp(arg, options[i].option, n) && arg[n] == '=') {
+        key = options[i].key;
+        value = arg + n + 1;
+        break;
       }
-      if (*arg != '-')
-         break;
-      if (!strcmp(arg, "--help") || !strcmp(arg, "-h")) {
-         apk_help();
-         return 1;
-      }
-      if (!strcmp(arg, "--list-profiles")) {
-         list = true;
-         continue;
-      }
-      if (!strcmp(arg, "--prepare-profile")) {
-         prepare = true;
-         continue;
-      }
-      if (!strcmp(arg, "--service-host")) {
-         service_host = true;
-         continue;
-      }
-      if (!strcmp(arg, "--install-only")) {
-         install = true;
-         continue;
-      }
-      if (!strcmp(arg, "--install-system") || !strcmp(arg, "--google-services")) {
-         install = system_install = true;
-         google_setup = !strcmp(arg, "--google-services");
-         continue;
-      }
-      if (!strcmp(arg, "--choose-profile")) {
-         choose = true;
-         profile_requested = false;
-         continue;
-      }
-      const char *key = NULL, *value = NULL;
-      static const struct {
-         const char *option, *key;
-      } options[] = {
-         {"--config", "LUNARIA_CONF"}, {"--data-root", "LUNARIA_DATA_ROOT"}, {"--profile", "LUNARIA_PROFILE"},
-      };
-      for (size_t i = 0; i < sizeof options / sizeof options[0]; i++) {
-         size_t n = strlen(options[i].option);
-         if (!strcmp(arg, options[i].option)) {
-            if (++at >= *argc)
-               return apk_error("%s requires a value", arg);
-            key = options[i].key;
-            value = (*argv)[at];
-            break;
-         }
-         if (!strncmp(arg, options[i].option, n) && arg[n] == '=') {
-            key = options[i].key;
-            value = arg + n + 1;
-            break;
-         }
-      }
-      if (!key || !value || !*value)
-         return apk_error("unknown or incomplete option: %s", arg);
-      if (env_set(key, value, true))
-         return -1;
-      if ((!strcmp(key, "LUNARIA_CONF") || !strcmp(key, "LUNARIA_DATA_ROOT")) &&
-          restart_environment_option(key, value)) return -1;
-      if (!strcmp(key, "LUNARIA_PROFILE")) {
-         choose = false;
-         profile_requested = true;
-      }
-   }
-   char selected[APK_PATH];
-   const char *argument;
-   if (at == *argc && google_setup) {
-      char note[APK_PATH + 128];
-      snprintf(note, sizeof note, "Shared data folder: %s",
-               env_value("LUNARIA_DATA_ROOT", "."));
-      if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
-      argument = selected;
-   } else {
-      if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
-      argument = (*argv)[at];
-   }
-   bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
-   if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
-      if (at != 1)
-         return apk_error("APK options require an APK archive");
-      return 0;
-   }
-   char input[APK_PATH], cwd[APK_PATH], exedir[APK_PATH], conf[APK_PATH], root[APK_PATH], cache_root[APK_PATH], cache[APK_PATH], pkgdir[APK_PATH], inst[APK_PATH], base[APK_PATH], ready[APK_PATH];
-   if (!luna_file_realpath(argument, input, sizeof input) || !apk_getcwd(cwd, sizeof cwd) || luna_os_executable_path(exedir, sizeof exedir))
-      return apk_error("cannot resolve APK or executable path");
-   /* APKPure's XAPK endpoint also serves ordinary APKs. The extension is a
-    * download label, not the archive structure: inspect the central directory
-    * before both launcher metadata and installation choose a parsing path. */
-   struct zip format = {0};
-   if (zip_open(&format, input)) return -1;
-   container = !zip_find(&format, "AndroidManifest.xml") &&
-               !zip_find(&format, "base/manifest/AndroidManifest.xml");
-   zip_close(&format);
-   char *slash = strrchr(exedir, '/');
-   if (!slash)
+    }
+    if (!key || !value || !*value)
+      return apk_error("unknown or incomplete option: %s", arg);
+    if (env_set(key, value, true))
       return -1;
-   *slash = 0;
+    if ((!strcmp(key, "LUNARIA_CONF") || !strcmp(key, "LUNARIA_DATA_ROOT")) &&
+        restart_environment_option(key, value)) return -1;
+    if (!strcmp(key, "LUNARIA_PROFILE")) {
+      choose = false;
+      profile_requested = true;
+    }
+  }
+  char selected[APK_PATH];
+  const char *argument;
+  if (at == *argc && google_setup) {
+    char note[APK_PATH + 128];
+    snprintf(note, sizeof note, "Shared data folder: %s",
+             env_value("LUNARIA_DATA_ROOT", "."));
+    if (luna_launcher_pick_named(selected, sizeof selected, "Install Google services", note)) return 1;
+    argument = selected;
+  } else {
+    if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
+    argument = (*argv)[at];
+  }
+  bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
+  if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
+    if (at != 1)
+      return apk_error("APK options require an APK archive");
+    return 0;
+  }
+  char input[APK_PATH], cwd[APK_PATH], exedir[APK_PATH], conf[APK_PATH], root[APK_PATH], cache_root[APK_PATH], cache[APK_PATH], pkgdir[APK_PATH], inst[APK_PATH], base[APK_PATH], ready[APK_PATH];
+  if (!luna_file_realpath(argument, input, sizeof input) || !apk_getcwd(cwd, sizeof cwd) || luna_os_executable_path(exedir, sizeof exedir))
+    return apk_error("cannot resolve APK or executable path");
+  /* APKPure's XAPK endpoint also serves ordinary APKs. The extension is a
+   * download label, not the archive structure: inspect the central directory
+   * before both launcher metadata and installation choose a parsing path. */
+  struct zip format = {0};
+  if (zip_open(&format, input)) return -1;
+  container = !zip_find(&format, "AndroidManifest.xml") &&
+              !zip_find(&format, "base/manifest/AndroidManifest.xml");
+  zip_close(&format);
+  char *slash = strrchr(exedir, '/');
+  if (!slash)
+    return -1;
+  *slash = 0;
 #ifdef __APPLE__
-   /* A .app uses its Resources directory as the distribution root. */
-   char resources[APK_PATH];
-   if (!path_join(resources, sizeof resources, exedir, "../Resources") && directory(resources) && luna_file_realpath(resources, exedir, sizeof exedir)) {}
+  /* A .app uses its Resources directory as the distribution root. */
+  char resources[APK_PATH];
+  if (!path_join(resources, sizeof resources, exedir, "../Resources") && directory(resources) && luna_file_realpath(resources, exedir, sizeof exedir)) {}
 #endif
-   if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
+  if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
+    return -1;
+  if (((!list && !prepare && !install) || choose || google_setup) && !service_host) {
+    if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
+    launch_ui_ready = luna_launcher_begin(input) != 0;
+  }
+  if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root))
+    return -1;
+  const char *configured_cache = getenv("LUNARIA_CACHE_DIR");
+  if (configured_cache && *configured_cache) {
+    if (absolute_path(configured_cache, cache_root, sizeof cache_root))
       return -1;
-   if (((!list && !prepare && !install) || choose || google_setup) && !service_host) {
-      if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
-      launch_ui_ready = luna_launcher_begin(input) != 0;
-   }
-   if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root))
-      return -1;
-   const char *configured_cache = getenv("LUNARIA_CACHE_DIR");
-   if (configured_cache && *configured_cache) {
-      if (absolute_path(configured_cache, cache_root, sizeof cache_root))
-         return -1;
-   } else if (path_join(cache_root, sizeof cache_root, root, "cache/packages"))
-      return -1;
-   luna_file_info info;
-   if (luna_file_infoat(LUNA_AT_FDCWD, input, &info, 0))
-      return -1;
-   uint64_t hash = hash_bytes(UINT64_C(14695981039346656037), input, strlen(input));
-   hash = hash_bytes(hash, &info.size, sizeof info.size);
-   hash = hash_bytes(hash, &info.modified, sizeof info.modified);
-   char key[64];
-   snprintf(key, sizeof key, "native-v1-%016" PRIx64, hash);
-   if (path_join(cache, sizeof cache, cache_root, key) || mkdirs(cache) || path_join(pkgdir, sizeof pkgdir, cache, "pkg") || path_join(inst, sizeof inst, cache, "inst") || path_join(ready, sizeof ready, cache, ".ready"))
-      return -1;
-   bool hit = exists(ready) && !env_true("LUNARIA_NO_CACHE");
-   fprintf(stderr, "[apk] Preparing %s%s\n", input, hit ? " (cached)" : "");
-   fflush(stderr);
-   struct zip outer = {0}, apk = {0};
-   struct manifest *m = calloc(1, sizeof *m), *split = calloc(1, sizeof *split);
-   struct text split_list = {0};
-   char **apks = NULL;
-   size_t apk_count = 0;
-   int result = -1;
-   if (!m || !split)
+  } else if (path_join(cache_root, sizeof cache_root, root, "cache/packages"))
+    return -1;
+  luna_file_info info;
+  if (luna_file_infoat(LUNA_AT_FDCWD, input, &info, 0))
+    return -1;
+  uint64_t hash = hash_bytes(UINT64_C(14695981039346656037), input, strlen(input));
+  hash = hash_bytes(hash, &info.size, sizeof info.size);
+  hash = hash_bytes(hash, &info.modified, sizeof info.modified);
+  char key[64];
+  snprintf(key, sizeof key, "native-v1-%016" PRIx64, hash);
+  if (path_join(cache, sizeof cache, cache_root, key) || mkdirs(cache) || path_join(pkgdir, sizeof pkgdir, cache, "pkg") || path_join(inst, sizeof inst, cache, "inst") || path_join(ready, sizeof ready, cache, ".ready"))
+    return -1;
+  bool hit = exists(ready) && !env_true("LUNARIA_NO_CACHE");
+  fprintf(stderr, "[apk] Preparing %s%s\n", input, hit ? " (cached)" : "");
+  fflush(stderr);
+  struct zip outer = {0}, apk = {0};
+  struct manifest *m = calloc(1, sizeof *m), *split = calloc(1, sizeof *split);
+  struct text split_list = {0};
+  char **apks = NULL;
+  size_t apk_count = 0;
+  int result = -1;
+  if (!m || !split)
+    goto done;
+  if (container) {
+    if (zip_open(&outer, input))
       goto done;
-   if (container) {
-      if (zip_open(&outer, input))
-         goto done;
-      /* Keep contained APKs and expansion archives intact. */
-      if (zip_extract(&outer, pkgdir, !hit))
-         goto done;
-      apks = calloc(outer.count ? outer.count : 1, sizeof(*apks));
-      if (!apks)
-         goto done;
-      for (size_t i = 0; i < outer.count; i++)
-         if (suffix(outer.entries[i].name, ".apk")) {
-            char path[APK_PATH];
-            if (path_join(path, sizeof path, pkgdir, outer.entries[i].name))
-               goto done;
-            apks[apk_count] = strdup(path);
-            if (!apks[apk_count])
-               goto done;
-            apk_count++;
-         }
-      if (!apk_count) {
-         apk_error("container has no APKs");
-         goto done;
+    /* Keep contained APKs and expansion archives intact. */
+    if (zip_extract(&outer, pkgdir, !hit))
+      goto done;
+    apks = calloc(outer.count ? outer.count : 1, sizeof(*apks));
+    if (!apks)
+      goto done;
+    for (size_t i = 0; i < outer.count; i++)
+      if (suffix(outer.entries[i].name, ".apk")) {
+        char path[APK_PATH];
+        if (path_join(path, sizeof path, pkgdir, outer.entries[i].name))
+          goto done;
+        apks[apk_count] = strdup(path);
+        if (!apks[apk_count])
+          goto done;
+        apk_count++;
       }
-      qsort(apks, apk_count, sizeof(*apks), compare_names);
-      bool found = false;
-      for (size_t i = 0; i < apk_count; i++) {
-         struct zip candidate = {0};
-         if (zip_open(&candidate, apks[i]))
-            goto done;
-         int r = manifest_zip(&candidate, split);
-         zip_close(&candidate);
-         if (r)
-            goto done;
-         if (!*split->split) {
-            if (copy_text(base, sizeof base, apks[i]))
-               goto done;
-            found = true;
-            break;
-         }
+    if (!apk_count) {
+      apk_error("container has no APKs");
+      goto done;
+    }
+    qsort(apks, apk_count, sizeof(*apks), compare_names);
+    bool found = false;
+    for (size_t i = 0; i < apk_count; i++) {
+      struct zip candidate = {0};
+      if (zip_open(&candidate, apks[i]))
+        goto done;
+      int r = manifest_zip(&candidate, split);
+      zip_close(&candidate);
+      if (r)
+        goto done;
+      if (!*split->split) {
+        if (copy_text(base, sizeof base, apks[i]))
+          goto done;
+        found = true;
+        break;
       }
-      if (!found) {
-         apk_error("container has no base APK");
-         goto done;
+    }
+    if (!found) {
+      apk_error("container has no base APK");
+      goto done;
+    }
+  } else if (copy_text(base, sizeof base, input))
+    goto done;
+  if (zip_open(&apk, base) || manifest_zip(&apk, m))
+    goto done;
+  if (zip_find(&apk, "BundleConfig.pb")) {
+    for (size_t i = 0; i < apk.count; i++) {
+      const char *name = apk.entries[i].name, *mapped = NULL;
+      if (!strncmp(name, "base/", 5)) {
+        mapped = name + 5;
+        if (!strncmp(mapped, "dex/", 4)) mapped += 4;
+        else if (!strncmp(mapped, "root/", 5)) mapped += 5;
+      } else {
+        const char *module = strchr(name, '/');
+        if (module && !strncmp(module + 1, "assets/", 7)) mapped = module + 1;
       }
-   } else if (copy_text(base, sizeof base, input))
-      goto done;
-   if (zip_open(&apk, base) || manifest_zip(&apk, m))
-      goto done;
-   if (zip_find(&apk, "BundleConfig.pb")) {
-      for (size_t i = 0; i < apk.count; i++) {
-         const char *name = apk.entries[i].name, *mapped = NULL;
-         if (!strncmp(name, "base/", 5)) {
-            mapped = name + 5;
-            if (!strncmp(mapped, "dex/", 4)) mapped += 4;
-            else if (!strncmp(mapped, "root/", 5)) mapped += 5;
-         } else {
-            const char *module = strchr(name, '/');
-            if (module && !strncmp(module + 1, "assets/", 7)) mapped = module + 1;
-         }
-         if (mapped) {
-            char *replacement = strdup(mapped);
-            if (!replacement) goto done;
-            free(apk.entries[i].name);
-            apk.entries[i].name = replacement;
-         }
+      if (mapped) {
+        char *replacement = strdup(mapped);
+        if (!replacement) goto done;
+        free(apk.entries[i].name);
+        apk.entries[i].name = replacement;
       }
-   }
-   if (config_load(conf, m->package) || keymap_resolve(exedir))
-      goto done;
-   if (!luna_google_profile_valid(luna_google_profile_current())) {
-      apk_error("invalid Google services environment name");
-      goto done;
-   }
-   /* Package configuration can relocate data independently of the APK cache. */
-   if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root) || env_set("LUNARIA_DATA_ROOT", root, true))
-      goto done;
-   char olddata[APK_PATH], newdata[APK_PATH];
-   if (path_join(olddata, sizeof olddata, root, "local/data") || path_join(newdata, sizeof newdata, root, "data"))
-      goto done;
-   if (directory(olddata) && !exists(newdata) && luna_file_rename(olddata, newdata))
-      goto done;
-   if (list) {
-      result = profiles_list(root, m->package) ? -1 : 1;
-      goto done;
-   }
-   if (system_install && !google_package_path(m->package)) {
-      apk_error("select a Google Play services, Play Store, or Google Services Framework APK/XAPK");
-      goto done;
-   }
-   char chosen[65];
-   if (choose || (!profile_requested && !list && !prepare && !install &&
-                  (launch_ui_ready || env_true("LUNARIA_PROFILE_PROMPT")))) {
-      if (profiles_choose(root, m->package, chosen, sizeof chosen) ||
-          env_set("LUNARIA_PROFILE", chosen, true)) goto done;
-   }
-   char profile[65];
-   if (copy_text(profile, sizeof profile, env_value("LUNARIA_PROFILE", "default"))) goto done;
-   if (google_package_path(m->package)) {
-      const char *selected = getenv("LUNARIA_GMS_PROFILE");
-      if (selected && *selected) {
-         if (profile_requested && strcmp(profile, selected)) {
-            apk_error("Google services environment and app profile must match"); goto done;
-         }
-         if (copy_text(profile, sizeof profile, selected)) goto done;
-      } else if (env_set("LUNARIA_GMS_PROFILE", profile, true)) goto done;
-   }
-   if (profile_storage(root, m->package, profile))
-      goto done;
-   if (prepare) {
-      char private_dir[APK_PATH];
-      if (copy_text(private_dir, sizeof private_dir, getenv("ANDROID_FILES_DIR")))
-         goto done;
-      char *last = strrchr(private_dir, '/');
-      if (last)
-         * last = 0;
-      printf("profile=%s\nprivate=%s\nexternal=%s\nobb=%s\nguest_root=%s\n", profile, private_dir, getenv("ANDROID_EXTERNAL_FILES_DIR"), getenv("ANDROID_EXTERNAL_OBB_DIR"), getenv("LUNARIA_GUEST_ROOT"));
-      result = 1;
-      goto done;
-   }
-   if (!hit && exists(ready) && luna_file_unlinkat(LUNA_AT_FDCWD, ready, 0))
-      goto done;
-   if (zip_extract(&apk, inst, !hit))
-      goto done;
-   bool arm64 = false, arm32 = false, armeabi = false;
-   for (size_t i = 0; i < apk.count; i++) {
-      const char *n = apk.entries[i].name;
-      arm64 |= !strncmp(n, "lib/arm64-v8a/", 14);
-      arm32 |= !strncmp(n, "lib/armeabi-v7a/", 16);
-      armeabi |= !strncmp(n, "lib/armeabi/", 12);
-   }
-   for (size_t i = 0; i < apk_count; i++)
-      if (strcmp(apks[i], base)) {
-         struct zip z = {0};
-         if (zip_open(&z, apks[i]))
-            goto done;
-         int r = manifest_zip(&z, split);
-         if (!r && strcmp(split->package, m->package))
-            r = apk_error("split package differs from base");
-         if (!r)
-            r = zip_extract(&z, inst, false);
-         for (size_t k = 0; k < z.count; k++) {
-            const char *n = z.entries[k].name;
-            arm64 |= !strncmp(n, "lib/arm64-v8a/", 14);
-            arm32 |= !strncmp(n, "lib/armeabi-v7a/", 16);
-            armeabi |= !strncmp(n, "lib/armeabi/", 12);
-         }
-         zip_close(&z);
-         if (r)
-            goto done;
-         if (text_add_row(&split_list, ";", "%s|%s", split->split, apks[i]))
-            goto done;
+    }
+  }
+  if (config_load(conf, m->package) || keymap_resolve(exedir))
+    goto done;
+  if (!luna_google_profile_valid(luna_google_profile_current())) {
+    apk_error("invalid Google services environment name");
+    goto done;
+  }
+  /* Package configuration can relocate data independently of the APK cache. */
+  if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root) || env_set("LUNARIA_DATA_ROOT", root, true))
+    goto done;
+  char olddata[APK_PATH], newdata[APK_PATH];
+  if (path_join(olddata, sizeof olddata, root, "local/data") || path_join(newdata, sizeof newdata, root, "data"))
+    goto done;
+  if (directory(olddata) && !exists(newdata) && luna_file_rename(olddata, newdata))
+    goto done;
+  if (list) {
+    result = profiles_list(root, m->package) ? -1 : 1;
+    goto done;
+  }
+  if (system_install && !google_package_path(m->package)) {
+    apk_error("select a Google Play services, Play Store, or Google Services Framework APK/XAPK");
+    goto done;
+  }
+  char chosen[65];
+  if (choose || (!profile_requested && !list && !prepare && !install &&
+                 (launch_ui_ready || env_true("LUNARIA_PROFILE_PROMPT")))) {
+    if (profiles_choose(root, m->package, chosen, sizeof chosen) ||
+        env_set("LUNARIA_PROFILE", chosen, true)) goto done;
+  }
+  char profile[65];
+  if (copy_text(profile, sizeof profile, env_value("LUNARIA_PROFILE", "default"))) goto done;
+  if (google_package_path(m->package)) {
+    const char *selected = getenv("LUNARIA_GMS_PROFILE");
+    if (selected && *selected) {
+      if (profile_requested && strcmp(profile, selected)) {
+        apk_error("Google services environment and app profile must match");
+        goto done;
       }
-   const char *arch = env_value("LUNARIA_ARCH", arm64 ? "arm64-v8a" : arm32 ? "armeabi-v7a" : armeabi ? "armeabi" : "arm64-v8a");
-   if (strcmp(arch, "arm64-v8a") && strcmp(arch, "armeabi-v7a") && strcmp(arch, "armeabi")) {
-      apk_error("unsupported architecture: %s", arch);
+      if (copy_text(profile, sizeof profile, selected)) goto done;
+    } else if (env_set("LUNARIA_GMS_PROFILE", profile, true)) goto done;
+  }
+  if (profile_storage(root, m->package, profile))
+    goto done;
+  if (prepare) {
+    char private_dir[APK_PATH];
+    if (copy_text(private_dir, sizeof private_dir, getenv("ANDROID_FILES_DIR")))
       goto done;
-   }
-   char relative[128], libdir[APK_PATH], staged_apk[APK_PATH];
-   snprintf(relative, sizeof relative, "lib/%s", arch);
-   if (path_join(libdir, sizeof libdir, inst, relative) || mkdirs(libdir) || path_join(staged_apk, sizeof staged_apk, inst, "base.apk") || materialize(base, staged_apk))
-      goto done;
-   if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set("ANDROID_SPLIT_APKS", text_get(&split_list), true))
-      goto done;
-   /* `am start -n`: the component named here is launched instead of the manifest's launcher. */
-   const char *forced_activity = getenv("LUNARIA_LAUNCH_ACTIVITY");
-   if (forced_activity && *forced_activity && class_name(m->activity, sizeof m->activity, m->package, forced_activity))
-      goto done;
-   if (!install && !service_host && !strcmp(m->package, "com.google.android.gms") &&
-       forced_activity && !strcmp(forced_activity, "com.android.settings.accounts.AddAccountSettings") &&
-       google_sign_in_enter(root, profile)) goto done;
-   const char *component_process = service_host ? getenv("ANDROID_PROCESS_NAME") : NULL;
-   const struct {
-      const char *key, *value;
-   } metadata[] = {
-      {"ANDROID_LAUNCH_ACTIVITY", m->activity}, {"ANDROID_APPLICATION_CLASS", m->application},
-      {"ANDROID_APPLICATION_PROCESS", m->application_process},
-      {"ANDROID_PROCESS_NAME", component_process && *component_process ? component_process :
-         service_host ? m->application_process : *m->activity_process ? m->activity_process : m->application_process},
-      {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
-      {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
-      {"ANDROID_RECEIVERS", text_get(&m->receivers)}, {"ANDROID_RECEIVER_FILTERS", text_get(&m->receiver_filters)}, {"ANDROID_SERVICES", text_get(&m->services)},
-      {"ANDROID_ACTIVITIES", text_get(&m->activities)}, {"ANDROID_ACTIVITY_FILTERS", text_get(&m->activity_filters)},
-      {"ANDROID_CONTENT_PROVIDERS", text_get(&m->providers)}, {"ANDROID_REQUESTED_PERMISSIONS", text_get(&m->permissions)},
-      {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
-      {"ANDROID_USES_CLEARTEXT_TRAFFIC", m->cleartext},
-      {"ANDROID_NETWORK_SECURITY_CONFIG", m->network_security},
-      {"ANDROID_QUERY_ACTIONS", text_get(&m->query_actions)}, {"ANDROID_QUERY_PACKAGES", text_get(&m->query_packages)},
-      {"ANDROID_USES_LIBRARIES", text_get(&m->libraries)},
-   };
-   for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {
-      if (*metadata[i].value) {
-         if (env_set(metadata[i].key, metadata[i].value, true))
-            goto done;
-      } else
-         luna_os_unsetenv(metadata[i].key);
-   }
-   /* A component host has no launcher Activity. Its process was chosen by AMS. */
-   if (service_host ? env_set("ANDROID_SERVICE_HOST", "1", true) : (luna_os_unsetenv("ANDROID_SERVICE_HOST"), 0))
-      goto done;
-   luna_os_unsetenv("ANDROID_APK_SIGNER_PKCS7");
-   for (size_t i = 0; i < apk.count; i++) {
-      struct zip_entry *e = apk.entries + i;
-      if (!strncasecmp(e->name, "META-INF/", 9) && (suffix(e->name, ".RSA") || suffix(e->name, ".DSA") || suffix(e->name, ".EC"))) {
-         char signer[APK_PATH];
-         if (path_join(signer, sizeof signer, inst, ".lunaria-apk-signer.p7b"))
-            goto done;
-         FILE *f = open_file(signer, "wb");
-         if (!f)
-            goto done;
-         int r = zip_read(&apk, e, f, NULL, 0, NULL);
-         if (fclose(f))
-            r = -1;
-         if (r || env_set("ANDROID_APK_SIGNER_PKCS7", signer, true))
-            goto done;
-         break;
+    char *last = strrchr(private_dir, '/');
+    if (last)
+      * last = 0;
+    printf("profile=%s\nprivate=%s\nexternal=%s\nobb=%s\nguest_root=%s\n", profile, private_dir, getenv("ANDROID_EXTERNAL_FILES_DIR"), getenv("ANDROID_EXTERNAL_OBB_DIR"), getenv("LUNARIA_GUEST_ROOT"));
+    result = 1;
+    goto done;
+  }
+  if (!hit && exists(ready) && luna_file_unlinkat(LUNA_AT_FDCWD, ready, 0))
+    goto done;
+  if (zip_extract(&apk, inst, !hit))
+    goto done;
+  bool arm64 = false, arm32 = false, armeabi = false;
+  for (size_t i = 0; i < apk.count; i++) {
+    const char *n = apk.entries[i].name;
+    arm64 |= !strncmp(n, "lib/arm64-v8a/", 14);
+    arm32 |= !strncmp(n, "lib/armeabi-v7a/", 16);
+    armeabi |= !strncmp(n, "lib/armeabi/", 12);
+  }
+  for (size_t i = 0; i < apk_count; i++)
+    if (strcmp(apks[i], base)) {
+      struct zip z = {0};
+      if (zip_open(&z, apks[i]))
+        goto done;
+      int r = manifest_zip(&z, split);
+      if (!r && strcmp(split->package, m->package))
+        r = apk_error("split package differs from base");
+      if (!r)
+        r = zip_extract(&z, inst, false);
+      for (size_t k = 0; k < z.count; k++) {
+        const char *n = z.entries[k].name;
+        arm64 |= !strncmp(n, "lib/arm64-v8a/", 14);
+        arm32 |= !strncmp(n, "lib/armeabi-v7a/", 16);
+        armeabi |= !strncmp(n, "lib/armeabi/", 12);
       }
-   }
-   luna_launcher_progress("Preparing runtime files and OBB resources", NULL, 0, 0);
-   fprintf(stderr, "[apk] Preparing runtime files and OBB resources\n");
-   fflush(stderr);
-   if (managed_setup(inst) || obb_setup(input, container ? pkgdir : NULL, inst, m->package) || font_defaults(exedir))
-      goto done;
-   if (env_default("LUNARIA_DEX_START", "1") || env_default("LUNARIA_JIT_UI", "1") || env_default("LUNARIA_A64_SELF_SCHED", "1"))
-      goto done;
-   /* An Android process starts at the launcher Activity in the dex; the app
-    * loads its own engine library from there. */
-   static const char *main_module;
-   main_module = service_host ? (!strcmp(arch, "arm64-v8a") ? "--service-process-arm64" : "--service-process-arm32")
-                              : (!strcmp(arch, "arm64-v8a") ? "--apk-process-arm64" : "--apk-process-arm32");
-   static const char *newargs[4];
-   FILE *stamp = open_file(ready, "wb");
-   if (!stamp)
-      goto done;
-   int stamp_error = fputs("native-v1\n", stamp) < 0;
-   if (fclose(stamp))
-      stamp_error = 1;
-   if (stamp_error) {
-      luna_file_unlinkat(LUNA_AT_FDCWD, ready, 0);
-      goto done;
-   }
-   fprintf(stderr, "[apk] %s: %s, %s, profile=%s\n[apk] installed view: %s\n", m->package, arch, hit ? "cache hit" : "installed", profile, inst);
-   if (system_install && google_package_install(root, m->package, input, base, container)) goto done;
-   if (install) {
-      printf("package=%s\nactivity=%s\narch=%s\ninstalled=%s\nmodule=%s\nconfigChanges=%s\n", m->package, m->activity, arch, inst, main_module, *m->config_changes ? m->config_changes : "0");
-      result = 1;
-      goto done;
-   }
-   /* A component host (e.g. Play services) has no launcher Activity by design. */
-   if (!service_host && !*m->activity && env_true("LUNARIA_DEX_START")) {
-      apk_error("manifest has no launcher Activity");
-      goto done;
-   }
-   newargs[0] = (*argv)[0];
-   newargs[1] = main_module;
-   newargs[2] = service_host ? "3" : NULL;
-   newargs[3] = NULL;
-   *argv = newargs;
-   *argc = service_host ? 3 : 2;
-   result = 0;
+      zip_close(&z);
+      if (r)
+        goto done;
+      if (text_add_row(&split_list, ";", "%s|%s", split->split, apks[i]))
+        goto done;
+    }
+  const char *arch = env_value("LUNARIA_ARCH", arm64 ? "arm64-v8a" : arm32 ? "armeabi-v7a" : armeabi ? "armeabi" : "arm64-v8a");
+  if (strcmp(arch, "arm64-v8a") && strcmp(arch, "armeabi-v7a") && strcmp(arch, "armeabi")) {
+    apk_error("unsupported architecture: %s", arch);
+    goto done;
+  }
+  char relative[128], libdir[APK_PATH], staged_apk[APK_PATH];
+  snprintf(relative, sizeof relative, "lib/%s", arch);
+  if (path_join(libdir, sizeof libdir, inst, relative) || mkdirs(libdir) || path_join(staged_apk, sizeof staged_apk, inst, "base.apk") || materialize(base, staged_apk))
+    goto done;
+  if (env_set("ANDROID_PACKAGE_NAME", m->package, true) || env_set("ANDROID_PACKAGE_CODE_PATH", inst, true) || env_set("ANDROID_APK_FILE", staged_apk, true) || env_set("ANDROID_NATIVE_LIB_DIR", libdir, true) || env_set("ANDROID_SPLIT_APKS", text_get(&split_list), true))
+    goto done;
+  /* `am start -n`: the component named here is launched instead of the manifest's launcher. */
+  const char *forced_activity = getenv("LUNARIA_LAUNCH_ACTIVITY");
+  if (forced_activity && *forced_activity && class_name(m->activity, sizeof m->activity, m->package, forced_activity))
+    goto done;
+  if (!install && !service_host && !strcmp(m->package, "com.google.android.gms") &&
+      forced_activity && !strcmp(forced_activity, "com.android.settings.accounts.AddAccountSettings") &&
+      google_sign_in_enter(root, profile)) goto done;
+  const char *component_process = service_host ? getenv("ANDROID_PROCESS_NAME") : NULL;
+  const struct {
+    const char *key, *value;
+  } metadata[] = {
+    {"ANDROID_LAUNCH_ACTIVITY", m->activity}, {"ANDROID_APPLICATION_CLASS", m->application},
+    {"ANDROID_APPLICATION_PROCESS", m->application_process},
+    { "ANDROID_PROCESS_NAME", component_process && *component_process ? component_process :
+      service_host ? m->application_process : *m->activity_process ? m->activity_process : m->application_process
+    },
+    {"ANDROID_LAUNCH_CONFIG_CHANGES", m->config_changes},
+    {"ANDROID_SCREEN_ORIENTATION", m->orientation}, {"ANDROID_THEME_RESOURCE", m->theme},
+    {"ANDROID_RECEIVERS", text_get(&m->receivers)}, {"ANDROID_RECEIVER_FILTERS", text_get(&m->receiver_filters)}, {"ANDROID_SERVICES", text_get(&m->services)},
+    {"ANDROID_ACTIVITIES", text_get(&m->activities)}, {"ANDROID_ACTIVITY_FILTERS", text_get(&m->activity_filters)},
+    {"ANDROID_CONTENT_PROVIDERS", text_get(&m->providers)}, {"ANDROID_REQUESTED_PERMISSIONS", text_get(&m->permissions)},
+    {"ANDROID_MIN_SDK", m->min_sdk}, {"ANDROID_TARGET_SDK", m->target_sdk},
+    {"ANDROID_USES_CLEARTEXT_TRAFFIC", m->cleartext},
+    {"ANDROID_NETWORK_SECURITY_CONFIG", m->network_security},
+    {"ANDROID_QUERY_ACTIONS", text_get(&m->query_actions)}, {"ANDROID_QUERY_PACKAGES", text_get(&m->query_packages)},
+    {"ANDROID_USES_LIBRARIES", text_get(&m->libraries)},
+  };
+  for (size_t i = 0; i < sizeof metadata / sizeof metadata[0]; i++) {
+    if (*metadata[i].value) {
+      if (env_set(metadata[i].key, metadata[i].value, true))
+        goto done;
+    } else
+      luna_os_unsetenv(metadata[i].key);
+  }
+  /* A component host has no launcher Activity. Its process was chosen by AMS. */
+  if (service_host ? env_set("ANDROID_SERVICE_HOST", "1", true) : (luna_os_unsetenv("ANDROID_SERVICE_HOST"), 0))
+    goto done;
+  luna_os_unsetenv("ANDROID_APK_SIGNER_PKCS7");
+  for (size_t i = 0; i < apk.count; i++) {
+    struct zip_entry *e = apk.entries + i;
+    if (!strncasecmp(e->name, "META-INF/", 9) && (suffix(e->name, ".RSA") || suffix(e->name, ".DSA") || suffix(e->name, ".EC"))) {
+      char signer[APK_PATH];
+      if (path_join(signer, sizeof signer, inst, ".lunaria-apk-signer.p7b"))
+        goto done;
+      FILE *f = open_file(signer, "wb");
+      if (!f)
+        goto done;
+      int r = zip_read(&apk, e, f, NULL, 0, NULL);
+      if (fclose(f))
+        r = -1;
+      if (r || env_set("ANDROID_APK_SIGNER_PKCS7", signer, true))
+        goto done;
+      break;
+    }
+  }
+  luna_launcher_progress("Preparing runtime files and OBB resources", NULL, 0, 0);
+  fprintf(stderr, "[apk] Preparing runtime files and OBB resources\n");
+  fflush(stderr);
+  if (managed_setup(inst) || obb_setup(input, container ? pkgdir : NULL, inst, m->package) || font_defaults(exedir))
+    goto done;
+  if (env_default("LUNARIA_DEX_START", "1") || env_default("LUNARIA_JIT_UI", "1") || env_default("LUNARIA_A64_SELF_SCHED", "1"))
+    goto done;
+  /* An Android process starts at the launcher Activity in the dex; the app
+   * loads its own engine library from there. */
+  static const char *main_module;
+  main_module = service_host ? (!strcmp(arch, "arm64-v8a") ? "--service-process-arm64" : "--service-process-arm32")
+                : (!strcmp(arch, "arm64-v8a") ? "--apk-process-arm64" : "--apk-process-arm32");
+  static const char *newargs[4];
+  FILE *stamp = open_file(ready, "wb");
+  if (!stamp)
+    goto done;
+  int stamp_error = fputs("native-v1\n", stamp) < 0;
+  if (fclose(stamp))
+    stamp_error = 1;
+  if (stamp_error) {
+    luna_file_unlinkat(LUNA_AT_FDCWD, ready, 0);
+    goto done;
+  }
+  fprintf(stderr, "[apk] %s: %s, %s, profile=%s\n[apk] installed view: %s\n", m->package, arch, hit ? "cache hit" : "installed", profile, inst);
+  if (system_install && google_package_install(root, m->package, input, base, container)) goto done;
+  if (install) {
+    printf("package=%s\nactivity=%s\narch=%s\ninstalled=%s\nmodule=%s\nconfigChanges=%s\n", m->package, m->activity, arch, inst, main_module, *m->config_changes ? m->config_changes : "0");
+    result = 1;
+    goto done;
+  }
+  /* A component host (e.g. Play services) has no launcher Activity by design. */
+  if (!service_host && !*m->activity && env_true("LUNARIA_DEX_START")) {
+    apk_error("manifest has no launcher Activity");
+    goto done;
+  }
+  newargs[0] = (*argv)[0];
+  newargs[1] = main_module;
+  newargs[2] = service_host ? "3" : NULL;
+  newargs[3] = NULL;
+  *argv = newargs;
+  *argc = service_host ? 3 : 2;
+  result = 0;
 done:
-   zip_close(&outer);
-   zip_close(&apk);
-   for (size_t i = 0; i < apk_count; i++)
-      free(apks[i]);
-   free(apks);
-   text_free(&split_list);
-   manifest_free(m);
-   manifest_free(split);
-   return result;
+  zip_close(&outer);
+  zip_close(&apk);
+  for (size_t i = 0; i < apk_count; i++)
+    free(apks[i]);
+  free(apks);
+  text_free(&split_list);
+  manifest_free(m);
+  manifest_free(split);
+  return result;
 }
 
 
@@ -2931,60 +3140,67 @@ static char **g_restart_environment;
 
 static int restart_environment_remember(void)
 {
-   if (g_restart_environment) return 0;
+  if (g_restart_environment) return 0;
 #ifdef _WIN32
-   char **source = _environ;
+  char **source = _environ;
 #else
-   char **source = environ;
+  char **source = environ;
 #endif
-   size_t n = 0;
-   while (source && source[n]) ++n;
-   char **saved = calloc(n + 1, sizeof *saved);
-   if (!saved) return -1;
-   for (size_t i = 0; i < n; ++i) {
-      saved[i] = strdup(source[i]);
-      if (!saved[i]) {
-         for (size_t k = 0; k < i; ++k) free(saved[k]);
-         free(saved); return -1;
-      }
-   }
-   g_restart_environment = saved;
-   return 0;
+  size_t n = 0;
+  while (source && source[n]) ++n;
+  char **saved = calloc(n + 1, sizeof *saved);
+  if (!saved) return -1;
+  for (size_t i = 0; i < n; ++i) {
+    saved[i] = strdup(source[i]);
+    if (!saved[i]) {
+      for (size_t k = 0; k < i; ++k) free(saved[k]);
+      free(saved);
+      return -1;
+    }
+  }
+  g_restart_environment = saved;
+  return 0;
 }
 
 /* Retain explicit common CLI options when returning to the launcher too.
  * Values derived from an APK's configuration are deliberately not retained. */
 static int restart_environment_option(const char *key, const char *value)
 {
-   if (!g_restart_environment) return -1;
-   size_t n = 0, key_length = strlen(key);
-   while (g_restart_environment[n]) {
-      if (!strncmp(g_restart_environment[n], key, key_length) && g_restart_environment[n][key_length] == '=') break;
-      ++n;
-   }
-   char *entry = malloc(key_length + strlen(value) + 2);
-   if (!entry) return -1;
-   sprintf(entry, "%s=%s", key, value);
-   if (!g_restart_environment[n]) {
-      char **grown = realloc(g_restart_environment, (n + 2) * sizeof *grown);
-      if (!grown) { free(entry); return -1; }
-      g_restart_environment = grown;
-      g_restart_environment[n + 1] = NULL;
-   } else free(g_restart_environment[n]);
-   g_restart_environment[n] = entry;
-   return 0;
+  if (!g_restart_environment) return -1;
+  size_t n = 0, key_length = strlen(key);
+  while (g_restart_environment[n]) {
+    if (!strncmp(g_restart_environment[n], key, key_length) && g_restart_environment[n][key_length] == '=') break;
+    ++n;
+  }
+  char *entry = malloc(key_length + strlen(value) + 2);
+  if (!entry) return -1;
+  sprintf(entry, "%s=%s", key, value);
+  if (!g_restart_environment[n]) {
+    char **grown = realloc(g_restart_environment, (n + 2) * sizeof *grown);
+    if (!grown) {
+      free(entry);
+      return -1;
+    }
+    g_restart_environment = grown;
+    g_restart_environment[n + 1] = NULL;
+  } else free(g_restart_environment[n]);
+  g_restart_environment[n] = entry;
+  return 0;
 }
 
 static void restart_remember(int argc, const char **argv)
 {
-   if (g_restart_argv) return;
-   g_restart_argv = calloc((size_t)argc + 1, sizeof *g_restart_argv);
-   if (!g_restart_argv) return;
-   for (int i = 0; i < argc; ++i) {
-      g_restart_argv[i] = strdup(argv[i]);
-      if (!g_restart_argv[i]) { g_restart_argv = NULL; return; }
-   }
-   g_restart_argc = argc;
+  if (g_restart_argv) return;
+  g_restart_argv = calloc((size_t)argc + 1, sizeof *g_restart_argv);
+  if (!g_restart_argv) return;
+  for (int i = 0; i < argc; ++i) {
+    g_restart_argv[i] = strdup(argv[i]);
+    if (!g_restart_argv[i]) {
+      g_restart_argv = NULL;
+      return;
+    }
+  }
+  g_restart_argc = argc;
 }
 
 /* The content authorities an APK's manifest declares, separated by ';', as a
@@ -2993,280 +3209,310 @@ static void restart_remember(int argc, const char **argv)
  * readable manifest. */
 int luna_apk_content_authorities(const char *apk_path, char **out)
 {
-   struct zip z = {0};
-   struct manifest *m = calloc(1, sizeof *m);
-   struct text found = {0};
-   int result = -1;
-   *out = NULL;
-   if (!m || zip_open(&z, apk_path) || manifest_zip(&z, m)) goto done;
-   /* Records are "name|authorities|metadata|process|..." after a "!2\n" header. */
-   const char *record = text_get(&m->providers);
-   if (!strncmp(record, "!2\n", 3)) record += 3;
-   while (*record) {
-      const char *end = strchr(record, '\n');
-      const size_t length = end ? (size_t)(end - record) : strlen(record);
-      const char *bar = memchr(record, '|', length);
-      if (bar) {
-         const char *authorities = bar + 1;
-         const char *stop = memchr(authorities, '|', (size_t)(record + length - authorities));
-         char *copy = luna_strndup(authorities, stop ? (size_t)(stop - authorities) : (size_t)(record + length - authorities));
-         if (!copy || (*copy && text_append(&found, copy, ";"))) { free(copy); goto done; }
-         free(copy);
+  struct zip z = {0};
+  struct manifest *m = calloc(1, sizeof *m);
+  struct text found = {0};
+  int result = -1;
+  *out = NULL;
+  if (!m || zip_open(&z, apk_path) || manifest_zip(&z, m)) goto done;
+  /* Records are "name|authorities|metadata|process|..." after a "!2\n" header. */
+  const char *record = text_get(&m->providers);
+  if (!strncmp(record, "!2\n", 3)) record += 3;
+  while (*record) {
+    const char *end = strchr(record, '\n');
+    const size_t length = end ? (size_t)(end - record) : strlen(record);
+    const char *bar = memchr(record, '|', length);
+    if (bar) {
+      const char *authorities = bar + 1;
+      const char *stop = memchr(authorities, '|', (size_t)(record + length - authorities));
+      char *copy = luna_strndup(authorities, stop ? (size_t)(stop - authorities) : (size_t)(record + length - authorities));
+      if (!copy || (*copy && text_append(&found, copy, ";"))) {
+        free(copy);
+        goto done;
       }
-      record += length + (end ? 1 : 0);
-   }
-   *out = found.s ? found.s : strdup("");
-   found.s = NULL;
-   result = *out ? 0 : -1;
+      free(copy);
+    }
+    record += length + (end ? 1 : 0);
+  }
+  *out = found.s ? found.s : strdup("");
+  found.s = NULL;
+  result = *out ? 0 : -1;
 done:
-   text_free(&found);
-   zip_close(&z);
-   manifest_free(m);
-   return result;
+  text_free(&found);
+  zip_close(&z);
+  manifest_free(m);
+  return result;
 }
 
 const char *luna_apk_profile_current(void)
 {
-   const char *p = getenv("LUNARIA_PROFILE");
-   return p && *p ? p : "default";
+  const char *p = getenv("LUNARIA_PROFILE");
+  return p && *p ? p : "default";
 }
 
 int luna_apk_profile_list(char (*names)[65], int max)
 {
-   const char *package = getenv("ANDROID_PACKAGE_NAME");
-   const char *root = getenv("LUNARIA_DATA_ROOT");
-   int n = 0;
-   if (max < 1) return 0;
-   snprintf(names[n++], 65, "default");
-   if (!package || !*package || !root || !*root) return n;
-   char dir[APK_PATH], relative[512];
-   snprintf(relative, sizeof relative, "profiles/%s", package);
-   if (path_join(dir, sizeof dir, root, relative)) return n;
-   luna_directory *d = luna_directory_open(dir);
-   if (!d) return n;
-   luna_directory_entry *e;
-   while (n < max && (e = luna_directory_read(d))) {
-      char path[APK_PATH];
-      if (!profile_valid(e->d_name) || !strcmp(e->d_name, "default")) continue;
-      if (path_join(path, sizeof path, dir, e->d_name) || !directory(path)) continue;
-      snprintf(names[n++], 65, "%s", e->d_name);
-   }
-   luna_directory_close(d);
-   return n;
+  const char *package = getenv("ANDROID_PACKAGE_NAME");
+  const char *root = getenv("LUNARIA_DATA_ROOT");
+  int n = 0;
+  if (max < 1) return 0;
+  snprintf(names[n++], 65, "default");
+  if (!package || !*package || !root || !*root) return n;
+  char dir[APK_PATH], relative[512];
+  snprintf(relative, sizeof relative, "profiles/%s", package);
+  if (path_join(dir, sizeof dir, root, relative)) return n;
+  luna_directory *d = luna_directory_open(dir);
+  if (!d) return n;
+  luna_directory_entry *e;
+  while (n < max && (e = luna_directory_read(d))) {
+    char path[APK_PATH];
+    if (!profile_valid(e->d_name) || !strcmp(e->d_name, "default")) continue;
+    if (path_join(path, sizeof path, dir, e->d_name) || !directory(path)) continue;
+    snprintf(names[n++], 65, "%s", e->d_name);
+  }
+  luna_directory_close(d);
+  return n;
 }
 
 /* The next unused "profile-N". */
 int luna_apk_profile_new_name(char *out, size_t cap)
 {
-   char names[64][65];
-   const int n = luna_apk_profile_list(names, 64);
-   for (int k = 2; k < 1000; ++k) {
-      char want[65];
-      bool taken = false;
-      snprintf(want, sizeof want, "profile-%d", k);
-      for (int i = 0; i < n; ++i) if (!strcmp(names[i], want)) taken = true;
-      if (!taken) return copy_text(out, cap, want);
-   }
-   return -1;
+  char names[64][65];
+  const int n = luna_apk_profile_list(names, 64);
+  for (int k = 2; k < 1000; ++k) {
+    char want[65];
+    bool taken = false;
+    snprintf(want, sizeof want, "profile-%d", k);
+    for (int i = 0; i < n; ++i) if (!strcmp(names[i], want)) taken = true;
+    if (!taken) return copy_text(out, cap, want);
+  }
+  return -1;
 }
 
 /* Starts this launch over under `profile` (NULL: the same one).  Returns only
  * when it could not. */
 int luna_apk_restart(const char *profile)
 {
-   char exe[APK_PATH];
-   if (!g_restart_argv || !g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
-   if (!profile) profile = luna_apk_profile_current();
-   if (!profile_valid(profile)) return -1;
-   const char **args = calloc((size_t)g_restart_argc + 3, sizeof *args);
-   if (!args) return -1;
-   int n = 0;
-   args[n++] = exe;
-   for (int i = 1; i < g_restart_argc; ++i) {
-      const char *a = g_restart_argv[i];
-      if (!strcmp(a, "--profile")) { ++i; continue; }
-      if (!strncmp(a, "--profile=", 10) || !strcmp(a, "--choose-profile")) continue;
-      args[n++] = a;
-   }
-   /* --profile goes before the archive, which must stay last. */
-   const char *archive = n > 1 ? args[n - 1] : NULL;
-   if (!archive) { free(args); return -1; }
-   args[n - 1] = "--profile";
-   args[n++] = profile;
-   args[n++] = archive;
-   args[n] = NULL;
-   fprintf(stderr, "[apk] restarting under profile %s\n", profile);
-   fflush(NULL);
+  char exe[APK_PATH];
+  if (!g_restart_argv || !g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
+  if (!profile) profile = luna_apk_profile_current();
+  if (!profile_valid(profile)) return -1;
+  const char **args = calloc((size_t)g_restart_argc + 3, sizeof *args);
+  if (!args) return -1;
+  int n = 0;
+  args[n++] = exe;
+  for (int i = 1; i < g_restart_argc; ++i) {
+    const char *a = g_restart_argv[i];
+    if (!strcmp(a, "--profile")) {
+      ++i;
+      continue;
+    }
+    if (!strncmp(a, "--profile=", 10) || !strcmp(a, "--choose-profile")) continue;
+    args[n++] = a;
+  }
+  /* --profile goes before the archive, which must stay last. */
+  const char *archive = n > 1 ? args[n - 1] : NULL;
+  if (!archive) {
+    free(args);
+    return -1;
+  }
+  args[n - 1] = "--profile";
+  args[n++] = profile;
+  args[n++] = archive;
+  args[n] = NULL;
+  fprintf(stderr, "[apk] restarting under profile %s\n", profile);
+  fflush(NULL);
 #ifdef _WIN32
-   _execve(exe, args, (const char *const *)g_restart_environment);
+  _execve(exe, args, (const char *const *)g_restart_environment);
 #else
-   execve(exe, (char *const *)args, g_restart_environment);
+  execve(exe, (char *const *)args, g_restart_environment);
 #endif
-   free(args);
-   return -1;
+  free(args);
+  return -1;
 }
 
 /* Launch a setup/account window without replacing the running application or
  * leaking its Android paths, profile, Binder sockets, or activity overrides. */
 static atomic_bool google_window_open;
 struct google_window_job {
-   char executable[APK_PATH], root[APK_PATH], conf[APK_PATH], archive[APK_PATH];
-   char profile[65];
-   char **environment;
-   int setup;
+  char executable[APK_PATH], root[APK_PATH], conf[APK_PATH], archive[APK_PATH];
+  char profile[65];
+  char **environment;
+  int setup;
 };
 static void google_environment_free(char **env)
 {
-   if (!env) return;
-   for (size_t i = 0; env[i]; ++i) free(env[i]);
-   free(env);
+  if (!env) return;
+  for (size_t i = 0; env[i]; ++i) free(env[i]);
+  free(env);
 }
 static char **google_environment(int setup, const char *profile)
 {
 #ifdef _WIN32
-   char **source = _environ;
+  char **source = _environ;
 #else
-   char **source = environ;
+  char **source = environ;
 #endif
-   size_t count = 0;
-   while (source && source[count]) ++count;
-   char **env = calloc(count + 3, sizeof *env);
-   if (!env) return NULL;
-   size_t n = 0;
-   for (size_t i = 0; i < count; ++i) {
-      const char *s = source[i];
-      if (!strncmp(s, "ANDROID_", 8)) continue;
-      if (!strncmp(s, "LUNARIA_", 8) && strncmp(s, "LUNARIA_CACHE_DIR=", 18) &&
-          strncmp(s, "LUNARIA_NET=", 12) && strncmp(s, "LUNARIA_PBUFFER=", 16)) continue;
-      env[n] = strdup(s);
-      if (!env[n++]) { google_environment_free(env); return NULL; }
-   }
-   if (!setup) {
-      env[n] = strdup("LUNARIA_LAUNCH_ACTIVITY=com.android.settings.accounts.AddAccountSettings");
-      if (!env[n]) { google_environment_free(env); return NULL; }
-      ++n;
-      char selected[96];
-      snprintf(selected, sizeof selected, "LUNARIA_GMS_PROFILE=%s", profile);
-      env[n] = strdup(selected);
-      if (!env[n]) { google_environment_free(env); return NULL; }
-   }
-   return env;
+  size_t count = 0;
+  while (source && source[count]) ++count;
+  char **env = calloc(count + 3, sizeof *env);
+  if (!env) return NULL;
+  size_t n = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const char *s = source[i];
+    if (!strncmp(s, "ANDROID_", 8)) continue;
+    if (!strncmp(s, "LUNARIA_", 8) && strncmp(s, "LUNARIA_CACHE_DIR=", 18) &&
+        strncmp(s, "LUNARIA_NET=", 12) && strncmp(s, "LUNARIA_PBUFFER=", 16)) continue;
+    env[n] = strdup(s);
+    if (!env[n++]) {
+      google_environment_free(env);
+      return NULL;
+    }
+  }
+  if (!setup) {
+    env[n] = strdup("LUNARIA_LAUNCH_ACTIVITY=com.android.settings.accounts.AddAccountSettings");
+    if (!env[n]) {
+      google_environment_free(env);
+      return NULL;
+    }
+    ++n;
+    char selected[96];
+    snprintf(selected, sizeof selected, "LUNARIA_GMS_PROFILE=%s", profile);
+    env[n] = strdup(selected);
+    if (!env[n]) {
+      google_environment_free(env);
+      return NULL;
+    }
+  }
+  return env;
 }
 static void *google_window_run(void *opaque)
 {
-   struct google_window_job *job = opaque;
-   char *setup_args[] = {job->executable, "--google-services", "--data-root", job->root,
-                         "--config", job->conf, NULL};
-   char *account_args[] = {job->executable, "--data-root", job->root, "--config", job->conf,
-                           "--profile", job->profile, job->archive, NULL};
-   char **args = job->setup ? setup_args : account_args;
-   int result = 0;
+  struct google_window_job *job = opaque;
+  char *setup_args[] = {job->executable, "--google-services", "--data-root", job->root,
+                        "--config", job->conf, NULL
+                       };
+  char *account_args[] = {job->executable, "--data-root", job->root, "--config", job->conf,
+                          "--profile", job->profile, job->archive, NULL
+                         };
+  char **args = job->setup ? setup_args : account_args;
+  int result = 0;
 #ifdef _WIN32
-   if (_spawnve(_P_WAIT, job->executable, (const char *const *)args,
-                (const char *const *)job->environment) < 0) result = errno;
+  if (_spawnve(_P_WAIT, job->executable, (const char *const *)args,
+               (const char *const *)job->environment) < 0) result = errno;
 #else
-   posix_spawn_file_actions_t actions;
-   posix_spawnattr_t attributes;
-   result = posix_spawn_file_actions_init(&actions);
-   bool have_actions = !result, have_attributes = false;
-   if (!result) { result = posix_spawnattr_init(&attributes); have_attributes = !result; }
+  posix_spawn_file_actions_t actions;
+  posix_spawnattr_t attributes;
+  result = posix_spawn_file_actions_init(&actions);
+  bool have_actions = !result, have_attributes = false;
+  if (!result) {
+    result = posix_spawnattr_init(&attributes);
+    have_attributes = !result;
+  }
 #if defined(__APPLE__) && defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
-   if (!result) result = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
+  if (!result) result = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT);
 #elif defined(__GLIBC__)
 #if __GLIBC_PREREQ(2,34)
-   if (!result) result = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+  if (!result) result = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
 #else
-   if (!result) result = ENOTSUP;
+  if (!result) result = ENOTSUP;
 #endif
 #else
-   if (!result) result = ENOTSUP;
+  if (!result) result = ENOTSUP;
 #endif
-   pid_t child;
-   if (!result) result = posix_spawn(&child, job->executable, &actions, &attributes, args, job->environment);
-   if (have_attributes) posix_spawnattr_destroy(&attributes);
-   if (have_actions) posix_spawn_file_actions_destroy(&actions);
-   if (!result) {
-      int status;
-      while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
-   }
+  pid_t child;
+  if (!result) result = posix_spawn(&child, job->executable, &actions, &attributes, args, job->environment);
+  if (have_attributes) posix_spawnattr_destroy(&attributes);
+  if (have_actions) posix_spawn_file_actions_destroy(&actions);
+  if (!result) {
+    int status;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+  }
 #endif
-   if (result) fprintf(stderr, "[google-services] cannot open window: %s\n", strerror(result));
-   google_environment_free(job->environment);
-   free(job);
-   atomic_store(&google_window_open, false);
-   return NULL;
+  if (result) fprintf(stderr, "[google-services] cannot open window: %s\n", strerror(result));
+  google_environment_free(job->environment);
+  free(job);
+  atomic_store(&google_window_open, false);
+  return NULL;
 }
 int luna_apk_google_package_installed(const char *package)
 {
-   char path[APK_PATH];
-   luna_file_info info;
-   return package && google_package_path(package) && !luna_apk_system_archive(package, path, sizeof path) &&
-          !luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0) && info.size > 22;
+  char path[APK_PATH];
+  luna_file_info info;
+  return package && google_package_path(package) && !luna_apk_system_archive(package, path, sizeof path) &&
+         !luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0) && info.size > 22;
 }
 int luna_apk_google_services_installed(void)
 {
-   return luna_apk_google_package_installed("com.google.android.gms");
+  return luna_apk_google_package_installed("com.google.android.gms");
 }
 int luna_apk_google_services_busy(void)
 {
-   return atomic_load(&google_window_open);
+  return atomic_load(&google_window_open);
 }
 int luna_apk_google_services_open(int setup, const char *profile)
 {
-   bool expected = false;
-   if (!atomic_compare_exchange_strong(&google_window_open, &expected, true)) { errno = EBUSY; return -1; }
-   struct google_window_job *job = calloc(1, sizeof *job);
-   const char *root = getenv("LUNARIA_DATA_ROOT");
-   if (!profile) profile = luna_google_profile_current();
-   if (!job || !root || !*root || !luna_google_profile_valid(profile) ||
-       copy_text(job->profile, sizeof job->profile, profile) || copy_text(job->root, sizeof job->root, root) ||
-       luna_os_executable_path(job->executable, sizeof job->executable) ||
-       conf_default_path(job->conf, sizeof job->conf) ||
-       (!setup && luna_apk_system_archive("com.google.android.gms", job->archive, sizeof job->archive)) ||
-       !(job->environment = google_environment(setup, profile))) {
-      if (job) { google_environment_free(job->environment); free(job); }
-      atomic_store(&google_window_open, false);
-      return -1;
-   }
-   job->setup = setup;
-   pthread_attr_t attributes;
-   int rc = pthread_attr_init(&attributes);
-   bool initialized = !rc;
-   if (!rc) rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
-   pthread_t thread;
-   if (!rc) rc = pthread_create(&thread, &attributes, google_window_run, job);
-   if (initialized) pthread_attr_destroy(&attributes);
-   if (rc) {
-      google_environment_free(job->environment); free(job);
-      atomic_store(&google_window_open, false);
-      errno = rc;
-      return -1;
-   }
-   return 0;
+  bool expected = false;
+  if (!atomic_compare_exchange_strong(&google_window_open, &expected, true)) {
+    errno = EBUSY;
+    return -1;
+  }
+  struct google_window_job *job = calloc(1, sizeof *job);
+  const char *root = getenv("LUNARIA_DATA_ROOT");
+  if (!profile) profile = luna_google_profile_current();
+  if (!job || !root || !*root || !luna_google_profile_valid(profile) ||
+      copy_text(job->profile, sizeof job->profile, profile) || copy_text(job->root, sizeof job->root, root) ||
+      luna_os_executable_path(job->executable, sizeof job->executable) ||
+      conf_default_path(job->conf, sizeof job->conf) ||
+      (!setup && luna_apk_system_archive("com.google.android.gms", job->archive, sizeof job->archive)) ||
+      !(job->environment = google_environment(setup, profile))) {
+    if (job) {
+      google_environment_free(job->environment);
+      free(job);
+    }
+    atomic_store(&google_window_open, false);
+    return -1;
+  }
+  job->setup = setup;
+  pthread_attr_t attributes;
+  int rc = pthread_attr_init(&attributes);
+  bool initialized = !rc;
+  if (!rc) rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+  pthread_t thread;
+  if (!rc) rc = pthread_create(&thread, &attributes, google_window_run, job);
+  if (initialized) pthread_attr_destroy(&attributes);
+  if (rc) {
+    google_environment_free(job->environment);
+    free(job);
+    atomic_store(&google_window_open, false);
+    errno = rc;
+    return -1;
+  }
+  return 0;
 }
 
 /* Starts over with no arguments: the screen a launch without an APK shows,
  * where another one can be chosen.  Returns only when it could not. */
 int luna_apk_restart_launcher(void)
 {
-   char exe[APK_PATH];
-   if (!g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
-   const char *args[2] = { exe, NULL };
-   fprintf(stderr, "[apk] returning to the launcher\n");
-   fflush(NULL);
+  char exe[APK_PATH];
+  if (!g_restart_environment || luna_os_executable_path(exe, sizeof exe)) return -1;
+  const char *args[2] = { exe, NULL };
+  fprintf(stderr, "[apk] returning to the launcher\n");
+  fflush(NULL);
 #ifdef _WIN32
-   _execve(exe, args, (const char *const *)g_restart_environment);
+  _execve(exe, args, (const char *const *)g_restart_environment);
 #else
-   execve(exe, (char *const *)args, g_restart_environment);
+  execve(exe, (char *const *)args, g_restart_environment);
 #endif
-   return -1;
+  return -1;
 }
 
 int luna_apk_prepare(int *argc, const char ***argv)
 {
-   int result = apk_prepare_inner(argc, argv);
-   if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
-   if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");
-   luna_launcher_end(result == 0);
-   return result;
+  int result = apk_prepare_inner(argc, argv);
+  if (result == 0 && host_driver_defaults()) result = apk_error("cannot configure host driver");
+  if (result == 0 && luna_launcher_cancelled()) result = apk_error("installation cancelled");
+  luna_launcher_end(result == 0);
+  return result;
 }

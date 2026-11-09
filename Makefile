@@ -451,11 +451,11 @@ $(SYSLIB_GUEST): src/lib/guest.c Makefile
 ART_IMAGES := libart.so libartbase.so libdexfile.so libnativeloader.so
 SYSLIB_ART := $(addprefix $(SYSLIB_DIR)/,$(ART_IMAGES))
 artlib: $(SYSLIB_ART)
-$(SYSLIB_ART): src/lib/art_image.c Makefile
+$(SYSLIB_ART): src/lib/stub.c Makefile
 	@mkdir -p $(SYSLIB_DIR)
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 \
 	    -fuse-ld=lld -Wl,-soname,$(notdir $@) -Wall -Wextra \
-	    -DART_IMAGE_SYMBOL=lunaria_image_$(basename $(notdir $@)) $< -o $@
+	    -DLUNARIA_STUB_ART_IMAGE -DART_IMAGE_SYMBOL=lunaria_image_$(basename $(notdir $@)) $< -o $@
 
 syslib-clean:
 	rm -rf $(SYSLIB_DIR)
