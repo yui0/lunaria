@@ -8,6 +8,15 @@
 # ANGLE_LIB_DIR.  Copy dylibs locally because external applications may update.
 set -eu
 
+# Print the failed URL: curl's own error line ("error: 504") does not say
+# which download died, so say it here before the script exits.
+fetch() {
+    curl --location --silent --show-error --fail "$@" || {
+        echo "fetch-macos-deps: curl failed with: $*" >&2
+        return 1
+    }
+}
+
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 deps="$root/.deps"
 glfw="$deps/glfw"
@@ -24,7 +33,7 @@ if command -v cmake >/dev/null 2>&1; then
 elif [ ! -x "$deps/cmake/CMake.app/Contents/bin/cmake" ]; then
     archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-cmake.XXXXXX.tar.gz")
     trap 'rm -f "$archive"' EXIT HUP INT TERM
-    curl --fail --location --silent --show-error \
+    fetch \
         https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-macos-universal.tar.gz \
         --output "$archive"
     mkdir -p "$deps/cmake"
@@ -40,7 +49,7 @@ fi
 if [ ! -f "$deps/boost/boost/version.hpp" ]; then
     archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-boost.XXXXXX.tar.bz2")
     trap 'rm -f "$archive"' EXIT HUP INT TERM
-    curl --fail --location --silent --show-error \
+    fetch \
         https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.bz2 \
         --output "$archive"
     mkdir -p "$deps/boost"
@@ -52,7 +61,7 @@ fi
 if [ ! -f "$glfw/include/GLFW/glfw3.h" ]; then
     archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-glfw.XXXXXX.tar.gz")
     trap 'rm -f "$archive"' EXIT HUP INT TERM
-    curl --fail --location --silent --show-error \
+    fetch \
         https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz \
         --output "$archive"
     mkdir -p "$glfw"
@@ -64,7 +73,11 @@ fi
 fetch_header() {
     url=$1
     out=$2
-    [ -s "$out" ] || curl --fail --location --silent --show-error "$url" --output "$out"
+    fallback=${3:-}
+    if [ -s "$out" ]; then return 0; fi
+    if ! fetch "$url" --output "$out" && [ -n "$fallback" ]; then
+        fetch "$fallback" --output "$out"
+    fi
 }
 
 egl=https://raw.githubusercontent.com/KhronosGroup/EGL-Registry/main/api
@@ -82,17 +95,20 @@ fetch_header "$gl/GLES3/gl3platform.h"     "$khr/GLES3/gl3platform.h"
 fetch_header "$egl/KHR/khrplatform.h"      "$khr/KHR/khrplatform.h"
 # macOS deliberately has no <elf.h>, but Lunaria loads Android ELF images.
 # Use musl's self-contained ABI header; this is target metadata, not a Linux
-# host dependency.
-fetch_header "https://git.musl-libc.org/cgit/musl/plain/include/elf.h" \
-             "$linux_abi/elf.h"
-fetch_header "https://git.musl-libc.org/cgit/musl/plain/include/link.h" \
-             "$linux_abi/link.h"
+# host dependency.  musl's cgit is down often, so read from the actively
+# maintained GitHub mirror first and fall back to upstream.
+fetch_header "https://raw.githubusercontent.com/kraj/musl/master/include/elf.h" \
+             "$linux_abi/elf.h" \
+             "https://git.musl-libc.org/cgit/musl/plain/include/elf.h"
+fetch_header "https://raw.githubusercontent.com/kraj/musl/master/include/link.h" \
+             "$linux_abi/link.h" \
+             "https://git.musl-libc.org/cgit/musl/plain/include/link.h"
 # The Vulkan bridge includes the official C headers even when a title uses
 # GLES.  Keep the header version fixed with the other local build inputs.
 if [ ! -f "$deps/vulkan/include/vulkan/vulkan.h" ]; then
     archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-vulkan-headers.XXXXXX.tar.gz")
     trap 'rm -f "$archive"' EXIT HUP INT TERM
-    curl --fail --location --silent --show-error \
+    fetch \
         https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.330.tar.gz \
         --output "$archive"
     mkdir -p "$deps/vulkan"
@@ -108,7 +124,7 @@ if [ -z "$angle" ] && [ "$(uname -m)" = arm64 ]; then
     if [ ! -f "$angle/libEGL.dylib" ] || [ ! -f "$angle/libGLESv2.dylib" ]; then
         archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-angle.XXXXXX.tar.gz")
         trap 'rm -f "$archive"' EXIT HUP INT TERM
-        curl --fail --location --silent --show-error \
+        fetch \
             "https://github.com/startergo/homebrew-angle/releases/download/v${angle_version}/angle-${angle_version}.arm64_sequoia.bottle.tar.gz" \
             --output "$archive"
         expected=29fe2175b157a65f12879f9a12b5c8f94d0a76fafdf41ff009a2fdb4e9df525c
@@ -200,7 +216,7 @@ if [ ! -s "$harfbuzz_library" ] || [ ! -s "$deps/lib/harfbuzz-LICENSE.txt" ] || 
     if [ ! -f "$harfbuzz_source/src/hb.h" ]; then
         archive=$(mktemp "${TMPDIR:-/tmp}/lunaria-harfbuzz.XXXXXX")
         trap 'rm -f "$archive"' EXIT HUP INT TERM
-        curl --fail --location --silent --show-error \
+        fetch \
             "https://github.com/harfbuzz/harfbuzz/archive/refs/tags/$harfbuzz_version.tar.gz" \
             --output "$archive"
         mkdir -p "$harfbuzz_source"

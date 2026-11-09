@@ -5,7 +5,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  *
- * See luna_overlay.h for what this layer is and why it exists.
+ * See luna_boot.h for what this layer is and why it exists.
  *
  * luna-ui owns the window in every other program in this tree; here it must
  * not, because the window, the GL context and the input queue all belong to
@@ -29,16 +29,13 @@
 #endif
 #include "luna-window.h"
 
-#include "luna_overlay.h"
 #include "luna_boot.h"
 #include "luna_google.h"
 #include <sys/stat.h>
 #include <dirent.h>
-#include "luna_input.h"
 #include <stdarg.h>
 #include "lunaria_os.h"
 #include "dvm/dvm.h"
-#include "luna_ime.h"
 #include "arm_exec.h"
 
 #include <math.h>
@@ -73,6 +70,8 @@ struct overlay_image_update {
  char key[64];
  int width,height;
  unsigned char *rgba;
+ bool refresh;          /* upload x0..x1 / y0..y1 of the stored picture instead of rgba */
+ int x0,y0,x1,y1;
 };
 static struct overlay_image_update *g_image_updates;
 static bool  g_from_files;   /* LUNARIA_UI_TEST names an HTML file */
@@ -210,10 +209,39 @@ static void overlay_render_windows(int w, int h)
 static pthread_mutex_t g_doc_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_native_input_focus;
 
+/* Sizes of the pictures queued under a key, readable at once: the layout pass
+ * wants a bitmap's intrinsic size long before the presenting thread uploads it. */
+struct overlay_image_size {char key[96];int width,height;struct overlay_image_size *next;};
+static struct overlay_image_size *g_image_sizes;
+
+static void overlay_note_image_size(const char *key,int width,int height)
+{
+ struct overlay_image_size **link=&g_image_sizes;
+ while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
+ struct overlay_image_size *e=*link;
+ if(!width || !height) {if(e) {*link=e->next;free(e);} return;}
+ if(!e) {
+  e=calloc(1,sizeof *e);if(!e) return;
+  snprintf(e->key,sizeof e->key,"%s",key);e->next=g_image_sizes;g_image_sizes=e;
+ }
+ e->width=width;e->height=height;
+}
+
+bool luna_overlay_image_size(const char *key,int *width,int *height)
+{
+ bool found=false;
+ pthread_mutex_lock(&g_doc_lock);
+ for(struct overlay_image_size *e=g_image_sizes;e;e=e->next)
+  if(!strcmp(e->key,key)) {*width=e->width;*height=e->height;found=true;break;}
+ pthread_mutex_unlock(&g_doc_lock);
+ return found;
+}
+
 static bool overlay_queue_image(const char *key,int width,int height,unsigned char *rgba)
 {
  if(!key || !*key || strlen(key)>=sizeof ((struct overlay_image_update *)0)->key) {free(rgba);return false;}
  pthread_mutex_lock(&g_doc_lock);
+ overlay_note_image_size(key,width,height);
  struct overlay_image_update *entry=g_image_updates;
  while(entry && strcmp(entry->key,key)) entry=entry->next;
  if(!entry) {
@@ -221,8 +249,18 @@ static bool overlay_queue_image(const char *key,int width,int height,unsigned ch
   if(!entry) {pthread_mutex_unlock(&g_doc_lock);free(rgba);return false;}
   strcpy(entry->key,key);entry->next=g_image_updates;g_image_updates=entry;
  }
- free(entry->rgba);entry->rgba=rgba;entry->width=width;entry->height=height;
+ free(entry->rgba);entry->rgba=rgba;entry->width=width;entry->height=height;entry->refresh=false;
  pthread_mutex_unlock(&g_doc_lock);luna_overlay_wake();return true;
+}
+/* A picture that is already RGBA, rows from the top (a decoded video frame):
+ * flipped into the order the renderer wants without touching a pixel. */
+bool luna_overlay_image_rgba(const char *key,int width,int height,const uint8_t *rgba_top_down)
+{
+ if(width<=0 || height<=0 || !rgba_top_down || (size_t)width>SIZE_MAX/4/(size_t)height) return false;
+ const size_t row=(size_t)width*4;
+ unsigned char *rgba=malloc(row*(size_t)height);if(!rgba) return false;
+ for(int y=0;y<height;++y) memcpy(rgba+row*(size_t)(height-1-y),rgba_top_down+row*(size_t)y,row);
+ return overlay_queue_image(key,width,height,rgba);
 }
 bool luna_overlay_image_argb(const char *key,int width,int height,const uint32_t *pixels)
 {
@@ -235,8 +273,63 @@ bool luna_overlay_image_argb(const char *key,int width,int height,const uint32_t
  }
  return overlay_queue_image(key,width,height,rgba);
 }
+/* Source lifetime is serialized with acquisition, separately from the document
+ * handoff. A pull may publish an image, so never hold g_doc_lock here. */
+struct overlay_image_source {
+ char key[96];void *user;luna_overlay_image_pull_fn pull;void (*release)(void *);
+ struct overlay_image_source *next;
+};
+static pthread_mutex_t g_source_lock=PTHREAD_MUTEX_INITIALIZER;
+static struct overlay_image_source *g_image_sources;
+static void overlay_source_remove_key(const char *key)
+{
+ pthread_mutex_lock(&g_source_lock);
+ struct overlay_image_source **link=&g_image_sources;
+ while(*link) {
+  struct overlay_image_source *e=*link;
+  if(!key || !strcmp(e->key,key)) {
+   *link=e->next;if(e->release) e->release(e->user);free(e);
+  } else link=&e->next;
+ }
+ pthread_mutex_unlock(&g_source_lock);
+}
+bool luna_overlay_image_source(const char *key,void *user,luna_overlay_image_pull_fn pull,
+                               void (*release)(void *))
+{
+ if(!key || !*key || strlen(key)>=96 || !pull) return false;
+ struct overlay_image_source *e=calloc(1,sizeof *e);if(!e) return false;
+ strcpy(e->key,key);e->user=user;e->pull=pull;e->release=release;
+ pthread_mutex_lock(&g_source_lock);
+ struct overlay_image_source **link=&g_image_sources;
+ while(*link && strcmp((*link)->key,key)) link=&(*link)->next;
+ if(*link) {struct overlay_image_source *old=*link;*link=old->next;if(old->release) old->release(old->user);free(old);}
+ e->next=g_image_sources;g_image_sources=e;
+ pthread_mutex_unlock(&g_source_lock);luna_overlay_wake();return true;
+}
+void luna_overlay_image_sources_remove(void *user)
+{
+ pthread_mutex_lock(&g_source_lock);
+ struct overlay_image_source **link=&g_image_sources;
+ while(*link) {
+  struct overlay_image_source *e=*link;
+  if(e->user==user) {*link=e->next;if(e->release) e->release(e->user);free(e);}
+  else link=&e->next;
+ }
+ pthread_mutex_unlock(&g_source_lock);
+}
+bool luna_overlay_has_image_sources(void)
+{
+ pthread_mutex_lock(&g_source_lock);bool have=g_image_sources!=NULL;
+ pthread_mutex_unlock(&g_source_lock);return have;
+}
+void luna_overlay_poll_image_sources(int64_t present_ns)
+{
+ pthread_mutex_lock(&g_source_lock);
+ for(struct overlay_image_source *e=g_image_sources;e;e=e->next) e->pull(e->user,e->key,present_ns);
+ pthread_mutex_unlock(&g_source_lock);
+}
 void luna_overlay_image_forget(const char *key)
-{if(key && *key) (void)overlay_queue_image(key,0,0,NULL);}
+{if(key && *key) {overlay_source_remove_key(key);(void)overlay_queue_image(key,0,0,NULL);}}
 
 /* luna_reset_document() frees every texture, host-uploaded ones included, and
  * a guest bitmap is only queued again when its pixels change.  Without a copy
@@ -259,18 +352,28 @@ static void overlay_store_image(const char *key,int width,int height,const unsig
   entry=calloc(1,sizeof *entry);if(!entry) return;
   snprintf(entry->key,sizeof entry->key,"%s",key);entry->next=g_image_store;g_image_store=entry;
  }
+ if(entry->rgba && entry->width==width && entry->height==height) {memcpy(entry->rgba,rgba,bytes);return;}
  unsigned char *copy=malloc(bytes);
  if(!copy) return;
  memcpy(copy,rgba,bytes);free(entry->rgba);entry->rgba=copy;entry->width=width;entry->height=height;
 }
 
-static void overlay_upload_images(void)
+static void overlay_upload_image_list(struct overlay_image_update *list)
 {
- /* Called with doc_lock and the GL context current. Coalesced entries never
-  * keep a borrowed VM pointer across either a draw or object destruction. */
- while(g_image_updates) {
-  struct overlay_image_update *entry=g_image_updates;g_image_updates=entry->next;
-  overlay_store_image(entry->key,entry->width,entry->height,entry->rgba);
+ /* Called with the GL context current and the document lock NOT held: the
+  * queue was taken (and the store updated) under the lock; the uploads, the
+  * long part, run unlocked. */
+ while(list) {
+  struct overlay_image_update *entry=list;list=entry->next;
+  if(entry->refresh) {
+   pthread_mutex_lock(&g_doc_lock);
+   for(struct overlay_image_store *st=g_image_store;st;st=st->next)
+    if(!strcmp(st->key,entry->key) && st->rgba)
+     (void)luna_update_texture_rgba_rect(st->key,st->width,st->height,st->rgba,
+        entry->x0,entry->y0,entry->x1-entry->x0,entry->y1-entry->y0);
+   pthread_mutex_unlock(&g_doc_lock);
+   free(entry);continue;
+  }
   if(entry->rgba) (void)luna_update_texture_rgba(entry->key,entry->width,entry->height,entry->rgba);
   else luna_invalidate_texture(entry->key);
   free(entry->rgba);free(entry);
@@ -280,10 +383,51 @@ static void overlay_upload_images(void)
 /* After a document reset: put every stored picture back. */
 static void overlay_restore_images(void)
 {
+ /* The document's own pictures stay resident across a republish (see
+  * luna_set_persistent_texture_prefix); only a picture that is not there is
+  * uploaded again.  The new elements pick the resident texture up by key. */
  for(struct overlay_image_store *e=g_image_store;e;e=e->next)
-  (void)luna_update_texture_rgba(e->key,e->width,e->height,e->rgba);
+  if(!luna_has_texture(e->key)) (void)luna_update_texture_rgba(e->key,e->width,e->height,e->rgba);
 }
 
+/* The picture under `key` changed only inside x0..x1, y0..y1 (rows from the top,
+ * as `pixels` has them).  Only that part is converted and uploaded -- a
+ * screen-sized raster repainted in a corner used to be converted and sent whole
+ * every frame.  Falls back to the whole picture when there is no earlier copy of
+ * the same size to patch, or a whole-picture upload is still waiting. */
+bool luna_overlay_image_argb_rect(const char *key,int width,int height,const uint32_t *pixels,
+                                  int x0,int y0,int x1,int y1)
+{
+ if(width<=0 || height<=0 || !pixels || !key || !*key) return false;
+ if(x0<0) x0=0;if(y0<0) y0=0;if(x1>width) x1=width;if(y1>height) y1=height;
+ if(x1<=x0 || y1<=y0) return true;
+ pthread_mutex_lock(&g_doc_lock);
+ struct overlay_image_store *st=g_image_store;
+ while(st && strcmp(st->key,key)) st=st->next;
+ struct overlay_image_update *pending=g_image_updates;
+ while(pending && strcmp(pending->key,key)) pending=pending->next;
+ if(!st || !st->rgba || st->width!=width || st->height!=height || (pending && !pending->refresh)) {
+  pthread_mutex_unlock(&g_doc_lock);
+  return luna_overlay_image_argb(key,width,height,pixels);
+ }
+ for(int y=y0;y<y1;++y) for(int x=x0;x<x1;++x) {
+  uint32_t p=pixels[(size_t)y*width+x];
+  unsigned char *q=st->rgba+4*((size_t)(height-1-y)*width+x);
+  q[0]=(unsigned char)(p>>16);q[1]=(unsigned char)(p>>8);q[2]=(unsigned char)p;q[3]=(unsigned char)(p>>24);
+ }
+ const int sy0=height-y1,sy1=height-y0;       /* the stored picture is upside down */
+ if(!pending) {
+  pending=calloc(1,sizeof *pending);
+  if(!pending) {pthread_mutex_unlock(&g_doc_lock);return luna_overlay_image_argb(key,width,height,pixels);}
+  strcpy(pending->key,key);pending->refresh=true;pending->width=width;pending->height=height;
+  pending->x0=x0;pending->x1=x1;pending->y0=sy0;pending->y1=sy1;
+  pending->next=g_image_updates;g_image_updates=pending;
+ } else {
+  if(x0<pending->x0) pending->x0=x0;if(x1>pending->x1) pending->x1=x1;
+  if(sy0<pending->y0) pending->y0=sy0;if(sy1>pending->y1) pending->y1=sy1;
+ }
+ pthread_mutex_unlock(&g_doc_lock);luna_overlay_wake();return true;
+}
 void luna_overlay_image_changed(const char *path)
 {
    if (!path || !*path) return;
@@ -301,7 +445,7 @@ void luna_overlay_image_changed(const char *path)
 /* Pointer events arrive on the host's event thread (GLFW polls there) and
  * cannot touch luna-ui's hit-testing state from outside the presenting
  * thread, so they queue here and are replayed at the top of present(). */
-struct overlay_pointer_event { double x, y; int action; };
+struct overlay_pointer_event { double x, y; int action; long long event_ms; };
 static struct overlay_pointer_event g_ptr_queue[64];
 static int g_ptr_count;
 static pthread_mutex_t g_ptr_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -769,6 +913,35 @@ static bool overlay_same(const char *a, const char *b)
    return strcmp(a, b) == 0;
 }
 
+/* Positions the guest changed without republishing the document (a scroll, an
+ * offsetTopAndBottom): absolute left/top per element id, applied to the live
+ * tree by the presenting thread. A republish supersedes them. */
+struct overlay_move { char id[32]; float left, top; struct overlay_move *next; };
+static struct overlay_move *g_moves;
+static void overlay_moves_free(struct overlay_move *m)
+{
+   while (m) { struct overlay_move *n = m->next; free(m); m = n; }
+}
+
+bool luna_overlay_move(const char *id, float left, float top)
+{
+   if (!id || !*id || strlen(id) >= sizeof ((struct overlay_move *)0)->id) return false;
+   pthread_mutex_lock(&g_doc_lock);
+   if (!g_html || g_doc_dirty) { pthread_mutex_unlock(&g_doc_lock); return false; }
+   struct overlay_move *m = g_moves;
+   while (m && strcmp(m->id, id)) m = m->next;
+   if (!m) {
+      m = calloc(1, sizeof *m);
+      if (!m) { pthread_mutex_unlock(&g_doc_lock); return false; }
+      strcpy(m->id, id);
+      m->next = g_moves; g_moves = m;
+   }
+   m->left = left; m->top = top;
+   pthread_mutex_unlock(&g_doc_lock);
+   luna_overlay_wake();
+   return true;
+}
+
 void luna_overlay_set_document(const char *html, const char *css)
 {
    pthread_mutex_lock(&g_doc_lock);
@@ -788,6 +961,7 @@ void luna_overlay_set_document(const char *html, const char *css)
       g_css = strdup(css);
    }
    g_doc_dirty = true;
+   overlay_moves_free(g_moves); g_moves = NULL;
    pthread_mutex_unlock(&g_doc_lock);
    luna_overlay_wake();
 }
@@ -1005,6 +1179,7 @@ static void overlay_drain_pointer(void)
             ? luna_get_element_by_id(g_web_pointer_capture)
             : luna_element_at_point(batch[i].x, batch[i].y);
          bool web_hit = false;
+         if (getenv("LUNARIA_TRACE_TOUCH")) { LunaElement *h = hit >= 0 ? luna_element_at(hit) : NULL; fprintf(stderr, "[ovl-hit] act=%d %d,%d hit=%d id=%s cls=%s\n", batch[i].action, (int)batch[i].x, (int)batch[i].y, hit, h ? h->id : "-", h ? h->class_name : "-"); }
          for (int parent = hit; parent >= 0;
               parent = luna_element_parent(parent)) {
             LunaElement *e = luna_element_at(parent);
@@ -1013,9 +1188,6 @@ static void overlay_drain_pointer(void)
                  strstr(e->class_name, "lunaria-touchview"))) {
                web_hit = true;
                framework_touch = strstr(e->class_name, "lunaria-touchview") != NULL;
-               if (batch[i].action == 1)
-                  snprintf(g_web_pointer_capture,
-                           sizeof g_web_pointer_capture, "%s", e->id);
                if (batch[i].action == 1) {
                   pthread_mutex_lock(&g_ptr_lock);
                   /* SurfaceView shares pointer forwarding with WebView,
@@ -1039,10 +1211,12 @@ static void overlay_drain_pointer(void)
                      if (candidate && candidate->id[0] == 'v') receiver = candidate;
                   }
                }
+               if (batch[i].action == 1)
+                  snprintf(g_web_pointer_capture,sizeof g_web_pointer_capture,"%s",receiver->id);
                if (g_web_pointer_capture[0])
                   g_web_pointer_fn(receiver->id,
                      (int)(batch[i].x - receiver->x), (int)(batch[i].y - receiver->y),
-                     batch[i].action);
+                     batch[i].action,batch[i].event_ms);
                break;
             }
          }
@@ -1308,22 +1482,52 @@ bound:
                g_prof.bind_ns += n - t_mark; t_mark = n; }
 
    if (overlay_start(w, h)) {
+      struct timespec image_now;clock_gettime(CLOCK_MONOTONIC,&image_now);
+      luna_overlay_poll_image_sources((int64_t)image_now.tv_sec*1000000000+image_now.tv_nsec);
+      luna_set_persistent_texture_prefix("lunaria-bitmap-");
+      /* Absolute paths are the emulator's own files (a drawable unpacked from the
+       * package, a converted vector); the same file is the same picture. */
+      luna_set_persistent_texture_prefix("/");
       luna_invalidate_gl_state();
       if (w != g_w || h != g_h) {
          g_w = w;
          g_h = h;
          luna_resize((float)w, (float)h);
       }
+      /* The lock covers taking what the guest published, nothing more. Parsing
+       * a document and uploading pictures are the compositor's own work on its
+       * own copies: while they ran under the lock, every capture the widget
+       * layer published (with the interpreter lock held) waited on them. */
       pthread_mutex_lock(&g_doc_lock);
       /* The boot screen is the card and nothing else; the application screen
        * is the guest's own widgets with the input method over them.  Which
        * one this is was decided in overlay_present_screen(). */
       const bool status_only = g_screen == OV_BOOT && g_status_html != NULL;
-      const char *html = status_only ? g_status_html : g_html;
-      const char *css  = status_only ? g_status_css  : g_css;
-      bool reparsed = g_doc_dirty;
-      if (g_doc_dirty) {
+      const bool reparsed = g_doc_dirty;
+      const bool from_files = g_from_files;
+      char *html = NULL, *css = NULL, *toast_html = NULL, *toast_css = NULL;
+      char *ime_html = NULL, *ime_css = NULL, *menu_html = NULL, *menu_css = NULL;
+      if (reparsed) {
+         const char *h = status_only ? g_status_html : g_html;
+         const char *c = status_only ? g_status_css : g_css;
+         html = h ? strdup(h) : NULL; css = c ? strdup(c) : NULL;
+         if (g_toast_html && !status_only) { toast_html = strdup(g_toast_html); toast_css = g_toast_css ? strdup(g_toast_css) : NULL; }
+         if (g_ime_html && !status_only) { ime_html = strdup(g_ime_html); ime_css = g_ime_css ? strdup(g_ime_css) : NULL; }
+         if (g_menu_html) { menu_html = strdup(g_menu_html); menu_css = g_menu_css ? strdup(g_menu_css) : NULL; }
          g_doc_dirty = false;
+      }
+      char *changed_image_path = g_changed_image_path;
+      g_changed_image_path = NULL;
+      struct overlay_image_update *image_updates = g_image_updates;
+      g_image_updates = NULL;
+      struct overlay_move *moves = g_moves;
+      g_moves = NULL;
+      /* The store is what a partial update patches, so it takes the new
+       * picture while the lock is held; only the GL upload runs unlocked. */
+      for (struct overlay_image_update *u = image_updates; u; u = u->next)
+         if (!u->refresh) overlay_store_image(u->key, u->width, u->height, u->rgba);
+      pthread_mutex_unlock(&g_doc_lock);
+      if (reparsed) {
          /* parse_html() appends, so the previous document has to be dropped
           * first or every republish stacks another copy of the page behind the
           * one on screen — with its ids, its click wiring and its animations
@@ -1332,7 +1536,7 @@ bound:
          /* Styles are resolved while the HTML is parsed, so the sheet has to
           * be in place first. */
          luna_reset_css();
-         if (g_from_files && g_html) {
+         if (from_files && html) {
             const char *path = getenv("LUNARIA_UI_TEST");
             char css_path[1024], base[1024];
             snprintf(base, sizeof base, "%s", path);
@@ -1357,18 +1561,18 @@ bound:
           * the layer below it, with its own sheet. */
          /* A toast is a window of its own too: over the application and its
           * dialogs, under the input method, and never touchable. */
-         if (g_toast_html && !status_only) {
-            if (g_toast_css) luna_parse_css(g_toast_css);
-            luna_parse_html(g_toast_html);
+         if (toast_html) {
+            if (toast_css) luna_parse_css(toast_css);
+            luna_parse_html(toast_html);
          }
-         if (g_ime_html && !status_only) {
-            if (g_ime_css) luna_parse_css(g_ime_css);
-            luna_parse_html(g_ime_html);
+         if (ime_html) {
+            if (ime_css) luna_parse_css(ime_css);
+            luna_parse_html(ime_html);
          }
          /* The emulator's menu is above every window, the card included. */
-         if (g_menu_html) {
-            if (g_menu_css) luna_parse_css(g_menu_css);
-            luna_parse_html(g_menu_html);
+         if (menu_html) {
+            if (menu_css) luna_parse_css(menu_css);
+            luna_parse_html(menu_html);
          }
          luna_resize((float)w, (float)h);
          g_surface_holes = false;
@@ -1377,7 +1581,9 @@ bound:
             luna_set_clear_before_paint(i, 1);
             g_surface_holes = true;
          }
+         pthread_mutex_lock(&g_doc_lock);
          overlay_restore_images();
+         pthread_mutex_unlock(&g_doc_lock);
          overlay_wire_clicks();
          /* One layout pass so a dump of element boxes is meaningful. */
          luna_update(overlay_now(), 0.0);
@@ -1409,13 +1615,18 @@ bound:
             ++parses;
          }
       }
-      if (g_changed_image_path) {
-         luna_invalidate_texture(g_changed_image_path);
-         free(g_changed_image_path);
-         g_changed_image_path = NULL;
+      free(html); free(css); free(toast_html); free(toast_css);
+      free(ime_html); free(ime_css); free(menu_html); free(menu_css);
+      if (changed_image_path) {
+         luna_invalidate_texture(changed_image_path);
+         free(changed_image_path);
       }
-      overlay_upload_images();
-      pthread_mutex_unlock(&g_doc_lock);
+      for (struct overlay_move *m = moves; m; m = m->next) {
+         const int idx = luna_get_element_by_id(m->id);
+         if (idx >= 0) luna_set_position(idx, m->left, m->top);
+      }
+      overlay_moves_free(moves);
+      overlay_upload_image_list(image_updates);
       if (prof) { const uint64_t n = overlay_ns();
                   g_prof.parse_ns += n - t_mark; t_mark = n; }
 
@@ -1500,6 +1711,7 @@ bound:
  * dialog — it must not eat the touches a title needs once it starts drawing. */
 bool luna_overlay_pointer(double x, double y, int action)
 {
+   if (getenv("LUNARIA_TRACE_TOUCH")) fprintf(stderr, "[ovl-in] %.0f,%.0f act=%d paused=%d\n", x, y, action, (int)luna_guest_paused());
    pthread_mutex_lock(&g_doc_lock);
    bool guest = g_html != NULL && !g_native_input_focus;
    bool ime = g_ime_html != NULL;
@@ -1535,6 +1747,7 @@ consume:
       g_ptr_queue[g_ptr_count].x = x;
       g_ptr_queue[g_ptr_count].y = y;
       g_ptr_queue[g_ptr_count].action = action;
+      g_ptr_queue[g_ptr_count].event_ms = (long long)(overlay_ns()/1000000u);
       ++g_ptr_count;
    }
    pthread_mutex_unlock(&g_ptr_lock);
@@ -1565,6 +1778,7 @@ void luna_overlay_shutdown(void)
    free(g_toast_css);
    free(g_menu_html);
    free(g_menu_css);
+   overlay_source_remove_key(NULL);
    pthread_mutex_lock(&g_doc_lock);
    free(g_changed_image_path);
    g_changed_image_path = NULL;
@@ -2377,11 +2591,11 @@ static int menu_sub_rows(struct menu_buf *b)
       if (!g_google_choice[0]) snprintf(g_google_choice, sizeof g_google_choice, "%s", luna_google_profile_current());
       y += menu_header(b, "GOOGLE SERVICES");
       y += menu_item(b, NULL, installed ? "Play services installed" : "Play services not installed", false, NULL);
+      y += menu_item(b, NULL, luna_apk_google_package_installed("com.android.vending") ? "Play Store installed" : "Play Store missing", false, NULL);
+      y += menu_item(b, NULL, luna_apk_google_package_installed("com.google.android.gsf") ? "Services Framework installed" : "Services Framework missing", false, NULL);
       y += menu_item(b, busy ? NULL : "google-install", "Install Google APK / XAPK...", false, NULL);
       y += menu_item(b, installed && !busy ? "google-new" : NULL, "Sign in to a new environment...", false, NULL);
-      const int selected_accounts = luna_apk_google_profile_accounts(g_google_choice);
-      if (!selected_accounts)
-         y += menu_item(b, installed && !busy ? "google-signin" : NULL, "Sign in to selected environment...", false, NULL);
+      y += menu_item(b, installed && !busy ? "google-signin" : NULL, "Sign in to selected environment...", false, NULL);
       y += menu_sep(b);
       y += menu_header(b, "SAVED ENVIRONMENTS");
       char profiles[PROFILE_MAX][65];
@@ -2796,6 +3010,11 @@ static void menu_clicked(const char *id)
       if (!strcmp(id, "google-new")) {
          result = luna_apk_google_profile_create(fresh, sizeof fresh);
          profile = fresh;
+         if (!result) {
+            if (menu_conf_write("LUNARIA_GMS_PROFILE", profile, false))
+               snprintf(g_google_choice, sizeof g_google_choice, "%s", profile);
+            else result = -1;
+         }
       }
       if (!result && !luna_apk_google_services_open(!strcmp(id, "google-install"), profile))
          menu_notice_locked("Opening Google services...");

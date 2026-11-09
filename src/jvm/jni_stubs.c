@@ -945,11 +945,7 @@ const char *lunaria_android_apk_path(void)
  * it finds with the process it runs in. */
 static const char *native_lib_abi_dir(void)
 {
-   const char *staged = getenv("ANDROID_NATIVE_LIB_DIR");
-   const char *abi = staged ? strrchr(staged, '/') : NULL;
-   abi = abi ? abi + 1 : staged;
-   if (abi && (!strcmp(abi, "armeabi-v7a") || !strcmp(abi, "armeabi"))) return "arm";
-   return "arm64";
+   return arm_exec_guest_is_64bit() ? "arm64" : "arm";
 }
 
 const char *lunaria_android_native_lib_path(void)
@@ -1026,9 +1022,10 @@ static const char *
 android_property_entry(const char *name, size_t index)
 {
    const struct lunaria_device *dev = lunaria_device();
-   static char sdk[8], fingerprint[192], display[96], build_id[48];
+   static char sdk[8], fingerprint[192], display[96], build_id[48], density[16];
    if (!sdk[0]) {
       snprintf(sdk, sizeof sdk, "%d", lunaria_sdk_int());
+      snprintf(density, sizeof density, "%d", dev->density);
       /* A retail build id is the platform's own release tag; DISPLAY is that
        * id again, and the fingerprint is assembled from the same parts in the
        * order the platform documents.  Every one of them therefore follows
@@ -1046,6 +1043,7 @@ android_property_entry(const char *name, size_t index)
    }
 
    const struct { const char *name, *value; } fixed[] = {
+      { "ro.sf.lcd_density", density },
       /* identity */
       { "ro.product.manufacturer",  dev->manufacturer },
       { "ro.product.brand",         dev->brand },
@@ -1057,12 +1055,13 @@ android_property_entry(const char *name, size_t index)
       { "ro.hardware",              dev->hardware },
       /* OpenGL ES 3.2, encoded as the framework reads it: major<<16 | minor. */
       { "ro.opengles.version",      "196610" },
-      /* ABI — one 64-bit image; abilist32 empty the way a 64-only device is. */
+      /* Both execution engines are installed. These device-wide properties
+       * are identical in 32-bit applications and 64-bit system services. */
       { "ro.product.cpu.abi",       "arm64-v8a" },
       { "ro.product.cpu.abi2",      "" },
-      { "ro.product.cpu.abilist",   "arm64-v8a" },
+      { "ro.product.cpu.abilist",   "arm64-v8a,armeabi-v7a" },
       { "ro.product.cpu.abilist64", "arm64-v8a" },
-      { "ro.product.cpu.abilist32", "" },
+      { "ro.product.cpu.abilist32", "armeabi-v7a" },
       /* build */
       { "ro.build.type",            "user" },
       { "ro.build.tags",            "release-keys" },
@@ -1134,7 +1133,11 @@ LUNARIA_BUILD_FIELD(HOST,         "ro.build.host")
 LUNARIA_BUILD_FIELD(BOOTLOADER,   "ro.bootloader")
 LUNARIA_BUILD_FIELD(RADIO,        "gsm.version.baseband")
 LUNARIA_BUILD_FIELD(UNKNOWN,      "ro.serialno")   /* Build.UNKNOWN == "unknown" */
-LUNARIA_BUILD_FIELD(CPU_ABI,      "ro.product.cpu.abi")
+jstring android_os_Build_CPU_ABI(JNIEnv *env, jobject object)
+{
+   (void)object;
+   return (*env)->NewStringUTF(env, arm_exec_guest_is_64bit() ? "arm64-v8a" : "armeabi-v7a");
+}
 LUNARIA_BUILD_FIELD(CPU_ABI2,     "ro.product.cpu.abi2")
 LUNARIA_BUILD_FIELD(VERSION_SECURITY_PATCH, "ro.build.version.security_patch")
 LUNARIA_BUILD_FIELD(VERSION_CODENAME,       "ro.build.version.codename")

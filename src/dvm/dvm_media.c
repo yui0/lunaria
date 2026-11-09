@@ -517,25 +517,26 @@ static bool is_vp9_mime(const char *mime)
  * Frame sink
  * ------------------------------------------------------------------------ */
 
-/* A producer (the codec thread) and a consumer (updateTexImage on the render
- * thread) that run concurrently, like a BufferQueue.  Three buffers: the
- * producer draws into `back`, commit swaps it with `mid` under the lock, and
- * take swaps `mid` into `front`, which only the consumer reads.  Neither side
- * ever touches a buffer the other one is using, and no pixel is copied twice. */
+/* The producer owns back; the consumer owns front until its next acquire.
+ * Timed frames keep their FIFO order. Immediate asynchronous submissions may
+ * replace another immediate frame, but never an explicitly scheduled frame. */
+#define LM_SINK_QUEUE_CAP 2u
 struct lm_sinkbuf {
    uint8_t *rgba;
    size_t cap;
    int w, h;
-   int64_t ts_ns;
+   int64_t ts_ns, due_ns;
+   bool timed;
 };
 
 struct lm_sink {
    atomic_uint refs;
    pthread_mutex_t mu;
-   struct lm_sinkbuf front, mid, back;
-   bool pending;            /* mid holds a frame front has not taken */
-   int64_t ts_ns;           /* of the newest committed frame */
-   uint64_t commit_id;
+   pthread_cond_t space;
+   struct lm_sinkbuf front, queued[LM_SINK_QUEUE_CAP], back;
+   unsigned head, count;
+   int64_t ts_ns;
+   uint64_t commit_id, front_serial;
    bool abandoned;
    struct liq_queue *images;
    int commit_status;       /* producer-owned; explains a rejected commit */
@@ -547,6 +548,7 @@ struct lm_sink *lm_sink_new(void)
    if (s) {
       atomic_init(&s->refs, 1);
       pthread_mutex_init(&s->mu, NULL);
+      pthread_cond_init(&s->space, NULL);
    }
    return s;
 }
@@ -573,10 +575,11 @@ void lm_sink_free(struct lm_sink *s)
 {
    if (!s || atomic_fetch_sub_explicit(&s->refs, 1, memory_order_acq_rel) != 1) return;
    free(s->front.rgba);
-   free(s->mid.rgba);
+   for (unsigned i=0;i<LM_SINK_QUEUE_CAP;++i) free(s->queued[i].rgba);
    free(s->back.rgba);
    liq_close(s->images);
    liq_unref(s->images);
+   pthread_cond_destroy(&s->space);
    pthread_mutex_destroy(&s->mu);
    free(s);
 }
@@ -598,7 +601,7 @@ uint8_t *lm_sink_begin(struct lm_sink *s, int w, int h)
    return b->rgba;
 }
 
-bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns)
+static bool sink_commit(struct lm_sink *s,int w,int h,int64_t timestamp_ns,bool timed)
 {
    if (s) s->commit_status = LIQ_INVALID_PARAMETER;
    if (!s || !s->back.rgba || w <= 0 || h <= 0) return false;
@@ -607,6 +610,8 @@ bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns)
    s->back.w = w;
    s->back.h = h;
    s->back.ts_ns = timestamp_ns;
+   s->back.timed = timed;
+   s->back.due_ns = timed ? timestamp_ns : 0;
    pthread_mutex_lock(&s->mu);
    if(s->abandoned) {s->commit_status=LIQ_INVALID_OBJECT;pthread_mutex_unlock(&s->mu);return false;}
    if (s->images) {
@@ -621,21 +626,46 @@ bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns)
       pthread_mutex_unlock(&s->mu);
       return status == LIQ_OK;
    }
-   struct lm_sinkbuf t = s->mid;
-   s->mid = s->back;
-   s->back = t;
-   s->pending = true;
-   s->ts_ns = timestamp_ns;
+   unsigned tail=(s->head+s->count)%LM_SINK_QUEUE_CAP;
+   bool replace=s->count && !timed && !s->queued[(tail+LM_SINK_QUEUE_CAP-1)%LM_SINK_QUEUE_CAP].timed;
+   if (replace) tail=(tail+LM_SINK_QUEUE_CAP-1)%LM_SINK_QUEUE_CAP;
+   else if (s->count==LM_SINK_QUEUE_CAP) {
+      s->commit_status=LIQ_WOULD_BLOCK;
+      pthread_mutex_unlock(&s->mu);
+      return false;
+   }
+   struct lm_sinkbuf t=s->queued[tail];
+   s->queued[tail]=s->back;s->back=t;
+   if (!replace) ++s->count;
+   s->ts_ns=timestamp_ns;
    ++s->commit_id;
-   s->commit_status = LIQ_OK;
+   s->commit_status=LIQ_OK;
    pthread_mutex_unlock(&s->mu);
    return true;
+}
+bool lm_sink_commit(struct lm_sink *s,int w,int h,int64_t timestamp_ns)
+{ return sink_commit(s,w,h,timestamp_ns,false); }
+bool lm_sink_commit_at(struct lm_sink *s,int w,int h,int64_t timestamp_ns)
+{ return sink_commit(s,w,h,timestamp_ns,true); }
+
+/* A finite wait lets the codec recheck flush/stop independently of the sink.
+ * There is no retry timer in acquisition: take/abandon signal available space. */
+static void sink_wait_space(struct lm_sink *s)
+{
+   struct timespec until;clock_gettime(CLOCK_REALTIME,&until);
+   until.tv_nsec+=10000000;
+   if (until.tv_nsec>=1000000000) {++until.tv_sec;until.tv_nsec-=1000000000;}
+   pthread_mutex_lock(&s->mu);
+   if (!s->abandoned && s->count==LM_SINK_QUEUE_CAP)
+      (void)pthread_cond_timedwait(&s->space,&s->mu,&until);
+   pthread_mutex_unlock(&s->mu);
 }
 
 void lm_sink_abandon(struct lm_sink *s)
 {
    if(!s) return;
-   pthread_mutex_lock(&s->mu);s->abandoned=true;s->pending=false;pthread_mutex_unlock(&s->mu);
+   pthread_mutex_lock(&s->mu);s->abandoned=true;s->count=0;
+   pthread_cond_broadcast(&s->space);pthread_mutex_unlock(&s->mu);
    liq_close(s->images);
 }
 uint64_t lm_sink_commit_id(struct lm_sink *s)
@@ -660,23 +690,65 @@ void lm_sink_push(struct lm_sink *s, const uint8_t *rgba, int w, int h,
    lm_sink_commit(s, w, h, timestamp_ns);
 }
 
-bool lm_sink_take(struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
+bool lm_sink_take_at(struct lm_sink *s,int64_t expected_present_ns,const uint8_t **rgba,int *w,int *h)
 {
    if (!s) return false;
    pthread_mutex_lock(&s->mu);
-   const bool have = s->pending && !s->abandoned;
+   bool have=s->count && !s->abandoned;
+   if (have && expected_present_ns>0) {
+      /* BufferQueueConsumer::acquireBuffer: a newer frame can retire an older
+       * timed frame only when the newer one is itself ready for this display.
+       * Timestamps outside the platform's one-second range are not schedules. */
+      const int64_t reasonable=1000000000;
+      while (s->count>1 && s->queued[s->head].timed) {
+         int64_t next=s->queued[(s->head+1)%LM_SINK_QUEUE_CAP].due_ns;
+         if (next<expected_present_ns-reasonable || next>expected_present_ns) break;
+         s->head=(s->head+1)%LM_SINK_QUEUE_CAP;--s->count;
+      }
+      const struct lm_sinkbuf *first=&s->queued[s->head];
+      if (first->timed && first->due_ns>expected_present_ns &&
+          (uint64_t)first->due_ns-(uint64_t)expected_present_ns<=1000000000u) have=false;
+   }
    if (have) {
-      struct lm_sinkbuf t = s->front;
-      s->front = s->mid;
-      s->mid = t;
-      s->pending = false;
+      struct lm_sinkbuf t=s->front;
+      s->front=s->queued[s->head];s->queued[s->head]=t;
+      ++s->front_serial;
+      s->head=(s->head+1)%LM_SINK_QUEUE_CAP;--s->count;
+      pthread_cond_broadcast(&s->space);
    }
    pthread_mutex_unlock(&s->mu);
    if (!have || !s->front.rgba) return false;
-   if (rgba) *rgba = s->front.rgba;
-   if (w) *w = s->front.w;
-   if (h) *h = s->front.h;
+   if (rgba) *rgba=s->front.rgba;
+   if (w) *w=s->front.w;
+   if (h) *h=s->front.h;
    return true;
+}
+bool lm_sink_take(struct lm_sink *s,const uint8_t **rgba,int *w,int *h)
+{
+   /* SurfaceTexture/GLConsumer supplies no expected display time. Its buffer
+    * timestamp is metadata; acquisition must not compare it to the clock. */
+   return lm_sink_take_at(s,0,rgba,w,h);
+}
+
+bool lm_sink_snapshot_argb(struct lm_sink *s,uint64_t *serial,uint32_t **pixels,int *w,int *h)
+{
+ if(!s || !serial || !pixels || !w || !h) return false;
+ pthread_mutex_lock(&s->mu);
+ const struct lm_sinkbuf *front=&s->front;
+ bool changed=front->rgba && front->w>0 && front->h>0 && *serial!=s->front_serial;
+ if(changed) {
+  size_t count=(size_t)front->w*front->h;
+  uint32_t *dst=*pixels;
+  if(!dst || *w!=front->w || *h!=front->h) {
+   dst=malloc(count*sizeof *dst);
+   if(!dst) {pthread_mutex_unlock(&s->mu);return false;}
+   free(*pixels);*pixels=dst;
+  }
+  const uint8_t *src=front->rgba;
+  for(size_t i=0;i<count;++i) dst[i]=((uint32_t)src[4*i+3]<<24)|((uint32_t)src[4*i]<<16)|((uint32_t)src[4*i+1]<<8)|src[4*i+2];
+  *w=front->w;*h=front->h;*serial=s->front_serial;
+ }
+ pthread_mutex_unlock(&s->mu);return changed;
 }
 
 bool lm_sink_peek(const struct lm_sink *s, const uint8_t **rgba, int *w, int *h)
@@ -753,7 +825,7 @@ struct lm_codec {
    pthread_mutex_t mu;
    pthread_cond_t cv;
    struct lm_job { int kind, idx, off, size, flags; int64_t pts;
-                   struct lm_sink *sink; unsigned epoch; int64_t surface_timestamp_ns; } jobs[16];
+                   struct lm_sink *sink; unsigned epoch; int64_t surface_timestamp_ns; bool timed; } jobs[16];
    int job_head, job_n;
    unsigned epoch;          /* bumped by flush(): older work is discarded */
    bool flush_decoder;      /* the thread owes avcodec_flush_buffers() */
@@ -944,6 +1016,14 @@ void lm_codec_add_csd(struct lm_codec *c, const uint8_t *data, size_t len)
 /* LUNARIA_TRACE_MEDIA=1 logs the codec's own state machine — which buffers the
  * caller took, what came back — because a stalled player looks exactly like a
  * quiet one from outside. */
+/* The asynchronous MediaCodec callbacks are posted by a pump on the host side.
+ * Anything that makes a buffer available says so here, and the pump runs at
+ * once instead of at the next frame: a player that gets one buffer back per
+ * frame period decodes audio at two thirds of real time. */
+static atomic_bool g_media_wake;
+void lm_media_wake(void) { atomic_store_explicit(&g_media_wake, true, memory_order_release); }
+bool lm_media_take_wake(void) { return atomic_exchange_explicit(&g_media_wake, false, memory_order_acq_rel); }
+
 bool lm_media_trace(void)
 {
    static int on = -1;
@@ -1147,17 +1227,19 @@ static bool codec_job_push(struct lm_codec *c, const struct lm_job *j)
  * a render or drop the frame. Cancellation is sampled under the codec lock,
  * independently of the sink's mutex, so flush/stop/free can finish. */
 static bool codec_commit_sink(struct lm_codec *c, struct lm_sink *sink,
-                               int w, int h, int64_t timestamp, unsigned epoch)
+                               int w, int h, int64_t timestamp, unsigned epoch, bool timed)
 {
    for (;;) {
       pthread_mutex_lock(&c->mu);
       const bool cancelled = c->th_stop || epoch != c->epoch;
       pthread_mutex_unlock(&c->mu);
       if (cancelled) return false;
-      if (lm_sink_commit(sink, w, h, timestamp)) return true;
-      if (!sink->images || sink->commit_status != LIQ_WOULD_BLOCK) return false;
-      int status = liq_wait_space(sink->images, 10);
-      if (status != LIQ_OK && status != LIQ_WOULD_BLOCK) return false;
+      if (sink_commit(sink,w,h,timestamp,timed)) return true;
+      if (sink->commit_status!=LIQ_WOULD_BLOCK) return false;
+      if (sink->images) {
+         int status=liq_wait_space(sink->images,10);
+         if (status!=LIQ_OK && status!=LIQ_WOULD_BLOCK) return false;
+      } else sink_wait_space(sink);
    }
 }
 
@@ -1198,9 +1280,19 @@ static void *codec_thread_main(void *arg)
          if (with_csd) c->vcsd_pending = false;
          c->in[j.idx].decoding = true;
          pthread_mutex_unlock(&c->mu);
+         struct timespec dt0; clock_gettime(CLOCK_MONOTONIC, &dt0);
          const bool got = j.epoch == c->epoch &&
             avcodec_decode_packet(c, c->in[j.idx].p + j.off, (size_t)j.size,
                                   j.pts, with_csd);
+         {
+            static __thread uint64_t sum, n; static __thread time_t last;
+            struct timespec dt1; clock_gettime(CLOCK_MONOTONIC, &dt1);
+            sum += (uint64_t)((dt1.tv_sec - dt0.tv_sec) * 1000000000LL + (dt1.tv_nsec - dt0.tv_nsec)); ++n;
+            if (dt1.tv_sec != last && getenv("LUNARIA_TRACE_MEDIA_TIME")) {
+               if (last) fprintf(stderr, "[media-time] decode %.2f ms avg over %llu packets\n", sum / 1e6 / (double)n, (unsigned long long)n);
+               last = dt1.tv_sec; sum = n = 0;
+            }
+         }
          pthread_mutex_lock(&c->mu);
          c->in[j.idx].decoding = false;
          c->in[j.idx].queued = false;
@@ -1217,9 +1309,23 @@ static void *codec_thread_main(void *arg)
             uint8_t *rgba = lm_sink_begin(j.sink, o->w, o->h);
             int64_t rendered_ns=0;
             if (rgba) {
+               struct timespec rt0; clock_gettime(CLOCK_MONOTONIC, &rt0);
                i420_to_rgba(o->yuv, o->w, o->h, rgba);
+               {
+                  static __thread uint64_t sum, n; static __thread time_t last;
+                  struct timespec rt1; clock_gettime(CLOCK_MONOTONIC, &rt1);
+                  sum += (uint64_t)((rt1.tv_sec - rt0.tv_sec) * 1000000000LL + (rt1.tv_nsec - rt0.tv_nsec)); ++n;
+                  if (rt1.tv_sec != last && getenv("LUNARIA_TRACE_MEDIA_TIME")) {
+                     if (last) fprintf(stderr, "[media-time] convert %.2f ms avg over %llu frames\n", sum / 1e6 / (double)n, (unsigned long long)n);
+                     last = rt1.tv_sec; sum = n = 0;
+                  }
+               }
+               /* releaseOutputBuffer(index, releaseTimeNs): the frame belongs on the
+                * screen at that time, not whenever the decoder was done with it.
+                * Showing it as soon as it was ready put frames on screen early by
+                * a varying amount, which is what judder looks like. */
                if(codec_commit_sink(c, j.sink, o->w, o->h,
-                     j.surface_timestamp_ns, j.epoch)) rendered_ns=codec_render_clock();
+                     j.surface_timestamp_ns, j.epoch,j.timed)) rendered_ns=codec_render_clock();
             }
             pthread_mutex_lock(&c->mu);
             if(rendered_ns && j.epoch==c->epoch && render_generation==c->render_generation)
@@ -1230,6 +1336,7 @@ static void *codec_thread_main(void *arg)
          o->ready = false;
       }
       lm_sink_free(j.sink);
+      lm_media_wake();
       pthread_cond_broadcast(&c->cv);
    }
    pthread_mutex_unlock(&c->mu);
@@ -1612,7 +1719,7 @@ bool lm_codec_queue_input(struct lm_codec *c, int idx, int offset, int size,
       if ((size > 0 || (flags & LM_BUFFER_FLAG_END_OF_STREAM)) &&
           codec_thread_ensure(c)) {
          struct lm_job j = { LM_JOB_DECODE, idx, offset, size, flags, pts_us,
-                             NULL, c->epoch, 0 };
+                             NULL, c->epoch, 0, false };
          ok = codec_job_push(c, &j);
          if (ok) ++c->pending_decodes;
       }
@@ -1641,6 +1748,7 @@ bool lm_codec_queue_input(struct lm_codec *c, int idx, int offset, int size,
          decoded=decode_aac(c, c->in[idx].p + offset, (size_t)size, pts_us);
       if(!decoded && !c->error) c->error=INT32_MIN;
    }
+   lm_media_wake();
    return true;
 }
 
@@ -1732,6 +1840,55 @@ static inline uint8_t clamp8(int v)
  * pointer instead of being re-indexed from the base on every sample.  At 720p
  * this runs 921,600 times a frame, at video rate, on the thread the guest is
  * waiting on -- the arithmetic per pixel is the whole cost. */
+#if defined(__SSE2__)
+#include <emmintrin.h>
+/* Sixteen pixels a step.  The fixed-point factors are the usual BT.601 ones
+ * scaled by 8192 and applied with mulhi on values shifted left 7, which leaves
+ * every intermediate in 1/16 units inside a signed 16 bit lane. */
+static int i420_row_sse2(const uint8_t *yr, const uint8_t *ur, const uint8_t *vr,
+                         uint8_t *dst, int w)
+{
+   const __m128i zero = _mm_setzero_si128();
+   const __m128i c16 = _mm_set1_epi16(16), c128 = _mm_set1_epi16(128);
+   const __m128i k_y = _mm_set1_epi16(9535), k_vr = _mm_set1_epi16(13074),
+                 k_ug = _mm_set1_epi16(3203), k_vg = _mm_set1_epi16(6660),
+                 k_ub = _mm_set1_epi16(16525);
+   const __m128i alpha = _mm_set1_epi8((char)255);
+   int x = 0;
+   for (; x + 16 <= w; x += 16) {
+      const __m128i y = _mm_loadu_si128((const __m128i *)(yr + x));
+      const __m128i u8 = _mm_loadl_epi64((const __m128i *)(ur + x / 2));
+      const __m128i v8 = _mm_loadl_epi64((const __m128i *)(vr + x / 2));
+      const __m128i u = _mm_unpacklo_epi8(u8, u8), v = _mm_unpacklo_epi8(v8, v8);   /* each chroma twice */
+      __m128i out[2][4];
+      for (int half = 0; half < 2; ++half) {
+         const __m128i yy16 = half ? _mm_unpackhi_epi8(y, zero) : _mm_unpacklo_epi8(y, zero);
+         const __m128i uu16 = half ? _mm_unpackhi_epi8(u, zero) : _mm_unpacklo_epi8(u, zero);
+         const __m128i vv16 = half ? _mm_unpackhi_epi8(v, zero) : _mm_unpacklo_epi8(v, zero);
+         const __m128i yv = _mm_mulhi_epi16(_mm_slli_epi16(_mm_sub_epi16(yy16, c16), 7), k_y);
+         const __m128i ud = _mm_slli_epi16(_mm_sub_epi16(uu16, c128), 7);
+         const __m128i vd = _mm_slli_epi16(_mm_sub_epi16(vv16, c128), 7);
+         const __m128i r = _mm_srai_epi16(_mm_add_epi16(yv, _mm_mulhi_epi16(vd, k_vr)), 4);
+         const __m128i g = _mm_srai_epi16(_mm_sub_epi16(_mm_sub_epi16(yv, _mm_mulhi_epi16(ud, k_ug)),
+                                                        _mm_mulhi_epi16(vd, k_vg)), 4);
+         const __m128i b = _mm_srai_epi16(_mm_add_epi16(yv, _mm_mulhi_epi16(ud, k_ub)), 4);
+         out[half][0] = r; out[half][1] = g; out[half][2] = b;
+      }
+      const __m128i r8 = _mm_packus_epi16(out[0][0], out[1][0]);
+      const __m128i g8 = _mm_packus_epi16(out[0][1], out[1][1]);
+      const __m128i b8 = _mm_packus_epi16(out[0][2], out[1][2]);
+      const __m128i rg_lo = _mm_unpacklo_epi8(r8, g8), rg_hi = _mm_unpackhi_epi8(r8, g8);
+      const __m128i ba_lo = _mm_unpacklo_epi8(b8, alpha), ba_hi = _mm_unpackhi_epi8(b8, alpha);
+      uint8_t *d = dst + (size_t)x * 4;
+      _mm_storeu_si128((__m128i *)(d +  0), _mm_unpacklo_epi16(rg_lo, ba_lo));
+      _mm_storeu_si128((__m128i *)(d + 16), _mm_unpackhi_epi16(rg_lo, ba_lo));
+      _mm_storeu_si128((__m128i *)(d + 32), _mm_unpacklo_epi16(rg_hi, ba_hi));
+      _mm_storeu_si128((__m128i *)(d + 48), _mm_unpackhi_epi16(rg_hi, ba_hi));
+   }
+   return x;
+}
+#endif
+
 static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba)
 {
    const int cw = (w + 1) / 2, ch = (h + 1) / 2;
@@ -1746,6 +1903,12 @@ static void i420_to_rgba(const uint8_t *yuv, int w, int h, uint8_t *rgba)
       const uint8_t *vr = vp + (size_t)(y / 2) * cw;
       uint8_t *dst = rgba + (size_t)y * w * 4;
       int x = 0;
+#if defined(__SSE2__)
+      {
+         const int done = i420_row_sse2(yr, ur, vr, dst, w);
+         yr += done; ur += done / 2; vr += done / 2; dst += (size_t)done * 4; x = done;
+      }
+#endif
       for (; x + 1 < w; x += 2) {
          const int d = *ur++ - 128;
          const int e = *vr++ - 128;
@@ -1790,7 +1953,8 @@ static void codec_release_output(struct lm_codec *c, int idx, bool render,
       if (c->out[idx].busy) {
          struct lm_job j = { .kind=LM_JOB_RENDER, .idx=idx, .sink=sink,
             .epoch=c->epoch, .surface_timestamp_ns=update_timestamp
-               ? timestamp_ns : (int64_t)((uint64_t)c->out[idx].pts_us * 1000u) };
+               ? timestamp_ns : (int64_t)((uint64_t)c->out[idx].pts_us * 1000u),
+            .timed=update_timestamp };
          if (!(render && sink && codec_thread_ensure(c) && codec_job_push(c, &j))) {
             c->out[idx].busy = false;
             c->out[idx].ready = false;
@@ -1810,8 +1974,8 @@ static void codec_release_output(struct lm_codec *c, int idx, bool render,
       uint8_t *rgba = lm_sink_begin(sink, o->w, o->h);
       if (rgba) {
          i420_to_rgba(o->yuv, o->w, o->h, rgba);
-         if(lm_sink_commit(sink, o->w, o->h, update_timestamp
-               ? timestamp_ns : (int64_t)((uint64_t)o->pts_us * 1000u))) codec_record_rendered(c,o->pts_us,codec_render_clock());
+         if(sink_commit(sink, o->w, o->h, update_timestamp
+               ? timestamp_ns : (int64_t)((uint64_t)o->pts_us * 1000u),update_timestamp)) codec_record_rendered(c,o->pts_us,codec_render_clock());
       }
    }
    if (trace_media())
@@ -1827,6 +1991,7 @@ void lm_codec_release_output(struct lm_codec *c, int idx, bool render,
                              struct lm_sink *sink)
 {
    codec_release_output(c, idx, render, sink, false, 0);
+   lm_media_wake();
 }
 
 void lm_codec_release_output_at(struct lm_codec *c, int idx,
@@ -2522,6 +2687,14 @@ unsigned luna_at_write(struct luna_audio_track *t, const int16_t *data, unsigned
     if (!t || !data || !frames) return 0;
     pthread_mutex_lock(&tracks_mutex);
     unsigned n=t->capacity-t->queued;
+    if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
+        static uint64_t asked, took, calls, last_ns; const uint64_t now=now_ns();
+        asked+=frames; ++calls; if (n<frames) took+=n; else took+=frames;
+        if (now-last_ns>=1000000000ull) {
+            if (last_ns) fprintf(stderr,"[audio-write] %llu frames offered, %llu fit (queued %u of %u), %llu calls in %.2f s\n",(unsigned long long)asked,(unsigned long long)took,t->queued,t->capacity,(unsigned long long)calls,(now-last_ns)/1e9);
+            last_ns=now; asked=took=calls=0;
+        }
+    }
     if (n>frames) n=frames;
     if (t->pcm.count==LUNA_PCM_BUFFERS) n=0;
     unsigned bytes=n*t->pcm.channels*sizeof(int16_t);
@@ -2603,6 +2776,14 @@ void luna_at_advance(unsigned frames, unsigned rate, unsigned channels)
 {
     pthread_mutex_lock(&tracks_mutex);
     const uint64_t now=now_ns();
+    if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
+        static uint64_t sum, last_ns, calls;
+        sum+=frames; ++calls;
+        if (now-last_ns>=1000000000ull) {
+            if (last_ns) fprintf(stderr,"[audio-clock] %llu output frames in %.2f s (%.0f/s at %u Hz, %llu calls)\n",(unsigned long long)sum,(now-last_ns)/1e9,sum*1e9/(double)(now-last_ns),rate,(unsigned long long)calls);
+            last_ns=now; sum=calls=0;
+        }
+    }
     for (struct luna_audio_track *t=tracks; t; t=t->next) {
         if (!t->playing) continue;
         advance_locked(t,frames,rate,channels);

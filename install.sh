@@ -339,9 +339,6 @@ install_main() {
   prefix="${PREFIX:-$(default_prefix)}"
   app_dir="${APP_DIR:-$(default_app_dir)}"
 
-  if [ "$os" = "macos" ] && [ "$arch" = "x86_64" ]; then
-    die "No macOS x86_64 release asset is published yet (Apple Silicon only). See https://github.com/${REPO}/releases"
-  fi
 
   log "Target: ${os}/$(asset_arch "$os" "$arch")  version: ${VERSION}  prefix: ${prefix}"
 

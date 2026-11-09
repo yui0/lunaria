@@ -392,10 +392,6 @@ static inline const char *android_gai_strerror(int error)
 #endif
 #include <GLES2/gl2.h>
 
-#include "luna_overlay.h"
-#include "luna_ime.h"
-#include "luna_boot.h"
-#include "luna_compositor.h"
 #include "binary128.h"
 
 /* dynarmic's process-wide A64 JIT compile counters (defined in
@@ -429,7 +425,6 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 extern "C" {
 #include "arm_exec.h"
 #include "aaudio_stream.h"
-#include "luna_input.h"
 #include "luna_qfkey.h"
 #include "linker64.h"
 #include "jvm/jvm.h"
@@ -4281,7 +4276,7 @@ extern "C" void arm_exec_timezone_unlock(void)
 static void a64_tls_report_holders(ArmExecCtx &ctx);
 
 // Allocate per-thread guest TLS and install the bionic stack canary.
-static uint64_t arm64_tls_for_tid(ArmExecCtx &ctx, uint32_t tid) {
+static uint64_t arm64_tls_for_tid(ArmExecCtx &ctx, uint32_t tid, bool fatal = true) {
     std::lock_guard<std::recursive_mutex> tls_lk(g_a64_tls_mx);
     uint32_t key = tid ? tid : 1u; /* main's internal 0 and pthread_self() 1 alias */
     auto it = ctx.tpidr_by_tid.find(key);
@@ -4294,13 +4289,25 @@ static uint64_t arm64_tls_for_tid(ArmExecCtx &ctx, uint32_t tid) {
     if (page == npages) {
         /* Reusing a live thread's TLS would corrupt its stack guard and
          * pthread_self(); fail loudly instead of silently aliasing. */
-        fprintf(stderr, "[arm64] TLS window exhausted at tid=%u "
-                "(%zu pages, base=0x%x end=0x%x)\n",
-                key, npages, TLS_WINDOW_BASE, TLS_WINDOW_END);
-        a64_tls_report_holders(ctx);
+        static bool said;
+        if (!said || fatal) {
+            said = true;
+            fprintf(stderr, "[arm64] TLS window exhausted at tid=%u "
+                    "(%zu pages, base=0x%x end=0x%x)\n",
+                    key, npages, TLS_WINDOW_BASE, TLS_WINDOW_END);
+            a64_tls_report_holders(ctx);
+        }
+        /* A Java thread that never calls native code does not need a TCB; the
+         * caller that can do without one says so and keeps running. */
+        if (!fatal) return 0;
         abort();
     }
     g_tls_page_used[page] = true;
+    if (lunaria_env("LUNARIA_TRACE_THREADS")) {
+        size_t used = 0;
+        for (bool u : g_tls_page_used) used += u;
+        fprintf(stderr, "[tls] alloc tid=%u page=%zu used=%zu (tpidr map %zu)\n", key, page, used, ctx.tpidr_by_tid.size());
+    }
     uint32_t tls = TLS_WINDOW_BASE + (uint32_t)page * 0x1000u;
     ctx.mem.map(tls, 0x1000u);
     memset(ctx.mem.ptr(tls), 0, 0x1000u);
@@ -4322,6 +4329,7 @@ static void arm64_tls_release(ArmExecCtx &ctx, uint32_t tid) {
     if (tls < TLS_WINDOW_BASE || tls >= TLS_WINDOW_END) return;
     size_t page = (tls - TLS_WINDOW_BASE) / 0x1000u;
     if (page < g_tls_page_used.size()) g_tls_page_used[page] = false;
+    if (lunaria_env("LUNARIA_TRACE_THREADS")) fprintf(stderr, "[tls] release tid=%u page=%zu\n", key, page);
 }
 static void arm64_setup_tls(ArmExecCtx &ctx) {
     if (g_tpidr_el0_val) return;
@@ -4708,7 +4716,9 @@ static bool arm_heap_owns(ArmExecCtx &ctx, uint32_t va) {
 uint32_t arm_heap_take_top(uint32_t len, uint32_t align_mask) {
     if (!g_ctx_for_heap) return 0;
     GuestHeapLock hold(*g_ctx_for_heap);
-    return lh_take_top(hold.h, len, align_mask);
+    const uint32_t addr = lh_take_top(hold.h, len, align_mask);
+    if (addr) g_small_mmap_top = addr;
+    return addr;
 }
 
 /* Optional allocator invariant test, run before guest code when requested. */
@@ -7003,6 +7013,7 @@ static uint64_t guest_maps_key(void)
     mix(g_guest_proc_arm64 ? 1u : 0u);
     mix(guest_pid());
     mix(g_heap_size);
+    mix(g_small_mmap_top);
     mix(g_mmap_next);
     mix(g_mmap2_base);
     mix(g_mmap2_next);
@@ -7132,10 +7143,13 @@ static const char *synth_guest_maps(void) {
         }
     }
 
+    /* The shared arena above the heap limit belongs to mmap, not both. */
+    const uint32_t heap_top = g_small_mmap_top ? g_small_mmap_top
+                                              : HEAP_BASE + g_heap_size;
     /* Image-window heap + mmap bump arenas (backing offsets). */
     if (g_guest_proc_arm64) {
         anon_a64(a64_guest_va(HEAP_BASE),
-                 a64_guest_va(HEAP_BASE + g_heap_size),
+                 a64_guest_va(heap_top),
                  "rw-p", "[heap]");
         if (g_mmap_next > MMAP_BASE)
             anon_a64(a64_guest_va(MMAP_BASE), a64_guest_va(g_mmap_next),
@@ -7145,7 +7159,7 @@ static const char *synth_guest_maps(void) {
             anon_a64(a64_guest_va(g_mmap2_base), a64_guest_va(m2n),
                      "rw-p", "[anon:mmap2]");
     } else {
-        emit_a32(HEAP_BASE, HEAP_BASE + g_heap_size, "rw-p", 0, 0, 0, 0,
+        emit_a32(HEAP_BASE, heap_top, "rw-p", 0, 0, 0, 0,
                  "[heap]");
         /* What the guest mmap()ed, with the protection it holds now.  The
          * kernel merges neighbours that look alike, anonymous ones included. */
@@ -10972,22 +10986,9 @@ static std::unordered_map<std::string, GuestVA> g_sysprop_handle_by_name;
 static std::unordered_map<GuestVA, size_t> g_sysprop_index_by_handle;
 
 static const char *sysprop_value_for(const char *name, bool is_arm64) {
-    if (!name) return "";
-    /* The ABI list describes the image this context is running; everything else
-     * describes the device, and the device is described in exactly one place,
-     * the same table android.os.Build is a view of. Two tables would be two
-     * answers to one question (ro.product.model vs Build.MODEL), which no
-     * Android device can produce. */
-    if (is_arm64) {
-        if (!strcmp(name, "ro.product.cpu.abi") ||
-            !strcmp(name, "ro.product.cpu.abilist") ||
-            !strcmp(name, "ro.product.cpu.abilist64"))
-            return "arm64-v8a";
-    } else {
-        if (!strcmp(name, "ro.product.cpu.abi"))     return "armeabi-v7a";
-        if (!strcmp(name, "ro.product.cpu.abilist")) return "armeabi-v7a,armeabi";
-    }
-    if (!strcmp(name, "ro.product.cpu.abi2")) return "";
+    (void)is_arm64;
+    /* System properties belong to the image and cannot change with the
+     * querying process's bitness. Build.CPU_ABI is the process-specific API. */
     return lunaria_android_property(name);
 }
 
@@ -11762,6 +11763,11 @@ struct GuestEglSurfRec {
 static std::vector<GuestEglSurfRec> g_egl_surf_tab;
 static constexpr uint32_t ARM_EGL_SURFTAB_BASE = 0x20u;
 static EGLContext  g_egl_ctx  = EGL_NO_CONTEXT;
+/* Android's libEGL reference-counts initialization. The host renderer owns a
+ * separate reference so a guest capability probe cannot terminate its display. */
+static unsigned g_egl_guest_refs;
+static bool g_egl_host_reference;
+static EGLint g_egl_major, g_egl_minor;
 /* init_host_egl owns the native window while the launch card is visible.
  * The first Android eglCreateWindowSurface transfers that window to the
  * application and may select a different EGLConfig. */
@@ -12142,9 +12148,17 @@ static void maybe_dump_screenshot(uint64_t swap_index, bool from_swap) {
     if (!want) {
         const char *trig = lunaria_env("LUNARIA_SHOT_TRIGGER");
         if (!trig || !trig[0]) trig = "/tmp/lunaria-shot";
-        if (luna_file_access(trig, F_OK) == 0) {
-            want = true;
-            luna_file_unlink(trig);
+        /* Looking for the file walks the path through the confinement checks,
+         * a handful of syscalls per swap; a person touching a file does not
+         * need an answer inside a frame, so look a few times a second. */
+        static uint64_t last_look_ns;
+        const uint64_t look_now = host_mono_ns();
+        if (look_now - last_look_ns >= 250'000'000ull) {
+            last_look_ns = look_now;
+            if (luna_file_access(trig, F_OK) == 0) {
+                want = true;
+                luna_file_unlink(trig);
+            }
         }
     }
 
@@ -12200,6 +12214,7 @@ static std::vector<EGLContext> g_egl_ctx_tab;
 // eglMakeCurrent binds per *thread* on real EGL.
 static std::map<uint32_t, uint32_t> g_egl_tid_ctx;  /* guest tid -> guest handle */
 static std::map<uint32_t, uint32_t> g_egl_tid_surf; /* guest tid -> guest surface handle */
+static std::map<uint32_t, uint32_t> g_egl_tid_read_surf;
 
 static bool join_try_complete(ArmExecCtx &ctx, ArmThread &joiner,
                               std::vector<uint32_t> *join_reap)
@@ -12231,6 +12246,8 @@ static bool join_try_complete(ArmExecCtx &ctx, ArmThread &joiner,
     for (auto it = g_tls.begin(); it != g_tls.end();)
         it = (it->first.first == joined) ? g_tls.erase(it) : std::next(it);
     g_egl_tid_ctx.erase(joined);
+    g_egl_tid_surf.erase(joined);
+    g_egl_tid_read_surf.erase(joined);
     joiner.waiting_join = 0;
     joiner.join_retval_ptr = 0;
     joiner.join_is_waitpid = false;
@@ -12278,6 +12295,7 @@ static void join_wake_on_target_exit(ArmExecCtx &ctx, uint32_t target_tid)
  * bind because the other thread has the same guest context current. */
 static thread_local uint32_t g_egl_bound_handle = 0u;
 static thread_local EGLSurface g_egl_bound_surf = EGL_NO_SURFACE;
+static thread_local EGLSurface g_egl_bound_read_surf = EGL_NO_SURFACE;
 /* Buffer bindings belong to an EGL context, not to the process.
  * GL_ARRAY_BUFFER is context state, but GL_ELEMENT_ARRAY_BUFFER is *vertex
  * array object* state: glBindVertexArray changes which element buffer is
@@ -12316,6 +12334,14 @@ static EGLConfig resolve_egl_config(uint32_t handle) {
         handle - ARM_EGL_CFGTAB_BASE < g_egl_cfg_tab.size())
         return g_egl_cfg_tab[handle - ARM_EGL_CFGTAB_BASE];
     return g_egl_cfg;
+}
+
+static uint32_t egl_register_guest_config(EGLConfig config) {
+    uint32_t index;
+    for (index = 0; index < g_egl_cfg_tab.size(); ++index)
+        if (g_egl_cfg_tab[index] == config) return ARM_EGL_CFGTAB_BASE + index;
+    g_egl_cfg_tab.push_back(config);
+    return ARM_EGL_CFGTAB_BASE + index;
 }
 
 // Guest EGL context handle -> host EGLContext.
@@ -12415,7 +12441,7 @@ static EGLSurface egl_host_surf(uint32_t handle) {
     return egl_resolve_guest_surface(handle);
 }
 
-static void egl_note_bound(uint32_t handle, EGLSurface surf) {
+static void egl_note_bound(uint32_t handle, EGLSurface surf, EGLSurface read) {
     if (handle != g_egl_bound_handle && lunaria_env("LUNARIA_TRACE_EGL")) {
         static int n = 0;
         if (n++ < 64)
@@ -12424,6 +12450,7 @@ static void egl_note_bound(uint32_t handle, EGLSurface surf) {
     }
     g_egl_bound_handle = handle;
     g_egl_bound_surf = surf;
+    g_egl_bound_read_surf = read;
     const GlBufferBindings &b = g_gl_buffer_bindings_by_ctx[handle];
     g_gl_bound_array_buf = b.array;
     g_gl_bound_elem_buf = b.element;
@@ -12433,11 +12460,16 @@ static void egl_note_bound(uint32_t handle, EGLSurface surf) {
     g_gl_texture_bindings = t.units;
 }
 
+static void egl_note_bound(uint32_t handle, EGLSurface surf) {
+    egl_note_bound(handle, surf, surf);
+}
+
 /* Host paths (overlay, arm_exec_call) that call eglMakeCurrent themselves
  * must tell us, or the next slice would restore from a stale ledger. */
 extern "C" void arm_exec_egl_invalidate_current(void) {
     g_egl_bound_handle = 0u;
     g_egl_bound_surf = EGL_NO_SURFACE;
+    g_egl_bound_read_surf = EGL_NO_SURFACE;
 }
 
 /* After a host path has restored the guest's binding, record it so the next
@@ -12464,7 +12496,7 @@ extern "C" void arm_exec_egl_note_current(void *egl_ctx, void *egl_draw) {
         arm_exec_egl_invalidate_current();
         return;
     }
-    egl_note_bound(h, surf);
+    egl_note_bound(h, surf, eglGetCurrentSurface(EGL_READ));
 }
 
 // Re-point the single host binding at whichever context the guest thread that is about to run had made current.
@@ -12476,13 +12508,17 @@ static void egl_sync_current_context(uint32_t tid) {
     if (ectx == EGL_NO_CONTEXT) return;
     uint32_t want_sh = egl_surf_for_tid(tid);
     EGLSurface want_s = egl_host_surf(want_sh);
+    const auto read_it = g_egl_tid_read_surf.find(tid);
+    EGLSurface want_read = read_it == g_egl_tid_read_surf.end()
+        ? want_s : egl_host_surf(read_it->second);
     /* Every host eglMakeCurrent goes through egl_note_bound or
      * arm_exec_egl_invalidate_current, so the ledger is the binding; asking the
      * driver every slice (118k/s in this title) is the cost of not keeping one. */
-    if (g_egl_bound_handle == want && g_egl_bound_surf == want_s)
+    if (g_egl_bound_handle == want && g_egl_bound_surf == want_s &&
+        g_egl_bound_read_surf == want_read)
         return;
-    if (eglMakeCurrent(g_egl_dpy, want_s, want_s, ectx))
-        egl_note_bound(want, want_s);
+    if (eglMakeCurrent(g_egl_dpy, want_s, want_read, ectx))
+        egl_note_bound(want, want_s, want_read);
 }
 
 /* Bind EGL for a host->guest entry (JNI callback, etc.). Prefer the calling
@@ -13279,6 +13315,7 @@ struct SlBufferQueue {
 static std::map<uint32_t, SlBufferQueue> g_sl_queues;  /* key: owner instance */
 
 /* Open the shared output device; source PCM is mixed by the buffer consumer. */
+extern "C" void arm_exec_audio_service(void);
 static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
     static int state = 0;   /* 0 unopened, 1 open, -1 explicitly disabled */
     static uint64_t retry_ns = 0;
@@ -13296,7 +13333,7 @@ static bool audio_sink_ready(uint32_t rate, uint32_t channels) {
     int opened;
     { ArmLockDropped unlock_for_coreaudio;
       opened = luna_os_audio_open(rate, channels); }
-    if (opened == 0) { state = 1; return true; }
+    if (opened == 0) { state = 1; luna_os_audio_set_pull(arm_exec_audio_service); return true; }
     /* Keep the sink recoverable: a user can select another output from the
      * host menu while this application is running.  The retry timer bounds
      * work when the machine has no usable card. */
@@ -15974,29 +16011,37 @@ static void glfw_window_close_cb(GLFWwindow *w) {
     arm_exec_request_quit();
 }
 
-static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
+extern "C" void arm_exec_pointer_button(int button, int down, float cx, float cy) {
     pinch_finish();
     slide_finish();
-    double cx = 0, cy = 0;
-    glfwGetCursorPos(w, &cx, &cy);
-    window_to_surface(&cx, &cy);
     /* Right click is the emulator's, never the guest's: a touchscreen has no
      * second button, so no app is waiting for one. */
-    if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-        if (action == GLFW_PRESS) {
+    if (button == 2) {
+        if (down) {
             keymap_release();
             luna_menu_open(cx, cy, g_fb_w, g_fb_h);
         }
         return;
     }
-    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
-    g_touch_down = (action == GLFW_PRESS);
+    if (button != 0) return;
+    g_touch_down = down != 0;
     /* A shown dialog is a window above the application's surface, and it is
      * modal: the compositor delivers the touch to it and the application below
      * gets nothing.  Feeding the guest a touch it should never have seen makes
      * it act on a tap the player aimed at the dialog. */
     if (luna_overlay_pointer(cx, cy, g_touch_down ? 1 : 0)) return;
     touch_contact(0, g_touch_down ? 0 : 1, (float)cx, (float)cy);
+}
+
+static void glfw_mouse_button_cb(GLFWwindow *w, int button, int action, int) {
+    double x = 0, y = 0;
+    glfwGetCursorPos(w, &x, &y);
+    window_to_surface(&x, &y);
+    int pointer_button = button == GLFW_MOUSE_BUTTON_LEFT ? 0 :
+                         button == GLFW_MOUSE_BUTTON_MIDDLE ? 1 :
+                         button == GLFW_MOUSE_BUTTON_RIGHT ? 2 : -1;
+    if (pointer_button >= 0)
+        arm_exec_pointer_button(pointer_button, action == GLFW_PRESS, (float)x, (float)y);
 }
 
 static void glfw_cursor_pos_cb(GLFWwindow *, double cx, double cy) {
@@ -16308,6 +16353,12 @@ static void window_take_app_identity(GLFWwindow *win);
 // Ensure GLFW window exists (called lazily)
 static bool ensure_glfw_window() {
     if (g_glfw) return true;
+    /* NativeWindow acquisition also comes here after EGL initialization.
+     * Keep a pbuffer display headless for its whole lifetime: creating a
+     * window later cannot add window configs to a surfaceless EGL display. */
+    const char *pbuffer = lunaria_env("LUNARIA_PBUFFER");
+    if (pbuffer && pbuffer[0] != '0') return false;
+    if (g_egl_dpy != EGL_NO_DISPLAY) return false;
     init_fb_size_from_env();
     fprintf(stderr, "[arm_exec] creating GLFW window (%dx%d)...\n", g_fb_w, g_fb_h);
     if (!glfwInit()) {
@@ -16784,10 +16835,15 @@ static bool init_host_egl() {
         return true;
     }
 
-    // Try GLFW window first (requires DISPLAY); fall back to headless EGL.
-    bool force_pbuffer = lunaria_env("LUNARIA_PBUFFER") && lunaria_env("LUNARIA_PBUFFER")[0] != '0';
+    /* A component host has no application window. EGL capability queries
+     * still need a real context, but must not create a host UI window. */
+    bool component_host = getenv("ANDROID_SERVICE_HOST") != NULL;
+    bool requested_pbuffer = lunaria_env("LUNARIA_PBUFFER") && lunaria_env("LUNARIA_PBUFFER")[0] != '0';
+    bool force_pbuffer = component_host || requested_pbuffer;
     bool has_window = force_pbuffer ? false : ensure_glfw_window();
-    if (force_pbuffer)
+    if (component_host)
+        fprintf(stderr, "[arm_exec] offscreen EGL for component process\n");
+    else if (requested_pbuffer)
         fprintf(stderr, "[arm_exec] LUNARIA_PBUFFER=1 — skipping GLFW window\n");
 
     EGLNativeDisplayType native_dpy = has_window
@@ -16869,6 +16925,15 @@ static bool init_host_egl() {
         }
     }
 
+    /* A guest can retain the EGLDisplay handle after terminating its last
+     * reference. Reusing that handle still requires driver initialization. */
+    if (!major && !g_egl_guest_refs && !g_egl_host_reference &&
+        !eglInitialize(g_egl_dpy, &major, &minor))
+        return false;
+    if (!major) { major = g_egl_major; minor = g_egl_minor; }
+    g_egl_host_reference = true;
+    g_egl_major = major;
+    g_egl_minor = minor;
     // Bind GLES API explicitly: eglCreateContext otherwise targets the currently-bound API (desktop GL by default on some.
     eglBindAPI(EGL_OPENGL_ES_API);
 
@@ -16900,7 +16965,7 @@ static bool init_host_egl() {
     }
 
     // Window surface path (X11 display available)
-    /* With a window, the window belongs to the compositor (luna_compositor.h)
+    /* With a window, the window belongs to the compositor (luna_boot.h)
      * and the guest's frames and the emulator's own UI (boot card, input
      * method, dialogs) are separate producers, as on a device.  The guest
      * draws into a window surface of its own: a native window of the same
@@ -17242,9 +17307,17 @@ static uint32_t egl_host_get_display(void) {
 }
 
 static int egl_host_initialize(int32_t *major, int32_t *minor) {
-    EGLint ma = 0, mi = 0;
-    EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
-        ? eglInitialize(g_egl_dpy, &ma, &mi) : EGL_FALSE;
+    EGLint ma = g_egl_major, mi = g_egl_minor;
+    EGLBoolean ok = EGL_FALSE;
+    if (g_egl_dpy != EGL_NO_DISPLAY) {
+        ok = (g_egl_guest_refs || g_egl_host_reference) ? EGL_TRUE
+            : eglInitialize(g_egl_dpy, &ma, &mi);
+        if (ok) {
+            ++g_egl_guest_refs;
+            g_egl_major = ma;
+            g_egl_minor = mi;
+        }
+    }
     fprintf(stderr, "[arm_exec] eglInitialize -> ok=%d %d.%d\n", ok, ma, mi);
     if (major) *major = ma;
     if (minor) *minor = mi;
@@ -17363,14 +17436,7 @@ static int egl_host_choose_config(const int32_t *attribs, uint32_t *out,
     if (out && n > 0) {
         int n_out = n < max ? n : max;
         for (int i = 0; i < n_out; ++i) {
-            uint32_t idx = ~0u;
-            for (uint32_t k = 0; k < g_egl_cfg_tab.size(); ++k)
-                if (g_egl_cfg_tab[k] == host_cfgs[i]) { idx = k; break; }
-            if (idx == ~0u) {
-                idx = (uint32_t)g_egl_cfg_tab.size();
-                g_egl_cfg_tab.push_back(host_cfgs[i]);
-            }
-            out[i] = ARM_EGL_CFGTAB_BASE + idx;
+            out[i] = egl_register_guest_config(host_cfgs[i]);
         }
         n = (EGLint)n_out;
     }
@@ -17381,7 +17447,7 @@ static int egl_host_choose_config(const int32_t *attribs, uint32_t *out,
 static uint32_t egl_host_create_context(uint32_t config_handle,
                                         uint32_t share_handle,
                                         const int32_t *attribs) {
-    if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg) return 0u;
+    if (g_egl_dpy == EGL_NO_DISPLAY) return 0u;
     /* EGL_KHR_no_config_context uses a null config, which Unity selects
      * after choosing its window config. Substituting the bootstrap config
      * here makes the otherwise valid window/context pair fail BAD_MATCH. */
@@ -17496,36 +17562,41 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
                     old_ctx_h, g_current_tid, lr);
         g_egl_tid_ctx.erase(g_current_tid);
         g_egl_tid_surf.erase(g_current_tid);
+        g_egl_tid_read_surf.erase(g_current_tid);
         gl_tid_unmark(g_current_tid);
         egl_note_bound(0u, EGL_NO_SURFACE);
         return EGL_TRUE;
     }
+    /* Guest threads share a host rendering thread. The host EGL cannot
+     * detect ownership conflicts between them, so validate before changing
+     * its binding. A failed bind leaves both guest bindings untouched. */
+    for (const auto &binding : g_egl_tid_ctx) {
+        if (binding.first == g_current_tid) continue;
+        const uint32_t other_draw = egl_surf_for_tid(binding.first);
+        const auto read_it = g_egl_tid_read_surf.find(binding.first);
+        const uint32_t other_read = read_it == g_egl_tid_read_surf.end()
+            ? other_draw : read_it->second;
+        if (binding.second == ctx_h ||
+            (draw_h && (draw_h == other_draw || draw_h == other_read)) ||
+            (read_h && (read_h == other_draw || read_h == other_read))) {
+            egl_set_guest_error(EGL_BAD_ACCESS);
+            if (!old_ctx_h) gl_tid_unmark(g_current_tid);
+            return EGL_FALSE;
+        }
+    }
     EGLBoolean ok = (g_egl_dpy != EGL_NO_DISPLAY)
         ? eglMakeCurrent(g_egl_dpy, draw, read_s, ectx) : EGL_FALSE;
     if (ok) {
-        /* An EGLContext may be current to at most one thread.  The host sees
-         * all guest threads on the pump thread, so eglMakeCurrent alone
-         * cannot evict the previous *guest* owner for us.  Do that in the
-         * guest ledger before publishing the new owner. */
-        for (auto it = g_egl_tid_ctx.begin(); it != g_egl_tid_ctx.end();) {
-            if (it->first == g_current_tid || it->second != ctx_h) {
-                ++it;
-                continue;
-            }
-            const uint32_t old_tid = it->first;
-            gl_tid_unmark(old_tid);
-            g_egl_tid_surf.erase(old_tid);
-            it = g_egl_tid_ctx.erase(it);
-        }
         g_egl_tid_ctx[g_current_tid] = ctx_h;
-        g_egl_tid_surf[g_current_tid] = (draw == EGL_NO_SURFACE) ? 0u : ARM_EGL_SURFACE;
+        g_egl_tid_surf[g_current_tid] = draw_h;
+        g_egl_tid_read_surf[g_current_tid] = read_h;
         if (ArmThread *thread = thread_slot_by_tid(g_current_tid)) {
             if (!thread->is_arm64) {
                 thread->egl_host_thread = pthread_self();
                 thread->egl_host_bound = true;
             }
         }
-        egl_note_bound(ctx_h, draw);
+        egl_note_bound(ctx_h, draw, read_s);
         /* The guest has taken the window surface.  The boot card draws
          * through its own unshared overlay context; it must not steal this
          * binding.  It comes down on the first guest present instead. */
@@ -17566,7 +17637,7 @@ static int egl_host_destroy_context(uint32_t h) {
     for (auto it = g_egl_tid_surf.begin(); it != g_egl_tid_surf.end();) {
         uint32_t tid = it->first;
         if (g_egl_tid_ctx.find(tid) == g_egl_tid_ctx.end())
-            it = g_egl_tid_surf.erase(it);
+        { g_egl_tid_read_surf.erase(tid); it = g_egl_tid_surf.erase(it); }
         else
             ++it;
     }
@@ -17764,32 +17835,13 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
     if (width <= 0 || height <= 0) return EGL_FALSE;
     ++g_guest_egl_swap_count;
     luna_boot_guest_presented();
-    luna_qfkey_start("lunaria", width, height);
-    if (luna_qfkey_wants_frame() && !(luna_comp_active() && version < 3)) {
-        /* A viewer is subscribed through qfkey: read the frame back for it.
-         * (The ES2 + compositor path below already holds the pixels.) */
-        static thread_local std::vector<uint8_t> qpx, qrow;
-        const size_t qstride = (size_t)width * 4u;
-        qpx.resize(qstride * (size_t)height); qrow.resize(qstride);
-        GLint alignment = 4;
-        pfn_glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
-        pfn_glPixelStorei(GL_PACK_ALIGNMENT, 4);
-        pfn_glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, qpx.data());
-        pfn_glPixelStorei(GL_PACK_ALIGNMENT, alignment);
-        for (int y = 0; y < height / 2; ++y) {
-            uint8_t *lo = qpx.data() + qstride * (size_t)y;
-            uint8_t *hi = qpx.data() + qstride * (size_t)(height - 1 - y);
-            memcpy(qrow.data(), lo, qstride); memcpy(lo, hi, qstride); memcpy(hi, qrow.data(), qstride);
-        }
-        luna_qfkey_publish(qpx.data(), width, height, (int)qstride, false);
-    }
     if (luna_comp_active()) {
         if (version < 3) {
             /* ES1/2 have no core framebuffer blit. Transfer the actual pixels
              * without submitting ES3 commands to the application's context. */
-            static thread_local std::vector<uint8_t> pixels, row;
+            static thread_local std::vector<uint8_t> pixels;
             size_t stride = (size_t)width * 4u;
-            pixels.resize(stride * (size_t)height); row.resize(stride);
+            pixels.resize(stride * (size_t)height);
             GLint alignment = 4;
             pfn_glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
             pfn_glPixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -17810,19 +17862,7 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
                 }
             }
             ArmLockDropped unlocked;
-            if (luna_qfkey_wants_frame()) {
-                /* qfkey frames run top-down; the compositor takes the
-                 * read-back order as it is, so flip a copy only for qfkey. */
-                for (int y = 0; y < height / 2; ++y) {
-                    uint8_t *lo = pixels.data() + stride * (size_t)y;
-                    uint8_t *hi = pixels.data() + stride * (size_t)(height - 1 - y);
-                    memcpy(row.data(), lo, stride); memcpy(lo, hi, stride); memcpy(hi, row.data(), stride);
-                }
-                luna_qfkey_publish(pixels.data(), width, height, (int)stride, false);
-                luna_comp_submit_pixels(width, height, pixels.data(), (int)stride, false, 1);
-            } else {
-                luna_comp_submit_pixels_bottom_up(width, height, pixels.data(), (int)stride, false, 1);
-            }
+            luna_comp_submit_pixels_bottom_up(width, height, pixels.data(), (int)stride, false, 1);
         } else {
             ArmLockDropped unlocked;
             luna_comp_submit(width, height, 1);
@@ -17831,7 +17871,11 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
         return EGL_TRUE;
     }
     EGLBoolean result;
-    { ArmLockDropped unlocked; result = eglSwapBuffers(g_egl_dpy, surface); }
+    { ArmLockDropped unlocked;
+      luna_overlay_present(width, height);
+      luna_qfkey_capture_gl(width, height);
+      result = eglSwapBuffers(g_egl_dpy, surface);
+    }
     if (result) egl_on_swap_complete();
     return (int)result;
 }
@@ -17855,6 +17899,52 @@ extern "C" uint32_t arm_exec_egl_get_display(void) { return egl_host_get_display
 
 extern "C" int arm_exec_egl_initialize(int32_t *major, int32_t *minor) {
     return egl_host_initialize(major, minor);
+}
+
+extern "C" int arm_exec_egl_terminate(void) {
+    if (g_egl_dpy == EGL_NO_DISPLAY) {
+        egl_set_guest_error(EGL_BAD_DISPLAY);
+        return EGL_FALSE;
+    }
+    if (!g_egl_guest_refs) return EGL_TRUE;
+    --g_egl_guest_refs;
+    if (g_egl_guest_refs || g_egl_host_reference) return EGL_TRUE;
+    return eglTerminate(g_egl_dpy);
+}
+
+extern "C" int arm_exec_egl_get_configs(uint32_t *out, int max, int32_t *num) {
+    if (max < 0 || !num) {
+        egl_set_guest_error(EGL_BAD_PARAMETER);
+        return EGL_FALSE;
+    }
+    EGLConfig *configs = out && max ? (EGLConfig *)malloc((size_t)max * sizeof *configs) : NULL;
+    if (out && max && !configs) {
+        egl_set_guest_error(EGL_BAD_ALLOC);
+        return EGL_FALSE;
+    }
+    EGLint count = 0;
+    EGLConfig empty;
+    EGLBoolean ok = eglGetConfigs(g_egl_dpy, out && !max ? &empty : configs, out ? max : 0, &count);
+    if (ok && configs)
+        for (int i = 0; i < count && i < max; ++i)
+            out[i] = egl_register_guest_config(configs[i]);
+    free(configs);
+    *num = count;
+    return ok;
+}
+
+extern "C" uint32_t arm_exec_egl_create_pbuffer_config(uint32_t config, const int32_t *attribs) {
+    EGLConfig native = resolve_egl_config(config);
+    if (!native) { egl_set_guest_error(EGL_BAD_CONFIG); return 0; }
+    EGLSurface surface = eglCreatePbufferSurface(g_egl_dpy, native, (const EGLint *)attribs);
+    if (surface == EGL_NO_SURFACE) return 0;
+    EGLint width = 0, height = 0;
+    if (!eglQuerySurface(g_egl_dpy, surface, EGL_WIDTH, &width) ||
+        !eglQuerySurface(g_egl_dpy, surface, EGL_HEIGHT, &height)) {
+        eglDestroySurface(g_egl_dpy, surface);
+        return 0;
+    }
+    return egl_register_guest_surface(surface, false, width, height);
 }
 
 extern "C" int arm_exec_egl_choose_config(const int32_t *attribs, uint32_t *out,
@@ -18752,8 +18842,44 @@ static std::string arsc_best_bitmap_path(uint32_t resid)
     return best;
 }
 
+static bool arsc_select_entry_uncached(uint32_t resid,struct arsc_entry_view *best,
+                                       size_t *string_base,size_t *string_count);
+
+/* The table, the splits and the device configuration are fixed once loaded, so a
+ * resource id always selects the same entry: a layout inflate asks for the same
+ * few hundred ids thousands of times (every attribute of every view).  Keep the
+ * answers per thread; the key includes what the answer depends on, so a table
+ * that is reloaded or a changed orientation starts a fresh cache. */
 static bool arsc_select_entry(uint32_t resid,struct arsc_entry_view *best,
                                size_t *string_base,size_t *string_count)
+{
+    arsc_ensure_loaded();
+    struct slot {uint32_t resid;bool found;struct arsc_entry_view view;size_t base,count;};
+    static thread_local slot cache[2048];
+    static thread_local const void *table;
+    static thread_local size_t splits;
+    static thread_local size_t table_size;
+    static thread_local uint8_t orientation_seen;
+    const uint8_t orientation=arsc_device_orientation();
+    size_t split_sig=0;   /* a split added later changes the answer */
+    for(const struct arsc_source *source=g_arsc_splits;source;source=source->next)
+        split_sig=split_sig*31u+source->size+1u;
+    if(table!=(const void *)g_arsc.data() || table_size!=g_arsc.size() ||
+       splits!=split_sig || orientation_seen!=orientation) {
+        memset(cache,0,sizeof cache);
+        table=g_arsc.data();table_size=g_arsc.size();splits=split_sig;orientation_seen=orientation;
+    }
+    slot &e=cache[(resid*2654435761u)>>21];
+    if(e.resid!=resid || !resid) {
+        e.found=arsc_select_entry_uncached(resid,&e.view,&e.base,&e.count);
+        e.resid=resid;
+    }
+    *best=e.view;*string_base=e.base;*string_count=e.count;
+    return e.found;
+}
+
+static bool arsc_select_entry_uncached(uint32_t resid,struct arsc_entry_view *best,
+                                       size_t *string_base,size_t *string_count)
 {
     arsc_ensure_loaded();
     struct arsc_entry_view candidate={0};
@@ -21323,19 +21449,32 @@ static int guest_file_inode(const char *host,luna_file_info *info)
     return 0;
 }
 
+/* Raw mappings may return their input for host-visible paths (/tmp, /dev).
+ * The namespace walker uses stack buffers, so publish into the caller's
+ * buffer before returning any of those mappings. */
+static const char *guest_path_result(const char *path,char *buf,size_t capacity)
+{
+    if (!path || path==buf) return path;
+    const size_t size=strnlen(path,capacity);
+    if (size==capacity) {errno=ENAMETOOLONG;return nullptr;}
+    memmove(buf,path,size+1);
+    return buf;
+}
+
 static const char *map_guest_path(const char *path,char *buf,size_t capacity)
 {
     static const bool registered=[] {
         luna_symlink_set_mapper(map_guest_path,unmap_guest_file);
         (void)guest_root_dir();
+        (void)guest_app_data_dir();
         luna_file_set_credentials(arm_exec_guest_uid(),arm_exec_guest_uid(),guest_file_inode);
         return true;
     }();
     (void)registered;
     if (!path) { errno=EFAULT; return nullptr; }
-    if (!*path || path_is_host_staging(path)) return map_guest_path_raw(path,buf,capacity);
+    if (!*path || path_is_host_staging(path)) return guest_path_result(map_guest_path_raw(path,buf,capacity),buf,capacity);
     char apk_host[PATH_MAX];const char *apk_inner=nullptr;
-    if (apk_path_locate(path,apk_host,sizeof apk_host,&apk_inner)) return map_guest_path_raw(path,buf,capacity);
+    if (apk_path_locate(path,apk_host,sizeof apk_host,&apk_inner)) return guest_path_result(map_guest_path_raw(path,buf,capacity),buf,capacity);
     char absolute[PATH_MAX],resolved[PATH_MAX];
     if (path[0]=='/') snprintf(absolute,sizeof absolute,"%s",path);
     else snprintf(absolute,sizeof absolute,"%s/%s",g_guest_cwd.load(std::memory_order_acquire),path);
@@ -21344,10 +21483,21 @@ static const char *map_guest_path(const char *path,char *buf,size_t capacity)
     if (path_under(absolute,"/proc",5)) {
         snprintf(resolved,sizeof resolved,"%s",absolute);
         guest_path_normalize(resolved);
-        if (path_under(resolved,"/proc",5)) return map_guest_path_raw(resolved,buf,capacity);
+        if (path_under(resolved,"/proc",5)) return guest_path_result(map_guest_path_raw(resolved,buf,capacity),buf,capacity);
     }
-    if (luna_symlink_namespace(absolute,resolved,sizeof resolved,map_guest_path_raw)) return nullptr;
-    return map_guest_path_raw(resolved,buf,capacity);
+    /* The walker reads directory metadata for each component. Like the file
+     * operations below, it may wait on storage and must not stop all guest
+     * threads while it does so. Its path is an owned snapshot (including cwd),
+     * and the raw mapper uses the same installed mounts as symlink callbacks
+     * from the already-unlocked host file operations. The filesystem layer
+     * serializes its own symlink metadata. */
+    const unsigned depth = arm_lock_unlock_all();
+    const int result = luna_symlink_namespace(absolute,resolved,sizeof resolved,map_guest_path_raw);
+    const int error = errno;
+    arm_lock_relock(depth);
+    errno = error;
+    if (result) return nullptr;
+    return guest_path_result(map_guest_path_raw(resolved,buf,capacity),buf,capacity);
 }
 
 /* mkdir treats a trailing slash on the final component like the name itself,
@@ -22328,6 +22478,17 @@ static int aasset_open_file_descriptor(GuestAsset &a, int64_t *start,
 
 /* Same lookup, for callers outside the JNI SVC path — the bytecode
  * interpreter's AssetManager, which cannot reach the C++ helper directly. */
+/* Runs the audio mixer once from a host thread other than the frame pump.  The
+ * mixer retires what the output has played and refills it; tied to the pump it
+ * ran once per frame period, and a player with only Java audio tracks fell a
+ * third short of real time whenever the pump turned slowly.  The pump's own
+ * calls and this one exclude each other (drive_opensles_callbacks). */
+extern "C" void arm_exec_audio_service(void);
+extern "C" void arm_exec_audio_service(void) {
+    if (!g_ctx || !luna_at_active()) return;
+    drive_opensles_callbacks(*g_ctx);
+}
+
 extern "C" unsigned char *arm_exec_asset_read(const char *name, size_t *len) {
     if(name && !strncmp(name,"@android/",9)) {
         const char *path=arm_exec_apk_entry_path(name);
@@ -22344,8 +22505,33 @@ extern "C" unsigned char *arm_exec_asset_read(const char *name, size_t *len) {
         if(len) *len=(size_t)size;
         return data;
     }
+    /* The package is fixed once installed, and the Java side reads the same layout
+     * and drawable entries over and over (one inflate of a list item reads its
+     * layout again, every item).  Each read probed the install tree for the entry
+     * under several roots and read it back from disk.  Keep small entries. */
+    static std::mutex cache_lock;
+    static std::unordered_map<std::string, std::vector<uint8_t>> cache;
+    static size_t cached_bytes;
+    const bool cacheable = name && name[0] && name[0] != '/' ;
+    if (cacheable) {
+        std::lock_guard<std::mutex> lk(cache_lock);
+        auto hit = cache.find(name);
+        if (hit != cache.end()) {
+            const std::vector<uint8_t> &d = hit->second;
+            unsigned char *buf = (unsigned char *)malloc(d.size() ? d.size() : 1);
+            if (!buf) return nullptr;
+            if (!d.empty()) memcpy(buf, d.data(), d.size());
+            if (len) *len = d.size();
+            return buf;
+        }
+    }
     std::vector<uint8_t> data;
     if (!aasset_load_bytes(name, data)) return nullptr;
+    if (cacheable && data.size() <= 512 * 1024) {
+        std::lock_guard<std::mutex> lk(cache_lock);
+        if (cached_bytes + data.size() <= 48u * 1024 * 1024 && cache.emplace(name, data).second)
+            cached_bytes += data.size();
+    }
     unsigned char *buf = (unsigned char *)malloc(data.size() ? data.size() : 1);
     if (!buf) return nullptr;
     if (!data.empty()) memcpy(buf, data.data(), data.size());
@@ -23891,6 +24077,20 @@ static void read_guest_tm(ArmExecCtx &ctx, GuestVA va, struct tm &t) {
     t.tm_wday  = (int)ctx.mem.read32(va + 24);
     t.tm_yday  = (int)ctx.mem.read32(va + 28);
     t.tm_isdst = (int)ctx.mem.read32(va + 32);
+}
+static void read_guest_tm_format(ArmExecCtx &ctx, GuestVA va, struct tm &t) {
+    read_guest_tm(ctx, va, t);
+#if !defined(_WIN32)
+    /* strftime uses these bionic extensions for %z and %Z. Read them in
+     * the guest ABI, and translate the zone pointer before host formatting. */
+    t.tm_gmtoff = ctx.is_arm64 ? (long)(int64_t)ctx.mem.read64(va + 40)
+                              : (long)(int32_t)ctx.mem.read32(va + 36);
+    const GuestVA zone = ctx.is_arm64 ? ctx.mem.read64(va + 48)
+                                    : ctx.mem.read32(va + 40);
+    /* macOS declares tm_zone as plain char *; glibc and the guest ABI use
+     * const.  strftime only reads the struct, so the const is discarded. */
+    t.tm_zone = zone ? const_cast<char *>(ctx.mem.cstr(zone)) : NULL;
+#endif
 }
 
 // Session 10 (LUNARIA_TRACE_WAPI): when mono logs a WAPI handle-store warning ("Attempting to ref/unref unused handle".
@@ -35894,25 +36094,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_EGL_CREATEPBUF: {
-        if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg) {
-            ensure_glfw_window();
-            init_host_egl();
-        }
-        if (g_egl_dpy == EGL_NO_DISPLAY || !g_egl_cfg) { ret32(0u); break; }
         auto attrs = read_egl_attribs(ctx, argp(2));
-        int w = 1, h = 1;
-        for (size_t i = 0; i + 1u < attrs.size(); i += 2u) {
-            if (attrs[i] == EGL_WIDTH) w = attrs[i + 1u];
-            else if (attrs[i] == EGL_HEIGHT) h = attrs[i + 1u];
-        }
-        if (w <= 0) w = 1;
-        if (h <= 0) h = 1;
-        EGLConfig cfg = resolve_egl_config((uint32_t)r1);
-        const EGLint pb_attribs[] = { EGL_WIDTH, w, EGL_HEIGHT, h, EGL_NONE };
-        EGLSurface surf = eglCreatePbufferSurface(
-            g_egl_dpy, cfg ? cfg : g_egl_cfg, pb_attribs);
-        ret32(surf != EGL_NO_SURFACE
-                  ? egl_register_guest_surface(surf, false, w, h) : 0u);
+        ret32(arm_exec_egl_create_pbuffer_config((uint32_t)r1, attrs.data()));
         break;
     }
     case SVC_EGL_CREATECTX: {
@@ -35992,6 +36175,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                  * guest frame, exactly where the system compositor puts an
                  * Android dialog. */
                 luna_overlay_present(g_fb_w, g_fb_h);
+                luna_qfkey_capture_gl(g_fb_w, g_fb_h);
                 maybe_dump_screenshot(g_guest_egl_swap_count - 1, true);
                 ok = eglSwapBuffers(g_egl_dpy, g_egl_surf);
                 gl_restore_texture_units();
@@ -36034,7 +36218,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_EGL_DESTROYCTX:
         ret32((uint32_t)egl_host_destroy_context(r1));
         break;
-    case SVC_EGL_TERMINATE:   ret32(EGL_TRUE); break;
+    case SVC_EGL_TERMINATE:   ret32(arm_exec_egl_terminate()); break;
     case SVC_EGL_WAIT_CLIENT:
         ret32(eglWaitClient());
         break;
@@ -36238,7 +36422,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_EGL_GETCURSURF:
-        ret32(egl_surf_for_tid(g_current_tid)); break;
+        if (r0 == EGL_DRAW) ret32(egl_surf_for_tid(g_current_tid));
+        else if (r0 == EGL_READ) {
+            auto it = g_egl_tid_read_surf.find(g_current_tid);
+            ret32(egl_ctx_for_tid(g_current_tid) && it != g_egl_tid_read_surf.end()
+                ? it->second : 0u);
+        } else { egl_set_guest_error(EGL_BAD_PARAMETER); ret32(0); }
+        break;
 
     // eglGetSystemTimeFrequencyNV() -> uint64_t ticks-per-second.
     case SVC_EGL_SYSTIME_FREQ: {
@@ -43420,7 +43610,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         char *buf = dst ? (char *)ctx.mem.ptr(dst) : nullptr;
         const char *fmt = argp(2) ? ctx.mem.cstr(argp(2)) : nullptr;
         struct tm tm{};
-        if (tm_va) read_guest_tm(ctx, tm_va, tm);
+        if (tm_va) read_guest_tm_format(ctx, tm_va, tm);
         size_t n = (buf && fmt && tm_va && r1)
             ? strftime(buf, (size_t)r1, fmt, &tm) : 0;
         ret32((uint32_t)n);
@@ -49516,7 +49706,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         const size_t max = (size_t)r1;
         const char *fmt = ctx.mem.cstr(argp(2));
         struct tm tmv;
-        if (tm_va) read_guest_tm(ctx, tm_va, tmv);
+        if (tm_va) read_guest_tm_format(ctx, tm_va, tmv);
         /* Let strftime enforce the caller's actual limit. Formatting into a fixed
          * 512-byte temporary first would return a nonzero "success" after silently
          * truncating to a smaller guest buffer. */
@@ -50183,21 +50373,23 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
 
     case SVC_LLDIV: {
-        /* lldiv_t lldiv(long long, long long).  Two 64-bit results: on both
-         * ABIs the pair is returned in x0/x1 (r0..r3 on A32). */
+        /* AAPCS64 returns this 16-byte aggregate in x0/x1. AAPCS32
+         * supplies its address in r0; the first 64-bit operand is aligned
+         * to r2/r3, and the second is on the stack. */
         int64_t num, den;
-        if (ctx.is_arm64) { num = (int64_t)argp(0); den = (int64_t)argp(1); }
-        else { num = (int64_t)(((uint64_t)regs[1] << 32) | regs[0]);
-               den = (int64_t)(((uint64_t)regs[3] << 32) | regs[2]); }
+        if (ctx.is_arm64) {
+            num = (int64_t)argp(0); den = (int64_t)argp(1);
+        } else {
+            num = (int64_t)((uint64_t)regs[2] | ((uint64_t)regs[3] << 32));
+            den = (int64_t)ctx.mem.read64(regs[13]);
+        }
         if (!den) { arm_set_errno(ctx, EDOM); ret32(0); break; }
         lldiv_t d = lldiv((long long)num, (long long)den);
         if (ctx.is_arm64) {
             ret_pair((uint64_t)d.quot, (uint64_t)d.rem);
         } else {
-            regs[0] = (uint32_t)(uint64_t)d.quot;
-            regs[1] = (uint32_t)((uint64_t)d.quot >> 32);
-            regs[2] = (uint32_t)(uint64_t)d.rem;
-            regs[3] = (uint32_t)((uint64_t)d.rem >> 32);
+            ctx.mem.write64(r0, (uint64_t)d.quot);
+            ctx.mem.write64(r0 + 8u, (uint64_t)d.rem);
         }
         break;
     }
@@ -51137,9 +51329,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (!den) { ret32(0); break; }
             ret_pair((uint64_t)(num / den), (uint64_t)(num % den));
         } else {
-            if ((int32_t)r1 == 0) { ret32(0); break; }
-            ldiv_t d = ldiv((long)(int32_t)r0, (long)(int32_t)r1);
-            ret_pair((uint32_t)d.quot, (uint32_t)d.rem);
+            /* LP32 ldiv_t is an eight-byte aggregate, also returned through
+             * a hidden pointer. The two 32-bit operands follow in r1/r2. */
+            if ((int32_t)r2 == 0) { ret32(0); break; }
+            ldiv_t d = ldiv((long)(int32_t)r1, (long)(int32_t)r2);
+            ctx.mem.write32(r0, (uint32_t)d.quot);
+            ctx.mem.write32(r0 + 4u, (uint32_t)d.rem);
         }
         break;
     }
@@ -56027,6 +56222,10 @@ extern "C" void arm_exec_dvm_thread_attach(void)
     if (!tid) return;
     thread_name_set(tid, "DvmThread");
     g_dvm_guest_tid = tid;
+    if (lunaria_env("LUNARIA_TRACE_THREADS")) {
+        static std::atomic<int> attached{0};
+        fprintf(stderr, "[tls] dvm attach tid=%u live=%d\n", tid, ++attached);
+    }
     g_dvm_native_stacks[tid].attached = true;
     g_dvm_native_stacks[tid].state = 'R';
 
@@ -56035,7 +56234,15 @@ extern "C" void arm_exec_dvm_thread_attach(void)
     g_current_tid = tid;
     if (!g_ctx->is_arm64) g_tpidr32_val = arm32_tls_for_tid(*g_ctx, tid);
     if (g_ctx->is_arm64) {
-        g_dvm_guest_tls = arm64_tls_for_tid(*g_ctx, tid);
+        g_dvm_guest_tls = arm64_tls_for_tid(*g_ctx, tid, false);
+        if (!g_dvm_guest_tls) {
+            /* Window full: stay a plain Java thread (no guest identity). */
+            g_dvm_native_stacks[tid].attached = false;
+            guest_tid_release(tid);
+            g_dvm_guest_tid = 0;
+            g_current_tid = 0;
+            return;
+        }
         g_tpidr_el0_val = g_dvm_guest_tls;
         g_tpidrro_el0_val = g_dvm_guest_tls;
         if (a64_has_private_tls(g_dvm_guest_tls) && g_fast64_mutex_lock_va)
@@ -56057,6 +56264,7 @@ extern "C" void arm_exec_dvm_thread_detach(void)
     if (!g_ctx || !g_dvm_guest_tid) return;
     ArmLockGuard locked;
     const uint32_t tid = g_dvm_guest_tid;
+    if (lunaria_env("LUNARIA_TRACE_THREADS")) fprintf(stderr, "[tls] dvm detach tid=%u\n", tid);
     /* Java-created threads are host pthreads too. Native libraries use their
      * pthread-key destructors to unregister from GC and release TLS state.
      * Run them on the exiting thread while its identity and stack are live. */
@@ -56136,7 +56344,17 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
         }
         const uint64_t queued = sink ? luna_os_audio_queued_frames() :
                                        silent_end - silent_played;
-        if (queued >= target || callbacks >= 64u) break;
+        static uint64_t t_calls, t_pass, t_full, t_dry, t_refused, t_queued, t_last;
+        const bool trace_audio = lunaria_env("LUNARIA_TRACE_AUDIO_CLOCK") != nullptr;
+        if (trace_audio) { ++t_pass; t_queued += queued;
+            const uint64_t tn = host_mono_ns();
+            if (tn - t_last >= 1000000000ull) {
+                if (t_last) fprintf(stderr, "[mix] %llu passes/s, avg queued %.0f, stops: full %llu dry %llu refused %llu (sink=%d)\n",
+                    (unsigned long long)t_pass, (double)t_queued / (double)(t_pass ? t_pass : 1), (unsigned long long)t_full,
+                    (unsigned long long)t_dry, (unsigned long long)t_refused, (int)sink);
+                t_last = tn; t_pass = t_full = t_dry = t_refused = t_queued = 0; }
+            (void)t_calls; }
+        if (queued >= target || callbacks >= 64u) { if (trace_audio) ++t_full; break; }
         unsigned wanted = (unsigned)(target - queued);
         if (wanted > 256u) wanted = 256u;
         int32_t mix[256 * 2]{};
@@ -56156,13 +56374,13 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
             if(n>produced)produced=n;
             if(s.state==luna_aaudio::started && !n && s.frames_written && now>s.presentation_end_ns && !s.underflow){++s.xruns;s.underflow=true;}
         }
-        if (!produced) break;
+        if (!produced) { if (trace_audio) ++t_dry; break; }
         for (unsigned i = 0; i < produced * channels; ++i) {
             int32_t v = mix[i];
             pcm[i] = (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
         }
         int accepted = sink ? luna_os_audio_write(pcm, produced) : (int)produced;
-        if (accepted <= 0) break;
+        if (accepted <= 0) { if (trace_audio) ++t_refused; break; }
         if (!sink) silent_end += (unsigned)accepted;
         luna_at_advance((unsigned)accepted, rate, channels);
         for(auto &kv:g_aaudio_streams){
@@ -58903,7 +59121,7 @@ static bool jit_ui_present_frame(void)
 
     if (prev_ctx != EGL_NO_CONTEXT &&
         eglMakeCurrent(dpy, prev_draw, prev_read, prev_ctx)) {
-        egl_note_bound(prev_handle, prev_ledger_surf);
+        egl_note_bound(prev_handle, prev_ledger_surf, prev_read);
         return true;
     }
     /* Nothing to give back (or it would not take): release rather than leave
@@ -58974,7 +59192,7 @@ static bool guest_window_present_frame(void)
 
     if (prev_ctx != EGL_NO_CONTEXT &&
         eglMakeCurrent(dpy, prev_draw, prev_read, prev_ctx)) {
-        egl_note_bound(prev_handle, prev_ledger_surf);
+        egl_note_bound(prev_handle, prev_ledger_surf, prev_read);
         return true;
     }
     (void)eglGetError();
@@ -59377,8 +59595,7 @@ static uint64_t a64_host_hook_call(uint32_t id, uint64_t a0, uint64_t a1,
         const uint8_t *a = a0 ? mem.ptr((GuestVA)a0) : nullptr;
         const uint8_t *b = a1 ? mem.ptr((GuestVA)a1) : nullptr;
         if (!a || !b) return 0;
-        uint64_t limit = 1ull << 22;
-        if (hs.handler == SVC_UE_STRNICMP) limit = std::min<uint64_t>(a2, limit);
+        uint64_t limit = hs.handler == SVC_UE_STRNICMP ? a2 : UINT64_MAX;
         int32_t r = 0;
         for (uint64_t n = 0; n < limit; ++n) {
             uint32_t c1, c2;
@@ -60981,12 +61198,11 @@ public:
                 const uint8_t *b = vb ? ctx->mem.ptr(vb) : nullptr;
                 /* Strnicmp compares at most x2 code units and answers 0 for a
                  * count of zero, exactly as the guest's own loop does. */
-                uint64_t limit = 1ull << 22;
-                if (svc_no == SVC_UE_STRNICMP)
-                    limit = std::min<uint64_t>(jit64->GetRegister(2), limit);
+                uint64_t limit = svc_no == SVC_UE_STRNICMP
+                    ? jit64->GetRegister(2) : UINT64_MAX;
                 if (a && b) {
-                    /* A bound, not a limit on the work: a guest pointer that
-                     * is not a string must not spin the emulator for ever. */
+                    /* Only Strnicmp's caller supplies a bound. Stricmp ends
+                     * at the terminator or first unequal folded code unit. */
                     for (uint64_t n = 0; n < limit; ++n) {
                         uint32_t c1, c2;
                         if (st.w1 == 2) { uint16_t v; memcpy(&v, a, 2); c1 = v; }
@@ -68123,6 +68339,7 @@ static int guest_program_spawn(const std::vector<std::string> &words,
  * RunningAppProcessInfo and ApplicationInfo.uid from here, so that one
  * process cannot disagree with itself about who it is. */
 extern "C" int arm_exec_guest_pid(void) { return (int)guest_pid(); }
+extern "C" int arm_exec_guest_is_64bit(void) { return g_guest_proc_arm64 ? 1 : 0; }
 /* FIRST_APPLICATION_UID unless the process was started as another package
  * (a hosted component process runs as that package's ledger uid). */
 extern "C" int arm_exec_guest_uid(void) {

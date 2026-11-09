@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <pthread.h>
+#include <GLES3/gl3.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -43,7 +46,8 @@ typedef struct qk_hdr {
 } qk_hdr;
 
 enum { M_HELLO = 1, M_RESIZE = 2,
-       M_SUBSCRIBE = 10, M_UNSUBSCRIBE = 11, M_TOUCH = 12, M_KEY = 13 };
+       M_SUBSCRIBE = 10, M_UNSUBSCRIBE = 11, M_TOUCH = 12, M_KEY = 13,
+       M_POINTER_BUTTON = 14 };
 
 static qk_hdr *g_hdr;
 static uint8_t *g_planes;
@@ -55,6 +59,63 @@ static _Atomic int g_started;
 static _Atomic int g_connected;
 
 bool luna_qfkey_wants_frame(void) { return atomic_load_explicit(&g_sub, memory_order_relaxed) != 0; }
+
+void luna_qfkey_capture_gl(int w, int h)
+{
+   luna_qfkey_start("lunaria", w, h);
+   if (!luna_qfkey_wants_frame() || w <= 0 || h <= 0 || w > QK_MAX_W || h > QK_MAX_H) return;
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   static uint8_t *pixels;
+   static size_t capacity;
+   pthread_mutex_lock(&lock);
+   const size_t stride = (size_t)w * 4u, bytes = stride * (size_t)h;
+   if (capacity < bytes + stride) {
+      uint8_t *next = realloc(pixels, bytes + stride);
+      if (!next) { pthread_mutex_unlock(&lock); return; }
+      pixels = next; capacity = bytes + stride;
+   }
+   int major = 0;
+   const char *version = (const char *)glGetString(GL_VERSION);
+   if (version) (void)sscanf(version, "OpenGL ES %d", &major);
+   GLint alignment = 4, framebuffer = 0, pack_buffer = 0, row_length = 0, skip_rows = 0, skip_pixels = 0, read_buffer = GL_BACK;
+   glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+   glPixelStorei(GL_PACK_ALIGNMENT, 4);
+   if (major >= 3) {
+      glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &framebuffer);
+      glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+      glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
+      glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
+      glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+      glGetIntegerv(GL_READ_BUFFER, &read_buffer);
+      glReadBuffer(GL_BACK);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+      glPixelStorei(GL_PACK_ROW_LENGTH, 0);
+      glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+      glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+   } else if (major >= 2) {
+      glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   }
+   glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+   glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+   if (major >= 3) {
+      glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
+      glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
+      glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER, (GLuint)pack_buffer);
+      glReadBuffer((GLenum)read_buffer);
+      glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)framebuffer);
+   } else if (major >= 2) glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)framebuffer);
+   uint8_t *row = pixels + bytes;
+   for (int y = 0; y < h / 2; ++y) {
+      uint8_t *lo = pixels + stride * (size_t)y;
+      uint8_t *hi = pixels + stride * (size_t)(h - 1 - y);
+      memcpy(row, lo, stride); memcpy(lo, hi, stride); memcpy(hi, row, stride);
+   }
+   luna_qfkey_publish(pixels, w, h, (int)stride, false);
+   pthread_mutex_unlock(&lock);
+}
 
 /* ---- platform layer ------------------------------------------------------
  * shm_create()   map the frame segment, filling g_hdr/g_planes/g_shm_name
@@ -315,10 +376,10 @@ static void send_hello(void)
  * events across; luna_qfkey_pump_input() drains it.  Full ring = drop. */
 #define QK_RING 128
 typedef struct qk_in {
-   uint8_t kind; /* 1 touch, 2 key */
-   int a;        /* touch: action; key: HID usage */
-   int down;     /* key only */
-   float x, y;   /* touch coords */
+   uint8_t kind; /* 1 touch, 2 key, 3 pointer button */
+   int a;        /* touch: action; key: HID usage; pointer: button */
+   int down;     /* key or pointer button */
+   float x, y;   /* surface coordinates */
 } qk_in;
 static qk_in g_ring[QK_RING];
 static _Atomic unsigned g_head, g_tail;
@@ -368,6 +429,8 @@ void luna_qfkey_pump_input(void)
             int code = hid_to_android(e.a);
             if (code) arm_exec_android_key(code);
          }
+      } else if (e.kind == 3 && !g_host_touch) {
+         arm_exec_pointer_button(e.a, e.down, e.x, e.y);
       }
    }
 }
@@ -385,6 +448,14 @@ static void on_key(const uint8_t *p, uint16_t len)
    if (len < 2) return;
    qk_in e = { 2, p[0], p[1] ? 1 : 0, 0, 0 }; /* a = HID usage */
    ring_push(e);
+}
+
+static void on_pointer_button(const uint8_t *p, uint16_t len)
+{
+   if (len != 10 || p[0] > 2 || p[1] > 1) return;
+   qk_in e = { 3, p[0], p[1], 0, 0 };
+   memcpy(&e.x, p + 2, 4); memcpy(&e.y, p + 6, 4);
+   if (isfinite(e.x) && isfinite(e.y)) ring_push(e);
 }
 
 static void session(void)
@@ -408,6 +479,7 @@ static void session(void)
       case M_UNSUBSCRIBE: atomic_store(&g_sub, 0); atomic_store(&g_hdr->subscribed, 0); break;
       case M_TOUCH:       on_touch(pay, len); break;
       case M_KEY:         on_key(pay, len); break;
+      case M_POINTER_BUTTON: on_pointer_button(pay, len); break;
       default: break;
       }
    }

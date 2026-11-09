@@ -172,6 +172,18 @@ static ssize_t stream_write(struct stream *s, const void *buf, size_t len)
  * that; this bounds how many of those in a row are tolerated. */
 #define HTTP_READ_STALL_MS 120000
 
+/* Whether a read now would return without waiting: decrypted bytes already
+ * held by TLS, or something readable on the socket. A custom transport has no
+ * way to say, so it is not asked to. */
+static bool stream_ready(struct stream *s)
+{
+   if (s->io.read) return false;
+   if (s->ssl && SSL_pending(s->ssl) > 0) return true;
+   if (s->fd < 0) return false;
+   struct pollfd p = { .fd = s->fd, .events = POLLIN };
+   return luna_socket_poll(&p, 1, 0) > 0 && (p.revents & POLLIN);
+}
+
 static ssize_t stream_read(struct stream *s, void *buf, size_t len)
 {
    long waited_ms = 0;
@@ -813,6 +825,11 @@ long dvm_http_read(struct dvm_http_response *r, void *buf, size_t n)
          r->ra_pos = 0;
          bool closed = false;
          while (r->ra_len < fill) {
+            /* The first bytes go to the caller as soon as there are any. Waiting
+             * for the whole buffer to fill first made a media loader's first
+             * read take as long as eight megabytes of transfer — and a dozen
+             * of them sharing one link all timed out and started over. */
+            if (r->ra_len > 0 && !stream_ready((struct stream *)r->stream)) break;
             ssize_t got = stream_read((struct stream *)r->stream,
                                       r->ra + r->ra_len, fill - r->ra_len);
             if (got < 0) {
@@ -1079,6 +1096,9 @@ bool dvm_http_perform_with_connector(void **transport,const char *method,const c
 void dvm_http_response_free(struct dvm_http_response *r)
 {
    if (!r) return;
+   if (r->content_length > 0 && getenv("LUNARIA_HTTP_CLOSE_TRACE"))
+      fprintf(stderr, "[http] closed after %lld of %lld bytes (status %d)\n",
+              r->body_read, r->content_length, r->status);
    free(r->status_line);r->status_line=NULL;
    http_stream_done(r);
    free(r->pre);

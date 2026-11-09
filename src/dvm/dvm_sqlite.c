@@ -27,6 +27,8 @@
 #include "dvm/dvm_internal.h"
 #include "arm_exec.h"
 #include "lunaria_os.h"
+#include "luna_google.h"
+#include <pthread.h>
 
 #include <errno.h>
 #include <inttypes.h>
@@ -95,12 +97,11 @@ static struct sq_api {
    int64_t (*last_insert_rowid)(sqlite3 *);
 } sq;
 
-static bool g_sq_tried, g_sq_ready;
+static bool g_sq_ready;
+static pthread_once_t sq_once = PTHREAD_ONCE_INIT;
 
-static bool sq_load(void)
+static void sq_load_once(void)
 {
-   if (g_sq_tried) return g_sq_ready;
-   g_sq_tried = true;
    void *lib = NULL;
 #if defined(_WIN32)
    lib = luna_os_library_open_local("winsqlite3.dll");
@@ -113,11 +114,11 @@ static bool sq_load(void)
    if (!lib) {
       fprintf(stderr, "[sqlite] the host's SQLite cannot be opened (%s)\n",
               luna_os_library_error());
-      return false;
+      return;
    }
 #define SQ_SYM(field, name) \
    do { *(void **)&sq.field = luna_os_library_symbol(lib, name); \
-        if (!sq.field) { fprintf(stderr, "[sqlite] missing %s\n", name); return false; } } while (0)
+        if (!sq.field) { fprintf(stderr, "[sqlite] missing %s\n", name); return; } } while (0)
    SQ_SYM(open_v2, "sqlite3_open_v2");
    SQ_SYM(close_v2, "sqlite3_close_v2");
    SQ_SYM(busy_timeout, "sqlite3_busy_timeout");
@@ -144,7 +145,11 @@ static bool sq_load(void)
    SQ_SYM(last_insert_rowid, "sqlite3_last_insert_rowid");
 #undef SQ_SYM
    g_sq_ready = true;
-   return true;
+}
+static bool sq_load(void)
+{
+   pthread_once(&sq_once, sq_load_once);
+   return g_sq_ready;
 }
 
 /* --- errors -------------------------------------------------------------- */
@@ -320,6 +325,11 @@ dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags)
    }
    d->readonly = (flags & 1) != 0;
    (void)sq.busy_timeout(d->db, 2500);
+   /* A commit that waits for the host disk to confirm (two or three fsyncs per
+    * transaction by default) is paid by the thread that wrote, and on the main
+    * thread that is a dropped frame per insert.  What the app stored only has
+    * to survive the app, not the host losing power under it. */
+   if (!memory && !d->readonly) (void)sq_exec(vm, d, "PRAGMA synchronous=OFF");
    struct dvm_class *c = dvm__class_by_desc(vm, DB_DESC);
    dvm_ref obj = c ? dvm_new_object(vm, c) : 0;
    if (!obj) { sq.close_v2(d->db); free(d); return 0; }
@@ -1295,6 +1305,184 @@ static bool sq_run_update(struct dvm *vm, struct sq_db *d, const char *sql,
 static const char *const k_conflict[] = {
    "", " OR ROLLBACK", " OR ABORT", " OR FAIL", " OR IGNORE", " OR REPLACE"
 };
+
+/* Platform settings use one host database for the virtual device environment,
+ * shared by app processes. No app's guest filesystem mapping owns this file. */
+static pthread_mutex_t settings_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct sq_db settings_db;
+static char settings_path[1024];
+
+static bool settings_failure(struct dvm *vm, sqlite3 *db, int rc)
+{
+   if (vm) sq_throw(vm, db, rc, "accessing platform settings", NULL);
+   else fprintf(stderr, "[settings] SQLite error %d: %s\n", rc, db ? sq.errmsg(db) : "open failed");
+   return false;
+}
+static bool settings_exec(struct dvm *vm, const char *sql)
+{
+   sqlite3_stmt *st = NULL;
+   int rc = sq.prepare_v2(settings_db.db, sql, -1, &st, NULL);
+   if (rc == SQ_OK) rc = sq.step(st);
+   if (st) sq.finalize(st);
+   return rc == SQ_DONE || settings_failure(vm, settings_db.db, rc);
+}
+/* Increment once per real boot, atomically with its identity. Process restarts
+ * do not change this count; persisted elapsed-time users can detect a reboot. */
+static bool settings_record_boot(struct dvm *vm)
+{
+   char id[64];
+   if (!luna_os_boot_id(id, sizeof id)) return true;
+   sqlite3_stmt *st = NULL;
+   int rc = sq.prepare_v2(settings_db.db,
+      "SELECT value FROM settings WHERE namespace='_device' AND name='boot_id'", -1, &st, NULL);
+   if (rc == SQ_OK) rc = sq.step(st);
+   bool same = rc == SQ_ROW && sq.column_text(st, 0) &&
+      !strcmp((const char *)sq.column_text(st, 0), id);
+   if (st) sq.finalize(st);
+   if (rc != SQ_ROW && rc != SQ_DONE) return settings_failure(vm, settings_db.db, rc);
+   if (same) return true;
+   if (!settings_exec(vm, "INSERT INTO settings(namespace,name,value) VALUES ('global','boot_count','1')"
+       " ON CONFLICT(namespace,name) DO UPDATE SET value=CAST(COALESCE(value,'0') AS INTEGER)+1")) return false;
+   st = NULL;
+   rc = sq.prepare_v2(settings_db.db,
+      "INSERT INTO settings(namespace,name,value) VALUES ('_device','boot_id',?)"
+      " ON CONFLICT(namespace,name) DO UPDATE SET value=excluded.value", -1, &st, NULL);
+   if (rc == SQ_OK) rc = sq.bind_text(st, 1, id, -1, SQ_TRANSIENT);
+   if (rc == SQ_OK) rc = sq.step(st);
+   if (st) sq.finalize(st);
+   return rc == SQ_DONE || settings_failure(vm, settings_db.db, rc);
+}
+
+/* Called under settings_mutex; profile changes in host tests reopen the store. */
+static bool settings_open(struct dvm *vm)
+{
+   char directory[1024], path[1024];
+   if (luna_google_accounts_directory(getenv("LUNARIA_DATA_ROOT"), luna_google_profile_current(),
+                                      directory, sizeof directory) ||
+       snprintf(path, sizeof path, "%s/settings.db", directory) >= (int)sizeof path) {
+      if (vm) dvm__throw(vm, "android/database/sqlite/SQLiteCantOpenDatabaseException", "No platform settings directory");
+      return false;
+   }
+   if (!sq_load()) { if (vm) sq_unavailable(vm); return false; }
+   if (settings_db.db && !strcmp(path, settings_path)) return true;
+   if (settings_db.db) sq.close_v2(settings_db.db);
+   memset(&settings_db, 0, sizeof settings_db);
+   sq_make_parent_dirs(path);
+   int rc = sq.open_v2(path, &settings_db.db, SQ_OPEN_READWRITE | SQ_OPEN_CREATE, NULL);
+   if (rc != SQ_OK) {
+      settings_failure(vm, settings_db.db, rc);
+      if (settings_db.db) sq.close_v2(settings_db.db);
+      settings_db.db = NULL;
+      return false;
+   }
+   sq.busy_timeout(settings_db.db, 2500);
+   snprintf(settings_path, sizeof settings_path, "%s", path);
+   bool ok = settings_exec(vm, "BEGIN IMMEDIATE");
+   sqlite3_stmt *st = NULL;
+   bool exists = false;
+   if (ok) {
+      rc = sq.prepare_v2(settings_db.db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings'", -1, &st, NULL);
+      if (rc == SQ_OK) { rc = sq.step(st); exists = rc == SQ_ROW; }
+      if (st) sq.finalize(st);
+      ok = rc == SQ_ROW || rc == SQ_DONE || settings_failure(vm, settings_db.db, rc);
+   }
+   if (ok && !exists) {
+      ok = settings_exec(vm, "CREATE TABLE settings (_id INTEGER PRIMARY KEY, namespace TEXT NOT NULL, name TEXT NOT NULL, value TEXT, UNIQUE(namespace,name))") &&
+           settings_exec(vm, "INSERT INTO settings(namespace,name,value) VALUES ('secure','user_setup_complete','1'),('global','device_provisioned','1')");
+   }
+   if (ok) ok = settings_record_boot(vm);
+   if (ok) ok = settings_exec(vm, "COMMIT");
+   if (!ok) {
+      settings_exec(NULL, "ROLLBACK");
+      sq.close_v2(settings_db.db); settings_db.db = NULL;
+   }
+   return ok;
+}
+
+bool dvm_settings_read(struct dvm *vm, const char *table, const char *name,
+                        char **value, bool *present)
+{
+   *value = NULL; *present = false;
+   /* Framework defaults also work before a data directory is selected. */
+   if (!getenv("LUNARIA_DATA_ROOT")) return true;
+   pthread_mutex_lock(&settings_mutex);
+   bool ok = settings_open(vm);
+   sqlite3_stmt *st = NULL;
+   int rc = SQ_OK;
+   if (ok) {
+      rc = sq.prepare_v2(settings_db.db, "SELECT value FROM settings WHERE namespace=? AND name=?", -1, &st, NULL);
+      if (rc == SQ_OK) rc = sq.bind_text(st, 1, table, -1, SQ_TRANSIENT);
+      if (rc == SQ_OK) rc = sq.bind_text(st, 2, name, -1, SQ_TRANSIENT);
+      if (rc == SQ_OK) rc = sq.step(st);
+      if (rc == SQ_ROW) {
+         *present = true;
+         const char *text = (const char *)sq.column_text(st, 0);
+         if (text && !(*value = strdup(text))) rc = SQ_NOMEM;
+      }
+      ok = rc == SQ_ROW || rc == SQ_DONE || settings_failure(vm, settings_db.db, rc);
+   }
+   if (st) sq.finalize(st);
+   pthread_mutex_unlock(&settings_mutex);
+   return ok;
+}
+
+bool dvm_settings_write(struct dvm *vm, const char *table, const char *name,
+                         const char *value, bool remove, int *changed)
+{
+   pthread_mutex_lock(&settings_mutex);
+   bool ok = settings_open(vm);
+   sqlite3_stmt *st = NULL;
+   if (ok) {
+      const char *sql = remove ? "DELETE FROM settings WHERE namespace=? AND name=?"
+          : "INSERT INTO settings(namespace,name,value) VALUES (?,?,?) ON CONFLICT(namespace,name) DO UPDATE SET value=excluded.value";
+      int rc = sq.prepare_v2(settings_db.db, sql, -1, &st, NULL);
+      if (rc == SQ_OK) rc = sq.bind_text(st, 1, table, -1, SQ_TRANSIENT);
+      if (rc == SQ_OK) rc = sq.bind_text(st, 2, name, -1, SQ_TRANSIENT);
+      if (rc == SQ_OK && !remove) rc = value ? sq.bind_text(st, 3, value, -1, SQ_TRANSIENT) : sq.bind_null(st, 3);
+      if (rc == SQ_OK) rc = sq.step(st);
+      ok = rc == SQ_DONE || settings_failure(vm, settings_db.db, rc);
+      if (ok && changed) *changed = sq.changes(settings_db.db);
+   }
+   if (st) sq.finalize(st);
+   pthread_mutex_unlock(&settings_mutex);
+   return ok;
+}
+
+/* The provider accepts column names, not SQL expressions. The virtual android_id
+ * row preserves the framework's caller-specific identity until SSAID is modeled. */
+dvm_ref dvm_settings_query(struct dvm *vm, const char *table, const char *name,
+                            dvm_ref projection, const char *android_id)
+{
+   char sql[2048] = "SELECT ";
+   const char *defaults[] = {"_id", "name", "value", "is_preserved_in_restore"};
+   unsigned count = projection ? dvm_array_length(vm, projection) : 4;
+   dvm_ref *columns = projection ? dvm_array_data(vm, projection) : NULL;
+   if (!count || count > 64) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Invalid settings projection"); return 0;
+   }
+   for (unsigned i = 0; i < count; ++i) {
+      const char *col = columns ? dvm_string_utf8(vm, columns[i]) : defaults[i];
+      bool valid = false;
+      for (unsigned j = 0; col && j < 4; ++j) if (!strcmp(col, defaults[j])) valid = true;
+      if (!valid || strlen(sql) + (col ? strlen(col) : 0) + 4 >= sizeof sql) {
+         dvm__throw(vm, "java/lang/IllegalArgumentException", "Invalid settings column"); return 0;
+      }
+      if (i) strcat(sql, ",");
+      strcat(sql, col);
+   }
+   strcat(sql, " FROM (SELECT CAST(_id AS TEXT) AS _id,name,value,'false' AS is_preserved_in_restore FROM settings WHERE namespace=?1"
+               " UNION ALL SELECT '-1','android_id',?2,'false' WHERE ?1='secure' AND ?2 IS NOT NULL"
+               " AND NOT EXISTS(SELECT 1 FROM settings WHERE namespace=?1 AND name='android_id'))");
+   if (name) strcat(sql, " WHERE name=?3");
+   struct sq_cell cells[3] = {{.type=SQ_TEXT,.p=(char *)table,.n=(int)strlen(table)},
+      {.type=android_id ? SQ_TEXT : SQ_NULL,.p=(char *)android_id,.n=android_id ? (int)strlen(android_id) : 0},
+      {.type=name ? SQ_TEXT : SQ_NULL,.p=(char *)name,.n=name ? (int)strlen(name) : 0}};
+   struct sq_binds binds = {.n=name ? 3 : 2,.v=cells};
+   pthread_mutex_lock(&settings_mutex);
+   dvm_ref result = settings_open(vm) ? sq_run_query(vm, &settings_db, sql, &binds) : 0;
+   pthread_mutex_unlock(&settings_mutex);
+   return result;
+}
 
 /* --- SQLiteDatabase methods ---------------------------------------------- */
 

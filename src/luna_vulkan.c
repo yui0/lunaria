@@ -68,7 +68,7 @@ typedef PFN_vkMapMemory2KHR PFN_vkMapMemory2;
 #include <string.h>
 
 #include "arm_exec.h"
-#include "luna_compositor.h"
+#include "luna_boot.h"
 #include "luna_qfkey.h"
 
 /* ---- the command table -------------------------------------------------- */

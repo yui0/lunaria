@@ -17,13 +17,30 @@ enum {
 };
 #define PARCEL_BUNDLE_MAGIC 0x4C444E42
 
-struct rt_parcel { uint8_t *buf; uint32_t size, cap, pos; bool ipc, failed; unsigned depth; };
+struct parcel_fds { int *fds;size_t count; };
+static void parcel_fds_clear(struct parcel_fds *f)
+{ for(size_t i=0;i<f->count;++i)luna_fd_close(f->fds[i]);free(f->fds);f->fds=NULL;f->count=0; }
+static int parcel_fds_copy(struct parcel_fds *out,const int *fds,size_t count)
+{
+   if(count>LUNA_PROCESS_FD_MAX || (count && !fds))return -EINVAL;
+   struct parcel_fds copy={0};
+   if(count){copy.fds=malloc(count*sizeof *copy.fds);if(!copy.fds)return -ENOMEM;}
+   for(size_t i=0;i<count;++i){
+      int fd=luna_fd_dup(fds[i],0,1);
+      if(fd<0){int error=errno;parcel_fds_clear(&copy);return -error;}
+      copy.fds[copy.count++]=fd;
+   }
+   parcel_fds_clear(out);*out=copy;return 0;
+}
+static _Thread_local struct parcel_fds binder_incoming_fds;
+struct rt_parcel { uint8_t *buf; uint32_t size, cap, pos; bool ipc, failed; unsigned depth;struct parcel_fds descriptors; };
 
 static void parcel_destroy(void *data)
 {
    struct rt_parcel *p = data;
    if (!p) return;
    free(p->buf);
+   parcel_fds_clear(&p->descriptors);
    free(p);
 }
 
@@ -56,7 +73,7 @@ static bool parcel_recycle(struct dvm *vm, dvm_ref self, const union dvm_value *
 {
    (void)args; (void)nargs; (void)out;
    struct rt_parcel *p = parcel_of(vm, self);
-   if (p) { free(p->buf); memset(p, 0, sizeof *p); }
+   if (p) { free(p->buf);parcel_fds_clear(&p->descriptors);memset(p, 0, sizeof *p); }
    RETV();
 }
 
@@ -115,6 +132,63 @@ static int32_t parcel_take_i32(struct rt_parcel *p)
 { int32_t v; parcel_take(p, &v, 4); return v; }
 static int64_t parcel_take_i64(struct rt_parcel *p)
 { int64_t v; parcel_take(p, &v, 8); return v; }
+
+/* FD records contain an attachment index, never a descriptor number from
+ * another process. The transport duplicates the associated open file description. */
+static bool parcel_put_fd(struct dvm *vm,struct rt_parcel *p,int fd)
+{
+   if(fd<0 || p->descriptors.count>=LUNA_PROCESS_FD_MAX){
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid file descriptor");return false;
+   }
+   int copy=luna_fd_dup(fd,0,1);
+   if(copy<0){dvm__throw(vm,"java/io/IOException","dup: %s",strerror(errno));return false;}
+   size_t index=p->descriptors.count;
+   int *fds=realloc(p->descriptors.fds,(index+1)*sizeof *fds);
+   if(!fds){luna_fd_close(copy);dvm__throw(vm,"java/lang/OutOfMemoryError","Parcel descriptors");return false;}
+   p->descriptors.fds=fds;fds[index]=copy;p->descriptors.count++;
+   return parcel_put_i32(vm,p,0x66642a85) && parcel_put_i32(vm,p,0) &&
+      parcel_put_i64(vm,p,(int64_t)index) && parcel_put_i64(vm,p,0);
+}
+static int parcel_take_fd(struct dvm *vm,struct rt_parcel *p)
+{
+   uint32_t type=(uint32_t)parcel_take_i32(p);(void)parcel_take_i32(p);
+   int64_t index=parcel_take_i64(p);(void)parcel_take_i64(p);
+   if(p->failed || type!=0x66642a85 || index<0 || (uint64_t)index>=p->descriptors.count){
+      dvm__throw(vm,"android/os/BadParcelableException","Invalid file descriptor attachment");return -1;
+   }
+   int fd=luna_fd_dup(p->descriptors.fds[index],0,1);
+   if(fd<0)dvm__throw(vm,"java/io/IOException","dup: %s",strerror(errno));
+   return fd;
+}
+static bool parcel_fd_write(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;struct rt_parcel *p=parcel_of(vm,ARG(0).l);
+   if(!p){dvm__throw(vm,"java/lang/NullPointerException","destination");return false;}
+   union dvm_value value={.i=-1};dvm_get_field(vm,self,"fd","I",&value);
+   struct dvm_object *o=dvm__obj(vm,self);
+   struct parcel_fd_owner *owner=o && o->data_destroy==parcel_fd_destroy ? o->data : NULL;
+   int comm=owner ? owner->comm_fd : -1;
+   if(!parcel_put_i32(vm,p,comm>=0) || !parcel_put_fd(vm,p,value.i) || (comm>=0 && !parcel_put_fd(vm,p,comm)))return false;
+   if(ARG(1).i & 1)return parcel_fd_close(vm,self,NULL,0,out);
+   RETV();
+}
+static bool parcel_fd_create(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)self;(void)nargs;struct rt_parcel *p=parcel_of(vm,ARG(0).l);
+   if(!p){dvm__throw(vm,"java/lang/NullPointerException","source");return false;}
+   int comm=parcel_take_i32(p);
+   int fd=parcel_take_fd(vm,p);if(fd<0)return false;
+   int extra=comm ? parcel_take_fd(vm,p) : -1;
+   if(comm && extra<0){luna_fd_close(fd);return false;}
+   dvm_ref result=parcel_fd_adopt(vm,fd);if(!result){if(extra>=0)luna_fd_close(extra);return false;}
+   ((struct parcel_fd_owner *)dvm__obj(vm,result)->data)->comm_fd=extra;RETL(result);
+}
+static bool parcel_fd_new_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{ (void)self;(void)nargs;RETL(dvm_new_array(vm,'L',"Landroid/os/ParcelFileDescriptor;",ARG(0).i)); }
+static const struct rt_method rt_parcel_fd_creator[]={
+   M("createFromParcel","(Landroid/os/Parcel;)Ljava/lang/Object;",parcel_fd_create),
+   M("newArray","(I)[Ljava/lang/Object;",parcel_fd_new_array),M_END
+};
 
 static bool parcel_put_string(struct dvm *vm, struct rt_parcel *p, dvm_ref s)
 {
@@ -227,6 +301,7 @@ static bool parcel_nop(struct dvm *vm, dvm_ref self, const union dvm_value *args
 static bool parcel_marshall(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
 {
    PARCEL_SELF()
+   if(p->descriptors.count){dvm__throw(vm,"java/lang/RuntimeException","Tried to marshall a Parcel that contains FileDescriptors");return false;}
    dvm_ref a = dvm_new_array(vm, 'B', "B", p->size);
    if (!a) { dvm__throw(vm, "java/lang/OutOfMemoryError", "Parcel.marshall"); return false; }
    if (p->size) memcpy(dvm_array_data(vm, a), p->buf, p->size);
@@ -244,6 +319,7 @@ static bool parcel_unmarshall(struct dvm *vm, dvm_ref self, const union dvm_valu
       dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "offset %d length %d", off, n);
       return false;
    }
+   parcel_fds_clear(&p->descriptors);
    p->size = p->pos = 0;
    if (!parcel_room(vm, p, (size_t)n)) return false;
    if (n) memcpy(p->buf, (uint8_t *)dvm_array_data(vm, a) + off, (size_t)n);
@@ -261,6 +337,7 @@ static bool parcel_appendFrom(struct dvm *vm, dvm_ref self, const union dvm_valu
       dvm__throw(vm, "java/lang/IllegalArgumentException", "Bad range %d+%d", off, n);
       return false;
    }
+   if(src->descriptors.count){dvm__throw(vm,"java/lang/UnsupportedOperationException","appendFrom with file descriptors");return false;}
    if (!parcel_put(vm, p, src->buf + off, (size_t)n)) return false;
    (void)out;
    RETV();
@@ -895,7 +972,6 @@ static bool parcel_read_value_inner(struct dvm *vm, dvm_ref self, struct rt_parc
       return true;
    }
    case PARCEL_VAL_PARCELABLE: {
-      if(p->ipc){p->failed=true;return false;}
       dvm_ref name, creator;
       if (!parcel_take_string(vm, p, &name) && dvm_exception(vm)) return false;
       if (!name) return true;
@@ -997,6 +1073,15 @@ static bool parcel_readHashMap(struct dvm *vm, dvm_ref self, const union dvm_val
 
 static int (*g_binder_send)(void *user, const char *peer, const void *bytes, size_t size);
 static void *g_binder_send_user;
+static int (*g_binder_fd_send)(void *,const char *,const void *,size_t,const int *,size_t);
+static void *g_binder_fd_user;
+void dvm_binder_set_fd_transport(int (*send)(void *,const char *,const void *,size_t,const int *,size_t),void *user)
+{ g_binder_fd_send=send;g_binder_fd_user=user; }
+static int binder_send_message(const char *peer,const void *bytes,size_t size,const struct parcel_fds *fds)
+{
+   if(fds && fds->count)return g_binder_fd_send ? g_binder_fd_send(g_binder_fd_user,peer,bytes,size,fds->fds,fds->count) : -ENOSYS;
+   return g_binder_send ? g_binder_send(g_binder_send_user,peer,bytes,size) : -ENOSYS;
+}
 void dvm_binder_set_transport(int (*send)(void *, const char *, const void *, size_t), void *user)
 { g_binder_send = send; g_binder_send_user = user; }
 
@@ -1029,9 +1114,9 @@ static void binder_link_learn(uint32_t peer, const char *name)
    g_binder_links = l;
 }
 
-static int binder_send_peer(uint32_t peer, const void *bytes, size_t size)
+static int binder_send_peer_fds(uint32_t peer,const void *bytes,size_t size,const struct parcel_fds *fds)
 {
-   if (!g_binder_send) return -ENOSYS;
+   if (!g_binder_send && !g_binder_fd_send) return -ENOSYS;
    for (struct binder_link *l = g_binder_links; l; l = l->next)
       if (l->peer == peer) {
          /* A package can have both a foreground process and component hosts. */
@@ -1040,12 +1125,14 @@ static int binder_send_peer(uint32_t peer, const void *bytes, size_t size)
          memcpy(direct, "LBD1", 4);
          for (unsigned i = 0; i < 4; ++i) direct[4+i] = (uint8_t)(peer >> (8*i));
          memcpy(direct + 8, bytes, size);
-         int rc = g_binder_send(g_binder_send_user, l->name, direct, size + 8);
+         int rc = binder_send_message(l->name,direct,size+8,fds);
          free(direct);
          return rc;
       }
    return -ENOENT;
 }
+static int binder_send_peer(uint32_t peer,const void *bytes,size_t size)
+{ return binder_send_peer_fds(peer,bytes,size,NULL); }
 
 static void bput(uint8_t *p, uint32_t v) { for (unsigned i = 0; i < 4; ++i) p[i] = (uint8_t)(v >> (i * 8)); }
 static uint32_t bget(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -1084,6 +1171,7 @@ struct binder_pending {
    int32_t status, handle;
    uint8_t *payload;
    size_t payload_size;
+   struct parcel_fds descriptors;
    dvm_ref connection;                     /* a bind: the ServiceConnection */
    char *package;                          /* a bind: the package asked */
    uint32_t peer;
@@ -1111,7 +1199,7 @@ static void binder_pending_drop(struct binder_pending *e)
    for (struct binder_pending **pp = &g_binder_pending; *pp; pp = &(*pp)->next)
       if (*pp == e) { *pp = e->next; break; }
    pthread_mutex_unlock(&g_binder_lock);
-   free(e->payload); free(e->package); free(e);
+   parcel_fds_clear(&e->descriptors);free(e->payload); free(e->package); free(e);
 }
 
 /* ---- BinderProxy ---- */
@@ -1162,6 +1250,9 @@ static dvm_ref binder_parcel_from(struct dvm *vm, const uint8_t *bytes, size_t s
    }
    p->size = p->cap = (uint32_t)size;
    p->pos = 0;
+   if(parcel_fds_copy(&p->descriptors,binder_incoming_fds.fds,binder_incoming_fds.count)<0){
+      dvm__throw(vm,"java/io/IOException","Unable to duplicate incoming Parcel descriptors");return 0;
+   }
    return parcel.l;
 }
 
@@ -1204,7 +1295,7 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
    if (!m) { if (wait) binder_pending_drop(wait); dvm__throw(vm, "java/lang/OutOfMemoryError", "Binder call"); return false; }
    bput(at, (uint32_t)handle); bput(at + 4, (uint32_t)code); bput(at + 8, (uint32_t)flags); bput(at + 12, dsize);
    if (dsize) memcpy(at + 16, d->buf, dsize);
-   int rc = binder_send_peer(peer, m, total);
+   int rc = binder_send_peer_fds(peer,m,total,d ? &d->descriptors : NULL);
    free(m);
    if (rc < 0) {
       if (wait) binder_pending_drop(wait);
@@ -1228,9 +1319,10 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
    if (wait->status >= 0 && reply && wait->payload_size) {
       struct rt_parcel *r = parcel_of(vm, reply);
       if (r) {
-         free(r->buf);
+         free(r->buf);parcel_fds_clear(&r->descriptors);
          r->buf = malloc(wait->payload_size);
          if (r->buf) { memcpy(r->buf, wait->payload, wait->payload_size); r->size = r->cap = (uint32_t)wait->payload_size; r->pos = 0; }
+         r->descriptors=wait->descriptors;wait->descriptors=(struct parcel_fds){0};
       }
    }
    *result = wait->status > 0;
@@ -1240,8 +1332,8 @@ bool dvm_binder_proxy_transact(struct dvm *vm, dvm_ref proxy, int32_t code, dvm_
    return true;
 }
 
-static void binder_reply(uint32_t peer, uint32_t seq, int32_t status, int32_t handle,
-                         const uint8_t *payload, size_t size)
+static void binder_reply_fds(uint32_t peer,uint32_t seq,int32_t status,int32_t handle,
+                              const uint8_t *payload,size_t size,const struct parcel_fds *fds)
 {
    uint8_t *at = NULL;
    size_t total = 0;
@@ -1249,9 +1341,11 @@ static void binder_reply(uint32_t peer, uint32_t seq, int32_t status, int32_t ha
    if (!m) return;
    bput(at, (uint32_t)status); bput(at + 4, (uint32_t)handle); bput(at + 8, (uint32_t)size);
    if (size) memcpy(at + 12, payload, size);
-   (void)binder_send_peer(peer, m, total);
+   (void)binder_send_peer_fds(peer,m,total,fds);
    free(m);
 }
+static void binder_reply(uint32_t peer,uint32_t seq,int32_t status,int32_t handle,const uint8_t *payload,size_t size)
+{ binder_reply_fds(peer,seq,status,handle,payload,size,NULL); }
 
 
 /* Provider operations are served by a handler the Android layer installs
@@ -1289,6 +1383,7 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
    }
    dvm_gil_relock(vm, depth);
    if (!done) { binder_pending_drop(wait); return -ETIMEDOUT; }
+   if(wait->descriptors.count){binder_pending_drop(wait);return -ENOTSUP;}
    *status = wait->status;
    *payload = wait->payload; *payload_size = wait->payload_size;
    wait->payload = NULL;
@@ -1577,7 +1672,7 @@ int dvm_service_pack(struct dvm *vm,uint32_t intent,int operation,void **bytes,s
    struct rt_parcel *p=parcel_of(vm,parcel.l);p->ipc=true;
    bool ok=parcel_put_i32(vm,p,0x3156534c) && parcel_put_i32(vm,p,operation);
    if(ok)ok=intent_write_body(vm,parcel.l,p,intent);
-   if(ok && !p->failed && !dvm_exception(vm)){
+   if(ok && !p->failed && !p->descriptors.count && !dvm_exception(vm)){
       *bytes=p->buf;*size=p->size;p->buf=NULL;p->size=p->cap=p->pos=0;
    } else ok=false;
    (void)parcel_recycle(vm,parcel.l,NULL,0,&ignored);
@@ -1586,7 +1681,7 @@ int dvm_service_pack(struct dvm *vm,uint32_t intent,int operation,void **bytes,s
 }
 
 /* The reverse: the Intent a body written by intent_write_body holds. */
-static bool intent_read_body(struct dvm *vm, dvm_ref parcel, struct rt_parcel *p, dvm_ref result)
+static bool intent_read_fields(struct dvm *vm,struct rt_parcel *p,dvm_ref result)
 {
    union dvm_value ignored={0};
    bool ok=true;
@@ -1624,11 +1719,19 @@ static bool intent_read_body(struct dvm *vm, dvm_ref parcel, struct rt_parcel *p
       } else ok=parcel_take_string(vm,p,&value.l);
       if(ok)ok=!p->failed && dvm_set_field(vm,result,f->name,f->type,value);
    }
-   dvm_ref extras=0;
-   if(ok)ok=parcel_read_bundle(vm,parcel,p,&extras);
-   if(ok && extras){dvm_pin(vm,extras);union dvm_value source={.l=extras};ok=map_putAll(vm,result,&source,1,&ignored);dvm_unpin(vm,extras);}
    return ok;
 }
+static bool intent_read_extras(struct dvm *vm,dvm_ref parcel,struct rt_parcel *p,dvm_ref result)
+{
+   dvm_ref extras=0;bool ok=parcel_read_bundle(vm,parcel,p,&extras);
+   if(ok && extras){
+      dvm_pin(vm,extras);union dvm_value source={.l=extras},ignored={0};
+      ok=map_putAll(vm,result,&source,1,&ignored);dvm_unpin(vm,extras);
+   }
+   return ok;
+}
+static bool intent_read_body(struct dvm *vm,dvm_ref parcel,struct rt_parcel *p,dvm_ref result)
+{ return intent_read_fields(vm,p,result) && intent_read_extras(vm,parcel,p,result); }
 
 int dvm_service_unpack(struct dvm *vm,const void *bytes,size_t size,int *operation,uint32_t *intent)
 {
@@ -1788,6 +1891,26 @@ static void binder_bind_connected(struct dvm *vm, struct binder_pending *e, cons
 
 /* One transaction: run the target Binder's transact() and, unless one-way,
  * answer.  Runs on the Binder thread (see binder_dispatch_transact). */
+static bool binder_connection_run(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                   int nargs,union dvm_value *out)
+{
+   (void)args;(void)nargs;
+   union dvm_value seq={0};
+   dvm_get_field(vm,self,"seq","I",&seq);
+   pthread_mutex_lock(&g_binder_lock);
+   struct binder_pending *e=g_binder_pending;
+   while(e && e->seq!=(uint32_t)seq.i)e=e->next;
+   pthread_mutex_unlock(&g_binder_lock);
+   if(e && e->connection && e->done){
+      binder_bind_connected(vm,e,e->payload,e->payload_size);
+      dvm_unpin(vm,e->connection);
+      binder_pending_drop(e);
+   }
+   RETV();
+}
+static const struct rt_method rt_binder_connection[]={M("run","()V",binder_connection_run),M_END};
+static const struct rt_field rt_binder_connection_fields[]={{"seq","I"},F_END};
+
 static void binder_serve_transact(struct dvm *vm, uint32_t sender, uint32_t seq, uint32_t caller_uid,
                                   const uint8_t *body, size_t blen)
 {
@@ -1824,9 +1947,10 @@ static void binder_serve_transact(struct dvm *vm, uint32_t sender, uint32_t seq,
                dvm_clear_exception(vm);
             }
          }
-         if (!(flags & BINDER_FLAG_ONEWAY)) binder_reply(sender, seq, status, 0, out, osize);
-         if (rep) dvm_unpin(vm, rep);
-         if (data) dvm_unpin(vm, data);
+         if (!(flags & BINDER_FLAG_ONEWAY)) binder_reply_fds(sender,seq,status,0,out,osize,rep ? &parcel_of(vm,rep)->descriptors : NULL);
+         union dvm_value ignored={0};
+         if (rep) {(void)parcel_recycle(vm,rep,NULL,0,&ignored);dvm_unpin(vm,rep);}
+         if (data) {(void)parcel_recycle(vm,data,NULL,0,&ignored);dvm_unpin(vm,data);}
          status = 1;
       }
       if (status < 0) binder_reply(sender, seq, status, 0, NULL, 0);
@@ -1837,7 +1961,7 @@ static void binder_serve_transact(struct dvm *vm, uint32_t sender, uint32_t seq,
  * a handler may block (BlockingServiceConnection refuses the main thread), and
  * the main looper must stay free to deliver what it waits for.  One thread
  * keeps the order of one-way calls to a Binder. */
-struct binder_job { uint32_t sender, seq, uid; int worker; size_t size; uint8_t body[]; };
+struct binder_job { uint32_t sender, seq, uid; int worker; bool provider; size_t size;struct parcel_fds descriptors; uint8_t body[]; };
 static const struct rt_field rt_binder_job_fields[] = { { "job", "J" }, F_END };
 
 /* A pool of Binder threads, as a process has (up to 15).  A synchronous
@@ -1862,6 +1986,20 @@ static dvm_ref binder_worker(struct dvm *vm, int index)
    return worker_handler(vm, name, &g_binder_workers[index]);
 }
 
+static void binder_serve_request(struct dvm *vm, uint32_t sender, uint32_t seq, uint32_t uid,
+                                  const uint8_t *body, size_t size, bool provider)
+{
+   if (!provider) { binder_serve_transact(vm, sender, seq, uid, body, size); return; }
+   uint32_t saved_uid = g_binder_caller_uid, saved_pid = g_binder_caller_pid;
+   g_binder_caller_uid = uid;
+   g_binder_caller_pid = sender;
+   int rc = g_binder_provider_serve ? g_binder_provider_serve(vm, sender, seq, body, size) : -ENOSYS;
+   if (rc < 0) binder_reply(sender, seq, rc, 0, NULL, 0);
+   if (dvm_exception(vm)) dvm_clear_exception(vm);
+   g_binder_caller_uid = saved_uid;
+   g_binder_caller_pid = saved_pid;
+}
+
 static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
@@ -1870,8 +2008,10 @@ static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *
    (void)dvm_get_field(vm, self, "job", "J", &ptr);
    struct binder_job *j = (struct binder_job *)(uintptr_t)ptr.j;
    if (j) {
+      struct parcel_fds saved=binder_incoming_fds;binder_incoming_fds=j->descriptors;
       if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] serving seq %u\n", j->seq);
-      binder_serve_transact(vm, j->sender, j->seq, j->uid, j->body, j->size);
+      binder_serve_request(vm, j->sender, j->seq, j->uid, j->body, j->size, j->provider);
+      binder_incoming_fds=saved;parcel_fds_clear(&j->descriptors);
       atomic_fetch_sub(&g_binder_load[j->worker], 1);
       free(j);
    }
@@ -1879,11 +2019,11 @@ static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *
 }
 static const struct rt_method rt_binder_job[] = { M("run", "()V", binder_job_run), M_END };
 
-static void binder_dispatch_transact(struct dvm *vm, uint32_t sender, uint32_t seq, uint32_t uid,
-                                     const uint8_t *body, size_t blen)
+static void binder_dispatch_request(struct dvm *vm, uint32_t sender, uint32_t seq, uint32_t uid,
+                                    const uint8_t *body, size_t blen, bool provider)
 {
    if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] transaction from %u seq %u (%zu bytes)\n", sender, seq, blen);
-   const bool oneway = blen >= 16 && (bget(body + 8) & BINDER_FLAG_ONEWAY);
+   const bool oneway = !provider && blen >= 16 && (bget(body + 8) & BINDER_FLAG_ONEWAY);
    const int worker = binder_pick_worker(oneway);
    dvm_ref handler = binder_worker(vm, worker);
    struct dvm_class *jc = dvm__class_by_desc(vm, "Llunaria/BinderJob;");
@@ -1891,10 +2031,12 @@ static void binder_dispatch_transact(struct dvm *vm, uint32_t sender, uint32_t s
    struct binder_job *j = job ? malloc(sizeof *j + blen) : NULL;
    if (!j) {
       if (getenv("LUNARIA_TRACE_BINDER")) fprintf(stderr, "[binder] no Binder thread (handler=%u job=%u): serving inline\n", (unsigned)handler, (unsigned)job);
-      binder_serve_transact(vm, sender, seq, uid, body, blen);
+      binder_serve_request(vm, sender, seq, uid, body, blen, provider);
       return;
    }
-   j->sender = sender; j->seq = seq; j->uid = uid; j->size = blen; j->worker = worker;
+   j->sender = sender; j->seq = seq; j->uid = uid; j->size = blen; j->worker = worker; j->provider = provider;
+   j->descriptors=(struct parcel_fds){0};
+   if(parcel_fds_copy(&j->descriptors,binder_incoming_fds.fds,binder_incoming_fds.count)<0){free(j);binder_reply(sender,seq,-EMFILE,0,NULL,0);return;}
    memcpy(j->body, body, blen);
    atomic_fetch_add(&g_binder_load[worker], 1);
    union dvm_value ptr = { .j = (int64_t)(uintptr_t)j }, post = { .l = job }, posted = { 0 };
@@ -1903,21 +2045,88 @@ static void binder_dispatch_transact(struct dvm *vm, uint32_t sender, uint32_t s
       if (dvm_exception(vm)) dvm_clear_exception(vm);
       (void)dvm_set_field(vm, job, "job", "J", (union dvm_value){ .j = 0 });
       atomic_fetch_sub(&g_binder_load[worker], 1);
-      free(j);
-      binder_serve_transact(vm, sender, seq, uid, body, blen);
+      parcel_fds_clear(&j->descriptors);free(j);
+      binder_serve_request(vm, sender, seq, uid, body, blen, provider);
    }
+}
+
+static void binder_receive_broadcast(struct dvm *,uint32_t,const char *,const uint8_t *,size_t);
+int dvm_binder_broadcast(struct dvm *vm,dvm_ref intent,dvm_ref permission)
+{
+   union dvm_value parcel={0},ignored={0};
+   if(!parcel_obtain(vm,0,NULL,0,&parcel))return -ENOMEM;
+   dvm_pin(vm,parcel.l);
+   struct rt_parcel *p=parcel_of(vm,parcel.l);p->ipc=true;
+   bool ok=parcel_put_string(vm,p,permission) && intent_write_body(vm,parcel.l,p,intent);
+   if(getenv("LUNARIA_TRACE_BROADCAST"))
+      fprintf(stderr,"[broadcast] pid=%ld encode ok=%d failed=%d bytes=%u exception=%u\n",
+              (long)getpid(),ok,p->failed,p->size,dvm_exception(vm));
+   int rc=-EINVAL;
+   if(ok && !p->failed && !dvm_exception(vm)){
+      const char *self=getenv("ANDROID_PACKAGE_NAME");
+      /* Even an in-process receiver sees the Binder snapshot, not an Intent
+       * the sender can mutate again after sendBroadcast returns. */
+      struct parcel_fds saved=binder_incoming_fds;binder_incoming_fds=p->descriptors;
+      binder_receive_broadcast(vm,(uint32_t)arm_exec_guest_uid(),self,p->buf,p->size);
+      binder_incoming_fds=saved;
+      if(!g_binder_send && !g_binder_fd_send){rc=0;goto done;}
+      uint8_t *at=NULL;size_t size=0;
+      uint8_t *message=binder_message("LBC1",0,p->size,&at,&size);
+      if(message){
+         memcpy(at,p->buf,p->size);
+         rc=binder_send_message(self ? self : "",message,size,&p->descriptors);
+         free(message);
+      }else rc=-ENOMEM;
+   }
+done:
+   (void)parcel_recycle(vm,parcel.l,NULL,0,&ignored);dvm_unpin(vm,parcel.l);
+   return rc;
+}
+static void binder_receive_broadcast(struct dvm *vm,uint32_t uid,const char *package,
+                                     const uint8_t *body,size_t size)
+{
+   dvm_ref parcel=binder_parcel_from(vm,body,size);
+   if(!parcel)return;
+   dvm_pin(vm,parcel);
+   struct rt_parcel *p=parcel_of(vm,parcel);p->ipc=true;
+   dvm_ref permission=0,intent=0;
+   bool ok=parcel_take_string(vm,p,&permission);
+   if(permission)dvm_pin(vm,permission);
+   if(ok)intent=dvm_new_object(vm,dvm_find_class(vm,"android/content/Intent"));
+   if(intent){
+      dvm_pin(vm,intent);union dvm_value ignored={0};
+      ok=map_init(vm,intent,NULL,0,&ignored) && intent_read_fields(vm,p,intent);
+      /* Resolve recipients using the plain Intent fields before invoking any
+       * application CREATOR. Unaddressed or denied broadcasts must not load
+       * another app's classes or execute its deserialization code. */
+      if(ok){
+         if(!dvm_runtime_broadcast_wanted(vm,intent,uid,package,permission)){dvm_unpin(vm,intent);goto done;}
+         ok=intent_read_extras(vm,parcel,p,intent);
+      }
+      if(getenv("LUNARIA_TRACE_BROADCAST"))
+         fprintf(stderr,"[broadcast] pid=%ld decode from=%s ok=%d failed=%d consumed=%u/%u exception=%u\n",
+                 (long)getpid(),package ? package : "",ok,p->failed,p->pos,p->size,dvm_exception(vm));
+      if(ok && !p->failed && p->pos==p->size && !dvm_exception(vm))
+         (void)dvm_runtime_deliver_broadcast(vm,intent,uid,package,permission);
+      dvm_unpin(vm,intent);
+   }
+done:
+   if(permission)dvm_unpin(vm,permission);
+   union dvm_value ignored={0};(void)parcel_recycle(vm,parcel,NULL,0,&ignored);
+   dvm_unpin(vm,parcel);
 }
 
 /* One received message.  `name` is the package/process it came from (a parent
  * hearing from a child) or NULL (a child hearing from its parent).  Returns 1
  * when the message was ours. */
-int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size_t size)
+static int binder_receive(struct dvm *vm, const char *name, const void *bytes, size_t size)
 {
    const uint8_t *m = bytes;
    if (!vm || !m || size < 24 || memcmp(m, "LB", 2)) return 0;
    const bool bind = !memcmp(m, "LBB1", 4), transact = !memcmp(m, "LBT1", 4), reply = !memcmp(m, "LBR1", 4);
    const bool provider_op = !memcmp(m, "LBQ1", 4);
-   if (!bind && !transact && !reply && !provider_op) return 0;
+   const bool broadcast = !memcmp(m, "LBC1", 4);
+   if (!bind && !transact && !reply && !provider_op && !broadcast) return 0;
    const uint32_t sender = bget(m + 4), seq = bget(m + 8), caller_uid = bget(m + 12), pkglen = bget(m + 16);
    if (pkglen > BINDER_PACKAGE_MAX || size < 24 + (size_t)pkglen) return 1;
    const uint32_t apklen = bget(m + 20 + pkglen);
@@ -1929,6 +2138,7 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
    memcpy(from, m + 20, pkglen);
    from[pkglen] = 0;
    binder_link_learn(sender, name ? name : pkglen ? from : NULL);
+   if(broadcast){binder_receive_broadcast(vm,caller_uid,from,body,blen);return 1;}
    if (pkglen && !reply) {
       /* The caller is an installed package of this device: make it known here,
        * with its APK where its own sourceDir says it is. */
@@ -1947,26 +2157,35 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
       for (e = g_binder_pending; e && e->seq != seq; e = e->next) {}
       pthread_mutex_unlock(&g_binder_lock);
       if (!e) return 1;
+      if(e->done)return 1;
       const int32_t status = (int32_t)bget(body), handle = (int32_t)bget(body + 4);
       const uint32_t n = bget(body + 8);
-      if (e->connection) {      /* a bind: complete on the main thread, here */
+      if (e->connection) {
          e->status = status; e->handle = handle; e->peer = sender;
          unsigned cookie = dvm_gil_enter_from_guest(vm);
-         struct dvm_tstate saved, main_turn = {0};
-         dvm__tstate_save(vm, &saved);
-         main_turn.cur_thread = vm->main_thread;
-         dvm__tstate_load(vm, &main_turn);
-         binder_bind_connected(vm, e, body + 12, n);
-         dvm_unpin(vm, e->connection);
-         dvm__tstate_load(vm, &saved);
+         /* A reply may be pumped by a background thread inside a synchronous
+          * provider call while it holds application monitors. ServiceDispatcher
+          * posts its callback; borrowing the main identity here can deadlock
+          * against those monitors and block the real main Looper too. */
+         e->payload=n ? malloc(n) : NULL;
+         e->payload_size=n;
+         dvm_ref job=(!n || e->payload) ? dvm_new_object(vm,
+            dvm__class_by_desc(vm,"Llunaria/BinderConnection;")) : 0;
+         if(n && e->payload)memcpy(e->payload,body+12,n);
+         e->done=true;
+         bool queued=job && dvm_set_field(vm,job,"seq","I",(union dvm_value){.i=(int32_t)e->seq})
+            && dvm__queue_runnable_at(vm,job,false,0);
+         if(!queued){dvm_unpin(vm,e->connection);binder_pending_drop(e);}
          dvm_gil_leave_to_guest(vm, cookie);
-         binder_pending_drop(e);
          return 1;
       }
       uint8_t *copy = n ? malloc(n) : NULL;
       if (n) { if (copy) memcpy(copy, body + 12, n); }
+      struct parcel_fds descriptors={0};
+      int fd_status=parcel_fds_copy(&descriptors,binder_incoming_fds.fds,binder_incoming_fds.count);
       pthread_mutex_lock(&g_binder_lock);
-      e->status = status; e->handle = handle; e->payload = copy; e->payload_size = copy ? n : 0; e->done = true;
+      e->status = fd_status<0 ? fd_status : (n && !copy) ? -ENOMEM : status;
+      e->handle = handle; e->payload = copy; e->payload_size = copy ? n : 0;e->descriptors=descriptors; e->done = true;
       pthread_mutex_unlock(&g_binder_lock);
       return 1;
    }
@@ -1979,8 +2198,7 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
    g_binder_caller_uid = caller_uid;
    g_binder_caller_pid = sender;
    if (provider_op) {
-      int rc = g_binder_provider_serve ? g_binder_provider_serve(vm, sender, seq, body, blen) : -ENOSYS;
-      if (rc < 0) binder_reply(sender, seq, rc, 0, NULL, 0);
+      binder_dispatch_request(vm, sender, seq, caller_uid, body, blen, true);
       g_binder_caller_uid = g_binder_caller_pid = 0;
       dvm__tstate_load(vm, &saved);
       dvm_gil_leave_to_guest(vm, cookie);
@@ -2014,7 +2232,7 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
       if (dvm_exception(vm)) { dvm_clear_exception(vm); if (status >= 0) status = -EIO; }
       binder_reply(sender, seq, status, handle, payload, psize);
    } else {   /* transact */
-      binder_dispatch_transact(vm, sender, seq, caller_uid, body, blen);
+      binder_dispatch_request(vm, sender, seq, caller_uid, body, blen, false);
    }
    g_binder_caller_uid = g_binder_caller_pid = 0;
    dvm__tstate_load(vm, &saved);
@@ -2024,6 +2242,50 @@ int dvm_binder_receive(struct dvm *vm, const char *name, const void *bytes, size
 
 /* Parent side: ask `package`'s process to bind the Service `intent` names, and
  * connect `connection` when it answers. */
+/* Transport readers can run while the main Looper is blocked. Package and
+ * VM state still require the GIL; lifecycle callbacks stay on the main queue. */
+int dvm_binder_receive_fds(struct dvm *vm,const char *name,const void *bytes,size_t size,const int *fds,size_t count)
+{
+   if (!vm || count>LUNA_PROCESS_FD_MAX || (count && !fds)) return 0;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   struct parcel_fds saved=binder_incoming_fds;binder_incoming_fds=(struct parcel_fds){(int *)fds,count};
+   int handled = binder_receive(vm, name, bytes, size);
+   binder_incoming_fds=saved;
+   dvm_gil_leave_to_guest(vm, cookie);
+   return handled;
+}
+int dvm_binder_receive(struct dvm *vm,const char *name,const void *bytes,size_t size)
+{
+   size_t count=0;const int *fds=luna_process_message_fds(&count);
+   return dvm_binder_receive_fds(vm,name,bytes,size,fds,count);
+}
+int dvm_binder_receive_io(struct dvm *vm, const void *bytes, size_t size)
+{
+   const uint8_t *m = bytes;
+   if (!vm || !m || size < 24) return 0;
+   bool request = !memcmp(m, "LBT1", 4) || !memcmp(m, "LBQ1", 4);
+   bool reply = !memcmp(m, "LBR1", 4);
+   /* The system delivers registered broadcasts through the process's Binder
+    * receiver endpoint. Enqueue onReceive on its Handler/Looper here; do not
+    * wait for a lifecycle turn on a possibly busy main thread. */
+   bool broadcast = !memcmp(m, "LBC1", 4);
+   if (!request && !reply && !broadcast) return 0;
+   unsigned cookie = dvm_gil_enter_from_guest(vm);
+   if (reply) {
+      uint32_t seq = bget(m + 8);
+      pthread_mutex_lock(&g_binder_lock);
+      struct binder_pending *e = g_binder_pending;
+      while (e && e->seq != seq) e = e->next;
+      bool connection = e && e->connection;
+      pthread_mutex_unlock(&g_binder_lock);
+      if (connection) { dvm_gil_leave_to_guest(vm, cookie); return 0; }
+   }
+   size_t count=0;const int *fds=luna_process_message_fds(&count);
+   int handled = dvm_binder_receive_fds(vm,NULL,bytes,size,fds,count);
+   dvm_gil_leave_to_guest(vm, cookie);
+   return handled;
+}
+
 int dvm_binder_remote_bind(struct dvm *vm, const char *package, dvm_ref intent, dvm_ref connection)
 {
    void *packed = NULL; size_t psize = 0;

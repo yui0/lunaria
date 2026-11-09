@@ -912,8 +912,7 @@ static bool x_drawable_tint(struct dvm *vm, dvm_ref self, const union dvm_value 
       (void)dvm_set_field(vm, self, "tintMode", "Landroid/graphics/PorterDuff$Mode;", ARG(0));
    }
    if (!x_drawable_apply_tint(vm, self)) return false;
-   ui_invalidate();
-   RETV();
+   return am_vcall(vm,self,"invalidateSelf","()V",NULL,0,out);
 }
 
 static bool x_drawable_getOutline(struct dvm *vm, dvm_ref self, const union dvm_value *args,

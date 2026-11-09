@@ -22,7 +22,7 @@ Chrome/Chromium browser or the included [luna-browser](luna-browser/) through th
 
 **Already demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Alchemia Story,
 Kikyu! Aeronaut (a 2013 ARM32 APK), Black Clover: Asta Fight, and other Unity and Unreal Engine titles.
-Java-based apps are also progressing: TVer displays its welcome screen, and APKPure renders its store and download manager.
+Java apps run from their original dex bytecode too: TVer browses its home feed and plays full episodes, and APKPure renders its store and download manager.
 See [Compatibility](#compatibility) for the tested stages and remaining limits.
 
 Lunaria follows the app's normal Android startup sequence: its `Application` and content providers initialize
@@ -59,14 +59,14 @@ Genshin Impact 7.1.0 (Unity IL2CPP, arm64-v8a) · Ni no Kuni: Cross Worlds (Unre
 
 ## What's working now
 
-As of **October 20, 2026**, the tested paths include open-world gameplay in Genshin Impact, field gameplay in Cross Worlds, and 2D gameplay in Black Clover. The Android UI implementation also runs Java application screens from their original dex bytecode and resources.
+As of **November 8, 2026**, the tested paths include open-world gameplay in Genshin Impact, field gameplay in Cross Worlds, 2D gameplay in Black Clover, and TVer playing full episodes. The Android UI implementation also runs Java application screens from their original dex bytecode and resources.
 
 | Try | What to expect |
 |---|---|
 | **Play a supported game** | Load a local package, select a keyboard mapping, and use mouse or touch input. Results depend on the title and build. |
 | **Browse and launch packages** | Use the graphical launcher to open a local APK/XAPK/APKS/AAB or search APKPure. |
 | **Keep accounts separate** | Share installed game resources while keeping each profile's login and app data separate. |
-| **Explore Android app support** | TVer welcome UI and APKPure store/download screens render; TVer playback and APKPure installation completion remain unverified. |
+| **Watch TVer** | A Java app from its unmodified XAPK: welcome screen, home feed with playing video tiles, episode details, and main-feature playback. Startup is still slow and polish continues. |
 
 [Install a release](#install) or [build from source](#quick-start). Check the [compatibility table](#compatibility) before choosing a title.
 
@@ -132,17 +132,25 @@ To build from source instead, see [Quick start](#quick-start).
 
 These captures show Lunaria's game rendering and Android application UI. Captions distinguish gameplay from welcome and loading screens.
 
-### Beyond native game rendering
+### Java apps: TVer plays video
 
 Lunaria executes application dex bytecode and implements Android views, layouts, text, resources, and lifecycle callbacks on the host. This path is still under development; displaying an app's UI does not establish that all of its services work.
 
+**TVer 6.40.0 now reaches full-episode playback.** From its unmodified XAPK, the app runs from the welcome screen through the home feed — video tiles included — into episode details, the ad break, and the main feature. Playback continues with steady frame updates; startup is still heavy and a few screens keep small layout gaps.
+
 <p align="center">
-  <img src="shots/trickcal-server-loading.jpg" width="66%" alt="Trickcal Chibi+Go 1.6.1 displaying its illustrated town and server configuration loading progress">
+  <img src="shots/tver-playback.png" width="30%" alt="TVer playing an episode of The Apothecary Diaries: the video frame above the episode title, broadcast dates, and Watch Later / Favorite buttons in Japanese">
+</p>
+
+<p align="center"><sub>TVer 6.40.0 · an episode page with the feature running · unmodified XAPK</sub></p>
+
+<p align="center">
+  <img src="shots/trickcal-server-loading.jpg" width="40%" alt="Trickcal Chibi+Go 1.6.1 displaying its illustrated town and server configuration loading progress">
   &nbsp;
   <img src="shots/tver-welcome.png" width="20%" alt="TVer portrait welcome screen with program artwork and the consent button">
 </p>
 
-<p align="center"><sub>Trickcal: server configuration loading, gameplay not yet verified · TVer: welcome screen, video playback not yet verified</sub></p>
+<p align="center"><sub>Trickcal: server configuration loading, gameplay not yet verified · TVer welcome screen</sub></p>
 
 APKPure has also displayed its store, recommendations, app details, and download manager. Download progress has been observed; a completed download, installation, and subsequent app launch have not yet been verified. See [Compatibility](#compatibility) for the current limits.
 
@@ -306,6 +314,16 @@ Even this 2013 `armeabi` APK runs through Lunaria’s ARM32 path. Its original `
   &nbsp;
   <img src="shots/cross-worlds-lighthouse.png" width="32%" alt="Cross Worlds field play at sunset with the HUD, quest list, and skill ring">
 </p>
+
+### Newest check: Disney Magic Kingdoms
+
+This Gameloft title gets past its Disney-logo hang and keeps drawing its content-verification screen from the unmodified XAPK. It stops there while it asks its servers for an update, so gameplay has not been reached yet.
+
+<p align="center">
+  <img src="shots/disney-magic-kingdoms-loading.png" width="66%" alt="Disney Magic Kingdoms: Minnie and Mickey on an ice stage in a Disney On Ice event, the Japanese content-verify message with a green progress bar below">
+</p>
+
+<p align="center"><sub>Disney Magic Kingdoms 12.1.1c · Unity · ARMv7 · content check in progress</sub></p>
 
 ### Open-source and smaller titles
 
@@ -481,11 +499,11 @@ By default, Lunaria looks for `lunaria.conf` in its startup working directory an
 
 Profile names are their data directory names under `profiles/<package>/`. The launcher, right-click menu, and `--list-profiles` use those same names. The `default` profile uses `data/<package>/`.
 
-Set `LUNARIA_PROFILE_PROMPT=1` to select a profile at every launch. `LUNARIA_SHARED_ASSETS` accepts colon-separated shared resource names; `LUNARIA_PROFILE_SEED_FILES` lists resource files to copy once into a new profile. The sample configuration includes the Genshin Impact resource layout. Each new profile starts with its own login state.
+Set `LUNARIA_PROFILE_PROMPT=1` to select a profile at every launch. External files, external cache, shared storage and OBB resources are common to all profiles of the same app. Internal files, preferences and databases remain separate. Login data stored externally is also shared. No game-specific resource list is needed.
 
-**Optional Google services.** Open **Google services** in the right-click menu to install a local Google Play services APK/XAPK. The same installer also accepts Play Store and Google Services Framework packages when an app needs them. Original archives, including splits, are retained under the current data folder; running applications need a restart after installation.
+**Optional Google services.** Open **Google services** in the right-click menu to install a local Google Play services APK/XAPK. The same installer also accepts Play Store and Google Services Framework packages when an app needs them. The menu reports Play services, Play Store, and Framework separately; a saved account alone does not mean all three packages are installed. If an app reports unsupported Play services, check for a missing Play Store package as well. Original archives, including splits, are retained under the current data folder; running applications need a restart after installation.
 
-Use **Sign in to a new environment…** once to create a separate GMS environment. Its Google application data and AccountManager store remain under `system/gms/gms-N/` in the current data folder. Choose a saved environment in another app's right-click menu and restart that app to reuse it. Selecting an environment saves the app's choice without opening authentication. The menu shows the number of saved Google accounts and suppresses duplicate sign-in windows for the same environment.
+Use **Sign in to a new environment…** once to create a separate GMS environment and select it for the current app. Restart the app after signing in. Its Google application data and AccountManager store remain under `system/gms/gms-N/` in the current data folder. Choose a saved environment in another app's right-click menu and restart that app to reuse it. Selecting an environment saves the app's choice without opening authentication. The menu shows the number of saved Google accounts and suppresses duplicate sign-in windows for the same environment.
 
 The `default` GMS environment retains the existing Google application data and `system/accounts.tsv`. Existing launches with `LUNARIA_LAUNCH_ACTIVITY=com.android.settings.accounts.AddAccountSettings` continue to use it. A named environment can also be selected with `LUNARIA_GMS_PROFILE=gms-2`; it is independent of the game's `--profile` setting.
 
@@ -521,7 +539,8 @@ These results describe **what was actually observed**, not a promise that every 
 | **Black Clover: Asta Fight** | Unity IL2CPP · AArch64 XAPK | Base + split load; title menu, stage selection and gameplay render headlessly |
 | **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | Boots through dex / SDK setup into the game's own dialog; without a route to the patch server the client asks to reconnect |
 | **Trickcal Chibi+Go 1.6.1** | Unity 6000.3.13f1 IL2CPP · ARMv7 XAPK | Terms Activity and server-configuration loading screen observed. Startup remains under investigation; gameplay has not been verified. |
-| **TVer** | Java / dex Android UI | Welcome screen with program artwork and consent button renders. End-to-end video playback has not been verified. |
+| **Disney Magic Kingdoms 12.1.1c** | Unity · ARMv7 XAPK | Draws its content-verification loading screen from the unmodified XAPK; it pauses while asking its servers for an update, and gameplay has not been reached. |
+| **TVer 6.40.0** | Java / dex Android UI | Welcome screen, home feed with playing video tiles, episode details, and main-feature playback run from the unmodified XAPK. Startup remains heavy and some screens keep layout gaps; frame pacing is not yet perfectly smooth. |
 | **APKPure 3.20.8002** | Java / dex Android UI | Store, recommendations, app details, and download manager render; HTTP download progress observed. Completed downloads, installation, and launching the installed app have not been verified. |
 | **Another Eden** | Native · ARMv7 XAPK | Existing-account load screen observed. Loading the game aborts; gameplay has not been reached. |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono starts, but rendering is not yet working. |

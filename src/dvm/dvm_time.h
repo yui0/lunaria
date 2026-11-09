@@ -88,6 +88,8 @@ static void time_break(int64_t ms, const char *zone, struct tm *tm)
    if (!zone || !*zone) zone = arm_exec_device_timezone();
    if (!strcmp(zone, "UTC") || !strcmp(zone, "GMT")) {
       gmtime_r(&secs, tm);
+      /* gmtime names its zone "GMT" whichever of the two was asked for. */
+      if (zone[0] == 'U') tm->tm_zone = "UTC";
       return;
    }
    /* TZ and tzset() are process-global POSIX state.  This emulates a

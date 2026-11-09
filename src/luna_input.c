@@ -2,7 +2,7 @@
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
-#include "luna_input.h"
+#include "luna_boot.h"
 #include <string.h>
 #include <stdio.h>
 #include <math.h>

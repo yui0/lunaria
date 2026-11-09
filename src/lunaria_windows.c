@@ -835,6 +835,28 @@ uint64_t luna_os_monotonic_ns(void)
               (uint64_t)freq.QuadPart;
 }
 
+bool luna_os_boot_id(char *out, size_t cap)
+{
+   if (!out || cap < 37) return false;
+   typedef LONG (WINAPI *query_system_info)(ULONG, void *, ULONG, ULONG *);
+   HMODULE module = GetModuleHandleW(L"ntdll.dll");
+   FARPROC symbol = module ? GetProcAddress(module, "NtQuerySystemInformation") : NULL;
+   if (!symbol) return false;
+   query_system_info query;
+   _Static_assert(sizeof query == sizeof symbol, "Windows procedure pointer");
+   memcpy(&query, &symbol, sizeof query);
+   /* SystemBootEnvironmentInformation, available since Windows Vista. */
+   struct { GUID id; ULONG firmware; ULONGLONG flags; } boot = {0};
+   if (query(90, &boot, sizeof boot, NULL) < 0) return false;
+   int n = snprintf(out, cap, "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+      (unsigned long)boot.id.Data1, (unsigned)boot.id.Data2, (unsigned)boot.id.Data3,
+      (unsigned)boot.id.Data4[0], (unsigned)boot.id.Data4[1],
+      (unsigned)boot.id.Data4[2], (unsigned)boot.id.Data4[3],
+      (unsigned)boot.id.Data4[4], (unsigned)boot.id.Data4[5],
+      (unsigned)boot.id.Data4[6], (unsigned)boot.id.Data4[7]);
+   return n == 36;
+}
+
 uint64_t luna_os_boottime_ns(void)
 {
    ULONGLONG ticks;
@@ -1044,6 +1066,8 @@ static void win_audio_reap(void)
       h->dwFlags = 0;
    }
 }
+
+void luna_os_audio_set_pull(void (*pull)(void)) { (void)pull; }
 
 int luna_os_audio_open(unsigned rate, unsigned channels)
 {

@@ -1573,9 +1573,8 @@ static bool context_get_package_resource_path(struct dvm *vm, dvm_ref self,
    RETL(dvm_new_string(vm, lunaria_android_apk_path()));
 }
 
-/* The process Application.  ActivityThread builds exactly one per process and
- * remembers it the moment its base Context is attached; cw_attachBaseContext()
- * below records it at that same point. */
+/* The initial Application published by ActivityThread in dvm_bind_application.
+ * Applications created by libraries do not replace the process Application. */
 static dvm_ref g_process_application;
 
 /* Context.getApplicationContext() — the process Application, never the
@@ -2110,9 +2109,15 @@ static bool text_set_transformation(struct dvm *vm, dvm_ref self,
                                     union dvm_value *out)
 {
    union dvm_value v = { .l = nargs ? ARG(0).l : 0 };
+   {
+      union dvm_value cur = { 0 };
+      (void)dvm_get_field(vm, self, "transformationMethod",
+                          "Landroid/text/method/TransformationMethod;", &cur);
+      if (cur.l == v.l) RETV();
+   }
    (void)dvm_set_field(vm, self, "transformationMethod",
                        "Landroid/text/method/TransformationMethod;", v);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    ui_invalidate();
    RETV();
 }
@@ -2225,14 +2230,41 @@ static bool text_get_text(struct dvm *vm, dvm_ref self,
    RETL(text.l ? text.l : dvm_new_string(vm, ""));
 }
 
+static bool text_size_unchanged(struct dvm *vm, dvm_ref view);
 static bool text_set_text(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
    union dvm_value text = { .l = nargs ? ARG(0).l : 0 };
+   /* Binding a list item sets the text it already shows, again and again.  The
+    * same string changes nothing: no measure, no repaint. */
+   union dvm_value old = { 0 };
+   (void)dvm_get_field(vm, self, "text", "Ljava/lang/CharSequence;", &old);
+   if (old.l && old.l == text.l) RETV();
+   if (old.l && text.l) {
+      struct dvm_object *a = dvm__obj(vm, old.l), *b = dvm__obj(vm, text.l);
+      if (a && b && a->kind == DVM_OBJ_STRING && b->kind == DVM_OBJ_STRING) {
+         const char *x = dvm_string_utf8(vm, old.l), *y = dvm_string_utf8(vm, text.l);
+         if (x && y && !strcmp(x, y)) RETV();
+      }
+   }
    (void)dvm_set_field(vm, self, "text", "Ljava/lang/CharSequence;", text);
-   ui_layout_changed();
-   ui_invalidate();
+   /* TextView.checkForRelayout(): a label whose box cannot change size with its
+    * text (fixed or match_parent width, and a fixed height or one line) is only
+    * repainted. Asking the whole window for a layout pass for every tick of a
+    * clock or counter is what made a playing video's screen so heavy. */
+   bool box_fixed = false;
+   if (rt_get_int(vm, self, "measuredDimensionSet")) {
+      union dvm_value lpv = { 0 };
+      (void)dvm_get_field(vm, self, "layoutParams", "Landroid/view/ViewGroup$LayoutParams;", &lpv);
+      if (lpv.l) {
+         const int32_t w = rt_get_int(vm, lpv.l, "width"), h = rt_get_int(vm, lpv.l, "height");
+         const bool one_line = rt_get_int(vm, self, "singleLine") || rt_get_int(vm, self, "maxLines") == 1;
+         box_fixed = w != -2 && (h != -2 || one_line);
+      }
+   }
+   if (!box_fixed && !text_size_unchanged(vm, self)) ui_view_layout_changed(vm, self);
+   ui_invalidate_view(vm, self, NULL, 0);
    RETV();
 }
 
@@ -2326,9 +2358,14 @@ static bool image_set_drawable(struct dvm *vm, dvm_ref self,
    (void)dvm_set_field(vm,self,"imageResource","I",(union dvm_value){.i=0});
    (void)dvm_set_field(vm, self, "drawable",
                        "Landroid/graphics/drawable/Drawable;", drawable);
-   if (resource.i || dimensions[0][0] != dimensions[1][0] || dimensions[0][1] != dimensions[1][1])
-      (void)view_request_layout(vm,self,NULL,0,out);
-   ui_invalidate();
+   if (resource.i || dimensions[0][0] != dimensions[1][0] || dimensions[0][1] != dimensions[1][1]) {
+      if (!view_request_layout(vm,self,NULL,0,out)) return false;
+   }
+   ui_invalidate_view(vm,self,NULL,0);
+   /* Built-in ImageViews publish the Drawable in the host document, whereas
+    * app onDraw overrides publish retained pixels. Re-emit either form without
+    * evicting unrelated View pictures. */
+   if (!g_ui_building && rt_get_int(vm,self,"attachedToWindow")) g_ui_pixels_only=false;
    if (dvm__env("LUNARIA_TRACE_DRAWABLE"))
       fprintf(stderr,"[image] view=%x drawable=%x intrinsic=%dx%d\n",self,drawable.l,
          dimensions[1][0],dimensions[1][1]);
@@ -2374,7 +2411,7 @@ static bool linear_set_orientation(struct dvm *vm, dvm_ref self,
 {
    union dvm_value value = { .i = nargs ? ARG(0).i : 0 };
    (void)dvm_set_field(vm, self, "orientation", "I", value);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    ui_invalidate();
    RETV();
 }
@@ -2399,7 +2436,7 @@ static bool linear_set_gravity(struct dvm *vm, dvm_ref self,
    if (!(g & 0x70)) g |= 0x30;
    union dvm_value value = { .i = g };
    (void)dvm_set_field(vm, self, "gravity", "I", value);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    ui_invalidate();
    RETV();
 }
@@ -2536,13 +2573,40 @@ static const struct rt_field rt_text_view_fields[] = {
       RETV();                                                                \
    }
 
-TEXT_SET_INT(text_set_text_color, "textColor")
-TEXT_SET_INT(text_set_hint_text_color, "hintTextColor")
-TEXT_SET_INT(text_set_bg_color,   "backgroundColor")
+/* Color changes repaint the owning TextView without changing its Layout. */
+static bool text_set_text_color(struct dvm *vm,dvm_ref self,
+                                const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   dvm_ref colors=color_state_list_new(vm,ARG(0).i);
+   if(!colors) return false;
+   (void)dvm_set_field(vm,self,"textColors","Landroid/content/res/ColorStateList;",(union dvm_value){.l=colors});
+   int32_t previous=rt_get_int(vm,self,"textColor");
+   (void)dvm_set_field(vm,self,"textColor","I",ARG(0));
+   if(previous!=ARG(0).i) ui_invalidate_view(vm,self,NULL,0);
+   RETV();
+}
+static bool text_set_hint_text_color(struct dvm *vm,dvm_ref self,
+                                     const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   int32_t previous=rt_get_int(vm,self,"hintTextColor");
+   (void)dvm_set_field(vm,self,"hintTextColor","I",ARG(0));
+   if(previous!=ARG(0).i) ui_invalidate_view(vm,self,NULL,0);
+   RETV();
+}
 TEXT_SET_INT(text_set_input_type, "inputType")
 TEXT_SET_INT(text_set_ime_options, "imeOptions")
-TEXT_SET_INT(text_set_max_lines,  "maxLines")
 #undef TEXT_SET_INT
+
+static bool text_set_max_lines(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   rt_set_int(vm,self,"maxLines",ARG(0).i);
+   union dvm_value ignored={0};
+   if(!am_vcall(vm,self,"requestLayout","()V",NULL,0,&ignored)) return false;
+   return am_vcall(vm,self,"invalidate","()V",NULL,0,out);
+}
 
 static bool text_set_hint(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
@@ -2551,7 +2615,7 @@ static bool text_set_hint(struct dvm *vm, dvm_ref self,
    (void)out;
    union dvm_value v = { .l = nargs ? ARG(0).l : 0 };
    (void)dvm_set_field(vm, self, "hint", "Ljava/lang/CharSequence;", v);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    ui_invalidate();
    RETV();
 }
@@ -2637,7 +2701,7 @@ static bool text_set_size(struct dvm *vm, dvm_ref self,
    default: RETV();
    }
    text_store_size(vm, self, size);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    ui_invalidate();
    RETV();
 }
@@ -2762,13 +2826,19 @@ static bool text_set_typeface(struct dvm *vm, dvm_ref self,
    (void)out;
    int32_t style = ARG(0).l ? rt_get_int(vm, ARG(0).l, "style") : 0;
    if (nargs >= 2) style = ARG(1).i;
+   /* Rebinding a list row sets the face it already has: nothing to measure. */
+   {
+      union dvm_value cur = { 0 };
+      (void)dvm_get_field(vm, self, "typeface", "Landroid/graphics/Typeface;", &cur);
+      if (cur.l == ARG(0).l && rt_get_int(vm, self, "textStyle") == (style & 3)) RETV();
+   }
    (void)dvm_set_field(vm, self, "typeface", "Landroid/graphics/Typeface;", ARG(0));
    union dvm_value paint = {0};
    (void)dvm_get_field(vm, self, "textPaint", "Landroid/text/TextPaint;", &paint);
    if (paint.l)
       (void)dvm_set_field(vm, paint.l, "typeface", "Landroid/graphics/Typeface;", ARG(0));
    rt_set_int(vm, self, "textStyle", style & 3);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    RETV();
 }
 
@@ -2782,7 +2852,7 @@ static bool text_set_gravity(struct dvm *vm, dvm_ref self,
    if (!(g & 0x07) && !(g & 0x800007)) g |= 0x800003;
    if (!(g & 0x70)) g |= 0x30;
    rt_set_int(vm, self, "gravity", g);
-   ui_layout_changed();
+   ui_view_layout_changed(vm, self);
    ui_invalidate();
    RETV();
 }
@@ -3065,7 +3135,7 @@ static const struct rt_method rt_text_view[] = {
    M("setTextColor", "(Landroid/content/res/ColorStateList;)V",
      text_set_color_state),
    M("setTextColor", "(I)V", text_set_text_color),
-   M("setBackgroundColor", "(I)V", text_set_bg_color),
+   M("setBackgroundColor", "(I)V", view_set_background_color),
    M("setInputType", "(I)V", text_set_input_type),
    M("setRawInputType", "(I)V", text_set_input_type),
    M("getInputType", "()I", text_get_input_type),
@@ -3566,7 +3636,47 @@ static bool linear_check_params(struct dvm *vm, dvm_ref self,
    RETI(0);
 }
 
-static const struct rt_field rt_linear_fields[] = { F_END };
+static bool linear_weight_sum(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                              int nargs,union dvm_value *out)
+{
+   if(nargs) {
+      union dvm_value value=ARG(0);
+      /* Math.max(0, value) preserves NaN and turns negative zero into +0. */
+      if(value.f<=0.f) value.f=0.f;
+      (void)dvm_set_field(vm,self,"weightSum","F",value);
+      RETV();
+   }
+   union dvm_value value={0};
+   (void)dvm_get_field(vm,self,"weightSum","F",&value);
+   RETF(value.f);
+}
+static bool linear_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                        int nargs,union dvm_value *out)
+{
+   if(!view_init_context(vm,self,args,nargs,out)) return false;
+   union dvm_value value={.f=-1.f};
+   if(nargs && ARG(0).l) {
+      dvm_ref ids=dvm_new_array(vm,'I',"I",1);
+      if(!ids) return false;
+      ((int32_t *)dvm_array_data(vm,ids))[0]=0x01010128; /* android:weightSum */
+      dvm_pin(vm,ids);
+      union dvm_value attributes[]={{.l=nargs>1 ? ARG(1).l : 0},{.l=ids},
+         {.i=nargs>2 ? ARG(2).i : 0},{.i=nargs>3 ? ARG(3).i : 0}},array={0};
+      bool good=am_vcall(vm,ARG(0).l,"obtainStyledAttributes",
+         "(Landroid/util/AttributeSet;[III)Landroid/content/res/TypedArray;",attributes,4,&array);
+      dvm_unpin(vm,ids);
+      if(!good) return false;
+      dvm_pin(vm,array.l);
+      union dvm_value get[]={{.i=0},{.f=-1.f}},ignored={0};
+      good=am_vcall(vm,array.l,"getFloat","(IF)F",get,2,&value);
+      if(good) good=am_vcall(vm,array.l,"recycle","()V",NULL,0,&ignored);
+      dvm_unpin(vm,array.l);
+      if(!good) return false;
+   }
+   (void)dvm_set_field(vm,self,"weightSum","F",value);
+   RETV();
+}
+static const struct rt_field rt_linear_fields[] = { {"weightSum","F"}, F_END };
 static const struct rt_method rt_linear_layout[] = {
    M("onLayout", "(ZIIII)V", widget_on_layout),
    M("onMeasure", "(II)V", widget_on_measure),
@@ -3574,11 +3684,14 @@ static const struct rt_method rt_linear_layout[] = {
    M("generateLayoutParams", "(Landroid/util/AttributeSet;)Landroid/view/ViewGroup$LayoutParams;", linear_generate_params),
    M("generateLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)Landroid/view/ViewGroup$LayoutParams;", linear_generate_params),
    M("checkLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)Z", linear_check_params),
-   M("<init>", "(Landroid/content/Context;)V", view_init_context),
+   M("<init>", "(Landroid/content/Context;)V", linear_init),
    M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;)V",
-     view_init_context),
+     linear_init),
    M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;I)V",
-     view_init_context),
+     linear_init),
+   M("<init>", "(Landroid/content/Context;Landroid/util/AttributeSet;II)V", linear_init),
+   M("setWeightSum", "(F)V", linear_weight_sum),
+   M("getWeightSum", "()F", linear_weight_sum),
    M("setGravity", "(I)V", linear_set_gravity),
    M("getGravity", "()I", linear_get_gravity),
    M("setOrientation", "(I)V", linear_set_orientation),
@@ -4713,6 +4826,7 @@ static bool res_getConfiguration(struct dvm *vm, dvm_ref self,
    } else {
       configuration_ensure_locale(vm, configuration);
    }
+   if (configuration) configuration_update_display(vm, configuration);
    RETL(configuration);
 }
 
@@ -6162,16 +6276,6 @@ static bool cw_attachBaseContext(struct dvm *vm, dvm_ref self,
    (void)out;
    union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
    (void)dvm_set_field(vm, self, "mBase", "Landroid/content/Context;", v);
-   /* Application.attachBaseContext() is where ActivityThread publishes the
-    * process Application, so every later getApplicationContext() can name it. */
-   struct dvm_object *o = dvm__obj(vm, self);
-   struct dvm_class *app = dvm__class_by_desc(vm, "Landroid/app/Application;");
-   if (o && app && dvm__class_assignable(vm, o->cls, app) &&
-       g_process_application != self) {
-      if (g_process_application) dvm_unpin(vm, g_process_application);
-      g_process_application = self;
-      dvm_pin(vm, self);
-   }
    RETV();
 }
 
@@ -6267,6 +6371,11 @@ static bool cp_attach_info(struct dvm *vm, dvm_ref self,
    (void)dvm_set_field(vm,self,"context","Landroid/content/Context;",context);
    (void)dvm_set_field(vm,self,"info","Landroid/content/pm/ProviderInfo;",
                        (union dvm_value){.l=nargs>1 ? ARG(1).l : 0});
+   /* AOSP ContentProvider.attachInfo owns this virtual callback, including
+    * an override that calls super.attachInfo from its own attachInfo. */
+   struct dvm_method *method=dvm_find_method(vm,dvm_object_class(vm,self),"onCreate","()Z");
+   union dvm_value ignored={0};
+   if(method && !dvm_call(vm,method,self,NULL,0,&ignored))return false;
    bool registered=false;
    for(dvm_ref p=vm->content_providers;p;){
       if(p==self){registered=true;break;}
@@ -6279,11 +6388,7 @@ static bool cp_attach_info(struct dvm *vm, dvm_ref self,
                           (union dvm_value){.l=vm->content_providers});
       dvm_pin(vm,self);vm->content_providers=self;
    }
-   /* AOSP ContentProvider.attachInfo owns this virtual callback, including
-    * an override that calls super.attachInfo from its own attachInfo. */
-   struct dvm_method *method=dvm_find_method(vm,dvm_object_class(vm,self),"onCreate","()Z");
-   union dvm_value ignored={0};
-   if(method && !dvm_call(vm,method,self,NULL,0,&ignored))return false;
+
    RETV();
 }
 
@@ -6750,9 +6855,6 @@ static bool svc_process_is_current(struct dvm *vm, dvm_ref resolve)
    const char *current = getenv("ANDROID_PROCESS_NAME");
    if (!current || !*current) current = getenv("ANDROID_PACKAGE_NAME");
    if (!wanted || !*wanted || !current || !strcmp(wanted, current)) return true;
-   /* A service host stands for its whole package: Android would run this in a
-    * process of its own, the host answers for all of the package's processes. */
-   if (getenv("ANDROID_SERVICE_HOST")) return true;
    /* A separate VM/address space is required. Never run its native library
     * against the caller's globals or acknowledge a fake start. */
    (void)dvm_get_field(vm, info.l, "name", "Ljava/lang/String;", &name);
@@ -6822,6 +6924,9 @@ static struct svc_rec *svc_find(struct dvm_class *cls)
    return NULL;
 }
 
+static void activity_process_publish(struct dvm *vm);
+static void activity_process_transition(struct dvm *vm,dvm_ref activity,const char *step);
+
 static struct svc_rec *svc_create(struct dvm *vm, struct dvm_class *cls)
 {
    struct svc_rec *r = svc_find(cls);
@@ -6836,7 +6941,10 @@ static struct svc_rec *svc_create(struct dvm *vm, struct dvm_class *cls)
    r->obj = obj;
    r->next = g_services;
    g_services = r;
+   activity_process_publish(vm);
    svc_call_void(vm, obj, "<init>", "()V", NULL, 0, NULL);
+   (void)dvm_set_field(vm, obj, "mApplication", "Landroid/app/Application;",
+                       (union dvm_value){ .l = g_process_application });
    /* ActivityThread.handleCreateService attaches a service Context before
     * onCreate. A bare ContextWrapper cannot resolve services or resources:
     * background download tasks then fail before reading their first byte. */
@@ -6866,6 +6974,7 @@ static void svc_bring_down_if_needed(struct dvm *vm, struct svc_rec *r)
       if (r->binds[i].intent) dvm_unpin(vm, r->binds[i].intent);
    }
    free(r);
+   activity_process_publish(vm);
 }
 
 /* The record of `intent`, running onBind() the first time that Intent is seen.
@@ -7261,10 +7370,25 @@ static bool svc_stopSelf(struct dvm *vm, dvm_ref self,
  * lifecycle callbacks are the app's; what has to exist here is the Context
  * behaviour (which ContextWrapper supplies) plus the calls a service makes
  * about itself. */
+static bool svc_get_application(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+   (void)args; (void)nargs;
+   union dvm_value application = { 0 };
+   (void)dvm_get_field(vm, self, "mApplication", "Landroid/app/Application;", &application);
+   RETL(application.l);
+}
+
+static const struct rt_field rt_service_fields[] = {
+   { "mApplication", "Landroid/app/Application;" }, F_END
+};
+
 static const struct rt_method rt_service[] = {
    /* Service's own constructor and onCreate() are empty on a device too — a
       subclass that calls super.onCreate() is not asking for anything. */
    M("<init>", "()V", empty_void),
+   M("getApplication", "()Landroid/app/Application;", svc_get_application),
    M("onCreate", "()V", empty_void),
    M("onDestroy", "()V", nop_void),
    M("onStartCommand", "(Landroid/content/Intent;II)I", ret_true),
@@ -7433,6 +7557,7 @@ static void dispatch_lifecycle(struct dvm *vm, dvm_ref activity,
 void dvm__activity_dispatch(struct dvm *vm, dvm_ref activity, const char *step,
                             bool post, dvm_ref bundle)
 {
+   if (!post) activity_process_transition(vm,activity,step);
    char name[48];
    snprintf(name, sizeof name, "onActivity%s%s", post ? "Post" : "Pre", step);
    const bool has_bundle = !strcmp(step, "Created");
@@ -7514,6 +7639,7 @@ struct act_rec {
    int32_t request_code;
    bool for_result;
    bool stopped, visible;
+   int importance;        /* ActivityThread lifecycle state, zero before launch */
    bool attached_only;    /* in the stack, window not shown yet */
 };
 static struct act_rec g_acts[ACT_MAX];
@@ -7561,6 +7687,39 @@ static int act_index(dvm_ref activity)
    return -1;
 }
 
+/* ActivityManager derives importance from real components in this process.
+ * The registry shares that state with other isolated guest processes. */
+static struct luna_process_info activity_process_current(void)
+{
+   struct luna_process_info info={0};
+   info.pid=arm_exec_guest_pid();info.uid=arm_exec_guest_uid();
+   const char *package=getenv("ANDROID_PACKAGE_NAME");
+   const char *name=getenv("ANDROID_PROCESS_NAME");
+   snprintf(info.package,sizeof info.package,"%s",package ? package : "");
+   snprintf(info.name,sizeof info.name,"%s",name && *name ? name : info.package);
+   info.importance=g_services ? 300 : 400;
+   for (int i=0;i<g_nacts;++i)
+      if (g_acts[i].importance && g_acts[i].importance<info.importance)
+         info.importance=g_acts[i].importance;
+   return info;
+}
+static void activity_process_publish(struct dvm *vm)
+{
+   (void)vm;
+   struct luna_process_info info=activity_process_current();
+   if (info.package[0]) (void)luna_process_state_publish(&info);
+}
+static void activity_process_transition(struct dvm *vm,dvm_ref activity,const char *step)
+{
+   int index=act_index(activity);
+   if (index<0) return;
+   int importance=0;
+   if (!strcmp(step,"Created") || !strcmp(step,"Started") || !strcmp(step,"Resumed")) importance=100;
+   else if (!strcmp(step,"Paused")) importance=200;
+   else if (!strcmp(step,"Stopped") || !strcmp(step,"Destroyed")) importance=400;
+   if (importance) { g_acts[index].importance=importance;activity_process_publish(vm); }
+}
+
 /* The launcher is created by loader.c rather than startActivity().  It still
  * belongs to the same activity stack and its window must be presented when
  * resumed, just like subsequently launched activities. */
@@ -7571,7 +7730,8 @@ void dvm__activity_attach(struct dvm *vm, dvm_ref activity)
 {
    if (act_index(activity) >= 0 || g_nacts >= ACT_MAX) return;
    dvm_pin(vm, activity);
-   g_acts[g_nacts++] = (struct act_rec){ .activity = activity, .attached_only = true };
+   g_acts[g_nacts++] = (struct act_rec){ .activity = activity, .attached_only = true, .importance = 100 };
+   activity_process_publish(vm);
 }
 
 void dvm__activity_visible(struct dvm *vm, dvm_ref activity)
@@ -8617,8 +8777,7 @@ static dvm_ref li_make_view(struct dvm *vm, const char *tag, dvm_ref context, dv
          const char *k = keys[i] ? dvm_string_utf8(vm, keys[i]) : NULL;
          const char *v = vals[i] ? dvm_string_utf8(vm, vals[i]) : NULL;
          if (k && v && !strcmp(k, "class") && *v) {
-            /* A bare name is a platform view: android.view.<name>. */
-            snprintf(named, sizeof named, "%s%s", strchr(v, '.') ? "" : "android.view.", v);
+            snprintf(named, sizeof named, "%s", v);
             name = named;
             break;
          }
@@ -8636,9 +8795,14 @@ static dvm_ref li_make_view(struct dvm *vm, const char *tag, dvm_ref context, dv
       snprintf(desc, sizeof desc, "Landroid/widget/%s;", name);
    }
    struct dvm_class *c = dvm__class_by_desc(vm, desc);
-   if ((!c || c->synthesized) && !strchr(name, '.')) {
-      snprintf(desc, sizeof desc, "Landroid/view/%s;", name);
-      c = dvm__class_by_desc(vm, desc);
+   if (!strchr(name, '.')) {
+      /* PhoneLayoutInflater tries widgets, WebKit and app views before
+       * LayoutInflater's android.view fallback. */
+      static const char *const prefixes[]={"android/webkit/","android/app/","android/view/"};
+      for(size_t i=0;(!c || c->synthesized) && i<sizeof prefixes/sizeof *prefixes;++i){
+         snprintf(desc, sizeof desc, "L%s%s;", prefixes[i], name);
+         c = dvm__class_by_desc(vm, desc);
+      }
    }
    if (!c || c->synthesized || !dvm__class_assignable(vm,c,dvm_find_class(vm,"android/view/View"))) {
       dvm__throw(vm,"android/view/InflateException","Error inflating class %s",name);
@@ -9080,6 +9244,9 @@ static const struct rt_method rt_layer_drawable[]={
    M("findDrawableByLayerId","(I)Landroid/graphics/drawable/Drawable;",layer_access),
    M("setLayerInset","(IIIII)V",layer_inset),
    M("onBoundsChange","(Landroid/graphics/Rect;)V",layer_bounds),
+   M("invalidateDrawable","(Landroid/graphics/drawable/Drawable;)V",drawable_child_callback),
+   M("scheduleDrawable","(Landroid/graphics/drawable/Drawable;Ljava/lang/Runnable;J)V",drawable_child_callback),
+   M("unscheduleDrawable","(Landroid/graphics/drawable/Drawable;Ljava/lang/Runnable;)V",drawable_child_callback),
    M("draw","(Landroid/graphics/Canvas;)V",layer_draw),M_END
 };
 
@@ -11250,7 +11417,7 @@ static const struct rt_method rt_native_activity[] = {
  * one; it is enough to place, read and press the dialogs an SDK puts up.
  */
 
-#include "luna_overlay.h"
+#include "luna_boot.h"
 
 /* Gravity bits, from android.view.Gravity. */
 #define UI_GRAVITY_CENTER_H 0x01
@@ -11328,6 +11495,18 @@ static float ui_float(struct dvm *vm, dvm_ref o, const char *name)
    (void)dvm_get_field(vm, o, name, "F", &v);
    return v.f;
 }
+
+#if defined(__GNUC__) && !defined(DVM_NO_CALLSITE_CACHE)
+/* With a literal name each use gets its own call-site cache (dvm_get_field is a
+ * macro too); anything else takes the functions above. */
+#define ui_int(vm_, o_, name_) (__builtin_constant_p(name_) ? ({ \
+      struct dvm *uv_ = (vm_); dvm_ref uo_ = (o_); union dvm_value uvv_ = { 0 }; int32_t ur_ = 0; \
+      if (dvm_get_field(uv_, uo_, (name_), "I", &uvv_) || dvm_get_field(uv_, uo_, (name_), "Z", &uvv_)) ur_ = uvv_.i; \
+      ur_; }) : (ui_int)((vm_), (o_), (name_)))
+#define ui_obj(vm_, o_, name_, type_) ((__builtin_constant_p(name_) && __builtin_constant_p(type_)) ? ({ \
+      union dvm_value uvv_ = { 0 }; \
+      (void)dvm_get_field((vm_), (o_), (name_), (type_), &uvv_); uvv_.l; }) : (ui_obj)((vm_), (o_), (name_), (type_)))
+#endif
 
 
 
@@ -11598,7 +11777,37 @@ static bool vector_write_svg(struct dvm *vm, const unsigned char *b, size_t n, c
 
 /* The image file a drawable resource shows: a bitmap as itself, a vector as
  * the SVG written for it. */
+static const char *ui_drawable_src_uncached(struct dvm *vm, int32_t res_id);
+
+/* A resource id names the same file for the life of the process (a vector
+ * drawable is converted once, beside its entry), but finding it walks the
+ * resource table and the host file system every time.  A layout asks for the
+ * same few hundred ids on every rebuild.  Answers, including "no such file",
+ * are remembered per id; the strings are kept for the process. */
 static const char *ui_drawable_src(struct dvm *vm, int32_t res_id)
+{
+   static struct { int32_t id; bool known; char *path; } memo[1024];
+   static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+   if (res_id <= 0) return ui_drawable_src_uncached(vm, res_id);
+   const size_t at = ((uint32_t)res_id * 2654435761u) >> 22;
+   pthread_mutex_lock(&lock);
+   if (memo[at].known && memo[at].id == res_id) {
+      const char *hit = memo[at].path;
+      pthread_mutex_unlock(&lock);
+      return hit;
+   }
+   pthread_mutex_unlock(&lock);
+   const char *found = ui_drawable_src_uncached(vm, res_id);
+   char *copy = found ? strdup(found) : NULL;
+   if (found && !copy) return found;
+   pthread_mutex_lock(&lock);
+   /* The displaced entry's string is not freed: a caller may still hold it. */
+   memo[at].id = res_id; memo[at].known = true; memo[at].path = copy;
+   pthread_mutex_unlock(&lock);
+   return copy;
+}
+
+static const char *ui_drawable_src_uncached(struct dvm *vm, int32_t res_id)
 {
    const char *png = ui_drawable_path(res_id);
    if (png || res_id <= 0) return png;
@@ -11627,6 +11836,12 @@ static const char *ui_drawable_src(struct dvm *vm, int32_t res_id)
  * anyway when it draws. */
 static bool ui_png_size(const char *path, int32_t *w, int32_t *h)
 {
+   if (!strncmp(path, "lunaria-bitmap-", 15)) {
+      int bw = 0, bh = 0;
+      if (!luna_overlay_image_size(path, &bw, &bh)) return false;
+      *w = bw; *h = bh;
+      return true;
+   }
    static const unsigned char sig[8] =
       { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
    unsigned char hdr[24];
@@ -11698,6 +11913,9 @@ static void ui_emit_drawables(struct dvm *vm, struct ui_buf *css, dvm_ref view,
 }
 
 static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view);
+struct ui_node;
+static bool ui_view_to_root(struct dvm *vm,dvm_ref view,float *ox,float *oy);
+static void ui_captured_add(struct dvm *vm, dvm_ref view, const char *key, const struct ui_node *n);
 static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
                          dvm_ref view, int parent_orientation, unsigned depth);
 static bool ui_is_clickable(struct dvm *vm, dvm_ref view);
@@ -12074,6 +12292,19 @@ static bool ui_intrinsic_image(struct dvm *vm, dvm_ref view, int32_t *w, int32_t
       if (bm) src = bitmap_png_path(vm, bm);
    }
    if (src && ui_png_size(src, w, h)) return true;
+   /* A drawable the app set itself (an icon, a vector): it knows its own size,
+    * and an ImageView measures to it.  Without this a button whose picture is
+    * a vector drawable measured to nothing, so it was neither seen nor
+    * pressable -- a player's seek and full-screen controls among them. */
+   {
+      dvm_ref d = ui_drawable_at_rest(vm, ui_obj(vm, view, "drawable",
+                                      "Landroid/graphics/drawable/Drawable;"));
+      union dvm_value iw = {0}, ih = {0};
+      if (d && am_vcall(vm, d, "getIntrinsicWidth", "()I", NULL, 0, &iw) &&
+          am_vcall(vm, d, "getIntrinsicHeight", "()I", NULL, 0, &ih) &&
+          iw.i > 0 && ih.i > 0) { *w = iw.i; *h = ih.i; return true; }
+      if (dvm_exception(vm)) dvm_clear_exception(vm);
+   }
    /* A vector or state-list source: not rasterised here, but on a device it
     * has the intrinsic size of a Material icon. */
    if (ui_int(vm, view, "imageResource") > 0) { *w = *h = 24; return true; }
@@ -12440,33 +12671,30 @@ static void ui_measure_linear(struct dvm *vm, dvm_ref view, struct ui_ms ws,
    const int32_t main_size = ui_resolve(total > min_main ? total : min_main, main_s);
    int32_t delta = main_size - total;
    if (total_weight > 0.f && (delta != 0 || main_s.mode == UI_MS_EXACT)) {
-      float weight_sum = total_weight;
-      total = 0;
+      const float specified_weight=ui_float(vm,view,"weightSum");
+      float weight_sum = specified_weight>0.f ? specified_weight : total_weight;
       max_cross = 0;
       for (uint32_t i = 0; i < nk; ++i) {
          if (ui_gone(vm, kids[i])) continue;
          struct ui_lp *lp = &lps[i];
          const int32_t lcross = vertical ? lp->w : lp->h;
-         const int32_t mmain = vertical ? lp->mt + lp->mb : lp->ml + lp->mr;
          const int32_t mcross = vertical ? lp->ml + lp->mr : lp->mt + lp->mb;
          struct ui_node *c = ui_node(vm, kids[i]);
          if (lp->weight > 0.f) {
-            const int32_t share = (int32_t)((float)delta * lp->weight / weight_sum);
+            const int32_t share = java_d2i(lp->weight * (float)delta / weight_sum);
             weight_sum -= lp->weight;
-            delta -= share;
+            delta = (int32_t)((uint32_t)delta - (uint32_t)share);
             int32_t size = skipped[i] ? share
-                         : (vertical ? c->h : c->w) + share;
+                         : (int32_t)((uint32_t)(vertical ? c->h : c->w) + (uint32_t)share);
             if (size < 0) size = 0;
             struct ui_ms cm = ui_ms_make(UI_MS_EXACT, size);
             struct ui_ms cc = ui_child_spec(cross_s, cross_pad + mcross, lcross);
             if (vertical) ui_measure(vm, kids[i], cc, cm, depth + 1);
             else ui_measure(vm, kids[i], cm, cc, depth + 1);
          }
-         total += (vertical ? c->h : c->w) + mmain;
          const int32_t cw = vertical ? c->w : c->h;
          if (cw + mcross > max_cross) max_cross = cw + mcross;
       }
-      total += main_pad;
    }
    int32_t cross_want = max_cross + cross_pad;
    int32_t min_cross = view_suggested_minimum(vm, view, !vertical);
@@ -12865,20 +13093,81 @@ static void ui_measure_dispatch(struct dvm *vm, dvm_ref view, struct ui_ms ws,
 
 /* LUNARIA_UI_LAYOUT_TRACE=1: every measure, with the specs it was given, the
  * LayoutParams it read and the size it took. */
+static unsigned g_mr_stat[6];
+static const char *g_mr_cls[48]; static unsigned g_mr_cnt[48]; static int g_mr_ncls; static unsigned g_mr_nonode;
+/* A measure memo of two entries per view. ConstraintLayout (and anything that
+ * measures a child twice, wrap first and exact after) alternates two specs on
+ * the same child; with one slot every call replaced the entry the next one
+ * needed, and the whole tree was measured again on every pass. */
+static void ui_measure_cache_clear(struct dvm *vm,dvm_ref view)
+{
+   (void)dvm_set_field(vm,view,"measureEpoch","J",(union dvm_value){0});
+   (void)dvm_set_field(vm,view,"measureEpoch2","J",(union dvm_value){0});
+   rt_set_int(vm,view,"measureNeededBeforeLayout",0);
+}
 static bool view_measure_reuse(struct dvm *vm,dvm_ref view,int32_t width,int32_t height)
 {
    union dvm_value epoch={0};
-   if(!ui_int(vm,view,"measuredDimensionSet") || ui_int(vm,view,"layoutRequired") ||
-      ui_int(vm,view,"measureWidthSpec")!=width || ui_int(vm,view,"measureHeightSpec")!=height ||
-      !dvm_get_field(vm,view,"measureEpoch","J",&epoch) || (uint64_t)epoch.j!=g_ui_measure_epoch) return false;
+   if(!ui_int(vm,view,"measuredDimensionSet")) { ++g_mr_stat[0]; return false; }
+   if(ui_int(vm,view,"forceLayout")) {
+      ++g_mr_stat[1];
+      static int tr=-1; if(tr<0) tr=getenv("LUNARIA_TRACE_LAYOUT")!=NULL;
+      if(tr) {
+         struct dvm_class *c=dvm_object_class(vm,view);
+         const char *nm=c ? c->name : "?";
+         int k=0; for(;k<g_mr_ncls && strcmp(g_mr_cls[k],nm);++k) {}
+         if(k==g_mr_ncls && g_mr_ncls<48) { g_mr_cls[g_mr_ncls]=nm; g_mr_cnt[g_mr_ncls++]=0; }
+         if(k<48) ++g_mr_cnt[k];
+         const struct ui_node *nd=ui_node(vm,view);
+         if(!nd) ++g_mr_nonode;
+      }
+      return false;
+   }
+   int slot=0;
+   if(ui_int(vm,view,"measureWidthSpec")!=width || ui_int(vm,view,"measureHeightSpec")!=height) {
+      if(ui_int(vm,view,"measureWidthSpec2")!=width || ui_int(vm,view,"measureHeightSpec2")!=height) { ++g_mr_stat[2]; return false; }
+      slot=2;
+   }
+   if(!dvm_get_field(vm,view,slot ? "measureEpoch2" : "measureEpoch","J",&epoch) || (uint64_t)epoch.j!=g_ui_measure_epoch) { ++g_mr_stat[3]; return false; }
    struct ui_node *node=ui_node(vm,view);
    if(!node) return false;
+   ++g_mr_stat[4];
+   if(slot) {
+      /* Cached dimensions do not restore a ViewGroup's measured children.
+       * View.layout must materialize those with onMeasure before onLayout. */
+      rt_set_int(vm,view,"measureNeededBeforeLayout",1);
+      rt_set_int(vm,view,"layoutRequired",1);
+      /* The older entry becomes the current measurement again. */
+      const int32_t mw=ui_int(vm,view,"measuredWidth2"),mh=ui_int(vm,view,"measuredHeight2");
+      rt_set_int(vm,view,"measuredWidth2",ui_int(vm,view,"measuredWidth"));
+      rt_set_int(vm,view,"measuredHeight2",ui_int(vm,view,"measuredHeight"));
+      rt_set_int(vm,view,"measureWidthSpec2",ui_int(vm,view,"measureWidthSpec"));
+      rt_set_int(vm,view,"measureHeightSpec2",ui_int(vm,view,"measureHeightSpec"));
+      union dvm_value e1={0};(void)dvm_get_field(vm,view,"measureEpoch","J",&e1);
+      (void)dvm_set_field(vm,view,"measureEpoch2","J",e1);
+      rt_set_int(vm,view,"measuredWidth",mw);rt_set_int(vm,view,"measuredHeight",mh);
+      rt_set_int(vm,view,"measureWidthSpec",width);rt_set_int(vm,view,"measureHeightSpec",height);
+      (void)dvm_set_field(vm,view,"measureEpoch","J",epoch);
+   }
    node->w=(int32_t)((uint32_t)ui_int(vm,view,"measuredWidth")&0x00ffffffu);
    node->h=(int32_t)((uint32_t)ui_int(vm,view,"measuredHeight")&0x00ffffffu);
    return true;
 }
-static void view_measure_remember(struct dvm *vm,dvm_ref view,int32_t width,int32_t height,uint64_t epoch)
+static void view_measure_remember(struct dvm *vm,dvm_ref view,int32_t width,int32_t height,uint64_t epoch,int32_t previous_width,int32_t previous_height)
 {
+   /* The entry being replaced moves to the second slot, unless it is the same
+    * spec re-measured (then there is nothing older worth keeping). */
+   if(ui_int(vm,view,"measuredDimensionSet") &&
+      (ui_int(vm,view,"measureWidthSpec")!=width || ui_int(vm,view,"measureHeightSpec")!=height)) {
+      union dvm_value e1={0};(void)dvm_get_field(vm,view,"measureEpoch","J",&e1);
+      if((uint64_t)e1.j==epoch) {
+         rt_set_int(vm,view,"measureWidthSpec2",ui_int(vm,view,"measureWidthSpec"));
+         rt_set_int(vm,view,"measureHeightSpec2",ui_int(vm,view,"measureHeightSpec"));
+         (void)dvm_set_field(vm,view,"measureEpoch2","J",e1);
+         rt_set_int(vm,view,"measuredWidth2",previous_width);
+         rt_set_int(vm,view,"measuredHeight2",previous_height);
+      }
+   }
    rt_set_int(vm,view,"measureWidthSpec",width);rt_set_int(vm,view,"measureHeightSpec",height);
    (void)dvm_set_field(vm,view,"measureEpoch","J",(union dvm_value){.j=(int64_t)epoch});
 }
@@ -12891,6 +13180,7 @@ static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
    int32_t height_spec=(int32_t)((uint32_t)hs.size|((uint32_t)hs.mode<<30));
    if(!ui_gone(vm,view) && view_measure_reuse(vm,view,width_spec,height_spec)) return;
    uint64_t epoch=g_ui_measure_epoch;
+   int32_t previous_width=ui_int(vm,view,"measuredWidth"),previous_height=ui_int(vm,view,"measuredHeight");
    struct dvm_class *klass = dvm_object_class(vm, view);
    struct dvm_method *on_measure = klass
       ? dvm_find_method(vm, klass, "onMeasure", "(II)V") : NULL;
@@ -12912,7 +13202,8 @@ static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       if (n) {
          union dvm_value sizes[2] = {{ .i = n->w }, { .i = n->h }}, ignored;
          (void)view_set_measured(vm, view, sizes, 2, &ignored);
-         view_measure_remember(vm,view,width_spec,height_spec,epoch);
+         rt_set_int(vm,view,"measureNeededBeforeLayout",0);
+         view_measure_remember(vm,view,width_spec,height_spec,epoch,previous_width,previous_height);
       }
    }
    static int trace = -1;
@@ -12933,6 +13224,25 @@ static void ui_measure(struct dvm *vm, dvm_ref view, struct ui_ms ws,
               (double)lp.weight, ui_int(vm, view, "orientation"),
               n ? n->w : -1, n ? n->h : -1);
    }
+}
+
+/* TextView.checkForRelayout(): a new text that lays out to the size the view
+ * already has needs a repaint, not a layout pass. The clock and the counters
+ * of a player change their text every second; asking the window to measure
+ * everything again for a "0:08" that became "0:09" was the largest cost of
+ * playing a video here. Measured exactly as the last measure was: same specs. */
+static bool text_size_unchanged(struct dvm *vm, dvm_ref view)
+{
+   struct ui_node *n = ui_node(vm, view);
+   if (!n || !rt_get_int(vm, view, "measuredDimensionSet") || rt_get_int(vm, view, "layoutRequired")) return false;
+   if (!ui_is_a(vm, view, "android/widget/TextView") || ui_is_a(vm, view, "android/widget/EditText")) return false;
+   const uint32_t w = (uint32_t)rt_get_int(vm, view, "measureWidthSpec");
+   const uint32_t h = (uint32_t)rt_get_int(vm, view, "measureHeightSpec");
+   if (!w && !h) return false;
+   struct ui_node tmp = *n;
+   ui_measure_leaf(vm, view, ui_ms_make((int)(w >> 30), (int32_t)(w & 0x3fffffffu)),
+                   ui_ms_make((int)(h >> 30), (int32_t)(h & 0x3fffffffu)), &tmp);
+   return tmp.w == n->w && tmp.h == n->h;
 }
 
 static void ui_measure_dispatch(struct dvm *vm, dvm_ref view, struct ui_ms ws,
@@ -12991,6 +13301,7 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
    if (resolve && !dvm_call(vm, resolve, self, NULL, 0, &ignored)) return false;
    if(view_measure_reuse(vm,self,ARG(0).i,ARG(1).i)) RETV();
    uint64_t epoch=g_ui_measure_epoch;
+   int32_t previous_width=ui_int(vm,self,"measuredWidth"),previous_height=ui_int(vm,self,"measuredHeight");
    union dvm_value flag = {0};
    (void)dvm_set_field(vm, self, "measuredDimensionSet", "Z", flag);
    struct dvm_method *m = c ? dvm_find_method(vm, c, "onMeasure", "(II)V") : NULL;
@@ -13000,7 +13311,8 @@ static bool view_measure_api(struct dvm *vm, dvm_ref self,
       dvm__throw(vm, "java/lang/IllegalStateException", "onMeasure must call setMeasuredDimension");
       return false;
    }
-   view_measure_remember(vm,self,ARG(0).i,ARG(1).i,epoch);
+   rt_set_int(vm,self,"measureNeededBeforeLayout",0);
+   view_measure_remember(vm,self,ARG(0).i,ARG(1).i,epoch,previous_width,previous_height);
    static int trace = -1;
    if (trace < 0) trace = dvm__env("LUNARIA_UI_LAYOUT_TRACE") != NULL;
    if (trace) {
@@ -13162,6 +13474,33 @@ static bool view_get_measured_state(struct dvm *vm, dvm_ref self,
          ((uint32_t)ui_int(vm, self, "measuredHeight") >> 16 & 0x0000ff00u));
 }
 
+/* Measurement may prepare new boxes while ViewGroup.layout is suppressed.
+ * Drawing still uses the last actual frames, including those of descendants. */
+static void ui_restore_layout_frames(struct dvm *vm,dvm_ref view,unsigned depth)
+{
+   if(!view || depth>64) return;
+   struct ui_node *node=ui_node(vm,view);
+   int32_t left=rt_get_int(vm,view,"left"),top=rt_get_int(vm,view,"top");
+   if(node) {
+      node->x=left;node->y=top;
+      node->w=(int32_t)((uint32_t)rt_get_int(vm,view,"right")-(uint32_t)left);
+      node->h=(int32_t)((uint32_t)rt_get_int(vm,view,"bottom")-(uint32_t)top);
+   }
+   struct rt_list *children=list_of(vm,view_children(vm,view,false));
+   for(uint32_t i=0;children && i<children->size;++i)
+      ui_restore_layout_frames(vm,children->items[i],depth+1);
+}
+static bool vg_layout_api(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                          int nargs,union dvm_value *out)
+{
+   if(rt_get_int(vm,self,"layoutSuppressed")) {
+      rt_set_int(vm,self,"layoutCalledWhileSuppressed",1);
+      ui_restore_layout_frames(vm,self,0);
+      RETV();
+   }
+   return view_layout_api(vm,self,args,nargs,out);
+}
+
 static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth)
 {
    struct ui_node *n = ui_node(vm, view);
@@ -13169,19 +13508,15 @@ static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth)
    struct dvm_class *klass = dvm_object_class(vm, view);
    struct dvm_method *callback = klass
       ? dvm_find_method(vm, klass, "onLayout", "(ZIIII)V") : NULL;
-   /* An app override owns its child placement. Do not overwrite it with a
-    * FrameLayout pass after the callback returns. */
-   if (callback && callback->builtin != empty_void) {
-      union dvm_value a[4] = {{.i=n->x}, {.i=n->y},
-         {.i=(int32_t)((uint32_t)n->x + (uint32_t)n->w)},
-         {.i=(int32_t)((uint32_t)n->y + (uint32_t)n->h)}}, ignored = {0};
-      (void)view_layout_api(vm, view, a, 4, &ignored);
-      return;
-   }
+   const bool suppressed=rt_get_int(vm,view,"layoutSuppressed")!=0;
    union dvm_value bounds[4] = {{.i=n->x}, {.i=n->y},
       {.i=(int32_t)((uint32_t)n->x + (uint32_t)n->w)},
       {.i=(int32_t)((uint32_t)n->y + (uint32_t)n->h)}}, ignored = {0};
-   if (!view_layout_api(vm, view, bounds, 4, &ignored)) return;
+   /* ViewGroup owns suppression, and app overrides own child placement. */
+   if (!am_vcall(vm,view,"layout","(IIII)V",bounds,4,&ignored)) return;
+   if(suppressed || (callback && callback->builtin!=empty_void)) return;
+   n=ui_node(vm,view);
+   if(!n) return;
    if (ui_is_a(vm, view, "android/widget/LinearLayout"))
       ui_layout_linear(vm, view, n);
    else if (ui_is_a(vm, view, "android/widget/RelativeLayout") ||
@@ -13199,9 +13534,46 @@ static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth)
       if (!c) continue;
       rt_set_int(vm, kids[i], "left", c->x);
       rt_set_int(vm, kids[i], "top", c->y);
-      rt_set_int(vm, kids[i], "right", c->x + c->w);
-      rt_set_int(vm, kids[i], "bottom", c->y + c->h);
+      rt_set_int(vm, kids[i], "right", (int32_t)((uint32_t)c->x + (uint32_t)c->w));
+      rt_set_int(vm, kids[i], "bottom", (int32_t)((uint32_t)c->y + (uint32_t)c->h));
    }
+}
+
+/* View.setFrame updates drawing bounds, without running a layout pass or
+ * consuming pending layout requests. Animation APIs use the same contract. */
+static bool view_frame_api(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                            int nargs,union dvm_value *out)
+{
+   (void)nargs;
+   if(strcmp(builtin_name(),"setFrame")) {
+      union dvm_value ignored={0};
+      if(!am_vcall(vm,self,"setFrame","(IIII)Z",args,4,&ignored)) return false;
+      RETV();
+   }
+   static const char *edges[]={"left","top","right","bottom"};
+   int32_t old[4];bool changed=false;
+   for(int i=0;i<4;++i) {old[i]=ui_int(vm,self,edges[i]);changed |= old[i]!=args[i].i;}
+   const int32_t old_w=(int32_t)((uint32_t)old[2]-(uint32_t)old[0]);
+   const int32_t old_h=(int32_t)((uint32_t)old[3]-(uint32_t)old[1]);
+   const int32_t new_w=(int32_t)((uint32_t)args[2].i-(uint32_t)args[0].i);
+   const int32_t new_h=(int32_t)((uint32_t)args[3].i-(uint32_t)args[1].i);
+   /* Measurement may already have filled the node with its new dimensions.
+    * Damage must first describe the old bounds, then the new bounds. */
+   struct ui_node *node=ui_node(vm,self);
+   if(node) {node->x=old[0];node->y=old[1];node->w=old_w;node->h=old_h;}
+   if(!changed) RETI(0);
+   ui_invalidate_view(vm,self,NULL,0);
+   for(int i=0;i<4;++i) rt_set_int(vm,self,edges[i],args[i].i);
+   node=ui_node(vm,self);
+   if(node) {node->x=args[0].i;node->y=args[1].i;node->w=new_w;node->h=new_h;}
+   /* Bounds are host document geometry as well as retained View pixels. */
+   if(!g_ui_building && rt_get_int(vm,self,"attachedToWindow")) g_ui_pixels_only=false;
+   if(new_w!=old_w || new_h!=old_h) {
+      union dvm_value size[]={{.i=new_w},{.i=new_h},{.i=old_w},{.i=old_h}},ignored={0};
+      if(!am_vcall(vm,self,"onSizeChanged","(IIII)V",size,4,&ignored)) return false;
+   }
+   ui_invalidate_view(vm,self,NULL,0);
+   RETI(1);
 }
 
 static bool view_layout_api(struct dvm *vm, dvm_ref self,
@@ -13209,36 +13581,17 @@ static bool view_layout_api(struct dvm *vm, dvm_ref self,
                              union dvm_value *out)
 {
    (void)nargs;
+   if(ui_int(vm,self,"measureNeededBeforeLayout")) {
+      union dvm_value specs[]={{.i=ui_int(vm,self,"measureWidthSpec")},{.i=ui_int(vm,self,"measureHeightSpec")}},ignored={0};
+      if(!am_vcall(vm,self,"onMeasure","(II)V",specs,2,&ignored)) return false;
+      rt_set_int(vm,self,"measureNeededBeforeLayout",0);
+   }
    static const char *edges[] = { "left", "top", "right", "bottom" };
-   bool changed = false;
    union dvm_value notification[9]={{.l=self},args[0],args[1],args[2],args[3]};
    for (int i=0;i<4;++i) notification[5+i].i=ui_int(vm,self,edges[i]);
-   const int32_t old_w = (int32_t)((uint32_t)ui_int(vm, self, "right") - (uint32_t)ui_int(vm, self, "left"));
-   const int32_t old_h = (int32_t)((uint32_t)ui_int(vm, self, "bottom") - (uint32_t)ui_int(vm, self, "top"));
-   for (int i = 0; i < 4; ++i) {
-      changed |= ui_int(vm, self, edges[i]) != ARG(i).i;
-      rt_set_int(vm, self, edges[i], ARG(i).i);
-   }
-   /* View.setFrame(): a new size is announced before onLayout, so a view that
-    * forwards it (Cocos2dxGLSurfaceView hands it to its renderer, which passes
-    * it to nativeInit) knows its extent when the surface is created. */
-   const int32_t new_w = (int32_t)((uint32_t)ARG(2).i - (uint32_t)ARG(0).i);
-   const int32_t new_h = (int32_t)((uint32_t)ARG(3).i - (uint32_t)ARG(1).i);
-   if (new_w != old_w || new_h != old_h) {
-      struct dvm_class *c = dvm_object_class(vm, self);
-      struct dvm_method *m = c ? dvm_find_method(vm, c, "onSizeChanged", "(IIII)V") : NULL;
-      union dvm_value a[4] = {{.i=new_w}, {.i=new_h}, {.i=old_w}, {.i=old_h}}, ignored = {0};
-      if (m && !dvm_call(vm, m, self, a, 4, &ignored)) return false;
-   }
-   struct ui_node *n = ui_node(vm, self);
-   if (n) {
-      if (dvm__env("LUNARIA_UI_LAYOUT_TRACE") && n->y != ARG(1).i)
-         fprintf(stderr, "[ui-relayout] v%u %s y %d -> %d\n", (unsigned)self,
-                 ui_class_simple_name(vm, self), n->y, ARG(1).i);
-      n->x = ARG(0).i; n->y = ARG(1).i;
-      n->w = (int32_t)((uint32_t)ARG(2).i - (uint32_t)ARG(0).i);
-      n->h = (int32_t)((uint32_t)ARG(3).i - (uint32_t)ARG(1).i);
-   }
+   union dvm_value frame={0};
+   if(!am_vcall(vm,self,"setFrame","(IIII)Z",args,4,&frame)) return false;
+   const bool changed=frame.i!=0;
    union dvm_value required = {0};
    (void)dvm_get_field(vm, self, "layoutRequired", "Z", &required);
    if (changed || required.i) {
@@ -13269,9 +13622,10 @@ static bool view_layout_api(struct dvm *vm, dvm_ref self,
          if (!good) return false;
       }
    }
+   /* FORCE_LAYOUT is consumed even when unchanged bounds skip onLayout. */
+   (void)dvm_set_field(vm, self, "forceLayout", "Z", (union dvm_value){0});
    union dvm_value yes = {.i=1};
    (void)dvm_set_field(vm, self, "laidOut", "Z", yes);
-   ui_invalidate();
    RETV();
 }
 
@@ -13296,8 +13650,8 @@ static bool widget_on_layout(struct dvm *vm, dvm_ref self,
    RETV();
 }
 
-static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
-                         dvm_ref view, int parent_orientation, unsigned depth)
+static void ui_emit_view_inner(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
+                               dvm_ref view, int parent_orientation, unsigned depth)
 {
    (void)parent_orientation;
    if (!view || depth > 48) return;
@@ -13308,6 +13662,7 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
 
    const char *raster=ui_capture_custom_view(vm,view);
    if (dvm_exception(vm)) return;
+   if (raster) ui_captured_add(vm, view, raster, n);
    const char *simple = ui_class_simple_name(vm, view);
    const bool is_compound = ui_is_a(vm, view, "android/widget/CompoundButton");
    const bool is_scroll = ui_is_a(vm, view, "android/widget/ScrollView") ||
@@ -13356,7 +13711,7 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
       dvm_ref hint = ui_obj(vm, view, "hint", "Ljava/lang/CharSequence;");
       text = hint ? dvm_string_utf8(vm, hint) : NULL;
    }
-   if ((text && *text) || is_compound) {
+   if (!raster && ((text && *text) || is_compound)) {
       int32_t pad[4];
       ui_pad(vm, view, pad);
       if (pad[0] || pad[1] || pad[2] || pad[3])
@@ -13371,6 +13726,15 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
          ui_printf(b2, "color:%s;", c);
       }
       if (ui_int(vm, view, "textStyle") & 1) ui_puts(b2, "font-weight:bold;");
+      /* A TextView never paints past its own box: one line is cut with an
+       * ellipsis when it does not fit (maxLines=1 / singleLine), several are
+       * clipped to the lines it was given. */
+      {
+         const int32_t lines = ui_int(vm, view, "maxLines");
+         const bool single = lines == 1 || ui_int(vm, view, "singleLine") != 0;
+         if (single) ui_puts(b2, "white-space:nowrap;text-overflow:ellipsis;");
+         ui_puts(b2, "overflow:hidden;");
+      }
       /* TextView defaults to top|start, Button to center, EditText to
        * center_vertical|start (their styles' android:gravity). */
       int32_t g = ui_int(vm, view, "gravity");
@@ -13399,18 +13763,10 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
                        (transition_set.i ? ui_float(vm, view, "transitionAlpha") : 1.0f);
    if (disabled || alpha_set.i || transition_set.i)
       ui_printf(b2, "opacity:%g;", (double)(alpha * (disabled ? 0.45f : 1.0f)));
-   /* An EditText takes a touch to focus it, listener or not. */
-   struct dvm_class *touch_class=dvm_object_class(vm,view);
-   struct dvm_method *touch_method=touch_class ? dvm_find_method(vm,touch_class,"onTouchEvent","(Landroid/view/MotionEvent;)Z") : NULL;
-   const bool custom_touch=raster || (touch_method && touch_method->has_code) ||
-                           ui_is_a(vm, view, "android/widget/NumberPicker");
-   const bool clickable = custom_touch || ui_is_clickable(vm, view) || is_compound ||
-                          is_webview ||
-                          ui_is_a(vm, view, "android/widget/EditText");
-   if (clickable && !disabled) ui_puts(b2, "cursor:pointer;pointer-events:auto;");
-   /* A view that does not handle a touch lets it through to what is under
-    * it (onTouchEvent returns false); only clickable views stop one. */
-   if (!clickable) ui_puts(b2, "pointer-events:none;");
+   /* The host paints Views; Android owns hit testing, interception, enabled
+    * state and click recognition. Even a non-clickable View can be covered by
+    * a parent touch listener, so route its gesture through the window root. */
+   ui_puts(b2,"pointer-events:auto;");
    ui_puts(b2, "}");
 
    /* SurfaceView draws into a separate surface behind its window. Its View
@@ -13418,7 +13774,7 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
     * or children (SurfaceView.draw/dispatchDraw, PorterDuff.Mode.CLEAR). */
    ui_printf(b, "<div id=\"v%u\" class=\"w%s %s%s%s\">", (unsigned)view,
              ui_is_a(vm, view, "android/view/SurfaceView") ? " lunaria-surface-hole" : "",
-             simple, is_webview ? " lunaria-webview" : custom_touch ? " lunaria-touchview" : "",
+             simple, is_webview ? " lunaria-webview lunaria-touchview" : " lunaria-touchview",
              ui_is_a(vm, view, "android/widget/NumberPicker") ? " lunaria-gestureview" : "");
    /* A custom View is its picture, but a ViewGroup that paints something of its
     * own (a status-bar scrim, a divider) still has children of the app's own
@@ -13434,8 +13790,19 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
       ui_put_escaped(b, text);
       ui_puts(b, "</span>");
    }
-   ui_emit_children(vm, b, css, view, -1, depth);
+   /* An INVISIBLE ViewGroup hides everything inside it (View.dispatchDraw never
+    * reaches the children), and a touch never enters it. Its subtree is not
+    * part of the picture, so it is not part of the document either: player
+    * controls, bottom sheets and other pages kept around for later cost
+    * nothing until they are shown. */
+   if (visibility != 4 || !dvm__env("LUNARIA_SKIP_INVISIBLE")) ui_emit_children(vm, b, css, view, -1, depth);
    ui_puts(b, "</div>");
+}
+
+static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
+                         dvm_ref view, int parent_orientation, unsigned depth)
+{
+   ui_emit_view_inner(vm, b, css, view, parent_orientation, depth);
 }
 
 /* Windows currently up, innermost last.  A dialog is a window; so is the
@@ -13444,10 +13811,86 @@ static void ui_emit_view(struct dvm *vm, struct ui_buf *b, struct ui_buf *css,
 static dvm_ref g_ui_windows[UI_MAX_WINDOWS];
 static int g_ui_nwindows;
 static bool g_ui_dirty;
+
 static bool g_ui_building;
+
+/* The views whose picture the last full rebuild captured into a raster (video
+ * surfaces, shimmer placeholders, custom-drawn views), with where they sit.  A
+ * rebuild whose only cause is that some of them were repainted needs no new
+ * document: the rasters are redrawn and nothing else is touched. */
+#define UI_CAPTURED_MAX 96
+static struct ui_captured { dvm_ref view; char key[64]; float x, y; int w, h; } g_ui_captured[UI_CAPTURED_MAX];
+static int g_ui_ncaptured;
+static bool g_ui_captured_complete;     /* the list holds every captured view of the last document */
+static void ui_captured_clear(struct dvm *vm)
+{
+   for (int i = 0; i < g_ui_ncaptured; ++i) dvm_unpin(vm, g_ui_captured[i].view);
+   g_ui_ncaptured = 0;
+   g_ui_captured_complete = true;
+}
+static void ui_captured_add(struct dvm *vm, dvm_ref view, const char *key, const struct ui_node *n)
+{
+   float ox = 0, oy = 0;
+   if (g_ui_ncaptured >= UI_CAPTURED_MAX || !key || strlen(key) >= sizeof g_ui_captured[0].key ||
+       !ui_view_to_root(vm, view, &ox, &oy)) {
+      if (dvm__env("LUNARIA_TRACE_REBUILD")) {
+         static int said;
+         if (said++ < 12)
+            fprintf(stderr, "[captured-incomplete] ncaptured=%d key=%s keylen=%zu to_root=%d\n", g_ui_ncaptured,
+                    key ? key : "-", key ? strlen(key) : 0, (int)(key != NULL));
+      }
+      g_ui_captured_complete = false;
+      return;
+   }
+   struct ui_captured *c = &g_ui_captured[g_ui_ncaptured++];
+   c->view = view; dvm_pin(vm, view);
+   strcpy(c->key, key);
+   c->x = ox; c->y = oy; c->w = n->w; c->h = n->h;
+}
+static bool ui_damage_inside_captured(void)
+{
+   if (!g_ui_damage.any || g_ui_damage.full) return false;   /* (nothing damaged is handled by the caller) */
+   for (int i = 0; i < g_ui_ncaptured; ++i) {
+      const struct ui_captured *c = &g_ui_captured[i];
+      if ((float)g_ui_damage.l >= c->x && (float)g_ui_damage.t >= c->y &&
+          (float)g_ui_damage.r <= c->x + (float)c->w && (float)g_ui_damage.b <= c->y + (float)c->h) return true;
+   }
+   return false;
+}
+static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view);
+/* Repaints the captured views the damage touches.  False when anything about
+ * them changed under it (a different picture name, a view gone): the caller
+ * then does the full rebuild, and the damage is already spent. */
+static dvm_ref ui_presented_window_content(struct dvm *vm, dvm_ref window);
+static bool ui_compute_scroll(struct dvm *vm,dvm_ref view,unsigned depth);
+static bool ui_rebuild_pixels(struct dvm *vm)
+{
+   g_ui_building = true;
+   g_ui_frame_damage = g_ui_damage;
+   g_ui_damage = (struct ui_damage){ 0 };
+   ++g_ui_build_seq;
+   bool ok = true;
+   /* The traversal's first step runs as it does in a full rebuild: scrollers
+    * and animations advance, and what they invalidate schedules the next one. */
+   for (int i = 0; i < g_ui_nwindows && ok; ++i) {
+      dvm_ref content = ui_presented_window_content(vm, g_ui_windows[i]);
+      if (content && !ui_compute_scroll(vm, content, 0)) ok = false;
+   }
+   for (int i = 0; ok && i < g_ui_ncaptured; ++i) {
+      if (!dvm__obj(vm, g_ui_captured[i].view)) { ok = false; break; }
+      const char *key = ui_capture_custom_view(vm, g_ui_captured[i].view);
+      if (dvm_exception(vm) || !key || strcmp(key, g_ui_captured[i].key)) ok = false;
+   }
+   g_ui_building = false;
+   if (!ok) {
+      if (dvm_exception(vm)) dvm_clear_exception(vm);
+      g_ui_damage.full = true;
+   }
+   return ok;
+}
 static unsigned g_ui_draw_trace_budget;
 static bool g_ui_measure_dirty = true;
-static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns,layout_ns,scroll_ns,emit_ns;} g_ui_render_prof;
+static struct {uint64_t builds,build_ns,draws,draw_ns,publish_ns,layout_ns,scroll_ns,emit_ns,reused,capture_miss[7];} g_ui_render_prof;
 static uint64_t ui_render_ns(void)
 {
    if(!dvm__env("LUNARIA_UI_RENDER_PROF")) return 0;
@@ -13503,6 +13946,7 @@ static void ui_click_from_overlay(const char *id)
    if (g_ui_nclicks < (int)(sizeof g_ui_clicks / sizeof g_ui_clicks[0]))
       g_ui_clicks[g_ui_nclicks++] = (dvm_ref)ref;
    pthread_mutex_unlock(&g_ui_click_lock);
+   dvm_pump_wake();
 }
 
 /* Drags the overlay saw, replayed on the main looper like clicks. */
@@ -13516,6 +13960,14 @@ static void ui_scroll_from_overlay(double x, double y, double dx, double dy)
    if (g_ui_nscrolls < (int)(sizeof g_ui_scrolls / sizeof g_ui_scrolls[0]))
       g_ui_scrolls[g_ui_nscrolls++] = (struct ui_scroll_event){ x, y, dx, dy };
    pthread_mutex_unlock(&g_ui_click_lock);
+   dvm_pump_wake();
+}
+
+/* Input the main thread has not handled yet: the pump starts its Java half
+ * for it at once instead of finishing its sleep. */
+bool dvm_ui_input_pending(void)
+{
+   return g_webview_npointers > 0 || g_ui_nclicks > 0 || g_ui_nscrolls > 0;
 }
 
 /* Content may be a subtree below PhoneWindow's content parent and DecorView.
@@ -13526,7 +13978,7 @@ static dvm_ref ui_window_root(struct dvm *vm,dvm_ref window)
 }
 
 static dvm_ref ui_presented_window_content(struct dvm *vm,dvm_ref window)
-{ return act_window_present(vm,window) ? ui_window_content(vm,window) : 0; }
+{ return act_window_present(vm,window) ? ui_window_root(vm,window) : 0; }
 
 /* The WindowManager.LayoutParams a window was given, if it has any.  A Dialog
  * keeps its Window in a field; a Window carries them itself. */
@@ -13624,24 +14076,16 @@ static void ui_emit_window_box(struct dvm *vm, struct ui_buf *css, dvm_ref windo
       if (!view_dispatch_attachment(vm, ui_window_root(vm,window), true)) {
          ui_report_exception(vm, "onAttachedToWindow"); return;
       }
-      struct ui_lp clp;
-      ui_read_lp(vm, content, &clp);
-      if (g_ui_measure_dirty)
-         ui_measure(vm, content, ui_child_spec(ws, clp.ml + clp.mr, clp.w),
-                    ui_child_spec(hs, clp.mt + clp.mb, clp.h), 0);
+      /* ViewRootImpl measures/layouts the actual DecorView, not a content
+       * subtree below it. Otherwise unmeasured ancestors clip damage to zero. */
+      if (g_ui_measure_dirty) ui_measure(vm, content, ws, hs, 0);
       if (dvm_exception(vm)) { ui_report_exception(vm, "onMeasure"); return; }
       struct ui_node *c = ui_node(vm, content);
-      if (ws.mode != UI_MS_EXACT) win_w = c->w + clp.ml + clp.mr;
-      if (hs.mode != UI_MS_EXACT) win_h = c->h + clp.mt + clp.mb;
-      /* The content view is a child of the window's content FrameLayout
-       * (android.R.id.content), placed by its layout_gravity. */
-      const int32_t cg = clp.gravity >= 0 ? clp.gravity : 0x33;
-      const int32_t chg = cg & 0x07, cvg = cg & 0x70;
+      if (!c) return;
+      if (ws.mode != UI_MS_EXACT) win_w = c->w;
+      if (hs.mode != UI_MS_EXACT) win_h = c->h;
       if (g_ui_measure_dirty) {
-         c->x = chg == UI_GRAVITY_CENTER_H ? (win_w - c->w) / 2 + clp.ml - clp.mr
-              : chg == UI_GRAVITY_RIGHT ? win_w - c->w - clp.mr : clp.ml;
-         c->y = cvg == UI_GRAVITY_CENTER_V ? (win_h - c->h) / 2 + clp.mt - clp.mb
-              : cvg == UI_GRAVITY_BOTTOM ? win_h - c->h - clp.mb : clp.mt;
+         c->x=0;c->y=0;
          ui_layout(vm, content, 0);
       }
       static int said;
@@ -13651,7 +14095,7 @@ static void ui_emit_window_box(struct dvm *vm, struct ui_buf *css, dvm_ref windo
                  (unsigned)window, w, h, g,
                  ui_window_floating(vm, window) ? " floating" : "",
                  win_w, win_h, ui_class_simple_name(vm, content), c->w, c->h,
-                 clp.gravity, c->x, c->y);
+                 0, c->x, c->y);
    }
    /* Placed on the display by its gravity and offset (Gravity.apply). */
    const int32_t hg = g & 0x07, vg = g & 0x70;
@@ -13715,10 +14159,17 @@ static void ui_dump_tree(struct dvm *vm, dvm_ref view, unsigned depth)
 {
    if (!view || depth > 40) return;
    const struct ui_node *n = ui_node(vm, view);
-   fprintf(stderr, "[tree] %*s%s id=0x%x vis=%d %dx%d @%d,%d ref=%u\n", (int)(depth * 2), "",
+   fprintf(stderr, "[tree] %*s%s id=0x%x vis=%d %dx%d @%d,%d ref=%u click=%d touch=%d\n", (int)(depth * 2), "",
            ui_class_simple_name(vm, view), (unsigned)ui_int(vm, view, "id"),
            ui_int(vm, view, "visibility"), n ? n->w : -1, n ? n->h : -1,
-           n ? n->x : 0, n ? n->y : 0,(unsigned)view);
+           n ? n->x : 0, n ? n->y : 0,(unsigned)view, (int)ui_is_clickable(vm, view),
+           ui_obj(vm,view,"touchListener","Landroid/view/View$OnTouchListener;")!=0);
+   if (ui_is_a(vm, view, "android/widget/ImageView")) {
+      dvm_ref dr = ui_obj(vm, view, "drawable", "Landroid/graphics/drawable/Drawable;");
+      fprintf(stderr, "[tree-image] ref=%u res=0x%x drawable=%s\n", (unsigned)view,
+              (unsigned)ui_int(vm, view, "imageResource"),
+              dr ? dvm_class_name(dvm_object_class(vm, dr)) : "null");
+   }
    dvm_ref source=ui_obj(vm,view,"text","Ljava/lang/CharSequence;");
    if(source) {
       const char *text=ui_text_of(vm,view);
@@ -13784,6 +14235,43 @@ static void ui_rebuild(struct dvm *vm)
       luna_overlay_set_document(NULL, NULL);
       return;
    }
+   const bool pixels_only = g_ui_pixels_only;
+   g_ui_pixels_only = false;
+   if (getenv("LUNARIA_TRACE_REBUILD")) {
+      static unsigned long n[8]; static time_t last;
+      ++n[0]; if (!pixels_only) ++n[1]; if (g_ui_measure_dirty) ++n[2]; if (!g_ui_captured_complete) ++n[3];
+      if (!g_ui_ncaptured) ++n[4]; if (g_ui_damage.full) ++n[5]; if (pixels_only && !g_ui_damage.full && !ui_damage_inside_captured()) ++n[6];
+      { static int shown; if (pixels_only && !ui_damage_inside_captured() && shown++ < 6) {
+           fprintf(stderr, "[rebuild] damage %d,%d..%d,%d any=%d full=%d; captured:", g_ui_damage.l, g_ui_damage.t, g_ui_damage.r, g_ui_damage.b, g_ui_damage.any, g_ui_damage.full);
+           for (int i = 0; i < g_ui_ncaptured && i < 8; ++i) fprintf(stderr, " [%g,%g %dx%d]", g_ui_captured[i].x, g_ui_captured[i].y, g_ui_captured[i].w, g_ui_captured[i].h);
+           fputc('\n', stderr); } }
+      time_t now = time(NULL);
+      if (now != last) { fprintf(stderr, "[rebuild] %lu rebuilds: not-pixels-only %lu, measure %lu, incomplete %lu, no-captured %lu, full-damage %lu, damage-outside %lu\n", n[0], n[1], n[2], n[3], n[4], n[5], n[6]); memset(n, 0, sizeof n); last = now; }
+   }
+   {
+      static int tm = -1;
+      if (tm < 0) tm = getenv("LUNARIA_TRACE_REBUILD") != NULL;
+      if (pixels_only && !g_ui_measure_dirty && g_ui_captured_complete && g_ui_ncaptured &&
+          (!g_ui_damage.any || ui_damage_inside_captured()) && !g_ui_damage.full) {
+         struct timespec t0, t1;
+         if (tm) clock_gettime(CLOCK_MONOTONIC, &t0);
+         const bool did = ui_rebuild_pixels(vm);
+         if (tm) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            static double sum_ms; static unsigned count; static time_t last;
+            sum_ms += (double)(t1.tv_sec - t0.tv_sec) * 1e3 + (double)(t1.tv_nsec - t0.tv_nsec) / 1e6;
+            ++count;
+            const time_t now = time(NULL);
+            if (now != last) {
+               fprintf(stderr, "[rebuild-pixels] %u in the last second, %.1f ms each, %.0f ms total\n", count,
+                       count ? sum_ms / count : 0.0, sum_ms);
+               sum_ms = 0; count = 0; last = now;
+            }
+         }
+         if (did) return;
+      }
+   }
+   ui_captured_clear(vm);
    struct ui_buf b = { 0 }, css = { 0 };
    g_ui_building = true;
    /* What this rebuild repaints; what changes while it runs is the next one's. */
@@ -13857,11 +14345,19 @@ static void ui_rebuild(struct dvm *vm)
    if(started) {
       ++g_ui_render_prof.builds;g_ui_render_prof.build_ns+=ui_render_ns()-started;
       if(g_ui_render_prof.builds==1 || g_ui_render_prof.builds%10==0) {
+         fprintf(stderr,"[mreuse] unset=%u forceLayout=%u spec=%u epoch=%u hit=%u\n",g_mr_stat[0],g_mr_stat[1],g_mr_stat[2],g_mr_stat[3],g_mr_stat[4]);memset(g_mr_stat,0,sizeof g_mr_stat);
+         for(int k=0;k<g_mr_ncls;++k){ if(g_mr_cnt[k]>=20) fprintf(stderr,"[mreuse-cls] %s %u\n",g_mr_cls[k],g_mr_cnt[k]); g_mr_cnt[k]=0; }
+         fprintf(stderr,"[mreuse-cls] nonode=%u\n",g_mr_nonode); g_mr_nonode=0;
+         fprintf(stderr,"[capture-miss] builtin=%llu absent=%llu size=%llu epoch=%llu upload=%llu sequence=%llu dirty=%llu\n",
+            (unsigned long long)g_ui_render_prof.capture_miss[0],(unsigned long long)g_ui_render_prof.capture_miss[1],
+            (unsigned long long)g_ui_render_prof.capture_miss[2],(unsigned long long)g_ui_render_prof.capture_miss[3],
+            (unsigned long long)g_ui_render_prof.capture_miss[4],(unsigned long long)g_ui_render_prof.capture_miss[5],
+            (unsigned long long)g_ui_render_prof.capture_miss[6]);
          fprintf(stderr,"[ui-stage] layout=%.3f scroll=%.3f emit=%.3f ms/build\n",
             g_ui_render_prof.layout_ns/1e6/g_ui_render_prof.builds,
             g_ui_render_prof.scroll_ns/1e6/g_ui_render_prof.builds,
             g_ui_render_prof.emit_ns/1e6/g_ui_render_prof.builds);
-         fprintf(stderr,"[ui-render-prof] %llu builds %.3f ms/build; %llu captures %.3f ms/draw %.3f ms/publish\n",
+         fprintf(stderr,"[ui-render-prof] reused=%llu ",(unsigned long long)g_ui_render_prof.reused);fprintf(stderr,"[ui-render-prof] %llu builds %.3f ms/build; %llu captures %.3f ms/draw %.3f ms/publish\n",
             (unsigned long long)g_ui_render_prof.builds,g_ui_render_prof.build_ns/1e6/g_ui_render_prof.builds,
             (unsigned long long)g_ui_render_prof.draws,g_ui_render_prof.draws ? g_ui_render_prof.draw_ns/1e6/g_ui_render_prof.draws : 0,
             g_ui_render_prof.draws ? g_ui_render_prof.publish_ns/1e6/g_ui_render_prof.draws : 0);
@@ -13998,6 +14494,11 @@ static bool view_perform_click(struct dvm *vm, dvm_ref self,
    }
    dvm_ref listener = ui_obj(vm, self, "clickListener",
                              "Landroid/view/View$OnClickListener;");
+   if (dvm__env("LUNARIA_TRACE_TOUCH")) {
+      struct dvm_class *vc = dvm_object_class(vm, self), *lc = listener ? dvm_object_class(vm, listener) : NULL;
+      fprintf(stderr, "[click] performClick %s id=0x%x listener=%s\n", vc ? vc->name : "?",
+              (unsigned)ui_int(vm, self, "id"), lc ? lc->name : "none");
+   }
    if (listener) {
       struct dvm_class *c = dvm_object_class(vm, listener);
       struct dvm_method *m = c ? dvm_find_method(vm, c, "onClick",
@@ -14016,42 +14517,138 @@ static bool view_perform_click(struct dvm *vm, dvm_ref self,
  * watches.  Without the guard the rebuild would mark itself stale for ever. */
 static void ui_mark_dirty(void)
 {
-   if (g_ui_nwindows && !g_ui_building) g_ui_dirty = true;
+   if (g_ui_nwindows && !g_ui_building) {
+      if (!g_ui_dirty) g_ui_pixels_only = true;   /* a rectangle repaint, until something says more */
+      g_ui_dirty = true;
+      if (g_ui_vm) (void)ui_schedule_traversal(g_ui_vm);
+   }
 }
 
 /* A view changed in a way that changes pixels. */
 static void ui_invalidate(void)
 {
-   if (g_ui_nwindows && !g_ui_building) {ui_damage_full();g_ui_dirty = true;}
+   const bool trace=dvm__env("LUNARIA_TRACE_UI_INVALIDATE")!=NULL;
+   if(trace || dvm__env("LUNARIA_UI_RENDER_PROF")) {
+      static unsigned calls;
+      ++calls;
+      if(trace || calls<=32 || calls%500==0) {
+         const struct dvm_method *m=dvm__builtin_method();
+         fprintf(stderr,"[capture-invalidate] %u building=%d builtin=%s.%s%s\n",calls,g_ui_building,
+            m && m->cls ? m->cls->name : "?",m ? m->name : "?",m ? m->sig : "");
+      }
+   }
+   /* Unscoped framework setters may change any captured View. Even while
+    * building, their old pictures must not become reusable. */
+   ++g_ui_draw_epoch;
+   if (g_ui_nwindows && !g_ui_building) {
+      ui_damage_full();g_ui_dirty = true;g_ui_pixels_only = false;
+      if (g_ui_vm) (void)ui_schedule_traversal(g_ui_vm);
+   }
 }
 
 static void ui_layout_changed(void)
 {
+   static int trace_layout = -1;
+   if (trace_layout < 0) trace_layout = getenv("LUNARIA_TRACE_LAYOUT") != NULL;
+   if (trace_layout) {
+      static void *addr[64]; static unsigned cnt[64]; static int n; static time_t last;
+      void *ra = __builtin_return_address(0);
+      int k = 0;
+      for (; k < n && addr[k] != ra; ++k) {}
+      if (k == n && n < 64) { addr[n] = ra; cnt[n++] = 0; }
+      if (k < 64) ++cnt[k];
+      time_t now = time(NULL);
+      if (now - last >= 5) {
+         if (last) for (int i = 0; i < n; ++i) { if (cnt[i] > 5) fprintf(stderr, "[ulc] %p x%u\n", addr[i], cnt[i]); cnt[i] = 0; }
+         last = now;
+      }
+   }
    ++g_ui_measure_epoch;
    if (g_ui_building) return;
    g_ui_measure_dirty = true;
    ui_invalidate();
 }
 
-static void ui_view_layout_changed(struct dvm *vm,dvm_ref view)
+/* A view that only moved: the box the document gave it is replaced in place on
+ * the presenting thread, and nothing is rebuilt. This is what Android does for
+ * a scroll (the display list is translated, never re-recorded). */
+static bool ui_move_view(struct dvm *vm, dvm_ref view)
 {
+   /* In-place moves are not verified against every layout yet: off unless asked for. */
+   if (!dvm__env("LUNARIA_SCROLL_MOVE")) return false;
+   const struct ui_node *n = ui_node(vm, view);
+   if (!n) return false;
+   dvm_ref parent = ui_obj(vm, view, "parent", "Landroid/view/ViewParent;");
+   const int32_t ox = parent ? ui_int(vm, parent, "scrollX") : 0, oy = parent ? ui_int(vm, parent, "scrollY") : 0;
+   char id[24];
+   snprintf(id, sizeof id, "v%u", (unsigned)view);
+   return luna_overlay_move(id, (float)(n->x - ox + (int32_t)ui_float(vm, view, "translationX")),
+                            (float)(n->y - oy + (int32_t)ui_float(vm, view, "translationY")));
+}
+
+/* A container's own scroll changed: its children moved against it. False when
+ * the container's picture depends on the scroll position too (it draws itself
+ * in app code) or the document is not in a state to be patched. */
+static bool ui_scrolled_moves(struct dvm *vm, dvm_ref view)
+{
+   if (!dvm__env("LUNARIA_SCROLL_MOVE")) return false;
+   if (!g_ui_nwindows || g_ui_building || g_ui_dirty || !ui_is_a(vm, view, "android/view/ViewGroup")) return false;
+   struct dvm_class *cls = dvm_object_class(vm, view);
+   static const char *const hooks[] = { "draw", "onDraw", "dispatchDraw" };
+   for (size_t i = 0; i < 3 && cls; ++i) {
+      struct dvm_method *m = dvm_find_method(vm, cls, hooks[i], "(Landroid/graphics/Canvas;)V");
+      if (m && m->has_code) return false;
+   }
+   dvm_ref kids[UI_MAX_KIDS];
+   const uint32_t nk = ui_children(vm, view, kids, UI_MAX_KIDS);
+   if (nk >= UI_MAX_KIDS) return false;
+   for (uint32_t i = 0; i < nk; ++i)
+      if (!ui_gone(vm, kids[i]) && !ui_move_view(vm, kids[i])) return false;
+   return true;
+}
+
+static void ui_view_layout_changed_at(struct dvm *vm,dvm_ref view,const char *site_file,int site_line)
+{
+   if(!view || !ui_is_a(vm,view,"android/view/View")) {ui_layout_changed();return;}
+   {
+      static int tr = -1;
+      if (tr < 0) tr = getenv("LUNARIA_TRACE_LAYOUT") != NULL;
+      if (tr) {
+         static void *addr[128]; static unsigned cnt[128]; static int n; static time_t last;
+         void *ra = (void *)(intptr_t)site_line;
+         int k = 0;
+         for (; k < n && addr[k] != ra; ++k) {}
+         if (k == n && n < 128) { addr[n] = ra; cnt[n++] = 0; }
+         if (k < 128) ++cnt[k];
+         time_t now = time(NULL);
+         if (now - last >= 5) {
+            if (last) for (int i = 0; i < n; ++i) { if (cnt[i] > 3) { struct dvm_class *tc = dvm_object_class(vm, view); fprintf(stderr, "[uvlc] %s:%d x%u (last view %s)\n", strrchr(site_file, '/') ? strrchr(site_file, '/') + 1 : site_file, (int)(intptr_t)addr[i], cnt[i], tc ? tc->name : "?"); } cnt[i] = 0; }
+            last = now;
+         }
+      }
+   }
    /* A child request must invalidate cached ancestor measurements as well;
     * unchanged sibling branches keep their measured dimensions/state. */
+   dvm_ref requested=view;
    for(unsigned depth=0;view && depth<64;++depth) {
       rt_set_int(vm,view,"layoutRequired",1);
+      rt_set_int(vm,view,"forceLayout",1);
+      ui_measure_cache_clear(vm,view);
       view=ui_obj(vm,view,"parent","Landroid/view/ViewParent;");
    }
-   if(g_ui_building) return;
-   g_ui_measure_dirty=true;ui_invalidate();
+   ui_invalidate_view(vm,requested,NULL,0);
+   if(g_ui_building || !rt_get_int(vm,requested,"attachedToWindow")) return;
+   g_ui_measure_dirty=true;g_ui_pixels_only=false;ui_damage_full();
 }
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window)
 {
+   ++g_ui_draw_epoch;
    g_ui_vm = vm;
    luna_overlay_set_scroll_handler(ui_scroll_from_overlay);
    g_ui_measure_dirty = true;
    for (int i = 0; i < g_ui_nwindows; ++i)
-      if (g_ui_windows[i] == window) { g_ui_dirty = true; return; }
+      if (g_ui_windows[i] == window) { g_ui_dirty = true, g_ui_pixels_only = false; return; }
    if (g_ui_nwindows >= UI_MAX_WINDOWS) return;
    luna_overlay_set_click_handler(ui_click_from_overlay);
    luna_overlay_set_web_pointer_handler(webview_pointer_from_overlay);
@@ -14062,7 +14659,7 @@ static void ui_window_shown(struct dvm *vm, dvm_ref window)
    g_ui_windows[g_ui_nwindows++] = window;
    fprintf(stderr, "[ui] window %u shown (%d up)\n", (unsigned)window,
            g_ui_nwindows);
-   g_ui_dirty = true;
+   g_ui_dirty = true, g_ui_pixels_only = false;
 }
 
 static void ui_window_hidden(struct dvm *vm, dvm_ref window)
@@ -14074,11 +14671,12 @@ static void ui_window_hidden(struct dvm *vm, dvm_ref window)
          ui_report_exception(vm, "onDetachedFromWindow");
       memmove(&g_ui_windows[i], &g_ui_windows[i + 1],
               (size_t)(g_ui_nwindows - i - 1) * sizeof g_ui_windows[0]);
+      ++g_ui_draw_epoch;
       --g_ui_nwindows;
       dvm_unpin(vm, window);
       fprintf(stderr, "[ui] window %u hidden (%d up)\n", (unsigned)window,
               g_ui_nwindows);
-      g_ui_dirty = true;
+      g_ui_dirty = true, g_ui_pixels_only = false;
       return;
    }
 }
@@ -14240,7 +14838,8 @@ static const struct rt_method rt_html[]={
 static const struct rt_field rt_list_view_fields[]={
    {"listAdapter","Landroid/widget/ListAdapter;"},
    {"listObserver","Landroid/database/DataSetObserver;"},
-   {"itemCount","I"},{"firstPosition","I"},{"dataGeneration","I"},F_END
+   {"itemCount","I"},{"firstPosition","I"},{"dataGeneration","I"},
+   {"listTouchRow","Landroid/view/View;"},{"listTouchX","F"},{"listTouchY","F"},F_END
 };
 static const struct rt_field rt_list_observer_fields[]={
    {"owner","Landroid/widget/ListView;"},F_END
@@ -14510,6 +15109,32 @@ static bool list_view_tap(struct dvm *vm,dvm_ref list,dvm_ref clicked)
    if(!rows || offset<0 || (uint32_t)offset>=rows->size)return true;
    union dvm_value call[3]={{.l=rows->items[offset]},position,id};
    return am_vcall(vm,list,"performItemClick","(Landroid/view/View;IJ)Z",call,3,&ignored);
+}
+/* Row clicks are a ListView touch operation, not a host DOM click. Child
+ * controls still get their own dispatch before the list handles an item. */
+static bool list_view_touch(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+   luna_touch_event event;
+   if (!nargs || !dvm_motion_event_read(vm,ARG(0).l,&event) || ui_int(vm,self,"disabled")) RETI(0);
+   int action=event.action&255;
+   dvm_ref row=ui_obj(vm,self,"listTouchRow","Landroid/view/View;");
+   if (action==0) {
+      row=0;dvm_ref children[UI_MAX_KIDS];uint32_t n=ui_children(vm,self,children,UI_MAX_KIDS);
+      float x=event.x+ui_int(vm,self,"scrollX"),y=event.y+ui_int(vm,self,"scrollY");
+      for (uint32_t i=0;i<n;++i) {
+         const struct ui_node *node=ui_node(vm,children[i]);
+         if(node && x>=node->x && y>=node->y && x<node->x+node->w && y<node->y+node->h) {row=children[i];break;}
+      }
+      (void)dvm_set_field(vm,self,"listTouchX","F",(union dvm_value){.f=event.x});
+      (void)dvm_set_field(vm,self,"listTouchY","F",(union dvm_value){.f=event.y});
+   } else if (action==3 || (action==2 &&
+       (fabsf(event.x-ui_float(vm,self,"listTouchX"))>8*rt_density() || fabsf(event.y-ui_float(vm,self,"listTouchY"))>8*rt_density()))) row=0;
+   else if (action==1) {
+      if (row && !list_view_tap(vm,self,row)) return false;
+      row=0;
+   }
+   (void)dvm_set_field(vm,self,"listTouchRow","Landroid/view/View;",(union dvm_value){.l=row});
+   RETI(1);
 }
 static const struct rt_method rt_item_click_listener[]={
    {"onItemClick","(Landroid/widget/AdapterView;Landroid/view/View;IJ)V",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},M_END

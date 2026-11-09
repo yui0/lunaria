@@ -23,7 +23,6 @@
 #include "luna-window.h"
 
 #include "luna_boot.h"
-#include "luna_overlay.h"
 #include "luna_qfkey.h"
 #include "lunaria_os.h"
 #include "jvm/jvm.h"
@@ -667,23 +666,7 @@ static void launcher_publish_qfkey(int w, int h)
     char title[96];
     launcher_qfkey_title(title, sizeof title);
     luna_qfkey_start(title, w, h);
-    if (!luna_qfkey_wants_frame() || w <= 0 || h <= 0) return;
-    size_t stride = (size_t)w * 4u;
-    size_t bytes = stride * (size_t)h;
-    uint8_t *px = (uint8_t *)malloc(bytes), *row = (uint8_t *)malloc(stride);
-    if (!px || !row) { free(px); free(row); return; }
-    GLint alignment = 4;
-    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
-    glPixelStorei(GL_PACK_ALIGNMENT, 4);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
-    for (int y = 0; y < h / 2; ++y) {
-        uint8_t *lo = px + stride * (size_t)y;
-        uint8_t *hi = px + stride * (size_t)(h - 1 - y);
-        memcpy(row, lo, stride); memcpy(lo, hi, stride); memcpy(hi, row, stride);
-    }
-    luna_qfkey_publish(px, w, h, (int)stride, false);
-    free(px); free(row);
+    luna_qfkey_capture_gl(w, h);
 }
 
 static void frame(int force)

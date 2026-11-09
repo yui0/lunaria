@@ -4307,32 +4307,26 @@ static bool dexcl_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
    if (path.l) {
       const char *gp = dvm_string_utf8(vm, path.l);
       if (gp && *gp) {
-         char host[DVM_PATH_MAX];
-         const char *hp = arm_exec_map_guest_path(gp, host, sizeof host);
-         if (hp) {
-            /* Multi-path ClassLoader entries are ':'-separated. */
-            char *copy = strdup(hp);
-            char *save = NULL;
-            for (char *tok = copy ? strtok_r(copy, ":", &save) : NULL; tok;
-                 tok = strtok_r(NULL, ":", &save)) {
-               unsigned char m[4] = { 0 };
-               FILE *f = luna_file_fopen(tok, "rb");
-               if (f) { (void)!fread(m, 1, sizeof m, f); fclose(f); }
-               if (m[0] == 'P' && m[1] == 'K') {
-                  size_t len = 0;
-                  unsigned char *d = arm_exec_zip_read(tok, "classes.dex", &len);
-                  if (d) {
-                     (void)dvm_add_dex_memory(vm, d, len, tok);
-                     free(d);
-                  }
-               } else {
-                  (void)dvm_add_dex(vm, tok);
-               }
-            }
-            free(copy);
+         /* Split guest paths before mapping: each entry has its own root. */
+         char *copy = strdup(gp), *save = NULL;
+         if (!copy) { dvm__throw(vm, "java/lang/OutOfMemoryError", "dex path"); return false; }
+         for (char *tok = strtok_r(copy, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+            char host[DVM_PATH_MAX];
+            const char *hp = arm_exec_map_guest_path(tok, host, sizeof host);
+            unsigned char magic[4] = {0};
+            FILE *f = hp ? luna_file_fopen(hp, "rb") : NULL;
+            if (f) { (void)!fread(magic, 1, sizeof magic, f); fclose(f); }
+            if (magic[0] == 'P' && magic[1] == 'K')
+               (void)dvm_add_apk_archive(vm, hp, tok);
+            else if (hp)
+               (void)dvm_add_dex(vm, hp);
          }
+         free(copy);
       }
    }
+   for (int i = first_dex; i < vm->ndexes; ++i) vm->dexes[i]->defining_loader = self;
+   if (vm->ndexes > first_dex) dvm_pin(vm, self);
+
    const char *library_path = nargs >= 3 && ARG(nargs - 2).l
                                ? dvm_string_utf8(vm, ARG(nargs - 2).l) : "";
    if (!dex_path_list_build(vm, self, first_dex, vm->ndexes, library_path)) return false;
@@ -4362,6 +4356,90 @@ static const struct rt_method rt_dex_class_loader[] = {
    M("getParent", "()Ljava/lang/ClassLoader;", clsl_get_parent),
    M("findLibrary", "(Ljava/lang/String;)Ljava/lang/String;", dexcl_find_library),
    M("getLdLibraryPath", "()Ljava/lang/String;", dexcl_library_path),
+   M_END,
+};
+
+/* Android's in-memory loader consumes only each buffer's remaining bytes.
+ * DEX storage is copied by dvm_add_dex_memory, so moving/reusing the buffers
+ * after construction cannot invalidate classes. No temporary files are used. */
+static bool bb_window(struct dvm *, dvm_ref, const int8_t **, int32_t *);
+static bool memory_dex_init(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+   bool single = builtin_sig()[1] != '[';
+   dvm_ref buffers = ARG(0).l;
+   if (!buffers) {
+      dvm__throw(vm, "java/lang/NullPointerException", "dexBuffers");
+      return false;
+   }
+   uint32_t count = single ? 1 : dvm_array_length(vm, buffers);
+   for (uint32_t i = 0; i < count; ++i) {
+      dvm_ref buffer = single ? buffers : ((dvm_ref *)dvm_array_data(vm, buffers))[i];
+      if (!buffer) {
+         dvm__throw(vm, "java/lang/NullPointerException", "dexBuffers contains null");
+         return false;
+      }
+   }
+   (void)dvm_set_field(vm, self, "parent", "Ljava/lang/ClassLoader;", ARG(nargs - 1));
+   const char *library_path = nargs == 3 && ARG(1).l ? dvm_string_utf8(vm, ARG(1).l) : "";
+   int first = vm->ndexes;
+   bool valid = true;
+   /* Validate all buffers before publishing any DEX, as ART opens the array
+    * as one DexFile. A malformed member suppresses the entire file. */
+   for (uint32_t i = 0; i < count; ++i) {
+      dvm_ref buffer = single ? buffers : ((dvm_ref *)dvm_array_data(vm, buffers))[i];
+      const int8_t *bytes = NULL;
+      int32_t size = 0;
+      struct dex_file check = {0};
+      if (!bb_window(vm, buffer, &bytes, &size) ||
+          !dex_open_memory(&check, (const uint8_t *)bytes, (size_t)size, NULL)) {
+         valid = false;
+         break;
+      }
+      dex_close(&check);
+   }
+   if (valid) for (uint32_t i = 0; i < count; ++i) {
+      dvm_ref buffer = single ? buffers : ((dvm_ref *)dvm_array_data(vm, buffers))[i];
+      const int8_t *bytes = NULL;
+      int32_t size = 0;
+      char origin[96];
+      snprintf(origin, sizeof origin, "InMemoryDexFile@%x!classes%u.dex", self, i + 1);
+      if (!bb_window(vm, buffer, &bytes, &size) ||
+          !dvm_add_dex_memory(vm, bytes, (size_t)size, origin)) {
+         dvm__throw(vm, "java/lang/OutOfMemoryError", "in-memory DEX");
+         return false;
+      }
+      vm->dexes[vm->ndexes - 1]->defining_loader = self;
+   }
+   if (vm->ndexes > first) dvm_pin(vm, self); /* DEXes live until VM teardown. */
+   if (!dex_path_list_build(vm, self, first, vm->ndexes, library_path)) return false;
+   union dvm_value list = {0}, elements = {0};
+   (void)dvm_get_field(vm, self, "pathList", "Ldalvik/system/DexPathList;", &list);
+   (void)dvm_get_field(vm, list.l, "dexElements", "[Ldalvik/system/DexPathList$Element;", &elements);
+   for (uint32_t i = 0; i < dvm_array_length(vm, elements.l); ++i) {
+      dvm_ref element = ((dvm_ref *)dvm_array_data(vm, elements.l))[i];
+      union dvm_value dex = {0}, null = {0};
+      (void)dvm_set_field(vm, element, "path", "Ljava/io/File;", null);
+      (void)dvm_get_field(vm, element, "dexFile", "Ldalvik/system/DexFile;", &dex);
+      (void)dvm_set_field(vm, dex.l, "path", "Ljava/lang/String;", null);
+   }
+   if (!valid) {
+      dvm__throw(vm, "java/io/IOException", "Invalid in-memory DEX");
+      dvm_ref error = dvm_exception(vm);
+      dvm_clear_exception(vm);
+      dvm_ref errors = dvm_new_array(vm, 'L', "Ljava/io/IOException;", 1);
+      if (!errors) return false;
+      ((dvm_ref *)dvm_array_data(vm, errors))[0] = error;
+      (void)dvm_set_field(vm, list.l, "dexElementsSuppressedExceptions", "[Ljava/io/IOException;",
+                         (union dvm_value){.l = errors});
+   }
+   RETV();
+}
+static const struct rt_method rt_in_memory_dex_class_loader[] = {
+   M("<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V", memory_dex_init),
+   M("<init>", "([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V", memory_dex_init),
+   M("<init>", "([Ljava/nio/ByteBuffer;Ljava/lang/String;Ljava/lang/ClassLoader;)V", memory_dex_init),
    M_END,
 };
 
@@ -4551,6 +4629,7 @@ static bool dexcl_find_library(struct dvm *vm, dvm_ref self,
 
 static const struct rt_field rt_dex_path_list_fields[] = {
    {"definingContext","Ljava/lang/ClassLoader;"},
+   {"dexElementsSuppressedExceptions","[Ljava/io/IOException;"},
    {"dexElements","[Ldalvik/system/DexPathList$Element;"},
    {"nativeLibraryDirectories","Ljava/util/List;"},
    {"systemNativeLibraryDirectories","Ljava/util/List;"},

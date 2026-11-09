@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MPL-2.0 */
 /*
  * Bridge to a local qfkey (qberry-core) process: publishes this emulator's
- * frames as a remote-desktop "window" and takes touch/key input back.
+ * frames as a remote-desktop "window" and takes touch/key/pointer input back.
  *
  * Transport: a control socket (qfkey listens; lunaria connects, retrying) and
  * one shared-memory segment per lunaria holding a double-buffered frame.
@@ -38,6 +38,9 @@ void luna_qfkey_pump_input(void);
 
 /* Publish a finished frame: top row first, 4 bytes/pixel, stride in bytes. */
 void luna_qfkey_publish(const void *pixels, int w, int h, int stride, bool bgra);
+/* Present thread, before swap: capture the composed default framebuffer.
+ * Does no readback unless subscribed; preserves the context's read/pack state. */
+void luna_qfkey_capture_gl(int w, int h);
 
 #ifdef __cplusplus
 }

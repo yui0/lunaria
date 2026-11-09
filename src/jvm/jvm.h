@@ -9,7 +9,7 @@
 #pragma once
 
 #include "jni.h"
-#include "../luna_input.h"
+#include "../luna_boot.h"
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -232,6 +232,9 @@ int lunaria_android_package_find(const char *name,
  * Binder), with its APK at `host_apk` shown at its sourceDir.  A name already
  * present is kept unchanged. */
 int lunaria_android_package_install(const char *name, uint32_t uid, const char *host_apk);
+/* Immutable manifest metadata read by the package registry when installing an APK. */
+int luna_apk_package_version(const char *apk, const char *package, int *code,
+                              char *name, size_t cap, int *target_sdk);
 
 /* Package visibility, as Android 11 defines it for PackageManager queries.
  *
