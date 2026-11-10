@@ -11793,6 +11793,10 @@ static inline CbWaitSlot *cb_wait_slot(void)
 #define g_cb_lock_wait             (cb_wait_slot()->lock)
 #define g_cb_resume_result_pending (cb_wait_slot()->resume_pending)
 #define g_cb_resume_result         (cb_wait_slot()->resume_result)
+/* sigsuspend() on a guest thread driven directly through JNI (UnityMain): the
+ * mask it replaced, restored when the handler that ends the wait returns. */
+static thread_local bool     g_dvm_sigsuspend_waiting = false;
+static thread_local uint64_t g_dvm_sigsuspend_old_mask = 0;
 static bool cb_lock_wait_try_grant(ArmExecCtx &ctx);
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth);
 static void cb_lock_wait_reset(void);
@@ -39360,6 +39364,44 @@ aaudio_write_retry:
         break;
       }
     }
+    /* A guest thread driven directly through JNI has neither a scheduler slot
+     * nor the main thread's id, and used to fall through to the immediate
+     * EINTR below.  Boehm's suspend handler loops "sigsuspend until the
+     * restart signal was seen", so that thread spun at millions of calls a
+     * second, held the execution lock most of the time and starved the
+     * collector that has to send the restart: stop-the-world never ended.
+     * Sleep, with the lock dropped, until a signal the temporary mask lets
+     * through is pending; the SVC return then enters its handler
+     * (Arm64Callbacks::take_main_signal). */
+    if (ctx.is_arm64 && !g_a64_is_worker && g_current_tid != 0 &&
+        g_current_tid < 4096 && g_dvm_native_stacks[g_current_tid].attached) {
+      const uint32_t self = g_current_tid;
+      uint64_t mask = guest_sigset_load(ctx, argp(0), sigset_is_wide(ctx, svc_no));
+      mask &= ~(1ull << (9 - 1));
+      mask &= ~(1ull << (19 - 1));
+      const uint64_t old_mask = signal_mask_load(self);
+      signal_mask_store(self, mask);
+      bool got = false;
+      while (!g_guest_quit.load(std::memory_order_relaxed) &&
+             !g_process_stopping.load(std::memory_order_relaxed)) {
+        if (g_dvm_pending_signals[self].load(std::memory_order_acquire) & ~mask) {
+          got = true;
+          break;
+        }
+        ArmLockDropped unlocked;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+      g_current_tid = self;
+      if (got) {
+        g_dvm_sigsuspend_waiting = true;
+        g_dvm_sigsuspend_old_mask = old_mask;
+      } else {
+        signal_mask_store(self, old_mask);
+      }
+      if (uint32_t eva = errno_va(ctx, self)) ctx.mem.write32(eva, EINTR);
+      ret32(~0u);
+      break;
+    }
     if (ss_log++ < 5)
       fprintf(stderr, "[sigsuspend] r0=0x%08" PRIx64 " tid=%u -> -1/EINTR\n", r0, g_current_tid);
     uint32_t eva = errno_va(ctx, g_current_tid);
@@ -66362,6 +66404,9 @@ public:
          * saved_sigmask does. */
         g_main_waiting_signal = false;
         frame.old_mask = g_main_sigsuspend_old_mask;
+      } else if (g_dvm_sigsuspend_waiting) {
+        g_dvm_sigsuspend_waiting = false;
+        frame.old_mask = g_dvm_sigsuspend_old_mask;
       }
       ++*depth;
       uint64_t blocked = cur_mask | sa.mask;
