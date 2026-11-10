@@ -61574,6 +61574,7 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
     int32_t mix[256 * 2] {};
     int16_t pcm[256 * 2];
     unsigned produced = luna_at_mix(mix, wanted, rate, channels);
+    unsigned sl_short = ~0u; /* fewest frames any playing OpenSL queue could supply */
     for (auto &kv : g_sl_queues) {
       SlBufferQueue &q = kv.second;
       if (q.play_state != 3u) continue;
@@ -61581,7 +61582,16 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
       luna_pcm_queue preview = q.pcm;
       unsigned n = luna_pcm_mix(&preview, mix, wanted, rate, channels);
       if (n > produced) produced = n;
+      if (n < sl_short) sl_short = n;
     }
+    /* The chunk's length is the longest source.  A playing OpenSL queue that
+     * runs out partway through it contributes zeros for the rest of the
+     * chunk, and those zeros were being written to the card as if they were
+     * the stream: CRI keeps a single buffer queued and refills it from the
+     * callback, so every buffer end cut a 160-192 frame hole into the music
+     * (the "static").  End the chunk where the queue ends; the next pass
+     * delivers the callback and continues with the refilled buffer. */
+
     for(auto &kv:g_aaudio_streams) {
       auto &s=kv.second;
       s.update_state(now);
@@ -61591,6 +61601,31 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
       if(s.state==luna_aaudio::started && !n && s.frames_written && now>s.presentation_end_ns && !s.underflow) {
         ++s.xruns;
         s.underflow=true;
+      }
+    }
+    /* (see above) the chunk ends where a playing OpenSL queue ends, whatever
+     * the other sources could still supply. */
+    if (sl_short > 0 && sl_short < produced) produced = sl_short;
+    /* A playing OpenSL queue that has run dry is not silence, it is a refill
+     * in flight: its owner (CRI) is re-enqueueing its one buffer from the
+     * callback this very pass owes it, or is inside it.  The mix timeline is
+     * the max over sources, so mixing on here spliced ~176 frames of zeros
+     * into the stream at every refill (an audible tick ~40 times a second)
+     * whenever another source — an idle AAudio stream is enough — kept the
+     * pass non-empty.  Hold the pass while the card still has a cushion; the
+     * next pass delivers the callback.  The grace bound keeps a player that
+     * stops enqueueing from freezing every other source. */
+    if (produced) {
+      static uint64_t starved_since = 0;
+      bool sl_empty = false;
+      for (auto &kv : g_sl_queues)
+        if (kv.second.play_state == 3u && !kv.second.pcm.count) sl_empty = true;
+      if (!sl_empty) {
+        starved_since = 0;
+      } else if (queued >= rate / 33u) {
+        const uint64_t tn = host_mono_ns();
+        if (!starved_since) starved_since = tn;
+        if (tn - starved_since < 60'000'000ull) break;
       }
     }
     if (!produced) {
