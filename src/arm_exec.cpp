@@ -12779,6 +12779,7 @@ static EGLSurface egl_host_surf(uint32_t handle) {
   return egl_resolve_guest_surface(handle);
 }
 
+static const char *egl_diag_host_role(void);
 static void egl_note_bound(uint32_t handle, EGLSurface surf, EGLSurface read) {
   if (handle != g_egl_bound_handle && lunaria_env("LUNARIA_TRACE_EGL")) {
     static int n = 0;
@@ -12855,8 +12856,20 @@ static void egl_sync_current_context(uint32_t tid) {
   if (g_egl_bound_handle == want && g_egl_bound_surf == want_s &&
       g_egl_bound_read_surf == want_read)
     return;
-  if (eglMakeCurrent(g_egl_dpy, want_s, want_read, ectx))
+  if (eglMakeCurrent(g_egl_dpy, want_s, want_read, ectx)) {
     egl_note_bound(want, want_s, want_read);
+  } else {
+    /* The context is current on another host thread (EGL_BAD_ACCESS): the
+     * guest thread is running somewhere other than the thread that owns GL,
+     * and every GL call it makes will find no context. */
+    static std::atomic<int> failures{0};
+    const EGLint err = eglGetError();
+    if (failures.fetch_add(1) < 16)
+      fprintf(stderr, "[egl] cannot bind ctx=0x%x for guest tid=%u on host "
+                      "thread %lu role=%s (err=0x%x, host_ctx=%p)\n",
+              want, tid, (unsigned long)pthread_self(), egl_diag_host_role(),
+              (unsigned)err, (void *)eglGetCurrentContext());
+  }
 }
 
 /* Bind EGL for a host->guest entry (JNI callback, etc.). Prefer the calling
@@ -18317,9 +18330,11 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
     static int n = 0;
     if (n++ < 32 || lunaria_env("LUNARIA_TRACE_EGL"))
       fprintf(stderr, "[egl] makeCurrent ctx=0x%x(%p) draw=%s ok=%d "
-                      "err=0x%x tid=%u lr=0x%08x\n",
+                      "err=0x%x tid=%u lr=0x%08x host=%lu role=%s depth=%d\n",
               ctx_h, ectx, draw == EGL_NO_SURFACE ? "NO_SURFACE" : "window",
-              (int)ok, (unsigned)eglGetError(), g_current_tid, lr);
+              (int)ok, (unsigned)eglGetError(), g_current_tid, lr,
+              (unsigned long)pthread_self(), egl_diag_host_role(),
+              g_slice_depth);
   }
   return (int)ok;
 }
@@ -18926,6 +18941,14 @@ static thread_local bool g_a64_is_worker = false;
  * a worker" is not the same test: every dvm bytecode thread also passes it,
  * and each one that ran a slice would build an engine of its own. */
 static thread_local bool g_a64_is_pump = false;
+/* Set once the frame pump's host thread exists.  Before that, GL-owning
+ * guest threads have nowhere to be handed to. */
+static std::atomic<bool> g_a64_pump_started{false};
+/* Which kind of host thread is calling, for EGL ownership diagnostics: a
+ * context bound on one host thread cannot be bound on another. */
+static const char *egl_diag_host_role(void) {
+  return g_a64_is_pump ? "pump" : g_a64_is_worker ? "worker" : "other";
+}
 /* Set by the loader before the engine runs: UE (and similar) keep the game on
  * guest pthread workers; the host pump only calls schedule_threads(). */
 static bool g_a64_worker_engine = false;
@@ -68005,7 +68028,17 @@ a64_hooks_done:
      * guest ForceQuit). Pin the guest thread to the pump for good, rewind the PC
      * onto the svc instruction and stop the slice: the arguments are still in
      * x0-x7, so the pump re-issues exactly this call on the engine that owns GL. */
-    if (svc_touches_gl(svc_no) && g_a64_is_worker) {
+    /* "Not on the pump" is the test, not "on a worker": a nested scheduler on
+     * some other host thread (a Java thread waiting inside a JNI call) also
+     * runs ordinary guest threads.  A thread that has released its GL binding
+     * is ordinary again, and if its next eglMakeCurrent ran there the context
+     * would be bound to that host thread for good; the pump then fails every
+     * later bind with EGL_BAD_ACCESS and glCreateShader answers 0.  Depth 0 is
+     * a direct JNI call with no scheduler to resume it, so it stays put. */
+    if (svc_touches_gl(svc_no) &&
+        (g_a64_is_worker ||
+         (!g_a64_is_pump && g_slice_depth > 0 &&
+          g_a64_pump_started.load(std::memory_order_acquire)))) {
       gl_tid_mark(g_current_tid, svc_no);
       jit64->SetPC(jit64->GetPC() - 4u);
       jit64->HaltExecution();
@@ -74331,6 +74364,7 @@ extern "C" void arm64_exec_threads_run_engine(int on) {
 
 extern "C" void arm64_exec_run_pending_threads(void) {
   g_a64_is_pump = true;   /* this is the frame pump's host thread */
+  g_a64_pump_started.store(true, std::memory_order_release);
   // During bootstrap, workers need long slices to finish Unity's thread-pool setup.
   if (!g_ctx || !g_ctx->jit64) return;
   uint64_t slice = env_ticks("LUNARIA_THREAD_TICKS", UINT64_MAX);
