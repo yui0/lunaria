@@ -34701,6 +34701,22 @@ static bool prefs_edit(struct dvm *vm, dvm_ref self,
 
 static bool prefs_put(struct dvm *vm, dvm_ref self, dvm_ref key, dvm_ref val)
 {
+  /* LUNARIA_TRACE_PREFS_PUT=1: which guest code stages each preference write.
+   * The chain is raw guest addresses; resolve them against the library. */
+  if (getenv("LUNARIA_TRACE_PREFS_PUT") && key) {
+    static int shown;
+    const char *k = dvm_string_utf8(vm, key);
+    if (k && shown++ < 80) {
+      const char *sv = (val && object_is_a(vm, val, "Ljava/lang/String;"))
+                       ? dvm_string_utf8(vm, val) : NULL;
+      if (val && !sv && object_is_a(vm, val, "Ljava/lang/Integer;"))
+        fprintf(stderr, "[prefs-put] %s = %d (int)\n", k, box_get(vm, val).i);
+      else
+        fprintf(stderr, "[prefs-put] %s = %s\n", k,
+                !val ? "(null: removes the key)" : sv ? sv : "(non-string value)");
+      arm_exec_log_guest_chain(k);
+    }
+  }
   union dvm_value pending = { 0 };
   (void)dvm_get_field(vm, self, "pending", "Ljava/lang/Object;", &pending);
   dvm_ref m = pending.l;
