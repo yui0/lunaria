@@ -762,6 +762,10 @@ struct stack_st_X509;
  * This reads installed-package metadata; it is not an APK installation verifier. */
 int dvm_apk_signers_read(const char *path, unsigned sdk,
                          struct stack_st_X509 **current, struct stack_st_X509 **history);
+/* v1 (JAR) signers of an APK with no v2/v3 block: the certificates named by
+ * META-INF/<name>.RSA|DSA|EC.  NULL when there is none.  Metadata only, the
+ * JAR digests are not checked.  The caller owns the returned stack. */
+struct stack_st_X509 *dvm_apk_v1_signers_read(const char *path);
 
 /* ---- JNI bridge to the guest (dvm_jni.c) ---- */
 void dvm_jni_shutdown(void);

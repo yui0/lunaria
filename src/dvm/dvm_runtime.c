@@ -54877,7 +54877,9 @@ bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref pi, uint32_t flags,
             apk ? apk : "unmapped",
             modern < 0 ? "unreadable or unsigned" : modern ? "APK Signature Scheme" : "no signing block");
   if (modern < 0) return false;
-  if (!modern) certs = source_dir ? NULL
+  /* The running app's v1 envelope comes from the launcher; another package
+   * (Play Store, Services Framework) is read from its own META-INF. */
+  if (!modern) certs = source_dir ? dvm_apk_v1_signers_read(apk)
                          : package_v1_signers(getenv("ANDROID_APK_SIGNER_PKCS7"));
   int count = certs ? sk_X509_num(certs) : 0;
   int past_count = past ? sk_X509_num(past) : 0;
