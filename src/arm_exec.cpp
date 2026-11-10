@@ -18486,6 +18486,26 @@ static uint32_t egl_host_create_window_surface(uint32_t config_handle,
     g_egl_surf = eglCreateWindowSurface(g_egl_dpy, cfg,
                                         g_egl_offscreen_win,
                                         surface_attrs.data());
+    if (g_egl_surf == EGL_NO_SURFACE && g_glfw) {
+      /* The bootstrap surface on this X window was only just destroyed.
+       * NVIDIA's EGL allows one surface per native window and releases it
+       * lazily, so a second eglCreateWindowSurface on the same window fails
+       * with EGL_BAD_ALLOC (Mesa tolerates it).  The window is unmapped and
+       * private to the guest, so move to a fresh one.  The old one is left
+       * for the X server to reap at exit: destroying it while the driver
+       * may still be tearing the old surface down is not safe. */
+      EGLNativeWindowType fresh = (EGLNativeWindowType)
+        luna_os_offscreen_window(g_glfw, g_fb_w, g_fb_h);
+      if (fresh) {
+        g_egl_surf = eglCreateWindowSurface(g_egl_dpy, cfg, fresh,
+                                            surface_attrs.data());
+        if (g_egl_surf != EGL_NO_SURFACE) {
+          g_egl_offscreen_win = fresh;
+          fprintf(stderr, "[arm_exec] guest window surface moved to a "
+                          "fresh unshown window\n");
+        }
+      }
+    }
     if (g_egl_surf == EGL_NO_SURFACE) {
       const EGLint error = eglGetError();
       fprintf(stderr, "[arm_exec] guest eglCreateWindowSurface on "
