@@ -2050,16 +2050,6 @@ android_content_pm_PackageInfo_versionCode(JNIEnv *env, jobject object)
   return code;
 }
 
-/* android.os.Process.setThreadPriority(int tid, int priority) or (int priority).
- * Just a hint; silently ignore in emulation. */
-void
-android_os_Process_setThreadPriority(JNIEnv *env, jclass cls, va_list args)
-{
-  (void)env;
-  (void)cls;
-  (void)args;
-}
-
 /* android.os.Environment.getExternalStorageState() → "mounted".
  * Unity checks if external storage is available before writing cache files. */
 jstring
@@ -3513,36 +3503,8 @@ jint android_view_Display_getWidth(JNIEnv *e, jobject o, va_list a)
   (void)a;
   return arm_exec_fb_width();
 }
-jint java_lang_Object_getWidth(JNIEnv *e, jobject o, va_list a)
-{
-  (void)e;
-  (void)o;
-  (void)a;
-  return arm_exec_fb_width();
-}
-jint java_lang_Class_getWidth(JNIEnv *e, jobject o, va_list a)
-{
-  (void)e;
-  (void)o;
-  (void)a;
-  return arm_exec_fb_width();
-}
 
 jint android_view_Display_getHeight(JNIEnv *e, jobject o, va_list a)
-{
-  (void)e;
-  (void)o;
-  (void)a;
-  return arm_exec_fb_height();
-}
-jint java_lang_Object_getHeight(JNIEnv *e, jobject o, va_list a)
-{
-  (void)e;
-  (void)o;
-  (void)a;
-  return arm_exec_fb_height();
-}
-jint java_lang_Class_getHeight(JNIEnv *e, jobject o, va_list a)
 {
   (void)e;
   (void)o;

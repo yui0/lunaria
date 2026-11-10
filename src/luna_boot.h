@@ -428,6 +428,8 @@ struct luna_text_bitmap {
 /* Immutable copied font data, cached until host shutdown. Zero is the system
  * face. Handles remain valid across platform-font reloads and glyph runs. */
 uint32_t luna_overlay_font_load(const void *data,size_t size,int index);
+/* Borrow the selected host system faces (regular, bold, CJK, mono). */
+bool luna_overlay_system_font(unsigned role,const void **data,size_t *size);
 /* direction: 0=automatic, 1=LTR, 2=RTL. */
 bool luna_overlay_shape_font_direction(uint32_t font,const uint16_t *text,size_t length,float px,bool bold,int direction,struct luna_text_run *run);
 /* Shape only [start,start+count), retaining the surrounding UTF-16 context.

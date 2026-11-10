@@ -29,6 +29,10 @@ extern "C" {
 typedef void (*luna_qfkey_touch_fn)(int action, float x, float y);
 typedef void (*luna_qfkey_key_fn)(int hid, int down);
 void luna_qfkey_set_host_handlers(luna_qfkey_touch_fn touch, luna_qfkey_key_fn key);
+/* Host-UI wheel: lines scrolled, positive y = content moves down (as GLFW's
+ * scroll callback).  Only delivered while host handlers are set. */
+typedef void (*luna_qfkey_scroll_fn)(double x, double y);
+void luna_qfkey_set_host_scroll(luna_qfkey_scroll_fn scroll);
 
 /* Starts the background connector if LUNARIA_QFKEY (or lunaria.conf qfkey) is
  * not "off".  Safe to call more than once.  When LUNARIA_INSTANCE is set and
@@ -38,6 +42,11 @@ void luna_qfkey_start(const char *title, int width, int height);
 /* True while qfkey wants frames.  Cheap (one atomic load); call before any
  * costly readback. */
 bool luna_qfkey_wants_frame(void);
+/* Wake a sleeping host UI after remote input or background progress.
+ * Callback runs under an internal lock; it must not call these helpers. */
+void luna_qfkey_set_wake(void (*wake)(void));
+void luna_qfkey_wake(void);
+void luna_qfkey_wait(unsigned timeout_ms);
 
 /* Pump thread, once per frame: delivers input received from qfkey to the
  * host handlers (if set) or the emulator's own queues. */

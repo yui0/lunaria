@@ -5103,7 +5103,99 @@ static const struct rt_field rt_dex_element_fields[] = {
 static const struct rt_field rt_native_element_fields[] = {
   {"path","Ljava/io/File;"},{"zipDir","Ljava/lang/String;"},F_END
 };
-static const struct rt_method rt_dex_path_list[] = {M_END};
+/* Android 12 DexPathList.makeDexElements: preserve path order, retain
+ * resource directories/archives, and collect only DEX I/O failures. */
+static bool dex_path_make_elements(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+  (void)self;
+  union dvm_value size = {0};
+  if (!am_vcall(vm, ARG(0).l, "size", "()I", NULL, 0, &size)) return false;
+  if (size.i < 0) return false;
+  uint32_t capacity = (uint32_t)size.i, count = 0;
+  dvm_ref elements = dvm_new_array(vm, 'L', "Ldalvik/system/DexPathList$Element;", capacity);
+  if (!elements) return false;
+  dvm_pin(vm, elements);
+  bool ok = false;
+  for (uint32_t i = 0; i < capacity; ++i) {
+    union dvm_value index = {.i = (int32_t)i}, item = {0};
+    if (!am_vcall(vm, ARG(0).l, "get", "(I)Ljava/lang/Object;", &index, 1, &item)) goto done;
+    const char *path = item.l ? file_path(vm, item.l) : NULL;
+    if (!path) {
+      dvm__throw(vm, "java/lang/NullPointerException", "dex path file");
+      goto done;
+    }
+    char host[DVM_PATH_MAX];
+    const char *mapped = arm_exec_map_guest_path(path, host, sizeof host);
+    struct stat st;
+    if (!mapped || luna_file_stat_follow(mapped, &st) ||
+        !(S_ISDIR(st.st_mode) || S_ISREG(st.st_mode))) continue;
+    dvm_ref dexfile = 0;
+    size_t length = strlen(path);
+    bool raw = length >= 4 && !strcmp(path + length - 4, ".dex");
+    if (!S_ISDIR(st.st_mode)) {
+      dexfile = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexFile"));
+      if (!dexfile) goto done;
+      dvm_pin(vm, dexfile);
+      int first = vm->ndexes;
+      bool loaded = dexfile_open(vm, dexfile, path);
+      for (int j = first; j < vm->ndexes; ++j)
+        vm->dexes[j]->defining_loader = nargs >= 4 ? ARG(3).l : 0;
+      if (vm->ndexes > first && nargs >= 4 && ARG(3).l) dvm_pin(vm, ARG(3).l);
+      if (!loaded) {
+        dvm_ref error = dvm_exception(vm);
+        struct dvm_object *exception = dvm__obj(vm, error);
+        if (!exception || !dvm__class_assignable(vm, exception->cls,
+              dvm_find_class(vm, "java/io/IOException"))) {
+          dvm_unpin(vm, dexfile);
+          goto done;
+        }
+        dvm_pin(vm, error);
+        dvm_clear_exception(vm);
+        union dvm_value value = {.l = error}, ignored = {0};
+        bool added = am_vcall(vm, ARG(2).l, "add", "(Ljava/lang/Object;)Z", &value, 1, &ignored);
+        dvm_unpin(vm, error);
+        if (!added) {
+          dvm_unpin(vm, dexfile);
+          goto done;
+        }
+      }
+      if (!loaded) {
+        dvm_unpin(vm, dexfile);
+        dexfile = 0;
+      }
+      if (!dexfile && raw) continue;
+    }
+    dvm_ref element = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList$Element"));
+    if (!element) {
+      if (dexfile) dvm_unpin(vm, dexfile);
+      goto done;
+    }
+    ((dvm_ref *)dvm_array_data(vm, elements))[count++] = element;
+    dvm_set_field(vm, element, "path", "Ljava/io/File;",
+                  (union dvm_value){.l = dexfile && raw ? 0 : item.l});
+    dvm_set_field(vm, element, "dexFile", "Ldalvik/system/DexFile;",
+                  (union dvm_value){.l = dexfile});
+    if (dexfile) dvm_unpin(vm, dexfile);
+  }
+  if (count != capacity) {
+    dvm_ref compact = dvm_new_array(vm, 'L', "Ldalvik/system/DexPathList$Element;", count);
+    if (!compact) goto done;
+    if (count) memcpy(dvm_array_data(vm, compact), dvm_array_data(vm, elements), count * sizeof(dvm_ref));
+    out->l = compact;
+  } else out->l = elements;
+  ok = true;
+done:
+  dvm_unpin(vm, elements);
+  return ok;
+}
+
+static const struct rt_method rt_dex_path_list[] = {
+  SM("makeDexElements", "(Ljava/util/List;Ljava/io/File;Ljava/util/List;Ljava/lang/ClassLoader;)[Ldalvik/system/DexPathList$Element;", dex_path_make_elements),
+  SM("makeDexElements", "(Ljava/util/List;Ljava/io/File;Ljava/util/List;Ljava/lang/ClassLoader;Z)[Ldalvik/system/DexPathList$Element;", dex_path_make_elements),
+  M_END
+};
 
 static bool map_keySet(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out);

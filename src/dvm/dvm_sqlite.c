@@ -1467,12 +1467,152 @@ static bool matrix_add_row(struct dvm *vm, dvm_ref self, const union dvm_value *
   RETV();
 }
 
+/* android.database.MatrixCursor$RowBuilder fills the row newRow() reserved:
+ * values land positionally with add(Object) (throwing once the row is full),
+ * by column hint with add(String, Object) (unknown columns silently ignored)
+ * and at an explicit index with add(int, Object).  Just like the Java builder
+ * borrows nothing, our builder borrows the cursor's storage and dies with it;
+ * the cursor stays reachable on the caller's stack while the builder is used. */
+struct sq_row_builder {
+  struct sq_cursor *c;
+  int row;              /* the row this builder fills */
+  int index;            /* next cell for add(Object) */
+  int end;              /* first cell past that row */
+};
+
+static void matrix_row_destroy(void *p) { free(p); }
+
+static bool matrix_new_row(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs, union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct sq_cursor *c = cursor_of(vm, self);
+  if (!c) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "MatrixCursor");
+    return false;
+  }
+  struct dvm_class *cls = dvm__class_by_desc(vm, "Landroid/database/MatrixCursor$RowBuilder;");
+  if (!cls) {
+    dvm__throw(vm, "java/lang/NoClassDefFoundError", "android.database.MatrixCursor$RowBuilder");
+    return false;
+  }
+  /* The row counts as present the moment it is created; values one add() at a
+   * time.  Unfilled cells answer as null, like the Java array. */
+  const int ncols = c->ncols ? c->ncols : 1;
+  struct sq_cell *grown = realloc(c->cells, (size_t)(c->nrows + 1) * (size_t)ncols * sizeof *c->cells);
+  if (!grown) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "MatrixCursor");
+    return false;
+  }
+  c->cells = grown;
+  struct sq_cell *dest = c->cells + (size_t)c->nrows * (size_t)ncols;
+  memset(dest, 0, (size_t)c->ncols * sizeof *dest);
+  for (int i = 0; i < c->ncols; ++i) dest[i].type = SQ_NULL;
+  struct sq_row_builder *b = calloc(1, sizeof *b);
+  if (!b) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "MatrixCursor$RowBuilder");
+    return false;
+  }
+  b->c = c;
+  b->row = c->nrows++;
+  b->index = b->row * c->ncols;
+  b->end = b->index + c->ncols;
+  dvm_ref builder = dvm_new_object(vm, cls);
+  if (!builder) {
+    free(b);
+    return false;
+  }
+  host_data_set(vm, builder, b, matrix_row_destroy);
+  RETL(builder);
+}
+
+static struct sq_row_builder *row_builder_of(struct dvm *vm, dvm_ref self)
+{
+  return host_data(vm, self);
+}
+
+static bool row_builder_add_object(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+  (void)nargs;
+  struct sq_row_builder *b = row_builder_of(vm, self);
+  if (!b || !b->c) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "MatrixCursor$RowBuilder");
+    return false;
+  }
+  /* AbstractCursor's contract: after the last column of the row, every add is
+   * a CursorIndexOutOfBoundsException ("No more columns left."). */
+  if (b->index == b->end) {
+    dvm__throw(vm, "android/database/CursorIndexOutOfBoundsException",
+               "No more columns left.");
+    return false;
+  }
+  if (!cell_from_object(vm, ARG(0).l, b->c->cells + (size_t)b->index)) return false;
+  ++b->index;
+  RETL(self);
+}
+
+static bool row_builder_add_hint(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+  (void)nargs;
+  struct sq_row_builder *b = row_builder_of(vm, self);
+  if (!b || !b->c) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "MatrixCursor$RowBuilder");
+    return false;
+  }
+  const char *name;
+  if (!sq_str(vm, ARG(0).l, &name)) {
+    dvm__throw(vm, "java/lang/NullPointerException", "columnName");
+    return false;
+  }
+  for (int i = 0; i < b->c->ncols; ++i)
+    if (!strcmp(b->c->names[i], name) &&
+        !cell_from_object(vm, ARG(1).l,
+                          b->c->cells + (size_t)b->row * (size_t)b->c->ncols + (size_t)i))
+      return false;
+  RETL(self);
+}
+
+static bool row_builder_add_at(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+  (void)nargs;
+  struct sq_row_builder *b = row_builder_of(vm, self);
+  if (!b || !b->c) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "MatrixCursor$RowBuilder");
+    return false;
+  }
+  const long at = (long)b->row * b->c->ncols + ARG(0).i;
+  /* The Java builder indexes an array here; a bad index is that exception. */
+  if (at < 0 || at >= (long)b->c->nrows * b->c->ncols) {
+    dvm__throw(vm, "android/database/CursorIndexOutOfBoundsException",
+               "Index %ld requested, with a size of %d", at, b->c->nrows * b->c->ncols);
+    return false;
+  }
+  if (!cell_from_object(vm, ARG(1).l, b->c->cells + (size_t)at)) return false;
+  RETL(self);
+}
+
+const struct dvm_sqlite_method dvm_sqlite_matrix_row_builder_methods[] = {
+  { "add", "(Ljava/lang/Object;)Landroid/database/MatrixCursor$RowBuilder;", row_builder_add_object, 0 },
+  { "add", "(Ljava/lang/String;Ljava/lang/Object;)Landroid/database/MatrixCursor$RowBuilder;", row_builder_add_hint, 0 },
+  { "add", "(ILjava/lang/Object;)Landroid/database/MatrixCursor$RowBuilder;", row_builder_add_at, 0 },
+  { NULL, NULL, NULL, 0 }
+};
+
 const struct dvm_sqlite_method dvm_sqlite_matrix_cursor_methods[] = {
   { "<init>", "([Ljava/lang/String;)V", matrix_init, 0 },
   { "<init>", "([Ljava/lang/String;I)V", matrix_init, 0 },
   { "addRow", "([Ljava/lang/Object;)V", matrix_add_row, 0 },
+  { "newRow", "()Landroid/database/MatrixCursor$RowBuilder;", matrix_new_row, 0 },
   { NULL, NULL, NULL, 0 }
 };
+
 
 /* --- SQL building -------------------------------------------------------- */
 

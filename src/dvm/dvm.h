@@ -260,6 +260,15 @@ void dvm_unpin(struct dvm *vm, dvm_ref ref);
 dvm_ref dvm_wrap_external(struct dvm *vm, const char *class_name, uint32_t host_handle);
 /* Non-zero when `ref` wraps a host handle. */
 uint32_t dvm_external_handle(struct dvm *vm, dvm_ref ref);
+/* The dvm object a JNI handle refers to (see dvm_jni.c's wrapper table). */
+dvm_ref dvm_host_wrapper_ref(uint32_t host);
+/* android/bitmap.h (libjnigraphics) backend, implemented next to the Bitmap
+ * class.  Return 0 on success, -2 when `host` is not a live Bitmap
+ * (ANDROIDBITMAP_RESULT_BAD_PARAMETER) and -1 when allocation failed. */
+int dvm_android_bitmap_info(uint32_t host, uint32_t *w, uint32_t *h,
+                            uint32_t *stride, int32_t *fmt, uint32_t *flags);
+int dvm_android_bitmap_lock(uint32_t host, uint8_t **out, uint32_t *bytes_out);
+int dvm_android_bitmap_unlock(uint32_t host, const uint8_t *bytes, uint32_t n);
 
 /* --- fields (for the JNI bridge) ---------------------------------------- */
 
@@ -391,6 +400,7 @@ void dvm_gil_wait(struct dvm *vm, unsigned ms);
 void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms);
 /* UINT64_MAX waits until notification without a timeout. */
 void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns);
+void dvm_gil_wait_for_looper_ns(struct dvm *vm, uintptr_t channel, uint64_t ns);
 
 /* Enter/leave the VM from guest code that holds the ARM execution lock; see
  * the definition for the lock-order argument.  The cookie is opaque and must

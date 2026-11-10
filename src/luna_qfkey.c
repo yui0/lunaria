@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <pthread.h>
 #include <GLES3/gl3.h>
 
@@ -54,8 +55,11 @@ typedef struct qk_hdr {
 
 enum { M_HELLO = 1, M_RESIZE = 2,
        M_SUBSCRIBE = 10, M_UNSUBSCRIBE = 11, M_TOUCH = 12, M_KEY = 13,
-       M_POINTER_BUTTON = 14
+       M_POINTER_BUTTON = 14,
+       /* extended input, sent only because HELLO announces QK_CAP_EXT_INPUT */
+       M_POINTER_MOVE = 15, M_WHEEL = 16
      };
+enum { QK_CAP_EXT_INPUT = 1 };
 
 static qk_hdr *g_hdr;
 static uint8_t *g_planes;
@@ -70,14 +74,29 @@ bool luna_qfkey_wants_frame(void) {
   return atomic_load_explicit(&g_sub, memory_order_relaxed) != 0;
 }
 
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t *pixels;
+static size_t capacity;
+static void release_capture_buffer(void) {
+  pthread_mutex_lock(&lock);
+  free(pixels);
+  pixels = NULL;
+  capacity = 0;
+  pthread_mutex_unlock(&lock);
+}
+
 void luna_qfkey_capture_gl(int w, int h)
 {
   luna_qfkey_start("lunaria", w, h);
-  if (!luna_qfkey_wants_frame() || w <= 0 || h <= 0 || w > QK_MAX_W || h > QK_MAX_H) return;
-  static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-  static uint8_t *pixels;
-  static size_t capacity;
+  if (w <= 0 || h <= 0 || w > QK_MAX_W || h > QK_MAX_H) return;
   pthread_mutex_lock(&lock);
+  if (!luna_qfkey_wants_frame()) {
+    free(pixels);
+    pixels = NULL;
+    capacity = 0;
+    pthread_mutex_unlock(&lock);
+    return;
+  }
   const size_t stride = (size_t)w * 4u, bytes = stride * (size_t)h;
   if (capacity < bytes + stride) {
     uint8_t *next = realloc(pixels, bytes + stride);
@@ -443,6 +462,7 @@ static void send_hello(void)
   b[o++] = (uint8_t)tl;
   memcpy(b + o, g_title, tl);
   o += tl;
+  b[o++] = QK_CAP_EXT_INPUT; /* optional trailing capability byte */
   send_msg(M_HELLO, b, (uint16_t)o);
 }
 
@@ -451,7 +471,7 @@ static void send_hello(void)
  * events across; luna_qfkey_pump_input() drains it.  Full ring = drop. */
 #define QK_RING 128
 typedef struct qk_in {
-  uint8_t kind; /* 1 touch, 2 key, 3 pointer button */
+  uint8_t kind; /* 1 touch, 2 key, 3 pointer button, 4 wheel, 5 hover */
   int a;        /* touch: action; key: HID usage; pointer: button */
   int down;     /* key or pointer button */
   float x, y;   /* surface coordinates */
@@ -460,11 +480,48 @@ static qk_in g_ring[QK_RING];
 static _Atomic unsigned g_head, g_tail;
 static luna_qfkey_touch_fn g_host_touch;
 static luna_qfkey_key_fn g_host_key;
+static luna_qfkey_scroll_fn g_host_scroll;
+
+void luna_qfkey_set_host_scroll(luna_qfkey_scroll_fn scroll)
+{
+  g_host_scroll = scroll;
+}
 
 void luna_qfkey_set_host_handlers(luna_qfkey_touch_fn touch, luna_qfkey_key_fn key)
 {
   g_host_touch = touch;
   g_host_key = key;
+}
+
+static pthread_mutex_t ui_wait_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t ui_wait_cond = PTHREAD_COND_INITIALIZER;
+static int ui_wake_pending;
+static void (*ui_wake_callback)(void);
+
+void luna_qfkey_set_wake(void (*wake)(void)) {
+  pthread_mutex_lock(&ui_wait_lock);
+  ui_wake_callback = wake;
+  pthread_mutex_unlock(&ui_wait_lock);
+}
+void luna_qfkey_wake(void) {
+  pthread_mutex_lock(&ui_wait_lock);
+  ui_wake_pending = 1;
+  pthread_cond_signal(&ui_wait_cond);
+  if (ui_wake_callback) ui_wake_callback();
+  pthread_mutex_unlock(&ui_wait_lock);
+}
+void luna_qfkey_wait(unsigned timeout_ms) {
+  struct timespec until;
+  clock_gettime(CLOCK_REALTIME, &until);
+  until.tv_sec += timeout_ms / 1000;
+  until.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+  if (until.tv_nsec >= 1000000000L) { ++until.tv_sec; until.tv_nsec -= 1000000000L; }
+  pthread_mutex_lock(&ui_wait_lock);
+  while (!ui_wake_pending) {
+    if (pthread_cond_timedwait(&ui_wait_cond, &ui_wait_lock, &until)) break;
+  }
+  ui_wake_pending = 0;
+  pthread_mutex_unlock(&ui_wait_lock);
 }
 
 static void ring_push(qk_in e)
@@ -473,6 +530,7 @@ static void ring_push(qk_in e)
   if (h - atomic_load_explicit(&g_tail, memory_order_acquire) >= QK_RING) return;
   g_ring[h % QK_RING] = e;
   atomic_store_explicit(&g_head, h + 1, memory_order_release);
+  luna_qfkey_wake();
 }
 
 static int hid_to_android(int hid)
@@ -510,6 +568,12 @@ void luna_qfkey_pump_input(void)
       }
     } else if (e.kind == 3 && !g_host_touch) {
       arm_exec_pointer_button(e.a, e.down, e.x, e.y);
+    } else if (e.kind == 4) {
+      /* wheel: only the launcher scrolls; a = axis (0 vertical), x = lines */
+      if (g_host_touch && g_host_scroll) g_host_scroll(e.a ? e.x : 0, e.a ? 0 : e.x);
+    } else if (e.kind == 5) {
+      /* hover (no button held): the launcher's pointer follows it */
+      if (g_host_touch) g_host_touch(2, e.x, e.y);
     }
   }
 }
@@ -528,6 +592,25 @@ static void on_key(const uint8_t *p, uint16_t len)
   if (len < 2) return;
   qk_in e = { 2, p[0], p[1] ? 1 : 0, 0, 0 }; /* a = HID usage */
   ring_push(e);
+}
+
+static void on_wheel(const uint8_t *p, uint16_t len)
+{
+  if (len < 5 || p[0] > 1) return;
+  int32_t delta;
+  memcpy(&delta, p + 1, 4);
+  if (delta < -1000 || delta > 1000 || !delta) return;
+  qk_in e = { 4, p[0], 0, (float)delta, 0 };
+  ring_push(e);
+}
+
+static void on_pointer_move(const uint8_t *p, uint16_t len)
+{
+  if (len < 8) return;
+  qk_in e = { 5, 0, 0, 0, 0 };
+  memcpy(&e.x, p, 4);
+  memcpy(&e.y, p + 4, 4);
+  if (isfinite(e.x) && isfinite(e.y)) ring_push(e);
 }
 
 static void on_pointer_button(const uint8_t *p, uint16_t len)
@@ -564,10 +647,13 @@ static void session(void)
     switch (head[0]) {
     case M_SUBSCRIBE:
       atomic_store(&g_sub, 1);
+      luna_qfkey_wake();
       atomic_store(&g_hdr->subscribed, 1);
       break;
     case M_UNSUBSCRIBE:
       atomic_store(&g_sub, 0);
+      release_capture_buffer();
+      luna_qfkey_wake();
       atomic_store(&g_hdr->subscribed, 0);
       break;
     case M_TOUCH:
@@ -579,12 +665,20 @@ static void session(void)
     case M_POINTER_BUTTON:
       on_pointer_button(pay, len);
       break;
+    case M_WHEEL:
+      on_wheel(pay, len);
+      break;
+    case M_POINTER_MOVE:
+      on_pointer_move(pay, len);
+      break;
     default:
       break;
     }
   }
   atomic_store(&g_connected, 0);
   atomic_store(&g_sub, 0);
+  release_capture_buffer();
+  luna_qfkey_wake();
   atomic_store(&g_hdr->subscribed, 0);
   io_close();
   fprintf(stderr, "[qfkey] disconnected, retrying\n");

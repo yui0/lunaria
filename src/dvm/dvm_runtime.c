@@ -24,6 +24,7 @@
 #include "dvm/dvm_media.h"
 #include "dvm/framework.h"
 #include "lunaria_file.h"
+#include "luna_certs.h"
 #include "dvm_lib.h"
 #include "dvm/dvm_net.h"
 #include "dvm/dvm_lib.h"
@@ -4083,17 +4084,34 @@ static bool regex_pattern_flags(struct dvm *vm, dvm_ref self,
   RETI(p ? p->flags : 0);
 }
 
+static bool am_vcall(struct dvm *, dvm_ref, const char *, const char *,
+                     const union dvm_value *, int, union dvm_value *);
+
 static bool regex_matcher(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
 {
   (void)nargs;
   struct rt_regex_pattern *p = pattern_of(vm, self);
+  if (!ARG(0).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "input == null");
+    return false;
+  }
   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/regex/Matcher;");
   dvm_ref ref = c ? dvm_new_object(vm, c) : 0;
   struct rt_regex_matcher *m = ref ? calloc(1, sizeof *m) : NULL;
   size_t n = 0;
-  const char *input = ARG(0).l ? sdata(vm, ARG(0).l, &n) : NULL;
+  const char *input = sdata(vm, ARG(0).l, &n);
+  if (!input) {
+    /* Any other CharSequence (StringBuilder, a Spanned text...) is matched
+     * as its characters, which is what toString() returns. */
+    union dvm_value text = { 0 };
+    if (!am_vcall(vm, ARG(0).l, "toString", "()Ljava/lang/String;", NULL, 0, &text)) {
+      free(m);
+      return false;
+    }
+    input = text.l ? sdata(vm, text.l, &n) : NULL;
+  }
   if (!ref || !m || !input || !p) {
     free(m);
     RETL(0);
@@ -10663,17 +10681,116 @@ static bool ll_getDefault(struct dvm *vm, dvm_ref self,
   RETL(locale_list_default(vm));
 }
 
+static bool ll_same_locale(struct dvm *vm, dvm_ref a, dvm_ref b)
+{
+  static const char *const parts[3] = { "language", "country", "variant" };
+  for (int i = 0; i < 3; ++i) {
+    union dvm_value x = { 0 }, y = { 0 };
+    (void)dvm_get_field(vm, a, parts[i], "Ljava/lang/String;", &x);
+    (void)dvm_get_field(vm, b, parts[i], "Ljava/lang/String;", &y);
+    const char *sx = x.l ? dvm_string_utf8(vm, x.l) : "", *sy = y.l ? dvm_string_utf8(vm, y.l) : "";
+    if (strcmp(sx ? sx : "", sy ? sy : "")) return false;
+  }
+  return true;
+}
+
+/* LocaleList(Locale...): an empty list is allowed; a null entry or a repeated
+ * locale is an error, as on a device. */
 static bool ll_init(struct dvm *vm, dvm_ref self,
                     const union dvm_value *args, int nargs,
                     union dvm_value *out)
 {
   dvm_ref locale = 0;
   struct dvm_object *array = nargs > 0 ? dvm__obj(vm, ARG(0).l) : NULL;
-  if (array && array->kind == DVM_OBJ_ARRAY && array->length && array->data)
-    locale = ((dvm_ref *)array->data)[0];
+  const bool is_array = array && array->kind == DVM_OBJ_ARRAY;
+  const dvm_ref *items = is_array && array->length ? array->data : NULL;
+  for (uint32_t i = 0; items && i < array->length; ++i) {
+    if (!items[i]) {
+      dvm__throw(vm, "java/lang/NullPointerException", "list[%u] is null", (unsigned)i);
+      return false;
+    }
+    for (uint32_t j = 0; j < i; ++j)
+      if (ll_same_locale(vm, items[j], items[i])) {
+        dvm__throw(vm, "java/lang/IllegalArgumentException", "list[%u] is a repetition", (unsigned)i);
+        return false;
+      }
+  }
+  if (items) locale = items[0];
   union dvm_value value = { .l = locale };
   (void)dvm_set_field(vm, self, "locale", "Ljava/util/Locale;", value);
+  if (is_array) {
+    union dvm_value all = { .l = ARG(0).l };
+    dvm_pin(vm, all.l);
+    (void)dvm_set_field(vm, self, "all", "[Ljava/util/Locale;", all);
+  }
   RETV();
+}
+
+/* The Locale at `index`, or 0 past the end.  A list built without an array
+ * (the default list) holds just its one locale. */
+static dvm_ref ll_at(struct dvm *vm, dvm_ref self, int index)
+{
+  union dvm_value all = { 0 };
+  (void)dvm_get_field(vm, self, "all", "[Ljava/util/Locale;", &all);
+  struct dvm_object *a = all.l ? dvm__obj(vm, all.l) : NULL;
+  if (a) return index >= 0 && (uint32_t)index < a->length ? ((dvm_ref *)a->data)[index] : 0;
+  if (index) return 0;
+  union dvm_value locale = { 0 };
+  (void)dvm_get_field(vm, self, "locale", "Ljava/util/Locale;", &locale);
+  return locale.l;
+}
+
+static int ll_count(struct dvm *vm, dvm_ref self)
+{
+  union dvm_value all = { 0 };
+  (void)dvm_get_field(vm, self, "all", "[Ljava/util/Locale;", &all);
+  struct dvm_object *a = all.l ? dvm__obj(vm, all.l) : NULL;
+  return a ? (int)a->length : 1;
+}
+
+/* LocaleList.forLanguageTags("ja-JP,en-US"): one Locale per tag. */
+static bool ll_forLanguageTags(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  const char *tags = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : "";
+  int n = 0;
+  for (const char *p = tags; *p; ) {
+    size_t len = strcspn(p, ",");
+    if (len) ++n;
+    p += len + (p[len] ? 1 : 0);
+  }
+  /* Parse every tag first, then keep the first of any repeated locale: the
+   * platform's forLanguageTags drops duplicates instead of failing. */
+  dvm_ref parsed[64];
+  int kept = 0;
+  if (n > 64) n = 64;
+  for (const char *p = tags; *p && kept < n; ) {
+    size_t len = strcspn(p, ",");
+    if (len) {
+      char tag[64];
+      snprintf(tag, sizeof tag, "%.*s", (int)(len < sizeof tag ? len : sizeof tag - 1), p);
+      union dvm_value arg = { .l = dvm_new_string(vm, tag) }, loc = { 0 };
+      if (!loc_forLanguageTag(vm, 0, &arg, 1, &loc)) return false;
+      bool seen = false;
+      for (int j = 0; j < kept && !seen; ++j) seen = ll_same_locale(vm, parsed[j], loc.l);
+      if (!seen) {
+        dvm_pin(vm, loc.l);
+        parsed[kept++] = loc.l;
+      }
+    }
+    p += len + (p[len] ? 1 : 0);
+  }
+  dvm_ref array = dvm_new_array(vm, 'L', "Ljava/util/Locale;", (uint32_t)kept);
+  struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/os/LocaleList;");
+  dvm_ref list = c ? dvm_new_object(vm, c) : 0;
+  for (int j = 0; array && j < kept; ++j) ((dvm_ref *)dvm_array_data(vm, array))[j] = parsed[j];
+  for (int j = 0; j < kept; ++j) dvm_unpin(vm, parsed[j]);
+  if (!array || !list) RETL(0);
+  union dvm_value a = { .l = array }, ignored = { 0 };
+  if (!ll_init(vm, list, &a, 1, &ignored)) return false;
+  RETL(list);
 }
 
 static bool ll_get(struct dvm *vm, dvm_ref self,
@@ -10681,9 +10798,8 @@ static bool ll_get(struct dvm *vm, dvm_ref self,
                    union dvm_value *out)
 {
   (void)nargs;
-  if (ARG(0).i != 0) RETL(0);
-  union dvm_value locale = { 0 };
-  (void)dvm_get_field(vm, self, "locale", "Ljava/util/Locale;", &locale);
+  union dvm_value locale = { .l = ll_at(vm, self, ARG(0).i) };
+  if (ARG(0).i != 0) RETL(locale.l);
   if (!locale.l) {
     (void)loc_getDefault(vm, 0, NULL, 0, &locale);
     if (locale.l) {
@@ -10721,29 +10837,32 @@ static bool ll_toLanguageTags(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  union dvm_value locale = { 0 }, language = { 0 }, country = { 0 };
-  (void)dvm_get_field(vm, self, "locale", "Ljava/util/Locale;", &locale);
-  if (locale.l) {
-    (void)dvm_get_field(vm, locale.l, "language", "Ljava/lang/String;", &language);
-    (void)dvm_get_field(vm, locale.l, "country", "Ljava/lang/String;", &country);
+  char tags[512] = "";
+  size_t used = 0;
+  for (int i = 0, n = ll_count(vm, self); i < n; ++i) {
+    dvm_ref locale = ll_at(vm, self, i);
+    union dvm_value language = { 0 }, country = { 0 };
+    if (locale) {
+      (void)dvm_get_field(vm, locale, "language", "Ljava/lang/String;", &language);
+      (void)dvm_get_field(vm, locale, "country", "Ljava/lang/String;", &country);
+    }
+    const char *l = language.l ? dvm_string_utf8(vm, language.l) : "en";
+    const char *c = country.l ? dvm_string_utf8(vm, country.l) : "US";
+    int w = snprintf(tags + used, sizeof tags - used, "%s%s%s%s", i ? "," : "",
+                     l ? l : "en", c && *c ? "-" : "", c && *c ? c : "");
+    if (w < 0 || (size_t)w >= sizeof tags - used) break;
+    used += (size_t)w;
   }
-  const char *l = language.l ? dvm_string_utf8(vm, language.l) : "en";
-  const char *c = country.l ? dvm_string_utf8(vm, country.l) : "US";
-  char tag[64];
-  snprintf(tag, sizeof tag, "%s%s%s", l ? l : "en",
-           c && *c ? "-" : "", c && *c ? c : "");
-  RETL(dvm_new_string(vm, tag));
+  RETL(dvm_new_string(vm, tags));
 }
 
 static bool ll_size(struct dvm *vm, dvm_ref self,
                     const union dvm_value *args, int nargs,
                     union dvm_value *out)
 {
-  (void)vm;
-  (void)self;
   (void)args;
   (void)nargs;
-  RETI(1);
+  RETI(ll_count(vm, self));
 }
 
 static bool cfg_getLocales(struct dvm *vm, dvm_ref self,
@@ -10940,16 +11059,174 @@ static bool cfg_set_locale(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_locale_list_fields[] = {
-  { "locale", "Ljava/util/Locale;" }, F_END
+  { "locale", "Ljava/util/Locale;" }, { "all", "[Ljava/util/Locale;" }, F_END
 };
+
+/* android.util.Size: an immutable width/height pair. */
+static bool size_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+  (void)nargs; (void)out;
+  union dvm_value w = { .i = ARG(0).i }, h = { .i = ARG(1).i };
+  (void)dvm_set_field(vm, self, "width", "I", w);
+  (void)dvm_set_field(vm, self, "height", "I", h);
+  RETV();
+}
+
+static bool size_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, !strcmp(builtin_name(), "getWidth") ? "width" : "height",
+                      "I", &v);
+  RETI(v.i);
+}
+
+static bool size_equals(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                        int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  struct dvm_class *c = ARG(0).l ? dvm_object_class(vm, ARG(0).l) : NULL;
+  if (!c || strcmp(c->name, "android/util/Size")) RETI(0);
+  union dvm_value aw = { 0 }, ah = { 0 }, bw = { 0 }, bh = { 0 };
+  (void)dvm_get_field(vm, self, "width", "I", &aw);
+  (void)dvm_get_field(vm, self, "height", "I", &ah);
+  (void)dvm_get_field(vm, ARG(0).l, "width", "I", &bw);
+  (void)dvm_get_field(vm, ARG(0).l, "height", "I", &bh);
+  RETI(aw.i == bw.i && ah.i == bh.i);
+}
+
+static bool size_hashCode(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value w = { 0 }, h = { 0 };
+  (void)dvm_get_field(vm, self, "width", "I", &w);
+  (void)dvm_get_field(vm, self, "height", "I", &h);
+  RETI(h.i ^ ((w.i << 16) | (int32_t)((uint32_t)w.i >> 16)));
+}
+
+static bool size_toString(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value w = { 0 }, h = { 0 };
+  (void)dvm_get_field(vm, self, "width", "I", &w);
+  (void)dvm_get_field(vm, self, "height", "I", &h);
+  char buf[32];
+  snprintf(buf, sizeof buf, "%dx%d", w.i, h.i);
+  RETL(dvm_new_string(vm, buf));
+}
+
+static const struct rt_method rt_size[] = {
+  M("<init>", "(II)V", size_init),
+  M("getWidth", "()I", size_get),
+  M("getHeight", "()I", size_get),
+  M("equals", "(Ljava/lang/Object;)Z", size_equals),
+  M("hashCode", "()I", size_hashCode),
+  M("toString", "()Ljava/lang/String;", size_toString),
+  M_END,
+};
+static const struct rt_field rt_size_fields[] = {
+  { "width", "I" }, { "height", "I" }, F_END
+};
+
+/* LocaleList.equals: the same locales in the same order. */
+static bool ll_equals(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  struct dvm_class *c = ARG(0).l ? dvm_object_class(vm, ARG(0).l) : NULL;
+  if (ARG(0).l == self) RETI(1);
+  if (!c || strcmp(c->name, "android/os/LocaleList")) RETI(0);
+  const int n = ll_count(vm, self);
+  if (n != ll_count(vm, ARG(0).l)) RETI(0);
+  for (int i = 0; i < n; ++i) {
+    dvm_ref a = ll_at(vm, self, i), b = ll_at(vm, ARG(0).l, i);
+    if (a != b && (!a || !b || !ll_same_locale(vm, a, b))) RETI(0);
+  }
+  RETI(1);
+}
+
+static bool ll_hashCode(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                        int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  int32_t hash = 1;
+  for (int i = 0, n = ll_count(vm, self); i < n; ++i) {
+    union dvm_value h = { 0 };
+    dvm_ref l = ll_at(vm, self, i);
+    if (l && !am_vcall(vm, l, "hashCode", "()I", NULL, 0, &h)) return false;
+    hash = (int32_t)(31u * (uint32_t)hash + (uint32_t)h.i);
+  }
+  RETI(hash);
+}
+
+/* "[ja_JP,en_US]": each locale's toString between brackets. */
+static bool ll_toString(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                        int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  char text[512] = "[";
+  size_t used = 1;
+  for (int i = 0, n = ll_count(vm, self); i < n; ++i) {
+    union dvm_value s = { 0 };
+    dvm_ref l = ll_at(vm, self, i);
+    if (l && !am_vcall(vm, l, "toString", "()Ljava/lang/String;", NULL, 0, &s)) return false;
+    const char *t = s.l ? dvm_string_utf8(vm, s.l) : "";
+    int w = snprintf(text + used, sizeof text - used - 1, "%s%s", i ? "," : "", t ? t : "");
+    if (w < 0 || (size_t)w >= sizeof text - used - 1) break;
+    used += (size_t)w;
+  }
+  text[used] = ']';
+  text[used + 1] = 0;
+  RETL(dvm_new_string(vm, text));
+}
+
+static bool ll_isEmpty(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  RETI(ll_count(vm, self) == 0);
+}
+
+static bool ll_indexOf(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  for (int i = 0, n = ll_count(vm, self); ARG(0).l && i < n; ++i) {
+    dvm_ref l = ll_at(vm, self, i);
+    if (l && ll_same_locale(vm, l, ARG(0).l)) RETI(i);
+  }
+  RETI(-1);
+}
+
+static bool ll_getEmptyLocaleList(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                  int nargs, union dvm_value *out)
+{
+  (void)self; (void)args; (void)nargs;
+  struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/os/LocaleList;");
+  dvm_ref list = c ? dvm_new_object(vm, c) : 0;
+  dvm_ref none = dvm_new_array(vm, 'L', "Ljava/util/Locale;", 0);
+  union dvm_value a = { .l = none }, ignored = { 0 };
+  if (!list || !none || !ll_init(vm, list, &a, 1, &ignored)) return false;
+  RETL(list);
+}
 
 static const struct rt_method rt_locale_list[] = {
   M("<init>", "([Ljava/util/Locale;)V", ll_init),
   SM("getDefault", "()Landroid/os/LocaleList;", ll_getDefault),
+  SM("forLanguageTags", "(Ljava/lang/String;)Landroid/os/LocaleList;", ll_forLanguageTags),
   SM("setDefault", "(Landroid/os/LocaleList;)V", ll_setDefault),
   M("get", "(I)Ljava/util/Locale;", ll_get),
   M("size", "()I", ll_size),
-  M("isEmpty", "()Z", ret_false),
+  M("isEmpty", "()Z", ll_isEmpty),
+  M("equals", "(Ljava/lang/Object;)Z", ll_equals),
+  M("hashCode", "()I", ll_hashCode),
+  M("toString", "()Ljava/lang/String;", ll_toString),
+  M("indexOf", "(Ljava/util/Locale;)I", ll_indexOf),
+  SM("getEmptyLocaleList", "()Landroid/os/LocaleList;", ll_getEmptyLocaleList),
   M("toLanguageTags", "()Ljava/lang/String;", ll_toLanguageTags),
   M_END,
 };
@@ -16766,7 +17043,12 @@ static bool locksupport_park(struct dvm *vm, dvm_ref self,
             thread, wait_ms);
   dvm__thread_set_state(vm, thread, timed ? DVM_THREAD_TIMED_WAITING : DVM_THREAD_WAITING);
   dvm__thread_set_wait(vm, (uintptr_t)thread);
-  dvm_gil_wait_for(vm, thread, wait_ms);
+  /* Dedicated workers sleep until unpark/interrupt/shutdown. The pump
+   * retains its bounded wait because it also dispatches host events. */
+  if (!timed && thread && dvm_on_bytecode_thread())
+    dvm_gil_wait_for_ns(vm, thread, UINT64_MAX);
+  else
+    dvm_gil_wait_for(vm, thread, wait_ms);
   dvm__thread_set_wait(vm, 0);
   dvm__thread_set_state(vm, thread, DVM_THREAD_RUNNABLE);
   permit.i = 0;
@@ -17616,7 +17898,105 @@ static bool tu_trimmed_length(struct dvm *vm,dvm_ref self,
   RETI(end-start);
 }
 
+/* TextUtils.ellipsize(text, paint, avail, where): `text` if it fits `avail`
+ * pixels; otherwise as much of it as fits beside an ellipsis, cut at the
+ * start, middle or end.  MARQUEE scrolls instead of cutting. */
+static bool tu_measure(struct dvm *vm, dvm_ref paint, const char *s, size_t n, float *width)
+{
+  union dvm_value arg = { .l = dvm_new_string_n(vm, s, n) }, r = { 0 };
+  if (!arg.l || !am_vcall(vm, paint, "measureText", "(Ljava/lang/String;)F", &arg, 1, &r))
+    return false;
+  *width = r.f;
+  return true;
+}
+
+/* Byte offset after `count` code points of s[0..n). */
+static size_t tu_advance(const char *s, size_t n, size_t count)
+{
+  size_t i = 0;
+  while (count && i < n) {
+    ++i;
+    while (i < n && ((unsigned char)s[i] & 0xc0) == 0x80) ++i;
+    --count;
+  }
+  return i;
+}
+
+static size_t tu_codepoints(const char *s, size_t n)
+{
+  size_t count = 0;
+  for (size_t i = 0; i < n; ++i) count += ((unsigned char)s[i] & 0xc0) != 0x80;
+  return count;
+}
+
+/* Most code points of the string (from its start, or from its end when
+ * `from_end`) whose width is within `avail`. */
+static bool tu_fit(struct dvm *vm, dvm_ref paint, const char *s, size_t n, float avail,
+                   bool from_end, size_t *bytes)
+{
+  size_t lo = 0, hi = tu_codepoints(s, n);
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo + 1) / 2, take;
+    float width;
+    if (from_end) take = n - tu_advance(s, n, tu_codepoints(s, n) - mid);
+    else take = tu_advance(s, n, mid);
+    if (!tu_measure(vm, paint, from_end ? s + n - take : s, take, &width)) return false;
+    if (width <= avail) lo = mid;
+    else hi = mid - 1;
+  }
+  *bytes = from_end ? n - tu_advance(s, n, tu_codepoints(s, n) - lo) : tu_advance(s, n, lo);
+  return true;
+}
+
+static bool tu_ellipsize(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  dvm_ref text = ARG(0).l, paint = ARG(1).l;
+  float avail = ARG(2).f, width;
+  if (!text) RETL(0);
+  union dvm_value str = { 0 }, name = { 0 };
+  if (!am_vcall(vm, text, "toString", "()Ljava/lang/String;", NULL, 0, &str)) return false;
+  const char *s = dvm_string_utf8(vm, str.l);
+  if (!s) RETL(text);
+  size_t n = strlen(s);
+  const char *where = "END";
+  if (ARG(3).l && dvm_get_field(vm, ARG(3).l, "name", "Ljava/lang/String;", &name) && name.l)
+    where = dvm_string_utf8(vm, name.l);
+  if (!strcmp(where, "MARQUEE")) RETL(text);
+  if (!tu_measure(vm, paint, s, n, &width)) return false;
+  if (width <= avail) RETL(text);
+  static const char ellipsis[] = "\xe2\x80\xa6";
+  float ew;
+  if (!tu_measure(vm, paint, ellipsis, 3, &ew)) return false;
+  avail -= ew;
+  size_t left = 0, right = 0;
+  if (avail >= 0) {
+    if (!strcmp(where, "START")) {
+      if (!tu_fit(vm, paint, s, n, avail, true, &right)) return false;
+    } else if (!strcmp(where, "MIDDLE")) {
+      if (!tu_fit(vm, paint, s, n, avail / 2, true, &right)) return false;
+      float rw = 0;
+      if (right && !tu_measure(vm, paint, s + n - right, right, &rw)) return false;
+      if (!tu_fit(vm, paint, s, n - right, avail - rw, false, &left)) return false;
+    } else if (!tu_fit(vm, paint, s, n, avail, false, &left)) return false;
+  }
+  char *buf = malloc(left + 3 + right + 1);
+  if (!buf) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "ellipsize");
+    return false;
+  }
+  memcpy(buf, s, left);
+  memcpy(buf + left, ellipsis, 3);
+  memcpy(buf + left + 3, s + n - right, right);
+  buf[left + 3 + right] = 0;
+  dvm_ref result = dvm_new_string(vm, buf);
+  free(buf);
+  RETL(result);
+}
+
 static const struct rt_method rt_textutils[] = {
+  SM("ellipsize", "(Ljava/lang/CharSequence;Landroid/text/TextPaint;FLandroid/text/TextUtils$TruncateAt;)Ljava/lang/CharSequence;", tu_ellipsize),
   SM("split", "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;", tu_split),
   SM("split", "(Ljava/lang/String;Ljava/util/regex/Pattern;)[Ljava/lang/String;", tu_split_pattern),
   SM("lastIndexOf", "(Ljava/lang/CharSequence;C)I", tu_lastIndexOf),
@@ -21751,16 +22131,7 @@ static dvm_ref load_host_accepted_issuers(struct dvm *vm)
 {
   if (vm->accepted_issuers) return vm->accepted_issuers;
 
-  const char *configured=getenv(X509_get_default_cert_file_env());
-  const char *bundles[] = {
-    configured && *configured ? configured : X509_get_default_cert_file(),
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
-    "/etc/ssl/cert.pem",
-    NULL
-  };
-  FILE *fp = NULL;
-  for (int i = 0; bundles[i] && !fp; ++i) fp = luna_file_fopen(bundles[i], "rb");
+  FILE *fp = luna_certs_open_system_bundle();
   if (!fp) {
     fprintf(stderr, "[tls] no host CA bundle — getAcceptedIssuers empty\n");
     vm->accepted_issuers =
@@ -23440,11 +23811,30 @@ static bool enum_map_copy(struct dvm *vm, dvm_ref self,
     dvm__throw(vm, "java/lang/NullPointerException", "null enum map");
     return false;
   }
-  if (!src || !src->enum_type) {
-    dvm__throw(vm, "java/lang/ClassCastException", "source is not an EnumMap");
-    return false;
+  struct dvm_class *type = src ? src->enum_type : NULL;
+  if (!type) {
+    /* EnumMap(Map): any other Map must be non-empty, and its first key names
+     * the enum type (a constant with a body is a subclass of its enum). */
+    union dvm_value n = { 0 }, keys = { 0 }, it = { 0 }, key = { 0 };
+    if (!am_vcall(vm, ARG(0).l, "size", "()I", NULL, 0, &n)) return false;
+    if (!n.i) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Specified map is empty");
+      return false;
+    }
+    if (!am_vcall(vm, ARG(0).l, "keySet", "()Ljava/util/Set;", NULL, 0, &keys) ||
+        !am_vcall(vm, keys.l, "iterator", "()Ljava/util/Iterator;", NULL, 0, &it) ||
+        !am_vcall(vm, it.l, "next", "()Ljava/lang/Object;", NULL, 0, &key))
+      return false;
+    type = key.l ? dvm_object_class(vm, key.l) : NULL;
+    if (type && type->super && strcmp(type->name, "java/lang/Enum") &&
+        strcmp(type->super->name, "java/lang/Enum") && type->super->super &&
+        !strcmp(type->super->super->name, "java/lang/Enum"))
+      type = type->super;
+    if (!type || !type->super || strcmp(type->super->name, "java/lang/Enum")) {
+      dvm__throw(vm, "java/lang/ClassCastException", "key type is not an enum");
+      return false;
+    }
   }
-  struct dvm_class *type = src->enum_type;
   if (!map_init(vm, self, NULL, 0, out)) return false;
   struct rt_map *dest = map_data(vm, self);
   if (!dest) {
@@ -23493,6 +23883,7 @@ static const char *const rt_iface_enum_map[] = {
 static const struct rt_method rt_enum_map[] = {
   M("<init>", "(Ljava/lang/Class;)V", enum_map_init),
   M("<init>", "(Ljava/util/EnumMap;)V", enum_map_copy),
+  M("<init>", "(Ljava/util/Map;)V", enum_map_copy),
   M("put", "(Ljava/lang/Enum;Ljava/lang/Object;)Ljava/lang/Object;", map_put),
   M("put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", map_put),
   M("get", "(Ljava/lang/Object;)Ljava/lang/Object;", map_get),
@@ -24654,6 +25045,18 @@ static bool zip_file_init(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+static bool zip_entry_metadata(struct dvm *vm, dvm_ref entry,
+                                const char *archive, const char *name)
+{
+  struct arm_zip_metadata meta;
+  if (!arm_exec_zip_metadata(archive, name, &meta)) return false;
+  dvm_set_field(vm, entry, "size", "J", (union dvm_value){.j = (int64_t)meta.size});
+  dvm_set_field(vm, entry, "compressedSize", "J", (union dvm_value){.j = (int64_t)meta.compressed_size});
+  dvm_set_field(vm, entry, "crc", "J", (union dvm_value){.j = meta.crc});
+  dvm_set_field(vm, entry, "method", "I", (union dvm_value){.i = meta.method});
+  return true;
+}
+
 static bool zip_file_get_entry(struct dvm *vm, dvm_ref self,
                                const union dvm_value *args, int nargs,
                                union dvm_value *out)
@@ -24663,32 +25066,16 @@ static bool zip_file_get_entry(struct dvm *vm, dvm_ref self,
   (void)dvm_get_field(vm, self, "path", "Ljava/lang/String;", &archive);
   const char *path = dvm_string_utf8(vm, archive.l);
   const char *name = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
-  size_t len = 0;
-  unsigned char *data = arm_exec_zip_read(path, name, &len);
-  {
-    static unsigned reports;
-    if (reports++ < 12)
-      fprintf(stderr, "[zip] getEntry %s!/%s -> %s (%zu bytes)\n",
-              path ? path : "null", name ? name : "null",
-              data ? "found" : "missing", len);
+  if (!name) {
+    dvm__throw(vm, "java/lang/NullPointerException", "zip entry name");
+    return false;
   }
-  if (!data) RETL(0);
-
-  dvm_ref bytes = dvm_new_array(vm, 'B', "B", (uint32_t)len);
-  struct dvm_object *array = bytes ? dvm__obj(vm, bytes) : NULL;
-  if (array && array->data && len) memcpy(array->data, data, len);
-  free(data);
-  if (!bytes) RETL(0);
-
   struct dvm_class *ec = dvm__class_by_desc(vm, "Ljava/util/zip/ZipEntry;");
   dvm_ref entry = ec ? dvm_new_object(vm, ec) : 0;
   if (!entry) RETL(0);
   union dvm_value value = { .l = ARG(0).l };
   (void)dvm_set_field(vm, entry, "name", "Ljava/lang/String;", value);
-  value.l = bytes;
-  (void)dvm_set_field(vm, entry, "bytes", "[B", value);
-  value.j = (int64_t)len;
-  (void)dvm_set_field(vm, entry, "size", "J", value);
+  if (!zip_entry_metadata(vm, entry, path, name)) RETL(0);
   RETL(entry);
 }
 
@@ -24751,9 +25138,7 @@ static bool zip_file_entries(struct dvm *vm, dvm_ref self,
       (void)dvm_set_field(vm, entry, "name", "Ljava/lang/String;", (union dvm_value) {
         .l = dvm_new_string(vm, names[i])
       });
-      (void)dvm_set_field(vm, entry, "size", "J", (union dvm_value) {
-        .j = -1
-      });
+      (void)zip_entry_metadata(vm, entry, dvm_string_utf8(vm, archive.l), names[i]);
       union dvm_value item = { .l = entry }, ignored = { 0 };
       (void)list_add(vm, list, &item, 1, &ignored);
     }
@@ -24792,6 +25177,10 @@ static bool zip_entry_init(struct dvm *vm, dvm_ref self,
   (void)out;
   union dvm_value value = { .l = nargs ? ARG(0).l : 0 };
   (void)dvm_set_field(vm, self, "name", "Ljava/lang/String;", value);
+  const char *unknown[] = {"size", "compressedSize", "crc"};
+  for (unsigned i = 0; i < 3; ++i)
+    dvm_set_field(vm, self, unknown[i], "J", (union dvm_value){.j = -1});
+  dvm_set_field(vm, self, "method", "I", (union dvm_value){.i = -1});
   RETV();
 }
 
@@ -24815,6 +25204,36 @@ static bool zip_entry_get_size(struct dvm *vm, dvm_ref self,
   union dvm_value value = { .j = -1 };
   (void)dvm_get_field(vm, self, "size", "J", &value);
   RETJ(value.j);
+}
+
+static bool zip_entry_get_compressed_size(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value value = {0};
+  dvm_get_field(vm, self, "compressedSize", "J", &value);
+  RETJ(value.j);
+}
+
+static bool zip_entry_get_crc(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value value = {0};
+  dvm_get_field(vm, self, "crc", "J", &value);
+  RETJ(value.j);
+}
+
+static bool zip_entry_get_method(struct dvm *vm, dvm_ref self,
+                            const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value value = {0};
+  dvm_get_field(vm, self, "method", "I", &value);
+  RETI(value.i);
 }
 
 static bool zip_entry_is_directory(struct dvm *vm, dvm_ref self,
@@ -24849,6 +25268,7 @@ static const struct rt_method rt_zip_file[] = {
 
 static const struct rt_field rt_zip_entry_fields[] = {
   { "name", "Ljava/lang/String;" }, { "bytes", "[B" }, { "size", "J" },
+  { "compressedSize", "J" }, { "crc", "J" }, { "method", "I" },
   F_END
 };
 
@@ -24856,7 +25276,9 @@ static const struct rt_method rt_zip_entry[] = {
   M("<init>", "(Ljava/lang/String;)V", zip_entry_init),
   M("getName", "()Ljava/lang/String;", zip_entry_get_name),
   M("getSize", "()J", zip_entry_get_size),
-  M("getCompressedSize", "()J", zip_entry_get_size),
+  M("getCompressedSize", "()J", zip_entry_get_compressed_size),
+  M("getCrc", "()J", zip_entry_get_crc),
+  M("getMethod", "()I", zip_entry_get_method),
   M("isDirectory", "()Z", zip_entry_is_directory),
   M("toString", "()Ljava/lang/String;", zip_entry_get_name),
   M_END,
@@ -35670,7 +36092,10 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
     union dvm_value q = { 0 };
     (void)dvm_get_field(vm, me, "quit", "Z", &q);
     if (q.i) break;
-    bool ran = false;
+    unsigned native_depth=dvm_gil_unlock_all(vm);
+    int native_events=arm_exec_alooper_dispatch_current();
+    dvm_gil_relock(vm,native_depth);
+    bool ran = native_events>0;
     uint64_t now = dvm__now_ms();
     for (int i = 0; i < vm->npending; ++i) {
       if (vm->pending_is_thread[i]) continue;
@@ -35735,7 +36160,7 @@ static bool looper_loop(struct dvm *vm, dvm_ref self,
       if (ns < wait_ns) wait_ns = ns;
     }
     if (!wait_ns) continue;
-    dvm_gil_wait_for_ns(vm, me, wait_ns);
+    dvm_gil_wait_for_looper_ns(vm, me, wait_ns);
   }
   g_current_looper = prev;
   RETV();
@@ -37147,6 +37572,46 @@ static dvm_ref cb_array_ref(struct dvm *vm,dvm_ref self)
   (void)dvm_get_field(vm,self,"chars","[C",&a);
   return a.l;
 }
+static dvm_ref cb_buf_ref(struct dvm *vm,dvm_ref self)
+{
+  union dvm_value a= {0};
+  (void)dvm_get_field(vm,self,"cbuf","[B",&a);
+  return a.l;
+}
+static int64_t cb_base_bytes(struct dvm *vm,dvm_ref self)
+{
+  union dvm_value n= {0};
+  (void)dvm_get_field(vm,self,"base","J",&n);
+  return n.j;
+}
+/* A char in the byte order the view was taken in (JDK: the byte buffer's
+ * order).  Array-backed buffers always read the char array as-is. */
+static uint16_t *cb_data(struct dvm *vm,dvm_ref self);
+static uint16_t cb_load(struct dvm *vm,dvm_ref self,int32_t index)
+{
+  dvm_ref bytes_array=cb_buf_ref(vm,self);
+  struct dvm_object *b=bytes_array ? dvm__obj(vm,bytes_array) : NULL;
+  if(b && b->data) {
+    const uint8_t *p=(const uint8_t *)b->data+(size_t)cb_base_bytes(vm,self)+(size_t)index*2u;
+    return sb_field(vm,self,"little")
+      ? (uint16_t)(p[0]|(uint16_t)p[1]<<8)
+      : (uint16_t)((uint16_t)p[0]<<8|p[1]);
+  }
+  return cb_data(vm,self)[index];
+}
+static void cb_store(struct dvm *vm,dvm_ref self,int32_t index,uint16_t v)
+{
+  dvm_ref bytes_array=cb_buf_ref(vm,self);
+  struct dvm_object *b=bytes_array ? dvm__obj(vm,bytes_array) : NULL;
+  if(b && b->data) {
+    bool little=sb_field(vm,self,"little");
+    uint8_t *p=(uint8_t *)b->data+(size_t)cb_base_bytes(vm,self)+(size_t)index*2u;
+    p[0]=(uint8_t)(v>>(little?0:8));
+    p[1]=(uint8_t)(v>>(little?8:0));
+    return;
+  }
+  cb_data(vm,self)[index]=v;
+}
 static uint16_t *cb_data(struct dvm *vm,dvm_ref self)
 {
   dvm_ref array=cb_array_ref(vm,self);
@@ -37194,6 +37659,42 @@ static bool cb_allocate(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if(!a)return sb_fail(vm,"java/lang/OutOfMemoryError");
   RETL(cb_new(vm,a,0,ARG(0).i,false));
 }
+/* A CharBuffer over another buffer's bytes (ByteBuffer.asCharBuffer()): it
+ * reads two bytes per char in the order it was taken, and writes through to
+ * the same bytes, like the JDK's view. */
+static dvm_ref cb_view_new(struct dvm *vm,dvm_ref bytes,int64_t base,int32_t capacity,
+                           bool little,bool direct,bool ro)
+{
+  dvm_ref o=cb_new(vm,0,0,capacity,ro);
+  if(!o)return 0;
+  (void)dvm_set_field(vm,o,"cbuf","[B",(union dvm_value) {
+    .l=bytes
+  });
+  (void)dvm_set_field(vm,o,"little","Z",(union dvm_value) {
+    .i=little
+  });
+  (void)dvm_set_field(vm,o,"direct","Z",(union dvm_value) {
+    .i=direct
+  });
+  (void)dvm_set_field(vm,o,"base","J",(union dvm_value) {
+    .j=base
+  });
+  return o;
+}
+static bool bb_asCharBuffer(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  union dvm_value bytes= {0},direct= {0};
+  (void)dvm_get_field(vm,self,"buf","[B",&bytes);
+  (void)dvm_get_field(vm,self,"direct","Z",&direct);
+  /* char i covers bytes [pos+i*2, pos+i*2+2) in this buffer's order, reading
+   * and writing through; the view spans 0..(limit-position)/2 chars. */
+  int32_t pos=sb_field(vm,self,"pos"),lim=sb_field(vm,self,"count");
+  dvm_ref o=cb_view_new(vm,bytes.l,pos,(lim-pos)/2,bb_little_endian(vm,self),direct.i!=0,bb_read_only(vm,self));
+  if(!o)return false;
+  RETL(o);
+}
 static bool cb_wrap(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)self;
@@ -37228,7 +37729,7 @@ static bool cb_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,int n
 {
   int32_t index=nargs ? ARG(0).i : sb_field(vm,self,"pos");
   if(index<0 || index>=sb_field(vm,self,"count"))return sb_fail(vm,nargs ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferUnderflowException");
-  uint16_t value=cb_data(vm,self)[index];
+  uint16_t value=cb_load(vm,self,index);
   if(!nargs)stream_set_field(vm,self,"pos",index+1);
   RETI(value);
 }
@@ -37237,7 +37738,7 @@ static bool cb_put(struct dvm *vm,dvm_ref self,const union dvm_value *args,int n
   if(!bb_writable(vm,self))return false;
   int32_t index=nargs==2 ? ARG(0).i : sb_field(vm,self,"pos");
   if(index<0 || index>=sb_field(vm,self,"count"))return sb_fail(vm,nargs==2 ? "java/lang/IndexOutOfBoundsException" : "java/nio/BufferOverflowException");
-  cb_data(vm,self)[index]=(uint16_t)ARG(nargs==2 ? 1 : 0).i;
+  cb_store(vm,self,index,(uint16_t)ARG(nargs==2 ? 1 : 0).i);
   if(nargs!=2)stream_set_field(vm,self,"pos",index+1);
   RETL(self);
 }
@@ -37250,9 +37751,17 @@ static bool cb_bulk(struct dvm *vm,dvm_ref self,const union dvm_value *args,int 
   if(off<0 || len<0 || (uint32_t)off>a->length || (uint32_t)len>a->length-(uint32_t)off)return sb_fail(vm,"java/lang/IndexOutOfBoundsException");
   if(len>sb_field(vm,self,"count")-pos)return sb_fail(vm,put ? "java/nio/BufferOverflowException" : "java/nio/BufferUnderflowException");
   if(len) {
-    uint16_t *array=a->data,*buffer=cb_data(vm,self)+pos;
-    if(put)memmove(buffer,array+off,(size_t)len*sizeof *array);
-    else memmove(array+off,buffer,(size_t)len*sizeof *array);
+    uint16_t *array=a->data;
+    if(cb_buf_ref(vm,self)) {                       /* byte-backed view */
+      for(int32_t i=0; i<len; ++i)
+        if(put)cb_store(vm,self,pos+i,array[off+i]);
+        else array[off+i]=cb_load(vm,self,pos+i);
+    }
+    else {
+      uint16_t *buffer=cb_data(vm,self)+pos;
+      if(put)memmove(buffer,array+off,(size_t)len*sizeof *array);
+      else memmove(array+off,buffer,(size_t)len*sizeof *array);
+    }
   }
   stream_set_field(vm,self,"pos",pos+len);
   RETL(self);
@@ -37271,7 +37780,15 @@ static bool cb_view(struct dvm *vm,dvm_ref self,const union dvm_value *args,int 
   (void)nargs;
   bool slice=!strcmp(builtin_name(),"slice"),ro=!strcmp(builtin_name(),"asReadOnlyBuffer") || bb_read_only(vm,self);
   int32_t pos=sb_field(vm,self,"pos"),lim=sb_field(vm,self,"count");
-  dvm_ref o=cb_new(vm,cb_array_ref(vm,self),sb_field(vm,self,"offset")+(slice ? pos : 0),slice ? lim-pos : sb_field(vm,self,"capacity"),ro);
+  dvm_ref o;
+  if(cb_buf_ref(vm,self)) {                       /* byte-backed view */
+    o=cb_view_new(vm,cb_buf_ref(vm,
+                self),cb_base_bytes(vm,self)+(int64_t)(slice ? pos : 0)*2,
+      slice ? lim-pos : sb_field(vm,self,"capacity"),sb_field(vm,self,"little"),sb_field(vm,self,"direct"),ro);
+  }
+  else {
+    o=cb_new(vm,cb_array_ref(vm,self),sb_field(vm,self,"offset")+(slice ? pos : 0),slice ? lim-pos : sb_field(vm,self,"capacity"),ro);
+  }
   if(!o)return false;
   union dvm_value sequence= {0};
   (void)dvm_get_field(vm,self,"sequence","Ljava/lang/CharSequence;",&sequence);
@@ -37288,6 +37805,11 @@ static bool cb_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int
   (void)args;
   (void)nargs;
   if(!bb_writable(vm,self))return false;
+  if(!cb_array_ref(vm,self)) {
+    dvm__throw(vm,"java/lang/UnsupportedOperationException",
+               "byte-backed char views have no char array");
+    return false;
+  }
   RETL(cb_array_ref(vm,self));
 }
 static bool cb_has_array(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -37301,6 +37823,11 @@ static bool cb_array_offset(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(!bb_writable(vm,self))return false;
   (void)args;
   (void)nargs;
+  if(!cb_array_ref(vm,self)) {
+    dvm__throw(vm,"java/lang/UnsupportedOperationException",
+               "byte-backed char views have no char array");
+    return false;
+  }
   RETI(sb_field(vm,self,"offset"));
 }
 static bool cb_to_string(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -37309,9 +37836,22 @@ static bool cb_to_string(struct dvm *vm,dvm_ref self,const union dvm_value *args
   (void)nargs;
   int32_t pos=sb_field(vm,self,"pos"),n=sb_field(vm,self,"count")-pos;
   if((size_t)n>(SIZE_MAX-1)/3)return sb_fail(vm,"java/lang/OutOfMemoryError");
+  const uint16_t *chars=NULL;
+  uint16_t *view=NULL;
+  if(cb_buf_ref(vm,self)) {                       /* byte-backed view */
+    view=malloc((size_t)n*2u);
+    if(!view)return sb_fail(vm,"java/lang/OutOfMemoryError");
+    for(int32_t i=0; i<n; ++i)view[i]=cb_load(vm,self,pos+i);
+    chars=view;
+  }
+  else chars=n ? cb_data(vm,self)+pos : NULL;
   char *text=malloc((size_t)n*3+1);
-  if(!text)return sb_fail(vm,"java/lang/OutOfMemoryError");
-  size_t bytes=jcs_utf16_to_wtf8(n ? cb_data(vm,self)+pos : NULL,(size_t)n,text);
+  if(!text) {
+    free(view);
+    return sb_fail(vm,"java/lang/OutOfMemoryError");
+  }
+  size_t bytes=jcs_utf16_to_wtf8(chars,(size_t)n,text);
+  free(view);
   dvm_ref result=dvm_new_string_n(vm,text,bytes);
   free(text);
   RETL(result);
@@ -37325,7 +37865,7 @@ static bool cb_char_at(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   (void)nargs;
   int32_t pos=sb_field(vm,self,"pos"),index=ARG(0).i;
   if(index<0 || index>=sb_field(vm,self,"count")-pos)return sb_fail(vm,"java/lang/IndexOutOfBoundsException");
-  RETI(cb_data(vm,self)[pos+index]);
+  RETI(cb_load(vm,self,pos+index));
 }
 static bool cb_subsequence(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -37347,7 +37887,11 @@ static bool cb_compact(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   (void)nargs;
   if(!bb_writable(vm,self))return false;
   int32_t pos=sb_field(vm,self,"pos"),n=sb_field(vm,self,"count")-pos;
-  if(n)memmove(cb_data(vm,self),cb_data(vm,self)+pos,(size_t)n*2);
+  if(n) {
+    if(cb_buf_ref(vm,self)) /* byte-backed view: move char by char */
+      for(int32_t i=0; i<n; ++i)cb_store(vm,self,i,cb_load(vm,self,pos+i));
+    else memmove(cb_data(vm,self),cb_data(vm,self)+pos,(size_t)n*2);
+  }
   stream_set_field(vm,self,"pos",n);
   stream_set_field(vm,self,"count",sb_field(vm,self,"capacity"));
   stream_set_field(vm,self,"mark",-1);
@@ -37366,7 +37910,7 @@ static bool cb_compare(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   int32_t na=sb_field(vm,self,"count")-pa,nb=sb_field(vm,ARG(0).l,"count")-pb;
   int32_t result=0,n=na<nb ? na : nb;
   for(int32_t i=0; i<n; ++i) {
-    result=(int32_t)cb_data(vm,self)[pa+i]-(int32_t)cb_data(vm,ARG(0).l)[pb+i];
+    result=(int32_t)cb_load(vm,self,pa+i)-(int32_t)cb_load(vm,ARG(0).l,pb+i);
     if(result)break;
   }
   if(!result)result=na-nb;
@@ -37378,7 +37922,7 @@ static bool cb_hash(struct dvm *vm,dvm_ref self,const union dvm_value *args,int 
   (void)nargs;
   uint32_t hash=1;
   int32_t pos=sb_field(vm,self,"pos");
-  for(int32_t i=sb_field(vm,self,"count"); i>pos;)hash=hash*31u+cb_data(vm,self)[--i];
+  for(int32_t i=sb_field(vm,self,"count"); i>pos;)hash=hash*31u+cb_load(vm,self,--i);
   RETI((int32_t)hash);
 }
 static bool cs_decode(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -37417,7 +37961,10 @@ static bool cs_decode(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
 static const struct rt_field rt_charbuffer_fields[]= {
   {"sequence","Ljava/lang/CharSequence;"},
   {"chars","[C"},{"offset","I"},{"capacity","I"},{"pos","I"},{"count","I"},{"mark","I"},
-  {"readOnly","Z"},{"direct","Z"},{"little","Z"},F_END
+  {"readOnly","Z"},{"direct","Z"},{"little","Z"},
+  /* A byte-backed view (ByteBuffer.asCharBuffer()): the [B it reads two bytes
+   * from per char, and where its char 0 sits in those bytes. */
+  {"cbuf","[B"},{"base","J"},F_END
 };
 static const char *const rt_charbuffer_interfaces[]= {
   "Ljava/lang/CharSequence;","Ljava/lang/Comparable;","Ljava/lang/Appendable;","Ljava/lang/Readable;",NULL
@@ -37721,6 +38268,7 @@ static const struct rt_method rt_bytebuffer[] = {
   M("put", "(Ljava/nio/ByteBuffer;)Ljava/nio/ByteBuffer;", bb_put_buffer),
   M("asFloatBuffer", "()Ljava/nio/FloatBuffer;", bb_asFloatBuffer),
   M("asShortBuffer", "()Ljava/nio/ShortBuffer;", bb_asShortBuffer),
+  M("asCharBuffer", "()Ljava/nio/CharBuffer;", bb_asCharBuffer),
   M_END,
 };
 
@@ -38741,6 +39289,7 @@ static const struct rt_method rt_surface_frame_listener[]= {
 
 static const struct rt_field rt_surfacetexture_fields[] = {
   { "sink", "J" }, { "texName", "I" }, { "listener", "Ljava/lang/Object;" },
+  { "bufferWidth", "I" }, { "bufferHeight", "I" },
   { "creatorLooper", "Landroid/os/Looper;" }, { "listenerLooper", "Landroid/os/Looper;" }, { "timestamp", "J" },
   /* The MediaPlayer feeding this texture, set by MediaPlayer.setSurface().
    * Playback is advanced asynchronously by dvm_media_pump_active(), like
@@ -38750,14 +39299,30 @@ static const struct rt_field rt_surfacetexture_fields[] = {
   F_END,
 };
 
+static bool sfxt_default_size(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  if(ARG(0).i<=0 || ARG(1).i<=0) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid SurfaceTexture buffer size");
+    return false;
+  }
+  struct rt_surface_texture *state=sfxt_state(vm,self);
+  if(!state || !state->sink) {
+    dvm__throw(vm,"java/lang/IllegalStateException","SurfaceTexture is released");
+    return false;
+  }
+  dvm_set_field(vm,self,"bufferWidth","I",ARG(0));
+  dvm_set_field(vm,self,"bufferHeight","I",ARG(1));
+  RETV();
+}
+
 static const struct rt_method rt_surfacetexture[] = {
   M("<init>", "(I)V", sfxt_init),
   M("<init>", "(IZ)V", sfxt_init),
   M("attachToGLContext", "(I)V", sfxt_attach),
   M("detachFromGLContext", "()V", sfxt_detach),
-  /* The frame size comes from the decoder's own output format, so the
-   * default buffer size a producer would have used is not consulted. */
-  M("setDefaultBufferSize", "(II)V", nop_void),
+  M("setDefaultBufferSize", "(II)V", sfxt_default_size),
   M("setOnFrameAvailableListener",
   "(Landroid/graphics/SurfaceTexture$OnFrameAvailableListener;)V",
   sfxt_setListener),
@@ -38806,15 +39371,24 @@ static bool surface_release(struct dvm *vm, dvm_ref self,
 
 static const struct rt_field rt_surface_fields[] = {
   { "st", "Landroid/graphics/SurfaceTexture;" },
+  { "bufferWidth", "I" }, { "bufferHeight", "I" },
   { "window", "Z" }, { "windowSink", "J" },
   { "bufferBitmap", "Landroid/graphics/Bitmap;" },
+  { "bufferCanvas", "Landroid/graphics/Canvas;" },
   { "bufferRect", "Landroid/graphics/Rect;" }, F_END,
 };
+
+/* Implemented with the Bitmap/Canvas renderer below. */
+static bool surface_lock_canvas(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool surface_post_canvas(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 
 static const struct rt_method rt_surface[] = {
   M("<init>", "()V", nop_void),
   M("<init>", "(Landroid/graphics/SurfaceTexture;)V", surface_init),
   M("isValid", "()Z", surface_isValid),
+  M("lockCanvas", "(Landroid/graphics/Rect;)Landroid/graphics/Canvas;", surface_lock_canvas),
+  M("lockHardwareCanvas", "()Landroid/graphics/Canvas;", surface_lock_canvas),
+  M("unlockCanvasAndPost", "(Landroid/graphics/Canvas;)V", surface_post_canvas),
   M("release", "()V", surface_release),
   /* Frame pacing is a display-side hint; there is one display here and it
    * runs at whatever the pump loop gives it. */
@@ -48947,6 +49521,16 @@ static bool proc_myPid(struct dvm *vm, dvm_ref self, const union dvm_value *args
   RETI((int32_t)arm_exec_guest_pid());
 }
 
+static bool proc_myTid(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  RETI((int32_t)arm_exec_guest_tid());
+}
+
 static bool proc_myUid(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
@@ -48974,7 +49558,8 @@ static bool proc_setThreadPriority(struct dvm *vm, dvm_ref self,
   (void)vm;
   (void)self;
   (void)out;
-  int32_t tid = nargs > 1 ? ARG(0).i : (int32_t)getpid();
+  int32_t tid = nargs > 1 ? ARG(0).i : arm_exec_guest_tid();
+  if (!tid) tid = arm_exec_guest_tid();
   int32_t prio = nargs > 1 ? ARG(1).i : ARG(0).i;
   int free_slot = -1;
   for (int i = 0; i < PROC_PRIO_SLOTS; ++i) {
@@ -48999,6 +49584,7 @@ static bool proc_getThreadPriority(struct dvm *vm, dvm_ref self,
   (void)self;
   (void)nargs;
   int32_t tid = ARG(0).i;
+  if (!tid) tid = arm_exec_guest_tid();
   for (int i = 0; i < PROC_PRIO_SLOTS; ++i)
     if (proc_prios[i].tid == tid) RETI(proc_prios[i].prio);
   RETI(0);   /* THREAD_PRIORITY_DEFAULT */
@@ -49136,7 +49722,7 @@ static const struct rt_method rt_process[] = {
   SM("getUidForName", "(Ljava/lang/String;)I", proc_getGidForName),
   SM("myPid", "()I", proc_myPid),
   SM("killProcess", "(I)V", proc_killProcess),
-  SM("myTid", "()I", proc_myPid),
+  SM("myTid", "()I", proc_myTid),
   SM("myUid", "()I", proc_myUid),
   SM("myProcessName", "()Ljava/lang/String;", proc_myProcessName),
   SM("isIsolated", "()Z", proc_isIsolated),
@@ -54953,6 +55539,20 @@ static bool storage_volumes(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(!good)return false;
   RETL(list);
 }
+/* The legacy API returns an array, unlike getStorageVolumes(). Both describe
+ * the same user-visible primary volume, even when it is not mounted. */
+static bool storage_volume_list(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self;
+  (void)args;
+  (void)nargs;
+  dvm_ref volume=storage_primary_volume(vm);
+  if(!volume)return false;
+  dvm_ref array=dvm_new_array(vm,'L',"Landroid/os/storage/StorageVolume;",1);
+  if(!array)return false;
+  ((dvm_ref *)dvm_array_data(vm,array))[0]=volume;
+  RETL(array);
+}
 static bool storage_volume_for_path(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)self;
@@ -55040,6 +55640,7 @@ static const struct rt_field rt_storage_sfields[]= {{"UUID_DEFAULT","Ljava/util/
 static const struct rt_method rt_storage[]= {
   M("getUuidForPath","(Ljava/io/File;)Ljava/util/UUID;",storage_uuid_for_path),
   M("getStorageVolumes","()Ljava/util/List;",storage_volumes),
+  M("getVolumeList","()[Landroid/os/storage/StorageVolume;",storage_volume_list),
   M("getPrimaryStorageVolume","()Landroid/os/storage/StorageVolume;",storage_primary),
   M("getStorageVolume","(Ljava/io/File;)Landroid/os/storage/StorageVolume;",storage_volume_for_path),M_END
 };
@@ -56473,6 +57074,74 @@ static bool websettings_get_ua(struct dvm *vm, dvm_ref self,
   (void)dvm_get_field(vm, self, "userAgent", "Ljava/lang/String;", &v);
   RETL(v.l);
 }
+
+/* WebView process services retain one provider instance and its settings. */
+static bool webstorage_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self;(void)args;(void)nargs;
+  static dvm_ref instance;
+  RETL(runtime_singleton(vm,"Landroid/webkit/WebStorage;",&instance));
+}
+static bool service_worker_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self;(void)args;(void)nargs;
+  static dvm_ref instance;
+  RETL(runtime_singleton(vm,"Landroid/webkit/ServiceWorkerController;",&instance));
+}
+static bool service_worker_settings(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args;(void)nargs;
+  union dvm_value settings={0};
+  dvm_get_field(vm,self,"settings","Landroid/webkit/ServiceWorkerWebSettings;",&settings);
+  if(!settings.l) {
+    settings.l=dvm_new_object(vm,dvm_find_class(vm,"android/webkit/ServiceWorkerWebSettings"));
+    if(!settings.l)return false;
+    dvm_set_field(vm,settings.l,"cacheMode","I",(union dvm_value){.i=-1});
+    dvm_set_field(vm,settings.l,"allowContentAccess","Z",(union dvm_value){.i=1});
+    dvm_set_field(vm,settings.l,"allowFileAccess","Z",(union dvm_value){.i=1});
+    dvm_set_field(vm,self,"settings","Landroid/webkit/ServiceWorkerWebSettings;",settings);
+  }
+  RETL(settings.l);
+}
+static bool service_worker_client(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  dvm_set_field(vm,self,"client","Landroid/webkit/ServiceWorkerClient;",(union dvm_value){.l=nargs?ARG(0).l:0});
+  RETV();
+}
+static bool service_worker_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  const char *name=builtin_name();
+  if(!name || strlen(name)<4)return false;
+  char field[64];snprintf(field,sizeof field,"%s",name+3);
+  field[0]=(char)tolower((unsigned char)field[0]);
+  const char *type=!strcmp(field,"cacheMode")?"I":"Z";
+  if(name[0]=='s') {
+    dvm_set_field(vm,self,field,type,(union dvm_value){.i=nargs?ARG(0).i:0});
+    RETV();
+  }
+  union dvm_value value={0};dvm_get_field(vm,self,field,type,&value);RETI(value.i);
+}
+static const struct rt_method rt_webstorage[]={
+  SM("getInstance","()Landroid/webkit/WebStorage;",webstorage_instance),M_END
+};
+static const struct rt_field rt_service_worker_fields[]={
+  {"settings","Landroid/webkit/ServiceWorkerWebSettings;"},
+  {"client","Landroid/webkit/ServiceWorkerClient;"},F_END
+};
+static const struct rt_method rt_service_worker[]={
+  SM("getInstance","()Landroid/webkit/ServiceWorkerController;",service_worker_instance),
+  M("getServiceWorkerWebSettings","()Landroid/webkit/ServiceWorkerWebSettings;",service_worker_settings),
+  M("setServiceWorkerClient","(Landroid/webkit/ServiceWorkerClient;)V",service_worker_client),M_END
+};
+static const struct rt_field rt_service_worker_settings_fields[]={
+  {"cacheMode","I"},{"allowContentAccess","Z"},{"allowFileAccess","Z"},{"blockNetworkLoads","Z"},F_END
+};
+static const struct rt_method rt_service_worker_settings[]={
+  M("getCacheMode","()I",service_worker_property),M("setCacheMode","(I)V",service_worker_property),
+  M("getAllowContentAccess","()Z",service_worker_property),M("setAllowContentAccess","(Z)V",service_worker_property),
+  M("getAllowFileAccess","()Z",service_worker_property),M("setAllowFileAccess","(Z)V",service_worker_property),
+  M("getBlockNetworkLoads","()Z",service_worker_property),M("setBlockNetworkLoads","(Z)V",service_worker_property),M_END
+};
 
 static const struct rt_field rt_web_settings_fields[] = {
   { "javascriptEnabled", "Z" },
@@ -59769,12 +60438,19 @@ static bool view_get_drawable_state(struct dvm *vm, dvm_ref self,
   RETL(state.l);
 }
 
+static bool view_state_list_follow(struct dvm *vm, dvm_ref view, dvm_ref animator);
+
 static bool view_drawable_state_changed(struct dvm *vm, dvm_ref self,
                                         const union dvm_value *args, int nargs,
                                         union dvm_value *out)
 {
   (void)args;
   (void)nargs;
+  {
+    union dvm_value animator = { 0 };
+    (void)dvm_get_field(vm, self, "stateListAnimator", "Landroid/animation/StateListAnimator;", &animator);
+    if (animator.l && !view_state_list_follow(vm, self, animator.l)) return false;
+  }
   const char *fields[] = { "background", "foreground" };
   for (unsigned i = 0; i < 2; ++i) {
     union dvm_value drawable = { 0 }, stateful = { 0 }, state = { 0 }, changed = { 0 };
@@ -60000,8 +60676,32 @@ static bool view_set_foreground(struct dvm *vm,dvm_ref self,const union dvm_valu
 }
 VIEW_SET_L(view_set_outline, "outlineProvider", "Landroid/view/ViewOutlineProvider;")
 VIEW_GET_L(view_get_outline, "outlineProvider", "Landroid/view/ViewOutlineProvider;")
-VIEW_SET_L(view_set_state_list_animator, "stateListAnimator",
-           "Landroid/animation/StateListAnimator;")
+static bool view_get_drawable_state(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
+/* The animator follows the view's drawable state from the moment it is set. */
+static bool view_state_list_follow(struct dvm *vm, dvm_ref view, dvm_ref animator)
+{
+  union dvm_value state = { 0 }, ignored = { 0 };
+  if (!animator) return true;
+  return view_get_drawable_state(vm, view, NULL, 0, &state) &&
+         am_vcall(vm, animator, "setState", "([I)V", &state, 1, &ignored);
+}
+static bool view_set_state_list_animator(struct dvm *vm, dvm_ref self,
+                                         const union dvm_value *args, int nargs,
+                                         union dvm_value *out)
+{
+  (void)out;
+  union dvm_value old = { 0 }, ignored = { 0 }, view = { .l = self }, none = { 0 };
+  (void)dvm_get_field(vm, self, "stateListAnimator", "Landroid/animation/StateListAnimator;", &old);
+  if (old.l == ARG(0).l) RETV();
+  if (old.l && !am_vcall(vm, old.l, "setTarget", "(Landroid/view/View;)V", &none, 1, &ignored)) return false;
+  (void)dvm_set_field(vm, self, "stateListAnimator", "Landroid/animation/StateListAnimator;", ARG(0));
+  if (ARG(0).l) {
+    if (!am_vcall(vm, ARG(0).l, "setTarget", "(Landroid/view/View;)V", &view, 1, &ignored) ||
+        !view_state_list_follow(vm, self, ARG(0).l) ||
+        !am_vcall(vm, ARG(0).l, "jumpToCurrentState", "()V", NULL, 0, &ignored)) return false;
+  }
+  RETV();
+}
 VIEW_GET_L(view_get_state_list_animator, "stateListAnimator",
            "Landroid/animation/StateListAnimator;")
 VIEW_GET_I(view_get_sysui_visibility, "sysUiVisibility", 0)
@@ -65753,6 +66453,86 @@ static const struct rt_method rt_drawable_wrapper[]= {
   M("scheduleDrawable","(Landroid/graphics/drawable/Drawable;Ljava/lang/Runnable;J)V",wrapper_callback),
   M("unscheduleDrawable","(Landroid/graphics/drawable/Drawable;Ljava/lang/Runnable;)V",wrapper_callback),M_END
 };
+/* InsetDrawable(drawable, insets): the wrapped drawable drawn inside its own
+ * bounds shrunk by the insets.  Integer insets are pixels; the float forms are
+ * fractions of the bounds' width (left/right) and height (top/bottom). */
+static const char *const inset_names[4]= {"insetLeft","insetTop","insetRight","insetBottom"};
+static const char *const inset_fractions[4]= {"fractionLeft","fractionTop","fractionRight","fractionBottom"};
+
+static bool inset_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  if(!wrapper_init(vm,self,args,1,out)) return false;
+  bool fraction=strstr(builtin_sig(),"F")!=NULL;
+  for(int i=0; i<4; ++i) {
+    union dvm_value v=nargs>2 ? args[1+i] : args[1];
+    if(fraction) dvm_set_field(vm,self,inset_fractions[i],"F",v);
+    else dvm_set_field(vm,self,inset_names[i],"I",v);
+  }
+  RETV();
+}
+static int32_t inset_edge(struct dvm *vm,dvm_ref self,int edge,int32_t span)
+{
+  union dvm_value pixels= {0},fraction= {0};
+  (void)dvm_get_field(vm,self,inset_names[edge],"I",&pixels);
+  (void)dvm_get_field(vm,self,inset_fractions[edge],"F",&fraction);
+  return pixels.i+(int32_t)(fraction.f*(float)span);
+}
+static bool inset_bounds(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  dvm_ref child=dc_current(vm,self);
+  union dvm_value b[4]= {{0},{0},{0},{0}},ignored= {0};
+  if(!child || !ARG(0).l) RETV();
+  static const char *const edges[4]= {"left","top","right","bottom"};
+  for(int i=0; i<4; ++i) (void)dvm_get_field(vm,ARG(0).l,edges[i],"I",&b[i]);
+  int32_t w=b[2].i-b[0].i,h=b[3].i-b[1].i;
+  union dvm_value r[4]= {{.i=b[0].i+inset_edge(vm,self,0,w)},{.i=b[1].i+inset_edge(vm,self,1,h)},
+    {.i=b[2].i-inset_edge(vm,self,2,w)},{.i=b[3].i-inset_edge(vm,self,3,h)}};
+  (void)out;
+  return am_vcall(vm,child,"setBounds","(IIII)V",r,4,&ignored);
+}
+static bool inset_intrinsic(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  dvm_ref child=dc_current(vm,self);
+  bool width=strstr(builtin_name(),"Width")!=NULL;
+  union dvm_value size= {.i=-1};
+  if(child && !am_vcall(vm,child,width ? "getIntrinsicWidth" : "getIntrinsicHeight","()I",args,nargs,&size)) return false;
+  if(size.i<0) RETI(-1);
+  RETI(size.i+inset_edge(vm,self,width ? 0 : 1,0)+inset_edge(vm,self,width ? 2 : 3,0));
+}
+static bool inset_padding(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  dvm_ref child=dc_current(vm,self);
+  union dvm_value has= {0};
+  static const char *const edges[4]= {"left","top","right","bottom"};
+  if(!ARG(0).l) RETI(0);
+  if(child && !am_vcall(vm,child,"getPadding","(Landroid/graphics/Rect;)Z",args,1,&has)) return false;
+  bool any=has.i!=0;
+  for(int i=0; i<4; ++i) {
+    union dvm_value v= {0};
+    int32_t inset=inset_edge(vm,self,i,0);
+    if(!has.i) { v.i=0; }
+    else (void)dvm_get_field(vm,ARG(0).l,edges[i],"I",&v);
+    v.i+=inset;
+    any|=inset!=0;
+    (void)dvm_set_field(vm,ARG(0).l,edges[i],"I",v);
+  }
+  RETI(any);
+}
+static const struct rt_method rt_inset_drawable[]= {
+  M("<init>","(Landroid/graphics/drawable/Drawable;I)V",inset_init),
+  M("<init>","(Landroid/graphics/drawable/Drawable;IIII)V",inset_init),
+  M("<init>","(Landroid/graphics/drawable/Drawable;F)V",inset_init),
+  M("<init>","(Landroid/graphics/drawable/Drawable;FFFF)V",inset_init),
+  M("onBoundsChange","(Landroid/graphics/Rect;)V",inset_bounds),
+  M("getIntrinsicWidth","()I",inset_intrinsic),M("getIntrinsicHeight","()I",inset_intrinsic),
+  M("getPadding","(Landroid/graphics/Rect;)Z",inset_padding),M_END
+};
+static const struct rt_field rt_inset_drawable_fields[]= {
+  {"insetLeft","I"},{"insetTop","I"},{"insetRight","I"},{"insetBottom","I"},
+  {"fractionLeft","F"},{"fractionTop","F"},{"fractionRight","F"},{"fractionBottom","F"},F_END
+};
 static float rotate_float(struct dvm *, dvm_ref, const char *);
 static void rotate_set_float(struct dvm *, dvm_ref, const char *, float);
 static bool rotate_init(struct dvm *, dvm_ref, const union dvm_value *, int, union dvm_value *);
@@ -66917,6 +67697,94 @@ static const struct rt_method rt_restrictions_manager[] = {
   M_END,
 };
 
+/* ShortcutManager: the launcher is the emulator's own, so pinned and manifest
+ * shortcuts are empty; dynamic shortcuts are kept so an app reads back what
+ * it published. */
+static dvm_ref sm_dynamic(struct dvm *vm, dvm_ref self)
+{
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, "dynamic", "Ljava/util/List;", &v);
+  if (!v.l) {
+    v.l = coll_new_list(vm, "Ljava/util/ArrayList;");
+    if (v.l) (void)dvm_set_field(vm, self, "dynamic", "Ljava/util/List;", v);
+  }
+  return v.l;
+}
+
+static bool sm_dynamic_op(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  const char *name = builtin_name();
+  dvm_ref list = sm_dynamic(vm, self);
+  union dvm_value r = { 0 };
+  if (!list) RETI(0);
+  if (!strcmp(name, "removeAllDynamicShortcuts")) {
+    if (!am_vcall(vm, list, "clear", "()V", NULL, 0, &r)) return false;
+    RETV();
+  }
+  if (!strcmp(name, "setDynamicShortcuts") && !am_vcall(vm, list, "clear", "()V", NULL, 0, &r))
+    return false;
+  if (!strcmp(name, "removeDynamicShortcuts")) {
+    /* Entries are identified by ShortcutInfo.getId(); drop those listed. */
+    union dvm_value n = { 0 };
+    if (!am_vcall(vm, list, "size", "()I", NULL, 0, &n)) return false;
+    for (int i = n.i - 1; i >= 0; --i) {
+      union dvm_value idx = { .i = i }, item = { 0 }, id = { 0 }, has = { 0 };
+      if (!am_vcall(vm, list, "get", "(I)Ljava/lang/Object;", &idx, 1, &item) ||
+          !am_vcall(vm, item.l, "getId", "()Ljava/lang/String;", NULL, 0, &id) ||
+          !am_vcall(vm, ARG(0).l, "contains", "(Ljava/lang/Object;)Z", &id, 1, &has))
+        return false;
+      if (has.i && !am_vcall(vm, list, "remove", "(I)Ljava/lang/Object;", &idx, 1, &item))
+        return false;
+    }
+    RETV();
+  }
+  /* set/add/update: append the list given. */
+  if (!am_vcall(vm, list, "addAll", "(Ljava/util/Collection;)Z", args, 1, &r)) return false;
+  RETI(1);
+}
+
+static bool sm_get_dynamic(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  if (strcmp(builtin_name(), "getDynamicShortcuts")) RETL(coll_new_list(vm, "Ljava/util/ArrayList;"));
+  dvm_ref copy = coll_new_list(vm, "Ljava/util/ArrayList;"), list = sm_dynamic(vm, self);
+  union dvm_value r = { .l = list }, ignored = { 0 };
+  if (copy && list && !am_vcall(vm, copy, "addAll", "(Ljava/util/Collection;)Z", &r, 1, &ignored))
+    return false;
+  RETL(copy);
+}
+
+static bool sm_max_count(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  (void)vm; (void)self; (void)args; (void)nargs;
+  RETI(15);
+}
+
+static const struct rt_method rt_shortcut_manager[] = {
+  M("removeAllDynamicShortcuts", "()V", sm_dynamic_op),
+  M("removeDynamicShortcuts", "(Ljava/util/List;)V", sm_dynamic_op),
+  M("setDynamicShortcuts", "(Ljava/util/List;)Z", sm_dynamic_op),
+  M("addDynamicShortcuts", "(Ljava/util/List;)Z", sm_dynamic_op),
+  M("updateShortcuts", "(Ljava/util/List;)Z", ret_true),
+  M("getDynamicShortcuts", "()Ljava/util/List;", sm_get_dynamic),
+  M("getPinnedShortcuts", "()Ljava/util/List;", sm_get_dynamic),
+  M("getManifestShortcuts", "()Ljava/util/List;", sm_get_dynamic),
+  M("getMaxShortcutCountPerActivity", "()I", sm_max_count),
+  M("isRateLimitingActive", "()Z", ret_false),
+  M("isRequestPinShortcutSupported", "()Z", ret_false),
+  M("reportShortcutUsed", "(Ljava/lang/String;)V", nop_void),
+  M("disableShortcuts", "(Ljava/util/List;)V", nop_void),
+  M("enableShortcuts", "(Ljava/util/List;)V", nop_void),
+  M_END,
+};
+static const struct rt_field rt_shortcut_manager_fields[] = {
+  { "dynamic", "Ljava/util/List;" }, F_END
+};
+
 /* Context.getSystemService() — the single name↔manager-class table.
  *
  * Android resolves a service by its string key and the caller casts the result
@@ -66946,6 +67814,7 @@ static const struct dvm_system_service dvm_services[] = {
   { "device_policy", "Landroid/app/admin/DevicePolicyManager;" },
   { "usagestats",    "Landroid/app/usage/UsageStatsManager;" },
   { "restrictions",  "Landroid/content/RestrictionsManager;" },
+  { "shortcut",      "Landroid/content/pm/ShortcutManager;" },
   { "telephony_subscription_service", "Landroid/telephony/SubscriptionManager;" },
   { "download",      "Landroid/app/DownloadManager;" },
   { "search",        "Landroid/app/SearchManager;" },
@@ -68022,11 +68891,16 @@ struct surface_view_state {
 static struct surface_view_state *surface_views;
 static bool surface_dispatching;
 
-static void surface_window_valid(struct dvm *vm, dvm_ref holder, bool valid)
+static void surface_window_valid(struct dvm *vm, dvm_ref holder, bool valid,int width,int height)
 {
   union dvm_value surface = {0};
-  if (surface_holder_get_surface(vm, holder, NULL, 0, &surface) && surface.l)
+  if (surface_holder_get_surface(vm, holder, NULL, 0, &surface) && surface.l) {
+    if(valid) {
+      dvm_set_field(vm,surface.l,"bufferWidth","I",(union dvm_value){.i=width});
+      dvm_set_field(vm,surface.l,"bufferHeight","I",(union dvm_value){.i=height});
+    }
     (void)surface_set_window(vm, surface.l, valid);
+  }
 }
 
 static bool surface_notify(struct surface_view_state *s, bool created,
@@ -68106,7 +68980,7 @@ static void surface_visit(struct dvm *vm, dvm_ref view, unsigned depth)
       if (created || reformat || s->width != w || s->height != h) {
         if (reformat) {
           if (!surface_notify(s, false, true)) return;
-          surface_window_valid(vm, holder, false);
+          surface_window_valid(vm, holder, false,0,0);
         }
         s->width = w;
         s->height = h;
@@ -68117,7 +68991,7 @@ static void surface_visit(struct dvm *vm, dvm_ref view, unsigned depth)
         rt_set_int(vm, frame.l, "top", 0);
         rt_set_int(vm, frame.l, "right", w);
         rt_set_int(vm, frame.l, "bottom", h);
-        surface_window_valid(vm, holder, true);
+        surface_window_valid(vm, holder, true,w,h);
         if (!surface_notify(s, created || reformat, false)) return;
       }
       if (surface_refresh_bitmap(vm, ui_obj(vm, holder, "surface", "Landroid/view/Surface;"))) {
@@ -68156,7 +69030,7 @@ static void surface_views_tick(struct dvm *vm)
       continue;
     }
     (void)surface_notify(s, false, true);
-    surface_window_valid(vm, s->holder, false);
+    surface_window_valid(vm, s->holder, false,0,0);
     *link = s->next;
     dvm_unpin(vm, s->view);
     free(s);
@@ -68594,6 +69468,7 @@ static bool view_dispatch_touch(struct dvm *vm,dvm_ref self,
   }
   dvm_ref kids[UI_MAX_KIDS];
   const uint32_t count = ui_children(vm,self,kids,UI_MAX_KIDS);
+  ui_z_sort(vm,self,kids,count);
   union dvm_value intercepted = {0};
   if ((action == 0 || target.l) && !ui_int(vm,self,"disallowIntercept"))
     (void)ui_touch_call(vm,self,"onInterceptTouchEvent",ARG(0).l,&intercepted);
@@ -68610,7 +69485,15 @@ static bool view_dispatch_touch(struct dvm *vm,dvm_ref self,
     for (uint32_t i=count; i>0 && !handled; --i) {
       dvm_ref child = kids[i-1];
       struct ui_node *n = ui_node(vm, child);
-      if (ui_int(vm,child,"visibility") != 0 || !n) continue;
+      if (ui_int(vm,child,"visibility") != 0 || !n) {
+        if (dvm__env("LUNARIA_TRACE_TOUCH")) {
+          struct dvm_class *tc = dvm_object_class(vm, child);
+          fprintf(stderr, "[touch-skip] %s id=0x%x visibility=%d node=%s\n",
+                  tc ? tc->name : "?", (unsigned)rt_get_int(vm, child, "id"),
+                  ui_int(vm,child,"visibility"), n ? "yes" : "none");
+        }
+        continue;
+      }
       struct ui_touch_mapping mapping;
       if (!ui_touch_mapping(vm,self,child,&mapping)) {
         if (dvm_exception(vm)) return false;
@@ -68618,7 +69501,15 @@ static bool view_dispatch_touch(struct dvm *vm,dvm_ref self,
       }
       float x,y;
       if (!ui_touch_map_point(&mapping,sample.x,sample.y,&x,&y) ||
-          x<0 || y<0 || x>=n->w || y>=n->h) continue;
+          x<0 || y<0 || x>=n->w || y>=n->h) {
+        if (dvm__env("LUNARIA_TRACE_TOUCH")) {
+          struct dvm_class *tc = dvm_object_class(vm, child);
+          fprintf(stderr, "[touch-miss] %s id=0x%x point %.0f,%.0f box %dx%d\n",
+                  tc ? tc->name : "?", (unsigned)rt_get_int(vm, child, "id"),
+                  (double)x, (double)y, (int)n->w, (int)n->h);
+        }
+        continue;
+      }
       handled = ui_touch_child(vm,self,child,&sample,sample.action,ARG(0).l,&mapping,out) && out->i;
       if (dvm__env("LUNARIA_TRACE_TOUCH")) {
         struct dvm_class *tc = dvm_object_class(vm, child), *pc = dvm_object_class(vm, self);
@@ -70947,17 +71838,55 @@ static const struct rt_method rt_edge_effect[] = {
 
 /* RippleDrawable(color, content, mask): the touch ripple over `content`.  The
  * content drawable is what the view shows at rest, so it is the one kept. */
+/* RippleDrawable(color, content, mask) is a LayerDrawable: the content is layer
+ * 0 and the mask is a layer with id android.R.id.mask.  The mask only shapes
+ * the ripple; it is never painted itself. */
+enum { RIPPLE_MASK_ID = 0x010202ba };
+
 static bool ripple_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                         int nargs, union dvm_value *out)
 {
   (void)nargs;
-  (void)out;
+  dvm_ref content = args[1].l, mask = args[2].l;
+  uint32_t n = (content ? 1 : 0) + (mask ? 1 : 0);
+  dvm_ref layers = dvm_new_array(vm, 'L', "Landroid/graphics/drawable/Drawable;", n);
+  if (!layers) return false;
+  dvm_ref *items = dvm_array_data(vm, layers);
+  uint32_t i = 0;
+  if (content) items[i++] = content;
+  if (mask) items[i++] = mask;
+  union dvm_value array = { .l = layers };
+  if (!layer_init(vm, self, &array, 1, out)) return false;
+  if (mask) {
+    struct rt_list *list = list_of(vm, layer_list(vm, self));
+    union dvm_value id = { .i = RIPPLE_MASK_ID };
+    if (!list || list->size != n ||
+        !dvm_set_field(vm, list->items[n - 1], "id", "I", id)) return false;
+  }
   (void)dvm_set_field(vm, self, "content", "Landroid/graphics/drawable/Drawable;", args[1]);
   (void)dvm_set_field(vm, self, "mask", "Landroid/graphics/drawable/Drawable;", args[2]);
   RETV();
 }
+static bool ripple_draw(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                        int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  uint32_t count = list_of(vm, layer_list(vm, self)) ? list_of(vm, layer_list(vm, self))->size : 0;
+  union dvm_value ignored = { 0 };
+  for (uint32_t i = 0; i < count; ++i) {
+    struct rt_list *list = list_of(vm, layer_list(vm, self));
+    dvm_ref item = list->items[i];
+    if (layer_int(vm, item, "id") == RIPPLE_MASK_ID) continue;
+    dvm_ref child = layer_ref(vm, item, "drawable", "Landroid/graphics/drawable/Drawable;");
+    if (child && !am_vcall(vm, child, "draw", "(Landroid/graphics/Canvas;)V", args, 1, &ignored))
+      return false;
+  }
+  (void)out;
+  RETV();
+}
 static const struct rt_method rt_ripple_drawable[] = {
   M("<init>", "(Landroid/content/res/ColorStateList;Landroid/graphics/drawable/Drawable;Landroid/graphics/drawable/Drawable;)V", ripple_init),
+  M("draw", "(Landroid/graphics/Canvas;)V", ripple_draw),
   M_END,
 };
 static const struct rt_field rt_ripple_drawable_fields[] = {
@@ -71969,6 +72898,19 @@ static const struct rt_method rt_context_wrapper[] = {
   M_END,
 };
 
+static bool mutable_context_set_base(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  if(!dvm_set_field(vm,self,"mBase","Landroid/content/Context;",ARG(0)))return false;
+  RETV();
+}
+static const struct rt_method rt_mutable_context_wrapper[] = {
+  M("<init>","(Landroid/content/Context;)V",cw_attachBaseContext),
+  M("setBaseContext","(Landroid/content/Context;)V",mutable_context_set_base),
+  M_END,
+};
+
 static bool sensor_getList(struct dvm *vm, dvm_ref self,
                            const union dvm_value *args, int nargs,
                            union dvm_value *out)
@@ -72714,6 +73656,8 @@ static const struct rt_field rt_paint_fields[] = {
   { "textSkewX", "F" },
   {"strokeJoin","Landroid/graphics/Paint$Join;"},
   {"textAlign","Landroid/graphics/Paint$Align;"},
+  { "letterSpacing", "F" }, { "shadowRadius", "F" }, { "shadowDx", "F" }, { "shadowDy", "F" },
+  { "shadowColor", "I" },
   { "color", "I" }, { "flags", "I" },
   { "typeface", "Landroid/graphics/Typeface;" },
   { "xfermode", "Landroid/graphics/Xfermode;" }, F_END
@@ -75614,6 +76558,7 @@ _Static_assert(sizeof(struct dvm_sqlite_field) == sizeof(struct rt_field) &&
 #define rt_cursor                 ((const struct rt_method *)dvm_sqlite_cursor_methods)
 #define rt_cursor_fields          ((const struct rt_field *)dvm_sqlite_cursor_fields)
 #define rt_matrix_cursor          ((const struct rt_method *)dvm_sqlite_matrix_cursor_methods)
+#define rt_matrix_cursor_row      ((const struct rt_method *)dvm_sqlite_matrix_row_builder_methods)
 #define rt_open_params            ((const struct rt_method *)dvm_sqlite_open_params_methods)
 #define rt_open_params_builder    ((const struct rt_method *)dvm_sqlite_open_params_builder_methods)
 #define rt_open_params_fields     ((const struct rt_field *)dvm_sqlite_open_params_fields)
@@ -78445,9 +79390,23 @@ static bool context_open_file_output(struct dvm *vm, dvm_ref self,
   RETL(s);
 }
 
-/* Context.getMainExecutor(): runs what it is given on the main thread, which
- * is the one thread the interpreter has.  The executor built-ins already do
- * exactly that, so hand out the shared instance rather than a second kind. */
+/* Context's executor posts to the main Looper, including calls made from
+ * the main thread itself. It is not a general-purpose worker pool. */
+static bool main_executor_execute(struct dvm *vm,dvm_ref self,
+                                  const union dvm_value *args,int nargs,
+                                  union dvm_value *out)
+{
+  (void)self;
+  if(!nargs || !ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","command");
+    return false;
+  }
+  if(!dvm__queue_runnable_at(vm,ARG(0).l,false,0)) return false;
+  RETV();
+}
+static const struct rt_method rt_main_executor[]={
+  M("execute","(Ljava/lang/Runnable;)V",main_executor_execute),M_END
+};
 static bool context_get_main_executor(struct dvm *vm, dvm_ref self,
                                       const union dvm_value *args, int nargs,
                                       union dvm_value *out)
@@ -78456,7 +79415,7 @@ static bool context_get_main_executor(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   static dvm_ref slot;
-  RETL(runtime_singleton(vm, "Ljava/util/concurrent/Executor;", &slot));
+  RETL(runtime_singleton(vm, "Llunaria/MainExecutor;", &slot));
 }
 
 /* Window.takeSurface(): the callback that would receive surfaceCreated().  UE
@@ -80142,7 +81101,8 @@ static const struct rt_field rt_key_event_fields[] = {
   { "eventTime", "J" }, { "downTime", "J" }, F_END
 };
 #define KEY_FLAG_CANCELED 0x20
-#define KEY_FLAG_TRACKING 0x40000000
+#define KEY_FLAG_TRACKING 0x200
+#define KEY_FLAG_START_TRACKING 0x40000000
 
 static bool keyevent_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                           int nargs, union dvm_value *out)
@@ -80244,7 +81204,7 @@ static bool keyevent_flag(struct dvm *vm, dvm_ref self, const union dvm_value *a
   (void)nargs;
   const char *name = builtin_name();
   if (!strcmp(name, "startTracking")) {
-    union dvm_value v = { .i = keyevent_int(vm, self, "flags") | KEY_FLAG_TRACKING };
+    union dvm_value v = { .i = keyevent_int(vm, self, "flags") | KEY_FLAG_START_TRACKING };
     (void)dvm_set_field(vm, self, "flags", "I", v);
     RETV();
   }
@@ -87200,6 +88160,218 @@ static const struct rt_field rt_color_named_sfields[]= {
 
 #include "dvm_graphics.h"
 
+static bool surface_lock_canvas(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  union dvm_value texture={0},locked={0},bitmap={0},width={0},height={0};
+  if(!surface_sink(vm,self)) {
+    dvm__throw(vm,"java/lang/IllegalStateException","Surface is released");return false;
+  }
+  dvm_get_field(vm,self,"bufferCanvas","Landroid/graphics/Canvas;",&locked);
+  if(locked.l) {
+    dvm__throw(vm,"java/lang/IllegalStateException","Surface already locked");return false;
+  }
+  dvm_get_field(vm,self,"st","Landroid/graphics/SurfaceTexture;",&texture);
+  if(texture.l) {
+    dvm_get_field(vm,texture.l,"bufferWidth","I",&width);
+    dvm_get_field(vm,texture.l,"bufferHeight","I",&height);
+  } else {
+    dvm_get_field(vm,self,"bufferWidth","I",&width);
+    dvm_get_field(vm,self,"bufferHeight","I",&height);
+  }
+  int w=width.i>0 ? width.i : 1,h=height.i>0 ? height.i : 1;
+  dvm_get_field(vm,self,"bufferBitmap","Landroid/graphics/Bitmap;",&bitmap);
+  struct rt_bitmap *bm=bitmap_of(vm,bitmap.l);
+  if(!bm || bm->recycled || bm->w!=w || bm->h!=h) {
+    bitmap.l=bitmap_new(vm,w,h);
+    if(!bitmap.l)return false;
+    bitmap_of(vm,bitmap.l)->is_mutable=true;
+    dvm_set_field(vm,self,"bufferBitmap","Landroid/graphics/Bitmap;",bitmap);
+  }
+  dvm_ref canvas=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Canvas"));
+  if(!canvas)return false;
+  dvm_set_field(vm,self,"bufferCanvas","Landroid/graphics/Canvas;",(union dvm_value){.l=canvas});
+  union dvm_value ignored={0};
+  if(!canvas_set_bitmap(vm,canvas,&bitmap,1,&ignored)) {
+    dvm_set_field(vm,self,"bufferCanvas","Landroid/graphics/Canvas;",(union dvm_value){0});
+    return false;
+  }
+  /* The backing bitmap retains the full previous frame; describe the full
+   * buffer as dirty so producers may redraw without relying on a clip hint. */
+  if(nargs && ARG(0).l) {
+    const char *fields[]={"left","top","right","bottom"};
+    int values[]={0,0,w,h};
+    for(int i=0;i<4;++i)dvm_set_field(vm,ARG(0).l,fields[i],"I",(union dvm_value){.i=values[i]});
+  }
+  RETL(canvas);
+}
+
+static bool surface_post_canvas(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  union dvm_value canvas={0},bitmap={0};
+  struct lm_sink *sink=surface_sink(vm,self);
+  dvm_get_field(vm,self,"bufferCanvas","Landroid/graphics/Canvas;",&canvas);
+  if(!sink || !canvas.l) {
+    dvm__throw(vm,"java/lang/IllegalStateException","Surface is not locked");return false;
+  }
+  if(canvas.l!=ARG(0).l) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","Canvas does not belong to this Surface lock");return false;
+  }
+  dvm_get_field(vm,self,"bufferBitmap","Landroid/graphics/Bitmap;",&bitmap);
+  struct rt_bitmap *bm=bitmap_of(vm,bitmap.l);
+  if(!bitmap_live(vm,bm))return false;
+  uint8_t *rgba=lm_sink_begin(sink,bm->w,bm->h);
+  if(!rgba) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","Surface frame");return false;
+  }
+  for(size_t i=0,n=(size_t)bm->w*bm->h;i<n;++i) {
+    uint32_t pixel=bm->px[i],alpha=pixel>>24;
+    rgba[i*4]=(uint8_t)((((pixel>>16)&255)*alpha+127)/255);
+    rgba[i*4+1]=(uint8_t)((((pixel>>8)&255)*alpha+127)/255);
+    rgba[i*4+2]=(uint8_t)(((pixel&255)*alpha+127)/255);
+    rgba[i*4+3]=(uint8_t)alpha;
+  }
+  if(!lm_sink_commit(sink,bm->w,bm->h,(int64_t)luna_os_monotonic_ns())) {
+    lm_sink_abandon(sink);
+    dvm__throw(vm,"java/lang/IllegalStateException","Surface frame could not be queued");return false;
+  }
+  dvm_set_field(vm,self,"bufferCanvas","Landroid/graphics/Canvas;",(union dvm_value){0});
+  RETV();
+}
+
+/* ------------------------------------------------------------------------ *
+ * android/bitmap.h (libjnigraphics)
+ * ------------------------------------------------------------------------ *
+ * AndroidBitmap_* is how native code (libflutter among them) reads a Bitmap
+ * that crossed the JNI boundary.  The three calls agree about the bitmap the
+ * interpreter owns: getInfo answers the pixel layout the NDK names,
+ * lockPixels hands native a premultiplied RGBA image (like
+ * copyPixelsToBuffer does for the same storage), and unlockPixels writes
+ * changes back.  The image lives in guest memory while it is locked; the
+ * emulator copies it out on lock and back on unlock.
+ *
+ * A bitmap can be locked by several callers at once (Flutter locks its own
+ * splash read while the app's loader reads an icon), so the lock state is a
+ * small table keyed by the JNI handle, not a global. */
+
+struct android_bitmap_lock_state {
+  uint32_t host;              /* 0 = slot free */
+  struct rt_bitmap *bm;
+  uint32_t bytes;
+  uint8_t *copy;              /* the locked image, owned while locked */
+};
+
+#define ANDROID_BITMAP_LOCK_SLOTS 8
+static struct android_bitmap_lock_state android_bitmap_locks[ANDROID_BITMAP_LOCK_SLOTS];
+static pthread_mutex_t android_bitmap_mx = PTHREAD_MUTEX_INITIALIZER;
+
+static struct rt_bitmap *android_bitmap_of(struct dvm *vm, uint32_t host)
+{
+  dvm_ref ref = vm ? dvm_host_wrapper_ref(host) : 0;
+  struct dvm_object *o = ref ? dvm__obj(vm, ref) : NULL;
+  struct rt_bitmap *bm = o && o->cls &&
+                         o->cls->name && !strcmp(o->cls->name, "android/graphics/Bitmap")
+                         ? (struct rt_bitmap *)o->data : NULL;
+  return bm && bm->px && !bm->recycled ? bm : NULL;
+}
+
+int dvm_android_bitmap_info(uint32_t host, uint32_t *w, uint32_t *h,
+                            uint32_t *stride, int32_t *fmt, uint32_t *flags)
+{
+  struct rt_bitmap *bm = android_bitmap_of(dvm_current(), host);
+  if (!bm) return -2;          /* ANDROID_BITMAP_RESULT_BAD_PARAMETER */
+  *w = (uint32_t)bm->w;
+  *h = (uint32_t)bm->h;
+  *stride = (uint32_t)bm->w * 4u;
+  *fmt = 1;                    /* ANDROID_BITMAP_FORMAT_RGBA_8888 */
+  *flags = bm->unpremultiplied ? 0u : 1u; /* ANDROID_BITMAP_FLAGS_ALPHA_PREMUL */
+  return 0;
+}
+
+/* The bitmap as native storage reads it: premultiplied RGBA, one word per
+ * pixel, little-endian.  Same convention as bm_copyPixelsToBuffer for the
+ * same storage, so both answers agree where they overlap.  Returns -3
+ * (ALLOCATION_FAILED) when the table or the image cannot be allocated —
+ * a full table means a caller forgot to unlock, not a bad bitmap. */
+int dvm_android_bitmap_lock(uint32_t host, uint8_t **out, uint32_t *bytes_out)
+{
+  struct rt_bitmap *bm = android_bitmap_of(dvm_current(), host);
+  if (!bm) return -2;
+  const uint32_t bytes = (uint32_t)bm->w * (uint32_t)bm->h * 4u;
+  uint8_t *copy = malloc(bytes ? bytes : 1u);
+  if (!copy) return -1;        /* ANDROID_BITMAP_RESULT_ALLOCATION_FAILED */
+
+  pthread_mutex_lock(&android_bitmap_mx);
+  struct android_bitmap_lock_state *slot = NULL;
+  for (int i = 0; i < ANDROID_BITMAP_LOCK_SLOTS; ++i)
+    if (!android_bitmap_locks[i].host) { slot = &android_bitmap_locks[i]; break; }
+  if (slot) {
+    slot->host = host;
+    slot->bm = bm;
+    slot->bytes = bytes;
+    slot->copy = copy;
+  }
+  pthread_mutex_unlock(&android_bitmap_mx);
+  if (!slot) {
+    free(copy);
+    return -1;
+  }
+
+  const bool pre = !bm->unpremultiplied;
+  for (size_t i = 0; i < (size_t)bm->w * bm->h; ++i, copy += 4) {
+    uint32_t color = bm->px[i];
+    unsigned a = bm->has_alpha ? color >> 24 : 255;
+    unsigned r = (color >> 16) & 255, g = (color >> 8) & 255, b = color & 255;
+    if (pre) {
+      r = (r * a + 127) / 255;
+      g = (g * a + 127) / 255;
+      b = (b * a + 127) / 255;
+    }
+    copy[0] = (uint8_t)r;
+    copy[1] = (uint8_t)g;
+    copy[2] = (uint8_t)b;
+    copy[3] = (uint8_t)a;
+  }
+  *out = slot->copy;
+  *bytes_out = bytes;
+  return 0;
+}
+
+/* Unlock: copy premultiplied RGBA back into the bitmap's unpremultiplied
+ * ARGB words, and move the generation so PNG caches that read px re-encode. */
+int dvm_android_bitmap_unlock(uint32_t host, const uint8_t *bytes, uint32_t n)
+{
+  pthread_mutex_lock(&android_bitmap_mx);
+  struct android_bitmap_lock_state *slot = NULL;
+  for (int i = 0; i < ANDROID_BITMAP_LOCK_SLOTS; ++i)
+    if (android_bitmap_locks[i].host == host) { slot = &android_bitmap_locks[i]; break; }
+  if (!slot || !bytes || n != slot->bytes) {
+    pthread_mutex_unlock(&android_bitmap_mx);
+    return -1;                 /* ANDROID_BITMAP_RESULT_JNI_EXCEPTION */
+  }
+  struct rt_bitmap *bm = slot->bm;
+  const bool pre = !bm->unpremultiplied;
+  for (size_t i = 0; i < (size_t)bm->w * bm->h; ++i, bytes += 4) {
+    unsigned a = bm->has_alpha ? bytes[3] : 255, r = bytes[0], g = bytes[1], b = bytes[2];
+    if (pre && a) {
+      r = (r * 255u + a / 2u) / a;
+      g = (g * 255u + a / 2u) / a;
+      b = (b * 255u + a / 2u) / a;
+    }
+    bm->px[i] = (bm->has_alpha ? a : 255) << 24 | r << 16 | g << 8 | b;
+  }
+  ++bm->gen;
+  free(slot->copy);
+  slot->host = 0;
+  slot->bm = NULL;
+  slot->bytes = 0;
+  slot->copy = NULL;
+  pthread_mutex_unlock(&android_bitmap_mx);
+  return 0;
+}
+
 /* ------------------------------------------------------------------------ *
  * android.view.animation
  * ------------------------------------------------------------------------ *
@@ -88717,30 +89889,250 @@ static const struct rt_method rt_animator_listener_adapter[] = {
   M_END,
 };
 
-/* StateListAnimator: the animators a view runs as its state changes.  They are
- * kept; state changes here do not drive them. */
+/* StateListAnimator: each state spec names the animators to run while a view's
+ * drawable state matches it.  The first matching spec wins; on a change the
+ * previous group is cancelled and the new one started.  A <set> of animators
+ * under one <item> is several entries sharing the one spec array, so a group
+ * is the run of consecutive entries with the same spec. */
+static bool sla_list(struct dvm *vm, dvm_ref self, const char *field, dvm_ref *list)
+{
+  union dvm_value v = { 0 };
+  (void)dvm_get_field(vm, self, field, "Ljava/util/List;", &v);
+  if (!v.l) {
+    v.l = coll_new_list(vm, "Ljava/util/ArrayList;");
+    if (!v.l || !dvm_set_field(vm, self, field, "Ljava/util/List;", v)) return false;
+  }
+  *list = v.l;
+  return true;
+}
+
 static bool sla_add_state(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                           int nargs, union dvm_value *out)
 {
   (void)nargs;
   (void)out;
-  union dvm_value list = { 0 }, ignored = { 0 };
-  (void)dvm_get_field(vm, self, "animators", "Ljava/util/List;", &list);
-  if (!list.l) {
-    list.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "animators", "Ljava/util/List;", list);
+  dvm_ref specs, animators;
+  union dvm_value ignored = { 0 };
+  if (!sla_list(vm, self, "specs", &specs) || !sla_list(vm, self, "animators", &animators))
+    return false;
+  if (!list_add(vm, specs, &args[0], 1, &ignored) ||
+      !list_add(vm, animators, &args[1], 1, &ignored)) return false;
+  if (args[1].l) {
+    union dvm_value target = { 0 };
+    (void)dvm_get_field(vm, self, "target", "Landroid/view/View;", &target);
+    if (target.l) (void)dvm_set_field(vm, args[1].l, "target", "Ljava/lang/Object;", target);
   }
-  if (ARG(1).l) (void)list_add(vm, list.l, &args[1], 1, &ignored);
   RETV();
 }
+
+static bool sla_set_target(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  (void)out;
+  dvm_ref animators;
+  if (!sla_list(vm, self, "animators", &animators)) return false;
+  (void)dvm_set_field(vm, self, "target", "Landroid/view/View;", args[0]);
+  struct rt_list *l = list_of(vm, animators);
+  for (uint32_t i = 0; l && i < l->size; ++i)
+    if (l->items[i]) (void)dvm_set_field(vm, l->items[i], "target", "Ljava/lang/Object;", args[0]);
+  RETV();
+}
+
+/* StateSet.stateSetMatches: every positive id present, every negative absent. */
+static bool sla_matches(struct dvm *vm, dvm_ref spec, dvm_ref state)
+{
+  const int32_t *want = spec ? dvm_array_data(vm, spec) : NULL;
+  const int32_t *have = state ? dvm_array_data(vm, state) : NULL;
+  uint32_t nw = spec ? dvm_array_length(vm, spec) : 0, nh = state ? dvm_array_length(vm, state) : 0;
+  for (uint32_t i = 0; i < nw; ++i) {
+    int32_t id = want[i];
+    if (!id) break;
+    bool present = false;
+    for (uint32_t j = 0; j < nh && !present; ++j) present = have[j] == (id < 0 ? -id : id);
+    if (present == (id < 0)) return false;
+  }
+  return true;
+}
+
+/* Apply `name` ("start", "cancel" or "end") to the group starting at `first`. */
+static bool sla_group(struct dvm *vm, dvm_ref self, int first, const char *name)
+{
+  dvm_ref specs, animators;
+  if (first < 0 || !sla_list(vm, self, "specs", &specs) || !sla_list(vm, self, "animators", &animators))
+    return true;
+  struct rt_list *sl = list_of(vm, specs), *al = list_of(vm, animators);
+  for (uint32_t i = (uint32_t)first; sl && al && i < sl->size && sl->items[i] == sl->items[first]; ++i) {
+    union dvm_value ignored = { 0 };
+    if (al->items[i] && !am_vcall(vm, al->items[i], name, "()V", NULL, 0, &ignored)) return false;
+  }
+  return true;
+}
+
+static bool sla_set_state(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  (void)out;
+  dvm_ref specs;
+  if (!sla_list(vm, self, "specs", &specs)) return false;
+  struct rt_list *sl = list_of(vm, specs);
+  int match = -1;
+  for (uint32_t i = 0; sl && i < sl->size; ++i)
+    if (sla_matches(vm, sl->items[i], args[0].l)) {
+      match = (int)i;
+      break;
+    }
+  /* Entries of one group share a spec: a group is the same match, whichever
+   * of its entries was found first. */
+  int last = rt_get_int(vm, self, "lastMatch") - 1;
+  if (dvm__env("LUNARIA_TRACE_SLA")) {
+    fprintf(stderr, "[sla] %u specs, state of %u ids -> match %d (was %d)\n",
+            sl ? (unsigned)sl->size : 0u, args[0].l ? dvm_array_length(vm, args[0].l) : 0u, match, last);
+    for (uint32_t i = 0; args[0].l && i < dvm_array_length(vm, args[0].l); ++i)
+      fprintf(stderr, "[sla]   state 0x%x\n", ((uint32_t *)dvm_array_data(vm, args[0].l))[i]);
+  }
+  if (match == last) RETV();
+  if (!sla_group(vm, self, last, "cancel")) return false;
+  rt_set_int(vm, self, "lastMatch", match + 1);
+  if (!sla_group(vm, self, match, "start")) return false;
+  RETV();
+}
+
+static bool sla_jump(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                     int nargs, union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  (void)out;
+  return sla_group(vm, self, rt_get_int(vm, self, "lastMatch") - 1, "end");
+}
+
 static const struct rt_method rt_state_list_animator[] = {
   M("<init>", "()V", empty_void),
   M("addState", "([ILandroid/animation/Animator;)V", sla_add_state),
-  M("jumpToCurrentState", "()V", empty_void),
+  M("setTarget", "(Landroid/view/View;)V", sla_set_target),
+  M("setState", "([I)V", sla_set_state),
+  M("jumpToCurrentState", "()V", sla_jump),
   M_END,
 };
 static const struct rt_field rt_state_list_animator_fields[] = {
-  { "animators", "Ljava/util/List;" }, F_END
+  { "specs", "Ljava/util/List;" }, { "animators", "Ljava/util/List;" },
+  { "target", "Landroid/view/View;" }, { "lastMatch", "I" }, F_END
+};
+
+/* AnimatorInflater.loadStateListAnimator(): <selector> of <item state_...>
+ * holding an <objectAnimator> or a <set> of them.  Only float properties of
+ * the view (elevation, translationZ, ...) are modelled, which is what the
+ * platform and Material state-list animators animate. */
+static bool inflater_object_animator(struct dvm *vm, struct dx *x, const struct dx_tag *t,
+                                     dvm_ref sla, dvm_ref spec)
+{
+  uint8_t type = 0;
+  uint32_t data = 0;
+  if (!dx_attr(x, t, "propertyName", &type, &data) || type != AX_STRING || data >= x->ns ||
+      !x->s[data]) {
+    dvm__throw(vm, "android/view/InflateException", "<objectAnimator> requires propertyName");
+    return false;
+  }
+  const float to = dx_float(x, t, "valueTo", 0.0f);
+  const bool from = dx_attr(x, t, "valueFrom", &type, &data);
+  const float begin = from ? dx_float(x, t, "valueFrom", 0.0f) : 0.0f;
+  uint8_t ptype = 0;
+  uint32_t pdata = 0;
+  (void)dx_attr(x, t, "propertyName", &ptype, &pdata);
+  dvm_ref values = dvm_new_array(vm, 'F', "F", from ? 2 : 1);
+  float *f = values ? dvm_array_data(vm, values) : NULL;
+  if (!f) return false;
+  if (from) f[0] = begin;
+  f[from ? 1 : 0] = to;
+  union dvm_value args[3] = { { .l = 0 }, { .l = dvm_new_string(vm, x->s[pdata]) }, { .l = values } };
+  union dvm_value animator = { 0 };
+  if (!oa_of_float_name(vm, 0, args, 3, &animator) || !animator.l) return false;
+  dvm_pin(vm, animator.l);
+  int64_t duration = 300;
+  if (dx_attr(x, t, "duration", &type, &data) && dx_resolve_attribute(vm, x, &type, &data)) {
+    if (type == AX_REFERENCE) {
+      int32_t resolved = 0;
+      const char *text = NULL;
+      if (arm_exec_apk_resource_value(data, &resolved, &text)) duration = resolved;
+    } else duration = (int32_t)data;
+  }
+  anim_set_j(vm, animator.l, "duration", duration);
+  union dvm_value add[2] = { { .l = spec }, animator }, ignored = { 0 };
+  bool good = sla_add_state(vm, sla, add, 2, &ignored);
+  dvm_unpin(vm, animator.l);
+  return good;
+}
+
+static bool inflater_load_state_list(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                     int nargs, union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  uint32_t resource = (uint32_t)ARG(1).i;
+  int32_t iv = 0;
+  const char *path = NULL;
+  size_t n = 0;
+  unsigned char *b = NULL;
+  if (arm_exec_apk_resource_value(resource, &iv, &path) == 'L' && path)
+    b = arm_exec_asset_read(path, &n);
+  if (!b || n < 8 || ax_u16(b) != 3) {
+    free(b);
+    dvm__throw(vm, "android/content/res/Resources$NotFoundException",
+               "Animator resource 0x%08x", resource);
+    return false;
+  }
+  struct dx x = { .b = b, .n = n, .pos = ax_u16(b + 2) };
+  x.s = ax_string_pool(b, n, &x.ns);
+  struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/animation/StateListAnimator;");
+  dvm_ref sla = c ? dvm_new_object(vm, c) : 0;
+  bool good = x.s && sla;
+  struct dx_tag root, item, leaf;
+  if (good) dvm_pin(vm, sla);
+  if (good && (dx_next(&x, &root) != 0x0102 || strcmp(root.name, "selector"))) {
+    dvm__throw(vm, "android/view/InflateException", "Unsupported animator resource 0x%08x", resource);
+    good = false;
+  }
+  for (int e; good && (e = dx_next(&x, &item)) != 0 && e != 0x0103;) {
+    if (strcmp(item.name, "item")) {
+      dx_skip(&x);
+      continue;
+    }
+    dvm_ref spec = dx_item_states(vm, &x, &item);
+    if (!spec) {
+      good = false;
+      break;
+    }
+    dvm_pin(vm, spec);
+    int depth = 1;
+    for (int k; good && depth > 0 && (k = dx_next(&x, &leaf)) != 0;) {
+      if (k == 0x0103) {
+        --depth;
+        continue;
+      }
+      if (!strcmp(leaf.name, "objectAnimator")) {
+        good = inflater_object_animator(vm, &x, &leaf, sla, spec);
+        dx_skip(&x);
+      } else if (strcmp(leaf.name, "set")) {
+        dx_skip(&x);
+      } /* a <set> is entered: its objectAnimators are read as the loop goes on */
+      else ++depth;
+    }
+    dvm_unpin(vm, spec);
+  }
+  for (uint32_t i = 0; x.s && i < x.ns; ++i) free(x.s[i]);
+  free(x.s);
+  free(b);
+  if (good) dvm_unpin(vm, sla);
+  else if (sla) dvm_unpin(vm, sla);
+  if (!good) return false;
+  RETL(sla);
+}
+static const struct rt_method rt_animator_inflater[] = {
+  SM("loadStateListAnimator", "(Landroid/content/Context;I)Landroid/animation/StateListAnimator;",
+     inflater_load_state_list),
+  M_END,
 };
 
 static const struct rt_method rt_value_animator[] = {
@@ -90994,7 +92386,7 @@ static void view_touch_from_overlay(struct dvm *vm,dvm_ref view,int x,int y,int 
   union dvm_value down= {.j=event_ms};
   if (action==1) (void)dvm_set_field(vm,view,"touchDownTime","J",down);
   else (void)dvm_get_field(vm,view,"touchDownTime","J",&down);
-  luna_touch_event sample= {.action=action==1 ? 0 : action==0 ? 1 : 2,
+  luna_touch_event sample= {.action=action==1 ? 0 : action==0 ? 1 : action==2 ? 3 : 2,
                             .x=(float)x,.y=(float)y,.event_ms=event_ms,.down_ms=down.j,
   .pointer_count=1,.pointers={{.id=0,.x=(float)x,.y=(float)y}}
                            };
@@ -91800,6 +93192,8 @@ static const struct rt_method rt_x_activity_sender[] = {
   M_END,
 };
 
+#include "dvm_extras_platform.h"
+
 struct rt_extra {
   const char *desc;
   const struct rt_method *methods;
@@ -91908,6 +93302,16 @@ static const struct rt_extra rt_extras[] = {
   { "Landroid/net/ConnectivityManager;", rt_x_conn_manager },
   { "Landroid/net/LinkProperties;", rt_x_link_properties },
   { "Landroid/os/Looper;", rt_x_looper },
+  { "Landroid/graphics/Matrix;", rt_x_matrix_rect },
+  { "Landroid/content/res/ColorStateList;", rt_x_color_state_more },
+  { "Landroid/graphics/Paint;", rt_x_paint_more },
+  { "Landroid/widget/TextView;", rt_x_text_view_more },
+  { "Landroid/content/Intent;", rt_x_intent_more },
+  { "Landroid/net/wifi/WifiManager;", rt_x_wifi_more },
+  { "Landroid/app/ActivityManager;", rt_x_activity_manager_user },
+  { "Landroid/os/Debug;", rt_x_debug_cpu },
+  { "Landroid/app/Activity;", rt_x_activity_child },
+  { "Landroid/os/StrictMode$VmPolicy$Builder;", rt_x_vm_policy_builder },
   { "Ljava/net/URI;", rt_x_java_uri },
   { "Landroid/content/res/Configuration;", rt_x_configuration },
   { "Landroid/os/FileObserver;", rt_x_file_observer },
@@ -92711,6 +94115,7 @@ static const struct rt_class rt_classes[] = {
   { "Ljava/util/Locale;", "Ljava/lang/Object;", rt_locale, rt_locale_fields, NULL },
   { "Ljava/util/Locale$Builder;", "Ljava/lang/Object;", rt_locale_builder,
     rt_locale_builder_fields, NULL },
+  { "Landroid/util/Size;", "Ljava/lang/Object;", rt_size, rt_size_fields, NULL },
   { "Landroid/os/LocaleList;", "Ljava/lang/Object;", rt_locale_list,
     rt_locale_list_fields, NULL
   },
@@ -93605,6 +95010,9 @@ static const struct rt_class rt_classes[] = {
     rt_cursor_fields, rt_iface_closeable
   },
   { "Landroid/database/MatrixCursor;", "Landroid/database/Cursor;", rt_matrix_cursor, NULL, NULL },
+  { "Landroid/database/MatrixCursor$RowBuilder;", "Ljava/lang/Object;",
+    rt_matrix_cursor_row, NULL, NULL
+  },
   { "Ljava/io/FileOutputStream;", "Ljava/io/OutputStream;", rt_file_output,
     rt_file_stream_fields, NULL
   },
@@ -93640,6 +95048,9 @@ static const struct rt_class rt_classes[] = {
   },
   { "Landroid/webkit/MimeTypeMap;", "Ljava/lang/Object;", rt_mime_type_map, NULL, NULL, rt_mime_fields },
   { "Landroid/webkit/URLUtil;", "Ljava/lang/Object;", rt_url_util, NULL, NULL },
+  { "Landroid/webkit/WebStorage;", "Ljava/lang/Object;",rt_webstorage,NULL,NULL },
+  { "Landroid/webkit/ServiceWorkerController;", "Ljava/lang/Object;",rt_service_worker,rt_service_worker_fields,NULL },
+  { "Landroid/webkit/ServiceWorkerWebSettings;", "Ljava/lang/Object;",rt_service_worker_settings,rt_service_worker_settings_fields,NULL },
   { "Landroid/webkit/WebSettings;", "Ljava/lang/Object;", rt_web_settings,
     rt_web_settings_fields, NULL
   },
@@ -93827,6 +95238,9 @@ static const struct rt_class rt_classes[] = {
   },
   { "Ljava/util/concurrent/Semaphore;", "Ljava/lang/Object;",
     rt_semaphore, rt_semaphore_fields, rt_iface_serializable
+  },
+  { "Llunaria/MainExecutor;", "Ljava/lang/Object;",
+    rt_main_executor, NULL, rt_iface_executor
   },
   { "Ljava/util/concurrent/Executor;", "Ljava/lang/Object;",
     rt_executor_service, rt_executor_fields, NULL
@@ -94255,6 +95669,7 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/animation/StateListAnimator;", "Ljava/lang/Object;", rt_state_list_animator,
     rt_state_list_animator_fields, NULL
   },
+  { "Landroid/animation/AnimatorInflater;", "Ljava/lang/Object;", rt_animator_inflater, NULL, NULL },
   { "Landroid/animation/ValueAnimator;", "Landroid/animation/Animator;",
     rt_value_animator, rt_value_animator_fields, NULL
   },
@@ -94519,11 +95934,11 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/graphics/drawable/RippleDrawable;",
     "Landroid/graphics/drawable/LayerDrawable;", rt_ripple_drawable, rt_ripple_drawable_fields, NULL
   },
-  { "Landroid/graphics/drawable/InsetDrawable;",
-    "Landroid/graphics/drawable/Drawable;", NULL, rt_shown_drawable_fields, NULL
-  },
   { "Landroid/graphics/drawable/DrawableWrapper;", "Landroid/graphics/drawable/Drawable;",
     rt_drawable_wrapper, rt_drawable_container_fields, rt_wrapper_ifaces
+  },
+  { "Landroid/graphics/drawable/InsetDrawable;",
+    "Landroid/graphics/drawable/DrawableWrapper;", rt_inset_drawable, rt_inset_drawable_fields, NULL
   },
   { "Landroid/graphics/drawable/Animatable;", "Ljava/lang/Object;",rt_animatable,NULL,NULL,NULL,true },
   { "Landroid/graphics/drawable/AnimatedRotateDrawable;", "Landroid/graphics/drawable/DrawableWrapper;",
@@ -94691,6 +96106,8 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/app/admin/DevicePolicyManager;", "Ljava/lang/Object;", rt_device_policy_manager, NULL, NULL },
   { "Landroid/app/usage/UsageStatsManager;", "Ljava/lang/Object;", rt_usage_stats_manager, NULL, NULL },
   { "Landroid/content/RestrictionsManager;", "Ljava/lang/Object;", rt_restrictions_manager, NULL, NULL },
+  { "Landroid/content/pm/ShortcutManager;", "Ljava/lang/Object;", rt_shortcut_manager,
+    rt_shortcut_manager_fields, NULL },
   { "Ldalvik/system/BlockGuard;", "Ljava/lang/Object;", rt_block_guard, NULL, NULL },
   { "Ldalvik/system/BlockGuard$Policy;", "Ljava/lang/Object;", rt_block_guard_policy, NULL, NULL, NULL, true },
   { "Ldalvik/system/BlockGuard$1;", "Ljava/lang/Object;", rt_block_guard_lax, NULL, rt_iface_block_guard_policy },
@@ -94815,6 +96232,9 @@ static const struct rt_class rt_classes[] = {
   },
   { "Landroid/content/ContextWrapper;", "Landroid/content/Context;",
     rt_context_wrapper, rt_context_wrapper_fields, NULL
+  },
+  { "Landroid/content/MutableContextWrapper;", "Landroid/content/ContextWrapper;",
+    rt_mutable_context_wrapper, NULL, NULL
   },
   { "Landroid/view/ContextThemeWrapper;", "Landroid/content/ContextWrapper;",
     rt_context_theme_wrapper, rt_context_theme_wrapper_fields, NULL

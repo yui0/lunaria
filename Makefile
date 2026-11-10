@@ -559,11 +559,12 @@ runtime/libOpenSLES.so: src/trace.h
 DVM_SRC = src/apkpure.c src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
-DVM_SRC += src/luna_process_ipc.c
+DVM_SRC += src/luna_process_ipc.c src/luna_certs.c
 DVM_HDR = src/jvm/jvm.h src/dvm/dvm_parcel.h src/dvm/dvm_lib.h src/luna_boot.h src/dvm/dvm_lib.h src/lunaria_file.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dvm.h src/dvm/dvm.h src/dvm/dvm_internal.h \
           src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/dvm.h \
           src/dvm/dvm_lib.h src/dvm/dvm_lib.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
           src/webview_cdp.h
+DVM_HDR += src/luna_certs.h
 DVM_HDR += src/unicode/breaks.h src/unicode/break_data.h
 DVM_HDR += src/dvm/dvm_lib.h src/dvm/calendar_data.h
 DVM_HDR += src/dvm/date_time_patterns_data.h src/dvm/dvm_extras_android.h
@@ -1523,6 +1524,33 @@ guest-string-test: lunaria $(BUILD_DIR)/guest_string_boundary32.so $(BUILD_DIR)/
 
 $(eval $(call GUEST_ABI_TEST,guest_signal_suspend,test/guest_signal_suspend.c,$(ABI32_CC)))
 $(eval $(call GUEST_ABI_TEST,raw_signal_action,test/raw_signal_action.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,raw_memory_advice,test/raw_memory_advice.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,mkdirat,test/mkdirat_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,libc_extra,test/libc_extra_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,alooper_callback,test/alooper_callback_test.c,$(ABI32_CC),-std=c11))
+.PHONY: alooper-callback-test
+alooper-callback-test: lunaria $(BUILD_DIR)/alooper_callback32.so $(BUILD_DIR)/alooper_callback64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/alooper_callback32.so $(BUILD_DIR)/alooper_callback64.so
+
+.PHONY: libc-extra-test
+libc-extra-test: lunaria $(BUILD_DIR)/libc_extra32.so $(BUILD_DIR)/libc_extra64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/libc_extra32.so $(BUILD_DIR)/libc_extra64.so
+.PHONY: mkdirat-test
+mkdirat-test: lunaria $(BUILD_DIR)/mkdirat32.so $(BUILD_DIR)/mkdirat64.so
+	@mkdirat_root=$$(mktemp -d "$(BUILD_DIR)/mkdirat-test.XXXXXX") || exit 1; \
+	    mkdir "$$mkdirat_root/files"; \
+	    ANDROID_FILES_DIR="$$mkdirat_root/files" ANDROID_PACKAGE_NAME=test.mkdirat python3 test/run_guest_results.py $(BUILD_DIR)/mkdirat32.so $(BUILD_DIR)/mkdirat64.so; \
+	    result=$$?; rm -rf "$$mkdirat_root"; exit $$result
+
+$(eval $(call GUEST_ABI_TEST,raw_process_identity,test/raw_process_identity.c,$(ABI32_CC),-std=c11))
+.PHONY: raw-identity-test
+raw-identity-test: lunaria $(BUILD_DIR)/jni-array-owner/code/classes.dex $(BUILD_DIR)/raw_process_identity32.so $(BUILD_DIR)/raw_process_identity64.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-array-owner/code" python3 test/run_guest_results.py $(BUILD_DIR)/raw_process_identity32.so $(BUILD_DIR)/raw_process_identity64.so
+
+.PHONY: raw-memory-test
+raw-memory-test: lunaria $(BUILD_DIR)/raw_memory_advice32.so $(BUILD_DIR)/raw_memory_advice64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/raw_memory_advice32.so $(BUILD_DIR)/raw_memory_advice64.so
+
 .PHONY: raw-signal-test
 raw-signal-test: lunaria $(BUILD_DIR)/raw_signal_action32.so $(BUILD_DIR)/raw_signal_action64.so
 	@python3 test/run_guest_results.py $(BUILD_DIR)/raw_signal_action32.so $(BUILD_DIR)/raw_signal_action64.so
@@ -3554,3 +3582,47 @@ settings-provider-test: test/test_dvm
 .PHONY: provider-publication-test
 provider-publication-test: test/test_dvm
 	./test/test_dvm --provider-publication-test
+
+.PHONY: main-executor-test
+main-executor-test: test/test_dvm
+	./test/test_dvm --main-executor-test
+
+test/test_dvm: test/main_executor_tests.h
+
+$(eval $(call GUEST_ABI_TEST,gl_clear_texture,test/gl_clear_texture_test.c,$(ABI32_CC),-std=c11))
+.PHONY: gl-clear-texture-test
+gl-clear-texture-test: lunaria $(BUILD_DIR)/gl_clear_texture32.so $(BUILD_DIR)/gl_clear_texture64.so
+	@EGL_PLATFORM=surfaceless LUNARIA_PBUFFER=1 python3 test/run_guest_results.py $(BUILD_DIR)/gl_clear_texture32.so $(BUILD_DIR)/gl_clear_texture64.so
+
+$(eval $(call GUEST_ABI_TEST,java_looper_fd,test/java_looper_fd_test.c,$(ABI32_CC),-std=c11))
+.PHONY: java-looper-fd-test
+java-looper-fd-test: lunaria $(BUILD_DIR)/egl-thread/code/classes.dex $(BUILD_DIR)/java_looper_fd32.so $(BUILD_DIR)/java_looper_fd64.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/egl-thread/code" python3 test/run_guest_results.py $(BUILD_DIR)/java_looper_fd32.so $(BUILD_DIR)/java_looper_fd64.so
+
+$(eval $(call GUEST_ABI_TEST,web_services,test/web_services_test.c,$(ABI32_CC),-std=c11))
+.PHONY: web-services-test
+web-services-test: lunaria $(BUILD_DIR)/egl-thread/code/classes.dex $(BUILD_DIR)/web_services32.so $(BUILD_DIR)/web_services64.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/egl-thread/code" python3 test/run_guest_results.py $(BUILD_DIR)/web_services32.so $(BUILD_DIR)/web_services64.so
+
+.PHONY: certs-cache-test
+certs-cache-test: $(BUILD_DIR)/test_certs_cache
+	$(BUILD_DIR)/test_certs_cache
+$(BUILD_DIR)/test_certs_cache: test/certs_cache_test.c src/luna_certs.c src/luna_certs.h $(LUNA_OS_OBJ) | $(BUILD_DIR)
+	$(CC) -std=c11 -g -O1 -D_GNU_SOURCE -Isrc $(CPPFLAGS) test/certs_cache_test.c src/luna_certs.c $(LUNA_OS_OBJ) $(HOST_CRYPTO_LIBS) $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -lm -o $@
+
+$(eval $(call GUEST_ABI_TEST,jni_direct_buffer_race,test/jni_direct_buffer_race_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,alooper_vsync,test/alooper_vsync_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,mutable_context,test/mutable_context_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,surface_canvas,test/surface_canvas_test.c,$(ABI32_CC),-std=c11))
+.PHONY: surface-canvas-test
+surface-canvas-test: lunaria $(BUILD_DIR)/egl-thread/code/classes.dex $(BUILD_DIR)/surface_canvas32.so $(BUILD_DIR)/surface_canvas64.so
+	@EGL_PLATFORM=surfaceless LUNARIA_PBUFFER=1 ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/egl-thread/code" python3 test/run_guest_results.py $(BUILD_DIR)/surface_canvas32.so $(BUILD_DIR)/surface_canvas64.so
+.PHONY: mutable-context-test
+mutable-context-test: lunaria $(BUILD_DIR)/egl-thread/code/classes.dex $(BUILD_DIR)/mutable_context32.so $(BUILD_DIR)/mutable_context64.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/egl-thread/code" python3 test/run_guest_results.py $(BUILD_DIR)/mutable_context32.so $(BUILD_DIR)/mutable_context64.so
+.PHONY: alooper-vsync-test
+alooper-vsync-test: lunaria $(BUILD_DIR)/alooper_vsync32.so $(BUILD_DIR)/alooper_vsync64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/alooper_vsync32.so $(BUILD_DIR)/alooper_vsync64.so
+.PHONY: jni-direct-buffer-race-test
+jni-direct-buffer-race-test: lunaria $(BUILD_DIR)/egl-thread/code/classes.dex $(BUILD_DIR)/jni_direct_buffer_race32.so $(BUILD_DIR)/jni_direct_buffer_race64.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/egl-thread/code" python3 test/run_guest_results.py $(BUILD_DIR)/jni_direct_buffer_race32.so $(BUILD_DIR)/jni_direct_buffer_race64.so

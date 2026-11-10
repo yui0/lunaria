@@ -130,6 +130,34 @@ static int32_t time_offset(int64_t ms, const char *zone)
 #endif
 }
 
+/* Wall-clock fields in `zone` (NULL: the device zone) to epoch milliseconds.
+ * Out-of-range fields roll over the way java.util.Date's deprecated
+ * constructors do; mktime normalises them identically. */
+static int64_t time_from_local(struct tm *tm, const char *zone)
+{
+  if (!zone || !*zone) zone = arm_exec_device_timezone();
+  tm->tm_isdst = -1;
+#ifdef _WIN32
+  int64_t millis;
+  if (luna_calendar_assemble(tm, zone, 0, &millis)) return -1000;
+  time_break(millis, zone, tm);
+  return millis;
+#else
+  arm_exec_timezone_lock();
+  char *old = getenv("TZ");
+  char saved[128] = "";
+  if (old) snprintf(saved, sizeof saved, "%s", old);
+  setenv("TZ", zone, 1);
+  tzset();
+  time_t t = mktime(tm);
+  if (old) setenv("TZ", saved, 1);
+  else unsetenv("TZ");
+  tzset();
+  arm_exec_timezone_unlock();
+  return (int64_t)t * 1000;
+#endif
+}
+
 /* --- java.util.Date ----------------------------------------------------- */
 
 static bool date_parse(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
@@ -143,6 +171,17 @@ static bool date_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     RETV();
   }
   (void)out;
+  if (nargs >= 3) {
+    /* Date(year-1900, month, date[, hrs, min[, sec]]) */
+    struct tm tm = {0};
+    tm.tm_year = ARG(0).i;
+    tm.tm_mon = ARG(1).i;
+    tm.tm_mday = ARG(2).i;
+    if (nargs >= 5) { tm.tm_hour = ARG(3).i; tm.tm_min = ARG(4).i; }
+    if (nargs >= 6) tm.tm_sec = ARG(5).i;
+    time_set_millis(vm, self, time_from_local(&tm, NULL));
+    RETV();
+  }
   time_set_millis(vm, self, nargs >= 1 ? ARG(0).j : now_millis());
   RETV();
 }
@@ -1896,6 +1935,9 @@ static const struct rt_method rt_date[] = {
   M("<init>","(Ljava/lang/String;)V",date_init),
   M("<init>", "()V", date_init),
   M("<init>", "(J)V", date_init),
+  M("<init>", "(III)V", date_init),
+  M("<init>", "(IIIII)V", date_init),
+  M("<init>", "(IIIIII)V", date_init),
   M("getTime", "()J", date_getTime),
   M("setTime", "(J)V", date_setTime),
   M("before", "(Ljava/util/Date;)Z", date_before),

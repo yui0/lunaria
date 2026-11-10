@@ -3717,9 +3717,8 @@ jvm_release(struct jvm *jvm)
     jvm_string_release(&jvm->methods[i].method.signature);
   }
 
-  *jvm = (struct jvm) {
-    0
-  };
+  /* Avoid a JVM-sized temporary on the host stack in debug builds. */
+  memset(jvm, 0, sizeof *jvm);
 }
 
 void
@@ -3730,9 +3729,8 @@ jvm_init(struct jvm *jvm)
     if (g_guest_jni_exceptions[i].owner == jvm)
       memset(&g_guest_jni_exceptions[i], 0, sizeof g_guest_jni_exceptions[i]);
   if (g_jni_exception.owner == jvm) memset(&g_jni_exception, 0, sizeof g_jni_exception);
-  *jvm = (struct jvm) {
-    0
-  };
+  /* Avoid a JVM-sized temporary on the host stack in debug builds. */
+  memset(jvm, 0, sizeof *jvm);
   vm_init(&jvm->vm, &jvm->invoke);
   env_init(&jvm->env, &jvm->native);
   jvm_make_class(jvm, "java/lang/Class");

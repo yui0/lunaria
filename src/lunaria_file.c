@@ -697,6 +697,12 @@ static int sym_at(int fd,const char *path,char *out)
     return -1;
   }
   if (fd==LUNA_AT_FDCWD || path[0]=='/' || (path[0] && path[1]==':')) return sym_copy(out,SYM_PATH,path);
+  luna_file_info info;
+  if (luna_file_fd_info(fd,&info)) return -1;
+  if ((info.mode&0170000)!=0040000) {
+    errno=ENOTDIR;
+    return -1;
+  }
   char parent[SYM_PATH];
   if (sym_fd_path(fd,parent,sizeof parent)) return -1;
   int n=snprintf(out,SYM_PATH,"%s/%s",parent,path);
@@ -956,6 +962,17 @@ int luna_symlink_access(const char *p,int mode) {
   return luna_symlink_accessat(LUNA_AT_FDCWD,p,mode,0);
 }
 
+int luna_symlink_mkdirat(int dirfd,const char *path,unsigned mode)
+{
+  sym_enter();
+  char absolute[SYM_PATH];
+  int r=-1;
+  if (path && !*path) errno=ENOENT;
+  else if (!sym_at(dirfd,path,absolute)) r=luna_symlink_mkdir(absolute,mode);
+  sym_leave();
+  return r;
+}
+
 int luna_symlink_mkdir(const char *path,unsigned mode)
 {
   sym_enter();
@@ -1142,6 +1159,15 @@ char *luna_file_canonical_namespace(const char *path,char *out,size_t capacity,
   memcpy(out,work,used+1);
   return out;
 }
+int luna_symlink_renameat(int fromfd,const char *from,int tofd,const char *to)
+{
+  sym_enter();
+  char a[SYM_PATH],b[SYM_PATH];
+  int r=sym_at(fromfd,from,a) || sym_at(tofd,to,b) ? -1 : luna_symlink_rename(a,b);
+  sym_leave();
+  return r;
+}
+
 int luna_symlink_rename(const char *from,const char *to)
 {
   sym_enter();

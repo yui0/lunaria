@@ -38,6 +38,7 @@ int luna_symlink_resolve(const char *path,char *out,size_t capacity,int follow);
 int luna_symlink_openat(int dirfd,const char *path,int flags,unsigned mode);
 int luna_symlink_open(const char *path,int flags,unsigned mode);
 int luna_symlink_mkdir(const char *path,unsigned mode);
+int luna_symlink_mkdirat(int dirfd,const char *path,unsigned mode);
 int luna_symlink_link(const char *from,const char *to);
 int luna_symlink_chmodat(int dirfd,const char *path,unsigned mode,int flags);
 int luna_symlink_timesat(int dirfd,const char *path,const luna_file_time times[2],int flags);
@@ -51,6 +52,7 @@ int luna_symlink_infoat(int dirfd,const char *path,luna_file_info *info,int flag
 int luna_symlink_unlinkat(int dirfd,const char *path,int flags);
 int luna_symlink_unlink(const char *path);
 int luna_symlink_rename(const char *from,const char *to);
+int luna_symlink_renameat(int fromfd,const char *from,int tofd,const char *to);
 ptrdiff_t luna_symlink_readlink(const char *path,char *out,size_t capacity);
 int luna_symlink_accessat(int dirfd,const char *path,int mode,int flags);
 int luna_symlink_access(const char *path,int mode);

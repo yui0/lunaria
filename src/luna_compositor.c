@@ -584,8 +584,10 @@ static void *comp_main(void *arg)
      * or the UI changes it. */
     const bool boot = luna_boot_active() && !have_frame && !luna_overlay_guest_window_up();
     const bool ime = luna_ime_active();
-    const uint64_t period = (boot || luna_overlay_has_image_sources()) ? 16000000ull : ime ? 33000000ull
-                            : luna_overlay_active() ? 100000000ull
+    const bool image_sources = luna_overlay_has_image_sources();
+    const bool overlay = luna_overlay_active();
+    const uint64_t period = (boot || image_sources) ? 16000000ull : ime ? 33000000ull
+                            : overlay ? 100000000ull
                             : 1000000000ull;
 
     pthread_mutex_lock(&g_mu);
@@ -600,6 +602,15 @@ static void *comp_main(void *arg)
         until.tv_nsec = (long)(ns % 1000000000ull);
         (void)pthread_cond_timedwait(&g_cv_comp, &g_mu, &until);
       }
+    }
+    /* The safety wake is not itself damage. Keep the last scanout when no
+     * producer, overlay animation or remote viewer needs a new frame. */
+    if (!g_wake && g_queued < 0 && !g_px_pending && !boot && !ime &&
+        !overlay && !image_sources &&
+        !luna_qfkey_wants_frame()) {
+      pthread_mutex_unlock(&g_mu);
+      last_draw = now_ns();
+      continue;
     }
     g_wake = false;
     int take = g_queued;

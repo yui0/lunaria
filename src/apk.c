@@ -14,6 +14,7 @@
 #define _FILE_OFFSET_BITS 64
 #endif
 #include "lunaria_os.h"
+#include "arm_exec.h"
 #include "lunaria_file.h"
 #include "dvm/dvm_lib.h"
 #include "luna_boot.h"
@@ -42,6 +43,7 @@ extern char **environ;
 #define APK_PATH 4096
 #define APK_META 65536
 #define APK_MAX_MANIFEST (16u*1024u*1024u)
+static int android_system_fonts(const char *root);
 static int apk_error(const char *format, ...)
 {
   va_list ap;
@@ -293,6 +295,28 @@ static struct zip_entry *zip_find(struct zip *z, const char *name)
       return z->entries + i;
   return NULL;
 }
+/* Java ZipEntry metadata uses the same checked ZIP64 index as installation.
+ * Reading metadata must not inflate a potentially multi-gigabyte member. */
+int arm_exec_zip_metadata(const char *archive, const char *name,
+                          struct arm_zip_metadata *out)
+{
+  if (!archive || !name || !out) return 0;
+  char mapped[APK_PATH];
+  const char *path = arm_exec_map_guest_path(archive, mapped, sizeof mapped);
+  struct zip zip = {0};
+  if (!path || zip_open(&zip, path)) return 0;
+  const struct zip_entry *entry = zip_find(&zip, name);
+  if (entry) {
+    out->size = entry->size;
+    out->compressed_size = entry->compressed;
+    out->crc = entry->crc;
+    out->method = entry->method;
+  }
+  int found = entry != NULL;
+  zip_close(&zip);
+  return found;
+}
+
 /* ZIP paths must stay under the installed tree on all three platforms. */
 static bool entry_safe(const char *name)
 {
@@ -1822,6 +1846,48 @@ static int config_load(const char *path, const char *package)
   fclose(f);
   return result;
 }
+/* Install selected host faces as Android system resources, preserving a
+ * supplied system image. Native Skia/Minikin clients consume fonts.xml. */
+static int android_font_write(const char *path,const void *data,size_t size)
+{
+  FILE *f=fopen(path,"wbx");
+  if(!f) return errno==EEXIST ? 0 : -1;
+  bool good=fwrite(data,1,size,f)==size;
+  if(fclose(f)) good=false;
+  if(!good) { remove(path); return -1; }
+  return 0;
+}
+static int android_system_fonts(const char *root)
+{
+  char path[PATH_MAX];
+  if(path_join(path,sizeof path,root,"system/etc/fonts.xml")) return -1;
+  luna_file_info info;
+  if(!luna_file_infoat(LUNA_AT_FDCWD,path,&info,LUNA_AT_NOFOLLOW)) return 0;
+  if(errno!=ENOENT) return -1;
+  const char *dirs[]={"system","system/etc","system/fonts"};
+  for(unsigned i=0;i<3;++i)
+    if(path_join(path,sizeof path,root,dirs[i]) || mkdirs(path)) return -1;
+  const char *files[]={"LunariaSans.ttf","LunariaSans-Bold.ttf","LunariaFallback.ttf","LunariaMono.ttf"};
+  bool loaded[4]={false};
+  for(unsigned i=0;i<4;++i) {
+    const void *data;size_t size;
+    if(!luna_overlay_system_font(i,&data,&size)) continue;
+    char relative[128];snprintf(relative,sizeof relative,"system/fonts/%s",files[i]);
+    if(path_join(path,sizeof path,root,relative) || android_font_write(path,data,size)) return -1;
+    loaded[i]=true;
+  }
+  if(!loaded[0]) { errno=ENOENT; return -1; }
+  char xml[2048];
+  int n=snprintf(xml,sizeof xml,
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<familyset version=\"23\">"
+    "<family name=\"sans-serif\"><font weight=\"400\" style=\"normal\">LunariaSans.ttf</font>%s</family>"
+    "<alias name=\"serif\" to=\"sans-serif\"/>%s%s</familyset>\n",
+    loaded[1]?"<font weight=\"700\" style=\"normal\">LunariaSans-Bold.ttf</font>":"",
+    loaded[3]?"<family name=\"monospace\"><font weight=\"400\" style=\"normal\">LunariaMono.ttf</font></family>":"<alias name=\"monospace\" to=\"sans-serif\"/>",
+    loaded[2]?"<family><font weight=\"400\" style=\"normal\">LunariaFallback.ttf</font></family>":"");
+  if(n<0 || (size_t)n>=sizeof xml || path_join(path,sizeof path,root,"system/etc/fonts.xml")) return -1;
+  return android_font_write(path,xml,(size_t)n);
+}
 static bool suffix(const char *s, const char *ext);
 
 /* Read the launcher's display inputs before creating its first window.
@@ -2219,7 +2285,7 @@ static int profile_storage(const char *root, const char *package, const char *pr
     return -1;
   /* Like the app directories above, the device filesystem belongs to the
    * selected profile. exec retains the previous launch's environment. */
-  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path))
+  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path) || android_system_fonts(path))
     return -1;
   return env_set("LUNARIA_PROFILE", profile, true);
 }

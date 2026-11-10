@@ -4376,6 +4376,7 @@ static bool vg_dispatch_draw(struct dvm *vm,dvm_ref self,const union dvm_value *
     children[i]=list->items[i];
     dvm_pin(vm,children[i]);
   }
+  ui_z_sort(vm,self,children,count);
   bool good=true,more=false;
   union dvm_value saved= {0},ignored= {0};
   good=am_vcall(vm,ARG(0).l,"save","()I",NULL,0,&saved);
@@ -6189,6 +6190,42 @@ static bool gd_setStroke(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+/* A ColorStateList paints with its default colour: this drawable is drawn
+ * without a state set, which is the state list's fall-through entry. */
+static bool gd_state_color(struct dvm *vm, dvm_ref list, int32_t *color)
+{
+  struct dvm_class *c = list ? dvm_object_class(vm, list) : NULL;
+  struct dvm_method *m = c ? dvm_find_method(vm, c, "getDefaultColor", "()I") : NULL;
+  union dvm_value r = {0};
+  if (!list) {
+    *color = 0; /* setColor((ColorStateList) null) clears the fill */
+    return true;
+  }
+  if (!m || !dvm_call(vm, m, list, NULL, 0, &r)) return false;
+  *color = r.i;
+  return true;
+}
+
+static bool gd_setColorState(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+  int32_t color;
+  if (!gd_state_color(vm, ARG(0).l, &color)) return false;
+  union dvm_value v = { .i = color };
+  return gradient_set_color(vm, self, &v, 1, out);
+}
+
+static bool gd_setStrokeState(struct dvm *vm, dvm_ref self,
+                              const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+  int32_t color;
+  if (!gd_state_color(vm, ARG(1).l, &color)) return false;
+  union dvm_value v[4] = { ARG(0), { .i = color }, ARG(2), ARG(3) };
+  return gd_setStroke(vm, self, v, nargs, out);
+}
+
 static bool gd_setOrientation(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
@@ -6538,6 +6575,9 @@ static const struct rt_method rt_gradient_drawable_full[] = {
   M("setCornerRadii", "([F)V", gd_setCornerRadii),
   M("setStroke", "(II)V", gd_setStroke),
   M("setStroke", "(IIFF)V", gd_setStroke),
+  M("setColor", "(Landroid/content/res/ColorStateList;)V", gd_setColorState),
+  M("setStroke", "(ILandroid/content/res/ColorStateList;)V", gd_setStrokeState),
+  M("setStroke", "(ILandroid/content/res/ColorStateList;FF)V", gd_setStrokeState),
   M("setColors", "([I)V", gd_setColors),
   M("setColors", "([I[F)V", gd_setColors),
   M("draw", "(Landroid/graphics/Canvas;)V", gd_draw),

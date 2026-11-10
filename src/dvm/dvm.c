@@ -2070,10 +2070,23 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
     }
   }
 
-  if (vm->hooks.call_external &&
-      vm->hooks.call_external(vm->hooks.user, vm, cls->name, name, sig,
-                              self, args, nargs, out))
-    return true;
+  if (vm->hooks.call_external) {
+    const bool handled=vm->hooks.call_external(vm->hooks.user, vm, cls->name,
+                                               name, sig,self,args,nargs,out);
+    /* FindClass/GetMethodID can raise while the host bridge probes an
+     * optional API, even when it declines the call. Deliver that exception
+     * here so the Java caller can catch it; leaving it pending would attach
+     * it to an unrelated native method much later. */
+    if(vm->hooks.take_pending_exception) {
+      dvm_ref raised=vm->hooks.take_pending_exception(vm->hooks.user,vm);
+      if(raised) {
+        memset(out,0,sizeof *out);
+        vm->exception=raised;
+        return false;
+      }
+    }
+    if(handled) return !vm->exception;
+  }
 
   /* Nothing implements this and the guest is calling it *now*: the zero
    * below is about to be used as an answer.  Report the caller with it —
@@ -5703,7 +5716,10 @@ void dvm_main_looper_tick(struct dvm *vm)
   const dvm_ref saved_looper = g_current_looper;
   g_current_looper = 0;
   dvm__network_tick(vm);
-  bool dispatched = false;
+  unsigned native_depth=dvm_gil_unlock_all(vm);
+  const int native_events=arm_exec_alooper_dispatch_main();
+  dvm_gil_relock(vm,native_depth);
+  bool dispatched = native_events>0;
   const uint64_t now = dvm__now_ms();
   for (int i = 0; i < vm->npending; ++i)
     if (!vm->pending_is_thread[i] && !vm->pending_looper[i] &&
@@ -6229,7 +6245,7 @@ void dvm_gil_wait_for(struct dvm *vm, uintptr_t channel, unsigned ms)
   dvm_gil_wait_for_ns(vm, channel, (uint64_t)ms * 1000000ull);
 }
 
-void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
+static void gil_wait_channel(struct dvm *vm, uintptr_t channel, uint64_t ns,bool native_looper)
 {
   if (dvm_is_stopping(vm)) return;
 
@@ -6285,6 +6301,7 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
   /* See dvm_gil_wait(): the execution lock cannot be held across a wait for
    * something that needs it to happen. */
   unsigned ael = arm_lock_unlock_all();
+  if(native_looper)arm_exec_alooper_watch_current(channel);
   struct timespec ts;
   if (ns != UINT64_MAX) {
     clock_gettime(clock, &ts);
@@ -6308,8 +6325,18 @@ void dvm_gil_wait_for_ns(struct dvm *vm, uintptr_t channel, uint64_t ns)
   pthread_mutex_unlock(&g_gil.m);
 
   pthread_cond_destroy(&w.cv);
+  if(native_looper)arm_exec_alooper_unwatch_current();
   dvm_gil_relock(vm, d);
   arm_lock_relock(ael);
+}
+
+void dvm_gil_wait_for_ns(struct dvm *vm,uintptr_t channel,uint64_t ns)
+{
+  gil_wait_channel(vm,channel,ns,false);
+}
+void dvm_gil_wait_for_looper_ns(struct dvm *vm,uintptr_t channel,uint64_t ns)
+{
+  gil_wait_channel(vm,channel,ns,true);
 }
 
 struct dvm *dvm_current(void) {

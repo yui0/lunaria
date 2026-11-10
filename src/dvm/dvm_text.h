@@ -1791,6 +1791,90 @@ static bool static_builder_set(struct dvm *vm,dvm_ref self,
   }
   RETL(self);
 }
+/* Android's Layout ellipsis: when the last allowed line cannot show all the
+ * text that belongs to it (more text follows, or the line is wider than the
+ * ellipsized width), that line shows as much as fits beside an ellipsis,
+ * kept from the start (END), the end (START) or both ends (MIDDLE).  The
+ * line keeps its source range; only what it paints changes. */
+static bool layout_units_width(struct dvm *vm,struct textview_layout *layout,
+                               const uint16_t *units,size_t count,float *width,
+                               struct luna_text_run *keep)
+{
+  struct luna_text_run run= {0};
+  if(!count) {
+    *width=0;
+    if(keep) *keep=run;
+    return true;
+  }
+  if(!paint_shape_units_direction(vm,layout->paint,units,count,layout->paragraph_direction,&run)) return false;
+  *width=run.width*layout->scale;
+  if(keep) *keep=run;
+  else free(run.glyphs);
+  return true;
+}
+/* The most units of `units[0..count)` (from its end when `from_end`) that fit
+ * `budget`, never splitting a surrogate pair. */
+static bool layout_fit_units(struct dvm *vm,struct textview_layout *layout,
+                             const uint16_t *units,size_t count,float budget,bool from_end,size_t *kept)
+{
+  size_t low=0,high=count;
+  while(low<high) {
+    size_t mid=low+(high-low+1)/2;
+    const uint16_t *at=from_end ? units+count-mid : units;
+    bool split=mid<count && (from_end ? (at[0]>=0xdc00 && at[0]<=0xdfff) : (at[mid-1]>=0xd800 && at[mid-1]<=0xdbff));
+    float width=0;
+    if(!split && !layout_units_width(vm,layout,at,mid,&width,NULL)) return false;
+    if(!split && width<=budget) low=mid;
+    else high=mid-1;
+  }
+  *kept=low;
+  return true;
+}
+static bool static_layout_ellipsize(struct dvm *vm,struct textview_layout *layout,
+                                    const char *where,float avail)
+{
+  if(!layout->count || !strcmp(where,"MARQUEE")) return true;
+  struct textview_line *line=&layout->lines[layout->count-1];
+  size_t total=layout->text.length,from=line->start;
+  while(total>from && (layout->text.data[total-1]=='\n' || layout->text.data[total-1]=='\r')) --total;
+  const uint16_t *src=layout->text.data+from;
+  size_t n=total-from;
+  float width;
+  if(!layout_units_width(vm,layout,src,n,&width,NULL)) return false;
+  if(width<=avail) return true;
+  static const uint16_t ellipsis[1]= {0x2026};
+  float ellipsis_width;
+  if(!layout_units_width(vm,layout,ellipsis,1,&ellipsis_width,NULL)) return false;
+  float budget=avail-ellipsis_width;
+  size_t left=0,right=0;
+  if(budget>0) {
+    if(!strcmp(where,"START")) {
+      if(!layout_fit_units(vm,layout,src,n,budget,true,&right)) return false;
+    } else if(!strcmp(where,"MIDDLE")) {
+      float right_width=0;
+      if(!layout_fit_units(vm,layout,src,n,budget/2,true,&right) ||
+          !layout_units_width(vm,layout,src+n-right,right,&right_width,NULL) ||
+          !layout_fit_units(vm,layout,src,n-right,budget-right_width,false,&left)) return false;
+    } else if(!layout_fit_units(vm,layout,src,n,budget,false,&left)) return false;
+  }
+  uint16_t *shown=malloc((left+1+right)*sizeof *shown);
+  if(!shown) {
+    dvm__throw(vm,"java/lang/OutOfMemoryError","ellipsized line");
+    return false;
+  }
+  memcpy(shown,src,left*sizeof *shown);
+  shown[left]=ellipsis[0];
+  memcpy(shown+left+1,src+n-right,right*sizeof *shown);
+  struct luna_text_run run= {0};
+  bool good=layout_units_width(vm,layout,shown,left+1+right,&width,&run);
+  free(shown);
+  if(!good) return false;
+  free(line->run.glyphs);
+  line->run=run;
+  layout->widest=0;
+  for(size_t i=0; i<layout->count; ++i) layout->widest=fmaxf(layout->widest,layout->lines[i].run.width*layout->scale);
+  return true;
+}
 static bool static_layout_build(struct dvm *vm,dvm_ref self,
                                 dvm_ref result,union dvm_value *out)
 {
@@ -1812,8 +1896,12 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
   dvm_get_field(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
   dvm_get_field(vm,self,"leftIndents","[I",&left);
   dvm_get_field(vm,self,"rightIndents","[I",&right);
-  if(ellipsis.l || dvm_array_length(vm,left.l) || dvm_array_length(vm,right.l) ||
-      rt_get_int(vm,self,"breakStrategy") || rt_get_int(vm,self,"hyphenation") || rt_get_int(vm,self,"justification")) {
+  /* breakStrategy and hyphenationFrequency only tune where a line may break;
+   * the host has no hyphenation dictionaries, so greedy breaking is the
+   * answer a device without them gives too.  Indents and justification change
+   * the line widths and are not modelled. */
+  if(dvm_array_length(vm,left.l) || dvm_array_length(vm,right.l) ||
+      rt_get_int(vm,self,"justification")) {
     free(units.owned);
     dvm__throw(vm,"java/lang/UnsupportedOperationException","StaticLayout advanced line breaking is not implemented");
     return false;
@@ -1859,6 +1947,15 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
   if(max && !textview_layout_build(vm,layout)) {
     textview_layout_destroy(layout);
     return false;
+  }
+  if(ellipsis.l) {
+    union dvm_value ename= {0};
+    const char *where=dvm_get_field(vm,ellipsis.l,"name","Ljava/lang/String;",&ename) && ename.l ? dvm_string_utf8(vm,ename.l) : "END";
+    int eavail=rt_get_int(vm,self,"ellipsizedWidth");
+    if(!where || !static_layout_ellipsize(vm,layout,where,(float)(eavail ? eavail : width))) {
+      textview_layout_destroy(layout);
+      return false;
+    }
   }
   int align=rt_get_int(vm,alignment.l,"ordinal");
   for(size_t i=0; i<layout->count; ++i) {

@@ -787,6 +787,7 @@ extern const struct dvm_sqlite_field  dvm_sqlite_database_fields[];
 extern const struct dvm_sqlite_method dvm_sqlite_cursor_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_cursor_fields[];
 extern const struct dvm_sqlite_method dvm_sqlite_matrix_cursor_methods[];
+extern const struct dvm_sqlite_method dvm_sqlite_matrix_row_builder_methods[];
 extern const struct dvm_sqlite_method dvm_sqlite_open_params_methods[];
 extern const struct dvm_sqlite_method dvm_sqlite_open_params_builder_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_open_params_fields[];

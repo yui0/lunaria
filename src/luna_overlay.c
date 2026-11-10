@@ -1403,7 +1403,7 @@ static void overlay_drain_pointer(void)
         g_web_focus[0] = 0;
         pthread_mutex_unlock(&g_ptr_lock);
       }
-      if (batch[i].action == 0) g_web_pointer_capture[0] = 0;
+      if (batch[i].action == 0 || batch[i].action == 2) g_web_pointer_capture[0] = 0;
     }
     /* A framework touch target owns the entire gesture. Sending the same
      * release through host click detection would also call performClick. */
@@ -3810,4 +3810,17 @@ bool luna_overlay_host_key(int key, int action, int mods)
   (void)action;
   (void)mods;
   return false;
+}
+
+/* Share the actual selected faces with native Android font consumers. */
+bool luna_overlay_system_font(unsigned role,const void **data,size_t *size)
+{
+  if(role>=4 || !data || !size || !luna_prepare_font_metrics()) return false;
+  const unsigned char *faces[]={g_font_ttf,g_bold_font_ttf,g_cjk_font_ttf,g_mono_font_ttf};
+  const unsigned slots[]={0,1,2,3};
+  long length=g_font_blob_sizes[slots[role]];
+  if(!faces[role] || length<=0) return false;
+  *data=faces[role];
+  *size=(size_t)length;
+  return true;
 }

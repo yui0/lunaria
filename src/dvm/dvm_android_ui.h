@@ -2978,6 +2978,7 @@ static const struct rt_field rt_text_view_fields[] = {
   { "paintFlags", "I" },
   { "textPaint", "Landroid/text/TextPaint;" },
   { "drawablePadding", "I" },
+  { "autoSizeMin", "I" }, { "autoSizeMax", "I" }, { "autoSizeStep", "I" },
   { "drawableLeft", "Landroid/graphics/drawable/Drawable;" },
   { "drawableTop", "Landroid/graphics/drawable/Drawable;" },
   { "drawableRight", "Landroid/graphics/drawable/Drawable;" },
@@ -9336,11 +9337,15 @@ struct act_launch {
   dvm_ref caller;
   int32_t request_code;
   bool for_result;
+  dvm_ref saved;         /* recreate(): the state onSaveInstanceState() wrote */
+  int replace_at;        /* recreate(): the stack slot the new instance takes */
 };
 static struct act_launch g_act_launches[8];
 static int g_nact_launches;
 static dvm_ref g_act_finishes[8];
 static int g_nact_finishes;
+static dvm_ref g_act_recreates[8];
+static int g_nact_recreates;
 static bool g_task_background, g_task_move_back;
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window);
@@ -9527,6 +9532,7 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
   g_act_launches[g_nact_launches++] = (struct act_launch) {
     .cls = cls, .component = component, .intent = intent, .caller = self,
                                                           .request_code = request_code, .for_result = for_result,
+                                                          .replace_at = -1,
   };
   fprintf(stderr, "[activity] start %s%s\n", cls->name,
           for_result ? " (for result)" : "");
@@ -9764,18 +9770,28 @@ static void act_do_launch(struct dvm *vm, const struct act_launch *l)
   union dvm_value iv = { .l = l->intent };
   (void)dvm_set_field(vm, obj, "intent", "Landroid/content/Intent;", iv);
 
-  /* The activity it covers is paused first. */
-  if (g_nacts && !g_task_background) act_perform(vm, g_acts[g_nacts - 1].activity, "Paused", "onPause", "()V", NULL, 0);
-  g_task_background = false;
-  if (g_nacts < ACT_MAX)
-    g_acts[g_nacts++] = (struct act_rec) {
-    .activity = obj, .caller = l->caller,
-                     .request_code = l->request_code, .for_result = l->for_result,
-  };
-  if (l->caller && l->for_result) dvm_pin(vm, l->caller);
-  union dvm_value bundle = { 0 };
+  const bool recreated = l->replace_at >= 0 && l->replace_at < g_nacts;
+  if (recreated) {
+    /* The instance it replaces was destroyed in place: same slot, same
+     * caller and request code, and nothing underneath is paused or resumed. */
+    g_acts[l->replace_at].activity = obj;
+    g_acts[l->replace_at].stopped = false;
+  } else {
+    /* The activity it covers is paused first. */
+    if (g_nacts && !g_task_background) act_perform(vm, g_acts[g_nacts - 1].activity, "Paused", "onPause", "()V", NULL, 0);
+    g_task_background = false;
+    if (g_nacts < ACT_MAX)
+      g_acts[g_nacts++] = (struct act_rec) {
+      .activity = obj, .caller = l->caller,
+                       .request_code = l->request_code, .for_result = l->for_result,
+    };
+    if (l->caller && l->for_result) dvm_pin(vm, l->caller);
+  }
+  union dvm_value bundle = { .l = recreated ? l->saved : 0 };
   act_perform(vm, obj, "Created", "onCreate", "(Landroid/os/Bundle;)V", &bundle, 1);
   act_perform(vm, obj, "Started", "onStart", "()V", NULL, 0);
+  if (recreated && bundle.l)
+    act_call(vm, obj, "onRestoreInstanceState", "(Landroid/os/Bundle;)V", &bundle, 1);
   act_call(vm, obj, "onPostCreate", "(Landroid/os/Bundle;)V", &bundle, 1);
   act_perform(vm, obj, "Resumed", "onResume", "()V", NULL, 0);
   ui_window_shown(vm, obj);
@@ -9814,10 +9830,74 @@ static void act_do_finish(struct dvm *vm, dvm_ref activity)
   dvm_unpin(vm, activity);
 }
 
+/* Activity.recreate(): asked for during a lifecycle callback, done between
+ * messages.  The instance is saved, stopped and destroyed, and a new one of
+ * the same class takes its slot and goes through the lifecycle again with the
+ * saved state (ActivityThread.handleRelaunchActivity). */
+static bool act_recreate(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs; (void)out;
+  if (g_nact_recreates >= (int)(sizeof g_act_recreates / sizeof g_act_recreates[0])) RETV();
+  for (int i = 0; i < g_nact_recreates; ++i)
+    if (g_act_recreates[i] == self) RETV();
+  dvm_pin(vm, self);
+  g_act_recreates[g_nact_recreates++] = self;
+  RETV();
+}
+
+static void act_do_recreate(struct dvm *vm, dvm_ref activity)
+{
+  const int i = act_index(activity);
+  union dvm_value finishing = { 0 };
+  (void)dvm_get_field(vm, activity, "finishing", "Z", &finishing);
+  if (i < 0 || finishing.i) return;
+  const struct act_rec rec = g_acts[i];
+  const bool top = i == g_nacts - 1 && !g_task_background;
+  struct dvm_class *cls = dvm_object_class(vm, activity);
+  struct dvm_class *bundle_class = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
+  dvm_ref saved = bundle_class ? dvm_new_object(vm, bundle_class) : 0;
+  union dvm_value ignored = { 0 }, component = { 0 }, intent = { 0 };
+  if (!cls || !saved || !map_init(vm, saved, NULL, 0, &ignored)) return;
+  dvm_pin(vm, saved);
+  (void)dvm_get_field(vm, activity, "componentName", "Landroid/content/ComponentName;", &component);
+  (void)dvm_get_field(vm, activity, "intent", "Landroid/content/Intent;", &intent);
+  if (component.l) dvm_pin(vm, component.l);
+  if (intent.l) dvm_pin(vm, intent.l);
+
+  if (top) act_perform(vm, activity, "Paused", "onPause", "()V", NULL, 0);
+  if (!rec.stopped) act_perform(vm, activity, "Stopped", "onStop", "()V", NULL, 0);
+  union dvm_value state = { .l = saved };
+  act_call(vm, activity, "onSaveInstanceState", "(Landroid/os/Bundle;)V", &state, 1);
+  act_perform(vm, activity, "Destroyed", "onDestroy", "()V", NULL, 0);
+  ui_window_hidden(vm, activity);
+
+  const struct act_launch launch = {
+    .cls = cls, .component = component.l, .intent = intent.l, .caller = rec.caller,
+    .request_code = rec.request_code, .for_result = rec.for_result,
+    .saved = saved, .replace_at = i,
+  };
+  act_do_launch(vm, &launch);
+  if (top) {
+    /* The new instance resumed inside act_do_launch; nothing else to do. */
+  }
+  dvm_unpin(vm, saved);
+  if (component.l) dvm_unpin(vm, component.l);
+  if (intent.l) dvm_unpin(vm, intent.l);
+  fprintf(stderr, "[activity] %s recreated\n", cls->name ? cls->name : "?");
+  dvm_unpin(vm, activity);
+}
+
 /* On the main thread, between messages: what startActivity()/finish()
  * asked for. */
 static void act_tick(struct dvm *vm)
 {
+  while (g_nact_recreates) {
+    dvm_ref a = g_act_recreates[0];
+    memmove(&g_act_recreates[0], &g_act_recreates[1],
+            (size_t)(--g_nact_recreates) * sizeof g_act_recreates[0]);
+    act_do_recreate(vm, a);
+  }
   while (g_nact_finishes) {
     dvm_ref a = g_act_finishes[0];
     memmove(&g_act_finishes[0], &g_act_finishes[1],
@@ -10231,20 +10311,38 @@ static bool act_back_pressed(struct dvm *vm,dvm_ref self,const union dvm_value *
 /* Activity.dispatchKeyEvent(): the event reaches onKeyDown() / onKeyUp(), which
  * an application overrides.  The defaults are the Back key: tracked while it is
  * down, and onBackPressed() once it comes up uncancelled. */
+/* KeyEvent.DispatcherState: a key that started tracking on DOWN is marked
+ * tracking on its UP, which is a different KeyEvent object.  Only one key is
+ * down at a time on the host's keyboard path, so one slot is the state. */
+static int32_t g_key_tracked = -1;
+
 static bool act_dispatch_key_event(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
+  enum { FLAG_TRACKING = 0x200, FLAG_START_TRACKING = 0x40000000 };
   (void)nargs;
   dvm_ref event=ARG(0).l;
   if(!event) {
     dvm__throw(vm,"java/lang/NullPointerException","event");
     return false;
   }
-  union dvm_value action= {0},code= {0};
+  union dvm_value action= {0},code= {0},repeat= {0},flags= {0};
   (void)dvm_get_field(vm,event,"action","I",&action);
   (void)dvm_get_field(vm,event,"keyCode","I",&code);
+  (void)dvm_get_field(vm,event,"repeat","I",&repeat);
+  (void)dvm_get_field(vm,event,"flags","I",&flags);
   if(action.i!=0 && action.i!=1) RETI(0);
+  if(action.i==1 && g_key_tracked==code.i) {
+    g_key_tracked=-1;
+    flags.i|=FLAG_TRACKING;
+    (void)dvm_set_field(vm,event,"flags","I",flags);
+  }
   union dvm_value key[2]= {{.i=code.i},{.l=event}};
-  return am_vcall(vm,self,action.i ? "onKeyUp" : "onKeyDown","(ILandroid/view/KeyEvent;)Z",key,2,out);
+  if(!am_vcall(vm,self,action.i ? "onKeyUp" : "onKeyDown","(ILandroid/view/KeyEvent;)Z",key,2,out)) return false;
+  if(action.i==0 && out->i) {
+    (void)dvm_get_field(vm,event,"flags","I",&flags);
+    if(repeat.i==0 && (flags.i&FLAG_START_TRACKING)) g_key_tracked=code.i;
+  }
+  return true;
 }
 static bool act_on_key_down(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -10291,6 +10389,7 @@ static const struct rt_method rt_activity[] = {
   M("onBackPressed", "()V", act_back_pressed),
   M("onSaveInstanceState", "(Landroid/os/Bundle;)V", act_save_instance_state),
   M("finishAfterTransition", "()V", act_finish),
+  M("recreate", "()V", act_recreate),
   M("dispatchTouchEvent","(Landroid/view/MotionEvent;)Z",activity_dispatch_touch),
   M("onTouchEvent","(Landroid/view/MotionEvent;)Z",ret_false),
   /* Framework default; app/AndroidX overrides receive the queued result. */
@@ -14001,6 +14100,38 @@ static float ui_float(struct dvm *vm, dvm_ref o, const char *name)
   return v.f;
 }
 
+#ifndef UI_MAX_KIDS
+#define UI_MAX_KIDS 256
+#endif
+
+/* ViewGroup.buildOrderedChildList: when any child has a Z (elevation +
+ * translationZ) the children are drawn lowest Z first, ties keeping their
+ * order in the group, and touched in the opposite direction.  A group that
+ * orders its own children (childrenDrawingOrderEnabled) is left alone. */
+static float ui_view_z(struct dvm *vm, dvm_ref v)
+{
+  return ui_float(vm, v, "elevation") + ui_float(vm, v, "translationZ");
+}
+
+static void ui_z_sort(struct dvm *vm, dvm_ref group, dvm_ref *kids, uint32_t count)
+{
+  if (count < 2 || ui_int(vm, group, "childrenDrawingOrderEnabled")) return;
+  bool any = false;
+  for (uint32_t i = 0; i < count && !any; ++i) any = ui_view_z(vm, kids[i]) != 0.0f;
+  if (!any) return;
+  for (uint32_t i = 1; i < count; ++i) {
+    dvm_ref item = kids[i];
+    float z = ui_view_z(vm, item);
+    uint32_t j = i;
+    while (j > 0 && ui_view_z(vm, kids[j - 1]) > z) {
+      kids[j] = kids[j - 1];
+      --j;
+    }
+    kids[j] = item;
+  }
+}
+
+
 #if defined(__GNUC__) && !defined(DVM_NO_CALLSITE_CACHE)
 /* With a literal name each use gets its own call-site cache (dvm_get_field is a
  * macro too); anything else takes the functions above. */
@@ -14477,8 +14608,12 @@ static void ui_emit_children(struct dvm *vm, struct ui_buf *b,
   union dvm_value enabled = { 0 };
   (void)dvm_get_field(vm, view, "childrenDrawingOrderEnabled", "Z", &enabled);
   if (!enabled.i || !l || !l->size) {
-    for (uint32_t i = 0; l && i < l->size; ++i)
-      ui_emit_view(vm, b, css, l->items[i], orientation, depth + 1);
+    dvm_ref ordered[UI_MAX_KIDS];
+    uint32_t n = 0;
+    for (uint32_t i = 0; l && i < l->size && n < UI_MAX_KIDS; ++i) ordered[n++] = l->items[i];
+    ui_z_sort(vm, view, ordered, n);
+    for (uint32_t i = 0; i < n; ++i)
+      ui_emit_view(vm, b, css, ordered[i], orientation, depth + 1);
     return;
   }
   /* Guest overrides can run arbitrary code, including modifying the child

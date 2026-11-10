@@ -406,6 +406,15 @@ char **arm_exec_asset_list(const char *name, size_t *count);
 unsigned char *arm_exec_zip_read(const char *archive, const char *name,
                                  size_t *len);
 
+/* Central-directory metadata, without inflating the member. Returns 1 if found. */
+struct arm_zip_metadata {
+  uint64_t size, compressed_size;
+  uint32_t crc;
+  uint16_t method;
+};
+int arm_exec_zip_metadata(const char *archive, const char *name,
+                          struct arm_zip_metadata *out);
+
 /* The member names of a zip/jar/apk, malloc'd array of malloc'd strings. */
 char **arm_exec_zip_list(const char *archive, size_t *count);
 
@@ -458,6 +467,11 @@ int arm_exec_jni_thread_alive(uint64_t token);
  * ALooper_forThread() answers the same way. */
 void arm_exec_alooper_mark_prepared(uint32_t tid);
 void arm_exec_alooper_mark_current_prepared(void);
+/* Nonblocking native FD delivery for Java Looper turns; call without GIL. */
+int arm_exec_alooper_dispatch_main(void);
+int arm_exec_alooper_dispatch_current(void);
+void arm_exec_alooper_watch_current(uintptr_t channel);
+void arm_exec_alooper_unwatch_current(void);
 
 /* Reports a guest operation that destroys something under a directory lunaria
  * staged — the extracted expansion, or the app's data.  Those are the two
@@ -493,6 +507,7 @@ void arm_exec_apk_version(int32_t *code, const char **name);
  * was handing out the *host* process's pid and uid, so the app appeared to be
  * running as root under a pid the guest's own getpid() had never heard of. */
 int arm_exec_guest_pid(void);
+int arm_exec_guest_tid(void);
 int arm_exec_guest_is_64bit(void);
 int arm_exec_guest_uid(void);
 /* Bounded C11 reader for ResTable_map_entry. No allocation or aligned reads. */

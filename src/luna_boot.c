@@ -701,6 +701,12 @@ static void qfkey_host_key(int hid, int down)
   if (!key) return;
   int action = down ? GLFW_PRESS : GLFW_RELEASE;
   if (luna_file_dialog_handle_key(key, 0, action, 0)) return;
+  /* Same as key(): Enter in the APKPure field searches. */
+  if (choosing && key == GLFW_KEY_ENTER && action == GLFW_PRESS &&
+      luna_focused_element() >= 0 && luna_focused_element() == luna_get_element_by_id("store-query")) {
+    pick_store_search(NULL);
+    return;
+  }
   if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS && pick_select_for < 0)
     cancelled = 1;
   luna_key(key, 0, action, shift ? GLFW_MOD_SHIFT : 0);
@@ -721,6 +727,8 @@ static void launcher_publish_qfkey(int w, int h)
   luna_qfkey_start(title, w, h);
   luna_qfkey_capture_gl(w, h);
 }
+
+static unsigned launcher_wait_ms = 20;
 
 static void frame(int force)
 {
@@ -753,13 +761,21 @@ static void frame(int force)
       fb_w = w;
       fb_h = h;
     }
-    glViewport(0, 0, w, h);
-    glClearColor(.95f, .96f, .97f, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
     if (!choosing) boot_frame();
     const double dt = last_frame ? (double)(now-last_frame)/1e9 : 0;
     luna_file_dialog_tick(dt);
-    luna_update(luna_platform_time(), dt);
+    int redraw = luna_needs_redraw(luna_platform_time(), dt);
+    launcher_wait_ms = (redraw & LUNA_REDRAW_ANIM) || luna_file_dialog_is_open() ||
+        luna_qfkey_wants_frame() || getenv("LUNARIA_LAUNCHER_SHOT") ? 20 :
+        redraw ? 500 : 1000;
+    if (!redraw && !luna_file_dialog_is_open() &&
+        !luna_qfkey_wants_frame() && !getenv("LUNARIA_LAUNCHER_SHOT")) {
+      last_frame = now;
+      return;
+    }
+    glViewport(0, 0, w, h);
+    glClearColor(.95f, .96f, .97f, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
     luna_render(w, h);
     luna_file_dialog_render(w, h);
     /* LUNARIA_LAUNCHER_SHOT=file.png: save the launcher's frame, once, a few
@@ -882,6 +898,7 @@ static int launcher_window_open(int width, int height)
   ready = 1;
   g_installing = true;
   luna_qfkey_set_host_handlers(qfkey_host_touch, qfkey_host_key);
+  luna_qfkey_set_host_scroll(luna_scroll);
   {
     char title[96];
     launcher_qfkey_title(title, sizeof title);
@@ -894,6 +911,7 @@ static int launcher_window_open(int width, int height)
     glfwSetCharCallback(window, character);
     glfwSetScrollCallback(window, scroll);
     glfwSetDropCallback(window, drop);
+    luna_qfkey_set_wake(glfwPostEmptyEvent);
   }
   return 1;
 fail:
@@ -985,6 +1003,7 @@ static int pick_store_progress(void *context,uint64_t bytes,uint64_t total)
   (void)context;
   atomic_store(&pick_store.bytes,bytes);
   atomic_store(&pick_store.total,total);
+  luna_qfkey_wake();
   return atomic_load(&pick_store.cancel);
 }
 static void *pick_store_worker(void *context)
@@ -997,6 +1016,7 @@ static void *pick_store_worker(void *context)
   else pick_store.result=apkpure_search(pick_store.query,pick_store.results,APKPURE_RESULTS,
                                           pick_store.error,sizeof pick_store.error,pick_store_progress,NULL);
   atomic_store_explicit(&pick_store.done,true,memory_order_release);
+  luna_qfkey_wake();
   return NULL;
 }
 static void pick_store_start(void)
@@ -1089,6 +1109,14 @@ static void pick_store_cancel(LunaElement *element)
   atomic_store(&pick_store.cancel,true);
 }
 
+static void pick_store_status(const char *text,int failed)
+{
+  int node=luna_get_element_by_id("store-status");
+  luna_set_text(node,text);
+  if (failed) luna_add_class(node,"failed");
+  else luna_remove_class(node,"failed");
+  luna_update_element_style(node);
+}
 static void pick_store_tick(void)
 {
   if (!pick_store.active) return;
@@ -1099,17 +1127,19 @@ static void pick_store_tick(void)
     else if (!pick_store.downloading) snprintf(status,sizeof status,"Searching APKPure…");
     else if (total) snprintf(status,sizeof status,"Downloading %s — %.1f / %.1f MiB",pick_store.query,bytes/1048576.0,total/1048576.0);
     else snprintf(status,sizeof status,"Downloading %s — %.1f MiB",pick_store.query,bytes/1048576.0);
-    luna_set_text(luna_get_element_by_id("store-status"),status);
+    pick_store_status(status,0);
     return;
   }
   pthread_join(pick_store.thread,NULL);
   pick_store.active=0;
   luna_add_class(luna_get_element_by_id("store-cancel"),"hidden");
   luna_update_element_style(luna_get_element_by_id("store-cancel"));
-  luna_set_text(luna_get_element_by_id("store-status"),"");
+  pick_store_status("",0);
   if (atomic_load(&pick_store.cancel)) return;
   if (pick_store.result<0 || (!pick_store.downloading && !pick_store.result)) {
-    luna_set_text(luna_get_element_by_id("error"),pick_store.error);
+    /* Right under the search field: the page's #error is below the fold, where a
+     * failed search just looked like one that had been cancelled. */
+    pick_store_status(pick_store.error,1);
     return;
   }
   if (pick_store.downloading) {
@@ -1118,7 +1148,7 @@ static void pick_store_tick(void)
     return;
   }
   pick_store.count=pick_store.result;
-  luna_set_text(luna_get_element_by_id("store-status"),"Select an application to download and open.");
+  pick_store_status("Select an application to download and open.",0);
   for (int i=0; i<pick_store.count; ++i) {
     char id[32];
     snprintf(id,sizeof id,"store-result%d",i);
@@ -1452,6 +1482,7 @@ static const char pick_css_extra[] =
   "#launcher-card .select-panel.hidden{display:none;}"
   "#launcher-card .hint{margin:0 0 2px 0;font-size:12px;color:#6f8ca2;}"
   "#launcher-card #error{color:#c0392b;margin:10px 0 0 0;min-height:18px;font-size:13px;}"
+  "#launcher-card #store-status.failed{color:#c0392b;font-size:13px;}"
   "#launcher-card .store-result{display:block;width:100%;padding:9px 12px;margin:4px 0;text-align:left;font-size:13px;}"
   "#launcher-card .hidden{display:none;}"
   "#launcher-card #store-cancel{padding:6px 12px;margin:4px 0;}"
@@ -1665,13 +1696,9 @@ static int launcher_form(char *path, size_t capacity,
       }
     }
     if (use_pbuffer) {
-#ifdef _WIN32
-      Sleep(20);
-#else
-      usleep(20000);
-#endif
+      luna_qfkey_wait(launcher_wait_ms);
     } else {
-      glfwWaitEventsTimeout(.02);
+      glfwWaitEventsTimeout((double)launcher_wait_ms / 1000.0);
     }
   }
   if (pick_store.active) {
@@ -1726,6 +1753,7 @@ void luna_launcher_end(int keep_window)
 {
   g_installing = false;
   luna_qfkey_set_host_handlers(NULL, NULL);
+  luna_qfkey_set_host_scroll(NULL);
   if (keep_window && ready) {
     boot_write_begin(&g_jit_seq);
     snprintf(g_jit_line, sizeof g_jit_line, "Starting application");
@@ -1736,6 +1764,7 @@ void luna_launcher_end(int keep_window)
     boot_write_end(&g_dex_seq);
     if (boot_ui_wanted()) boot_show();
   }
+  luna_qfkey_set_wake(NULL);
   if (window) {
     glfwSetCursorPosCallback(window, NULL);
     glfwSetMouseButtonCallback(window, NULL);

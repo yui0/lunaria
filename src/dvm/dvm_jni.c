@@ -190,6 +190,15 @@ static dvm_ref find_wrapper(uint32_t host)
   return slot->ref;
 }
 
+/* The dvm object a JNI handle refers to, for android/bitmap.h: AndroidBitmap_*
+ * (libjnigraphics) promises access to a Bitmap which crossed through JNI, so
+ * the handle it carries is exactly the key the wrapper table registered.  The
+ * caller holds the interpreter lock. */
+dvm_ref dvm_host_wrapper_ref(uint32_t host)
+{
+  return find_wrapper(host);
+}
+
 static void remember_wrapper(uint32_t host, dvm_ref ref)
 {
   if (!host || !ref) return;
@@ -199,8 +208,7 @@ static void remember_wrapper(uint32_t host, dvm_ref ref)
                                 "[dvm] cannot grow wrapper table (%zu entries) — host 0x%x loses "
                                 "instance state across JNI\n", g_nwrappers, host);
     return;
-  }
-  struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
+  }  struct dvm_wrapper *slot = wrapper_slot(g_wrappers, g_wrapper_cap, host);
   if (!slot->host) {
     slot->host = host;
     ++g_nwrappers;
