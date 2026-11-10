@@ -46540,10 +46540,13 @@ static bool files_createDirectories(struct dvm *vm, dvm_ref self,
   (void)nargs;
   union dvm_value pathv = { 0 };
   (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &pathv);
-  const char *p = dvm_string_utf8(vm, pathv.l);
+  /* The Path names the guest filesystem; map it to the host the way
+   * File.mkdirs() does, or /data/data/<pkg>/... never gets created. */
+  const char *p = pathv.l ? dvm_string_utf8(vm, pathv.l) : NULL;
   if (!p || !*p) RETL(ARG(0).l);
+  const char *hp = file_host_path(vm, pathv.l);
   char buf[DVM_PATH_MAX];
-  snprintf(buf, sizeof buf, "%s", p);
+  snprintf(buf, sizeof buf, "%s", hp ? hp : p);
   for (char *q = buf + 1; *q; ++q) if (*q == '/') {
       *q = '\0';
       (void)luna_file_mkdir(buf, 0777);
