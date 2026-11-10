@@ -11797,6 +11797,11 @@ static inline CbWaitSlot *cb_wait_slot(void)
  * mask it replaced, restored when the handler that ends the wait returns. */
 static thread_local bool     g_dvm_sigsuspend_waiting = false;
 static thread_local uint64_t g_dvm_sigsuspend_old_mask = 0;
+/* Index into g_main_signal_frames of the handler that interrupted a callback
+ * wait which could not be suspended (a pthread_cond_wait or mutex park), or -1.
+ * The wait's result must reach the interrupted code through that frame's saved
+ * x0, not the live x0 the handler was entered with. */
+static thread_local int g_cb_signal_deferred = -1;
 static bool cb_lock_wait_try_grant(ArmExecCtx &ctx);
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth);
 static void cb_lock_wait_reset(void);
@@ -66427,6 +66432,17 @@ public:
     jit64->SetRegister(30, restorer);
     jit64->SetSP(frame_sp);
     jit64->SetPC(handler);
+    if (!t) {
+      const int frame_ix = (int)*depth - 1;
+      const bool parked = g_cb_depth && !g_cb_lock_wait.from_slice &&
+                          g_cb_lock_wait.kind != CbLockWait::Idle;
+      if (parked) {
+        if (g_cb_signal_deferred < 0 || g_cb_signal_deferred >= frame_ix)
+          g_cb_signal_deferred = frame_ix;
+      } else if (g_cb_signal_deferred >= frame_ix) {
+        g_cb_signal_deferred = -1; /* stale: that handler has returned */
+      }
+    }
     return true;
   }
 
@@ -70969,7 +70985,18 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
     if (waiting) __atomic_sub_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
     if (lock_abandon) break;
     if (g_cb_resume_result_pending) {
-      j.SetRegister(0, g_cb_resume_result);
+      /* A handler entered while this wait was parked is still running: x0 is
+       * its argument (the signal number), and the wait's result belongs to the
+       * code the handler interrupted.  Boehm's suspend handler aborts with
+       * "Bad signal in suspend_handler" when it sees the result instead. */
+      if (g_cb_signal_deferred >= 0 &&
+          (int)g_main_signal_depth > g_cb_signal_deferred) {
+        const GuestVA uc = g_main_signal_frames[g_cb_signal_deferred].uc;
+        if (uc) ctx.mem.write64(uc + A64_UC_REGS, g_cb_resume_result);
+      } else {
+        j.SetRegister(0, g_cb_resume_result);
+      }
+      g_cb_signal_deferred = -1;
       g_cb_resume_result_pending = false;
     }
     /* Guest code runs without the ARM execution lock, here as in a thread slice.
