@@ -47669,6 +47669,12 @@ static const struct rt_method rt_activity_manager[] = {
   M("getRunningAppProcesses", "()Ljava/util/List;",
   activity_getRunningAppProcesses),
   M("getRunningServices", "(I)Ljava/util/List;", activity_getRunningServices),
+  /* Both return a non-null List on Android; with no task stack to report
+   * it is empty.  null made task trackers (Repro SDK in Fate/GO) throw from
+   * UnityPlayerActivity.onStart/onResume, which left Unity unresumed. */
+  M("getAppTasks", "()Ljava/util/List;", pm_empty_list),
+  M("getRunningTasks", "(I)Ljava/util/List;", pm_empty_list),
+  M("getRecentTasks", "(II)Ljava/util/List;", pm_empty_list),
   SM("getMyMemoryState",
   "(Landroid/app/ActivityManager$RunningAppProcessInfo;)V",
   activity_getMyMemoryState),
@@ -73707,6 +73713,22 @@ static bool notification_create_channel(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+/* NotificationManager.getNotificationChannels() never returns null: it lists
+ * what createNotificationChannel() registered, or nothing.  Unity's
+ * notification plugin calls List.size() on the result at startup, and the null
+ * stub made Fate/GO's AdManager fail to initialize. */
+static bool notification_get_channels(struct dvm *vm, dvm_ref self,
+                                      const union dvm_value *args, int nargs,
+                                      union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  union dvm_value channels = { 0 };
+  (void)dvm_get_field(vm, self, "channels", "Ljava/util/List;", &channels);
+  if (!channels.l) channels.l = coll_new_list(vm, "Ljava/util/ArrayList;");
+  RETL(channels.l);
+}
+
 static bool notification_active(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out)
@@ -73750,6 +73772,7 @@ static const struct rt_method rt_notification_manager[] = {
   M("cancelAll", "()V", empty_void),
   M("createNotificationChannel", "(Landroid/app/NotificationChannel;)V",
   notification_create_channel),
+  M("getNotificationChannels", "()Ljava/util/List;", notification_get_channels),
   M("getActiveNotifications",
   "()[Landroid/service/notification/StatusBarNotification;",
   notification_active),
