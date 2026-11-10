@@ -31753,9 +31753,27 @@ static bool ht_run(struct dvm *vm, dvm_ref self,
   uint64_t host=thread_base_get(vm,self,"hostThread","J").ju;
   if(host && luna_os_thread_nice(host,android_priority.i)<0) {
     int error=errno;
-    dvm__throw(vm,error==EPERM || error==EACCES ? "java/lang/SecurityException" : "java/lang/IllegalArgumentException",
-               "HandlerThread priority %d: %s",android_priority.i,strerror(error));
-    return false;
+    if(error==EPERM || error==EACCES) {
+      /* The host refuses to *raise* a thread's priority (a nice value is
+       * inherited from the creating thread, and lowering it needs
+       * CAP_SYS_NICE), where Android's own scheduler policy lets an app
+       * request THREAD_PRIORITY_DEFAULT freely.  Process.setThreadPriority
+       * already treats that as "keep the priority the thread has"; throwing
+       * here killed the HandlerThread before its Looper started, so every
+       * Runnable posted to it (a Binder worker's job included) stayed
+       * pending forever — Play Integrity's requestIntegrityToken never
+       * answered, and the app's App Check wait never ended. */
+      static bool warned;
+      if(!warned) {
+        warned=true;
+        fprintf(stderr,"[thread] HandlerThread priority %d not applied: %s (continuing)\n",
+                android_priority.i,strerror(error));
+      }
+    } else {
+      dvm__throw(vm,"java/lang/IllegalArgumentException",
+                 "HandlerThread priority %d: %s",android_priority.i,strerror(error));
+      return false;
+    }
   }
 
   /* A subclass's onLooperPrepared() runs between prepare() and loop(), which
