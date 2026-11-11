@@ -503,6 +503,8 @@ bool luna_ime_click(const char *id);
  * False when it could not start — the caller then presents the way it did
  * without one. */
 bool luna_comp_start(void *egl_display, void *egl_config, void *native_window);
+/* Stop and join the display thread before VM or driver teardown. */
+void luna_comp_stop(void);
 
 /* True once started and running. */
 bool luna_comp_active(void);

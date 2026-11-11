@@ -963,6 +963,8 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
       m->shorty = dex_proto_shorty(d, mid.proto_idx);
       m->access = list[i].access_flags;
       m->dex = d;
+      m->dex_method_index = list[i].method_idx;
+      m->dex_code_offset = list[i].code_off;
       m->sig = dex_proto_signature_alloc(d, mid.proto_idx);
       if (!m->sig) continue;
       if (list[i].code_off && dex_code(d, list[i].code_off, &m->code))
@@ -2086,6 +2088,13 @@ bool dvm__call_out(struct dvm *vm, struct dvm_class *cls, const char *name,
       }
     }
     if(handled) return !vm->exception;
+  }
+
+  if (is_native) {
+    if (!dvm_exception(vm))
+      dvm__throw(vm,"java/lang/UnsatisfiedLinkError","No implementation found for %s.%s%s",
+                  cls->name,name,sig);
+    return false;
   }
 
   /* Nothing implements this and the guest is calling it *now*: the zero

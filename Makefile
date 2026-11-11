@@ -447,15 +447,21 @@ $(SYSLIB_GUEST): src/lib/guest.c Makefile
 	    src/lib/guest.c -o $@
 	@echo "guestlib: $@ ready"
 
-# Placeholder ART runtime images: /proc/self/maps of a zygote child lists them.
+# Zygote runtime images. libartbase also carries the VM's guest file transport.
 ART_IMAGES := libart.so libartbase.so libdexfile.so libnativeloader.so
 SYSLIB_ART := $(addprefix $(SYSLIB_DIR)/,$(ART_IMAGES))
 artlib: $(SYSLIB_ART)
-$(SYSLIB_ART): src/lib/stub.c Makefile
+$(filter-out $(SYSLIB_DIR)/libartbase.so,$(SYSLIB_ART)): src/lib/stub.c Makefile
 	@mkdir -p $(SYSLIB_DIR)
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 \
 	    -fuse-ld=lld -Wl,-soname,$(notdir $@) -Wall -Wextra \
 	    -DLUNARIA_STUB_ART_IMAGE -DART_IMAGE_SYMBOL=lunaria_image_$(basename $(notdir $@)) $< -o $@
+
+$(SYSLIB_DIR)/libartbase.so: src/lib/stub.c Makefile
+	@mkdir -p $(SYSLIB_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 \
+	    -fuse-ld=lld -Wl,-soname,libartbase.so -Wl,--hash-style=both -Wall -Wextra \
+	    -DLUNARIA_STUB_ARTBASE $< -o $@
 
 syslib-clean:
 	rm -rf $(SYSLIB_DIR)
@@ -1526,14 +1532,14 @@ $(eval $(call GUEST_ABI_TEST,guest_signal_suspend,test/guest_signal_suspend.c,$(
 $(eval $(call GUEST_ABI_TEST,raw_signal_action,test/raw_signal_action.c,$(ABI32_CC),-std=c11))
 $(eval $(call GUEST_ABI_TEST,raw_memory_advice,test/raw_memory_advice.c,$(ABI32_CC),-std=c11))
 $(eval $(call GUEST_ABI_TEST,mkdirat,test/mkdirat_test.c,$(ABI32_CC),-std=c11))
-$(eval $(call GUEST_ABI_TEST,libc_extra,test/libc_extra_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,libc_extra,test/libc_extra_test.c,$(ABI32_CC),-std=c11 -DLUNARIA_TEST_ARTBASE_PATH='"$(abspath $(SYSLIB_DIR))/libartbase.so"'))
 $(eval $(call GUEST_ABI_TEST,alooper_callback,test/alooper_callback_test.c,$(ABI32_CC),-std=c11))
 .PHONY: alooper-callback-test
 alooper-callback-test: lunaria $(BUILD_DIR)/alooper_callback32.so $(BUILD_DIR)/alooper_callback64.so
 	@python3 test/run_guest_results.py $(BUILD_DIR)/alooper_callback32.so $(BUILD_DIR)/alooper_callback64.so
 
 .PHONY: libc-extra-test
-libc-extra-test: lunaria $(BUILD_DIR)/libc_extra32.so $(BUILD_DIR)/libc_extra64.so
+libc-extra-test: lunaria artlib $(BUILD_DIR)/libc_extra32.so $(BUILD_DIR)/libc_extra64.so
 	@python3 test/run_guest_results.py $(BUILD_DIR)/libc_extra32.so $(BUILD_DIR)/libc_extra64.so
 .PHONY: mkdirat-test
 mkdirat-test: lunaria $(BUILD_DIR)/mkdirat32.so $(BUILD_DIR)/mkdirat64.so
@@ -3590,6 +3596,11 @@ main-executor-test: test/test_dvm
 test/test_dvm: test/main_executor_tests.h
 
 $(eval $(call GUEST_ABI_TEST,gl_clear_texture,test/gl_clear_texture_test.c,$(ABI32_CC),-std=c11))
+$(eval $(call GUEST_ABI_TEST,gl_window_rectangles,test/gl_clear_texture_test.c,$(ABI32_CC),-std=c11 -DLUNARIA_TEST_WINDOW_RECTANGLES))
+.PHONY: gl-window-rectangles-test
+gl-window-rectangles-test: lunaria $(BUILD_DIR)/gl_window_rectangles32.so $(BUILD_DIR)/gl_window_rectangles64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/gl_window_rectangles32.so $(BUILD_DIR)/gl_window_rectangles64.so
+
 .PHONY: gl-clear-texture-test
 gl-clear-texture-test: lunaria $(BUILD_DIR)/gl_clear_texture32.so $(BUILD_DIR)/gl_clear_texture64.so
 	@EGL_PLATFORM=surfaceless LUNARIA_PBUFFER=1 python3 test/run_guest_results.py $(BUILD_DIR)/gl_clear_texture32.so $(BUILD_DIR)/gl_clear_texture64.so

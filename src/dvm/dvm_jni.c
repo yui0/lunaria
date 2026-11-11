@@ -2807,6 +2807,75 @@ bool dvm_jni_class_exists(const char *class_name)
   return r;
 }
 
+bool dvm_jni_describe_method(JNIEnv *env, jmethodID method,
+                              struct dvm_jni_method_metadata *out)
+{
+  struct dvm *vm = vm_get();
+  if (!vm || !env || !method || !out) return false;
+  const char *owner = NULL, *name = NULL, *sig = NULL;
+  if (!jvm_field_info(jnienv_get_jvm(env),(jfieldID)method,&owner,&name,&sig) ||
+      !sig || sig[0] != '(') return false;
+  unsigned cookie = dvm_gil_enter_from_guest(vm);
+  struct dvm_method *m = dvm_lookup(vm,owner,name,sig);
+  bool good = m != NULL;
+  if (m) {
+    memset(out,0,sizeof *out);
+    out->declaring_class = dvm_class_object(vm,m->cls);
+    out->declaring_name = m->cls->name;
+    out->access = m->access;
+    out->dex_method_index = m->dex ? m->dex_method_index : UINT32_MAX;
+    for (int i = 0; i < m->cls->nmethods; ++i)
+      if (m == &m->cls->methods[i]) { out->method_index = (uint32_t)i; break; }
+    if (m->dex) {
+      out->dex_data = m->dex->p;
+      out->dex_size = m->dex->len;
+      out->code_offset = m->dex_code_offset;
+    }
+  }
+  dvm_gil_leave_to_guest(vm,cookie);
+  return good;
+}
+
+bool dvm_jni_quick_invoke(JNIEnv *env, jmethodID method, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out)
+{
+  struct dvm *vm = vm_get();
+  const char *owner = NULL, *name = NULL, *sig = NULL;
+  if (!vm || !env || !out || !jvm_field_info(jnienv_get_jvm(env),(jfieldID)method,
+                                               &owner,&name,&sig)) return false;
+  JNIEnv *saved_env = g_env;
+  g_env = env;
+  g_env_any = env;
+  unsigned cookie = dvm_gil_enter_from_guest(vm);
+  struct dvm_method *m = dvm_lookup(vm,owner,name,sig);
+  bool good = m != NULL;
+  dvm_pin(vm,self);
+  for (int i = 0; i < nargs; ++i) {
+    char type[256];
+    if (dvm__sig_param(sig,i,type,sizeof type) && (type[0]=='L' || type[0]=='['))
+      dvm_pin(vm,args[i].l);
+  }
+  if (m) good = dvm_call(vm,m,self,args,nargs,out);
+  /* Materialize a JNI root for references held by the enclosing native
+   * invocation; its bridge frame releases these roots on return. */
+  if (good && dvm_sig_return_kind(sig)=='L' && out->l) (void)to_jobject(vm,env,out->l);
+  for (int i = nargs; i > 0;) {
+    char type[256]; --i;
+    if (dvm__sig_param(sig,i,type,sizeof type) && (type[0]=='L' || type[0]=='['))
+      dvm_unpin(vm,args[i].l);
+  }
+  dvm_unpin(vm,self);
+  if (!good && dvm_exception(vm)) {
+    jthrowable exception = (jthrowable)to_jobject(vm,env,dvm_exception(vm));
+    dvm_clear_exception(vm);
+    if (exception) (*env)->Throw(env,exception);
+  }
+  dvm_gil_leave_to_guest(vm,cookie);
+  g_env = saved_env;
+  return good;
+}
+
 void dvm_jni_shutdown(void)
 {
   /* Do not initialize a VM just to shut the process down. All callbacks must

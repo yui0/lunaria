@@ -1000,6 +1000,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"glMultiDrawArraysIndirectEXT", SVC_GL_EXT_MultiDrawArraysIndirectEXT},
   {"glMultiDrawElementsIndirectEXT", SVC_GL_EXT_MultiDrawElementsIndirectEXT},
   {"glTextureBarrierNV", SVC_GL_EXT_TextureBarrierNV},
+  {"glWindowRectanglesEXT", SVC_GL_EXT_WindowRectanglesEXT},
 
   {"glIsTransformFeedback", SVC_GL3_IsTransformFeedback},
   {"glPauseTransformFeedback", SVC_GL3_PauseTransformFeedback},
@@ -1995,6 +1996,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"pipe",                    SVC_PIPE},
   {"pipe2",                   SVC_PIPE2},
   {"eglGetCurrentDisplay",    SVC_EGL_GETCURDPY},
+  {"eglReleaseThread",        SVC_EGL_RELEASE_THREAD},
+  {"eglGetConfigs",           SVC_EGL_GET_CONFIGS},
   {"glGetInteger64v",         SVC_GL_GETINTEGER64V},
   {"arc4random_buf",          SVC_ARC4RANDOM_BUF},
   {"arc4random",              SVC_ARC4RANDOM},
@@ -3061,6 +3064,8 @@ static bool usable_dynamic_definition(const char *name, const ln64_sym &symbol) 
 }
 
 // Symbols resolved to a direct guest VA instead of an SVC trampoline
+static uint32_t g_stdio_array;
+static unsigned g_stdio_closed;
 static uint32_t lookup_symbol_direct_va(const char *name) {
   if (uint32_t va = lookup_direct_va_static(name)) return va;
   /* Vulkan: host-call trampolines, when the bridge is on.  They live in the
@@ -3092,9 +3097,10 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
   if (strcmp(name, "timezone") == 0) return misc_tzvars();
   if (strcmp(name, "daylight") == 0)  return misc_daylight();
   // bionic FILE* table / aliases — must be real data, not SVC trampolines
-  if (strcmp(name, "stdin") == 0 || strcmp(name, "stdout") == 0 ||
-      strcmp(name, "stderr") == 0 || strcmp(name, "__sF") == 0)
-    return misc_stdio();
+  if (!strcmp(name, "stdin")) return misc_stdio();
+  if (!strcmp(name, "stdout")) return misc_stdio() + 8u;
+  if (!strcmp(name, "stderr")) return misc_stdio() + 16u;
+  if (!strcmp(name, "__sF")) return g_stdio_array;
   if (strcmp(name, "environ") == 0 || strcmp(name, "__environ") == 0)
     return misc_environ();
   /* getopt(3) state — same class as environ: process data, never an SVC.
@@ -3946,7 +3952,23 @@ struct RegisteredNative {
 class ArmCallbacks;
 class Arm64Callbacks;
 
+struct ArtMethodRecord {
+  uint32_t host_id, address;
+  const char *owner, *name, *signature;
+};
+struct ArtDexRecord { const unsigned char *source; size_t size; uint32_t address; };
+
+static bool art_class_equal(const char *a, const char *b);
+static void art_method_registered(ArmExecCtx &ctx, const char *owner, const char *name,
+                                   const char *signature, GuestVA function);
+
 struct ArmExecCtx {
+  ArtMethodRecord *art_methods = nullptr;
+  size_t art_method_count = 0, art_method_capacity = 0;
+  ArtDexRecord *art_dex = nullptr;
+  size_t art_dex_count = 0, art_dex_capacity = 0;
+  uint32_t art_pool = 0, art_pool_used = 4096;
+  ~ArmExecCtx();
   struct luna_prng31 libc_random {}; /* protected by the ARM execution lock */
   ArmMemory                        mem;
   struct jvm                      *jvm = nullptr;
@@ -5070,8 +5092,7 @@ static bool     g_stepa_requested = false;
 /* Host FILE* table for ARM fopen/fclose/fread/fwrite/fseek/ftell. A C stream
  * is an object with identity: two threads that each luna_file_fopen() a file get two
  * streams, and one thread's fclose() never turns another thread's stream
- * into someone else's file. A table of 256 slots handed to the guest by
- * index gives neither guarantee for free, so:
+ * into someone else's file. The dynamically sized pool uses:
  *  - one lock around every claim and release (an unlocked scan-then-store
  * lets two threads claim the same slot);
  *  - a rotating cursor so a freed slot is not the next one handed out (a
@@ -5080,8 +5101,10 @@ static bool     g_stepa_requested = false;
  * generation no longer matches its slot names a stream that has been closed;
  * it resolves to NULL, which every caller here already treats as "this
  * stream is finished". */
-static FILE*      g_file_tab[256] = {};
-static uint32_t   g_file_gen[256] = {};
+static void arm_set_errno(ArmExecCtx &ctx, int host_e);
+struct FileSlot { FILE *stream; uint32_t generation; };
+static FileSlot *g_file_slots;
+static uint32_t g_file_capacity;
 static uint32_t   g_file_cursor   = 1;
 static std::mutex g_file_lock;
 
@@ -5111,12 +5134,12 @@ enum {
 /* Release a slot and retire its generation.  Returns the stream that was in
  * it, already detached from the table, for the caller to fclose(). */
 static FILE *file_table_detach(uint32_t idx, uint32_t gen, bool check_gen) {
-  if (idx == 0 || idx >= 256u) return nullptr;
   std::lock_guard<std::mutex> guard(g_file_lock);
-  if (check_gen && g_file_gen[idx] != gen) return nullptr;
-  FILE *f = g_file_tab[idx];
-  g_file_tab[idx] = nullptr;
-  ++g_file_gen[idx];
+  if (idx == 0 || idx >= g_file_capacity) return nullptr;
+  if (check_gen && g_file_slots[idx].generation != gen) return nullptr;
+  FILE *f = g_file_slots[idx].stream;
+  g_file_slots[idx].stream = nullptr;
+  ++g_file_slots[idx].generation;
   return f;
 }
 
@@ -5157,8 +5180,8 @@ static int guest_stream_close(FILE *f) {
 }
 
 /* The (index, generation) pair a guest stream handle names.  A handle below
- * 256 is a bare index from the arm_malloc-failed path in register_file() and
- * carries no generation. */
+ * 256 is a legacy bare index and carries no generation. New streams always
+ * use allocated shims, so table growth never changes the handle encoding. */
 static void file_handle_parts(ArmExecCtx &ctx, GuestVA h, uint32_t *idx,
                               uint32_t *gen, bool *stamped) {
   *stamped = (h >= 256u);
@@ -5261,15 +5284,32 @@ struct GuestPopen {
 };
 static std::map<uint32_t, GuestPopen> g_popen_status;
 
+/* Bionic keeps three FILE objects for the standard descriptors. Pointer
+ * variables and the legacy __sF array must identify those same objects. */
+static int standard_file_index(ArmExecCtx &ctx, GuestVA h) {
+  if (!g_stdio_array || !h) return -1;
+  const uint32_t backing = file_shim_backing(ctx, h);
+  const uint32_t stride = ctx.is_arm64 ? 152u : 84u;
+  if (backing < g_stdio_array) return -1;
+  const uint32_t delta = backing - g_stdio_array;
+  return delta < 3u * stride && delta % stride == 0 ? (int)(delta / stride) : -1;
+}
+static FILE *standard_file(int index) {
+  if (index < 0 || (g_stdio_closed & (1u << index))) return nullptr;
+  return index == 0 ? stdin : index == 1 ? stdout : stderr;
+}
+
 static FILE* resolve_file(ArmExecCtx &ctx, GuestVA h) {
+  const int standard = standard_file_index(ctx, h);
+  if (standard >= 0) return standard_file(standard);
   if (h == 0) return nullptr;
   uint32_t idx = 0, gen = 0;
   bool stamped = false;
   file_handle_parts(ctx, h, &idx, &gen, &stamped);
-  if (idx == 0 || idx >= 256u) return nullptr;
   std::lock_guard<std::mutex> guard(g_file_lock);
-  if (stamped && g_file_gen[idx] != gen) return nullptr;
-  return g_file_tab[idx];
+  if (idx == 0 || idx >= g_file_capacity) return nullptr;
+  if (stamped && g_file_slots[idx].generation != gen) return nullptr;
+  return g_file_slots[idx].stream;
 }
 
 /* Recycled A64 GFILE shims for synthetic /proc streams. Cross Worlds'
@@ -5305,17 +5345,29 @@ static bool file_table_claim(FILE *f, uint32_t *idx_out, uint32_t *gen_out) {
   if (!f || !idx_out || !gen_out) return false;
   uint32_t idx = 0, gen = 0;
   std::lock_guard<std::mutex> guard(g_file_lock);
-  for (uint32_t n = 0; n < 255u; ++n) {
-    const uint32_t k = 1u + ((g_file_cursor - 1u + n) % 255u);
-    if (!g_file_tab[k]) {
-      idx = k;
-      break;
+  if (g_file_capacity > 1) {
+    const uint32_t count = g_file_capacity - 1;
+    for (uint32_t n = 0; n < count; ++n) {
+      const uint32_t k = 1u + (((uint64_t)(g_file_cursor - 1u) + n) % count);
+      if (!g_file_slots[k].stream) { idx = k; break; }
     }
   }
-  if (!idx) return false;
-  g_file_tab[idx] = f;
-  gen = ++g_file_gen[idx];
-  g_file_cursor = 1u + (idx % 255u);
+  if (!idx) {
+    /* Like bionic's __sfp, grow the stream pool when all slots are in use.
+     * Slots are internal indices, so realloc never moves a guest FILE. */
+    if (g_file_capacity > UINT32_MAX / 2u) { errno = ENOMEM; return false; }
+    const uint32_t capacity = g_file_capacity ? g_file_capacity * 2u : 256u;
+    if ((size_t)capacity > SIZE_MAX / sizeof(FileSlot)) { errno = ENOMEM; return false; }
+    FileSlot *slots = (FileSlot *)realloc(g_file_slots, (size_t)capacity * sizeof(FileSlot));
+    if (!slots) return false;
+    memset(slots + g_file_capacity, 0, (capacity - g_file_capacity) * sizeof(FileSlot));
+    idx = g_file_capacity ? g_file_capacity : 1u;
+    g_file_slots = slots;
+    g_file_capacity = capacity;
+  }
+  g_file_slots[idx].stream = f;
+  gen = ++g_file_slots[idx].generation;
+  g_file_cursor = 1u + (idx % (g_file_capacity - 1u));
   *idx_out = idx;
   *gen_out = gen;
   return true;
@@ -5342,7 +5394,7 @@ static uint32_t register_synth_gfile(ArmExecCtx &ctx, const char *src,
   if (!file_table_claim(ph, &idx, &gen)) {
     std::lock_guard<std::mutex> g(g_synth_gfile_mu);
     if (rec.shim) g_synth_gfile_free.push_back(rec);
-    fprintf(stderr, "[register_synth_gfile] ERROR: g_file_tab full\n");
+    arm_set_errno(ctx, errno ? errno : ENOMEM);
     return 0u;
   }
 
@@ -5418,31 +5470,15 @@ static void synth_gfile_recycle(ArmExecCtx &ctx, GuestVA fh) {
   }
 }
 
-/* Register a host FILE* into g_file_tab and return a guest shim backing off.
+/* Register a host FILE* into the stream pool and return a guest shim backing off.
  * `reader` asks for the A64 memory-backed fgets/feof path. */
 static uint32_t register_file(ArmExecCtx &ctx, FILE *f, bool reader = false) {
   if (!f) return 0u;
   uint32_t idx = 0, gen = 0;
-  {
-    std::lock_guard<std::mutex> guard(g_file_lock);
-    /* Start where the last claim left off, so a slot released a moment
-     * ago is the last one reused rather than the first. */
-    for (uint32_t n = 0; n < 255u; ++n) {
-      const uint32_t k = 1u + ((g_file_cursor - 1u + n) % 255u);
-      if (!g_file_tab[k]) {
-        idx = k;
-        break;
-      }
-    }
-    if (idx) {
-      g_file_tab[idx] = f;
-      gen = ++g_file_gen[idx];
-      g_file_cursor = 1u + (idx % 255u);
-    }
-  }
-  if (!idx) {
-    fprintf(stderr, "[register_file] ERROR: g_file_tab full (256 entries)\n");
-    fclose(f);
+  if (!file_table_claim(f, &idx, &gen)) {
+    const int error = errno ? errno : ENOMEM;
+    guest_stream_close(f);
+    arm_set_errno(ctx, error);
     return 0u;
   }
   const uint32_t shim_bytes = ctx.is_arm64 ? (uint32_t)GFILE_A64
@@ -5471,7 +5507,10 @@ static uint32_t register_file(ArmExecCtx &ctx, FILE *f, bool reader = false) {
     }
     return shim;
   }
-  return idx; /* arm_malloc failed: bare index fallback */
+  (void)file_table_detach(idx, gen, true);
+  guest_stream_close(f);
+  arm_set_errno(ctx, ENOMEM);
+  return 0u;
 }
 
 /* Where the luna_file_fopen(3) calls come from. "fopen is expensive" is never the
@@ -14292,13 +14331,12 @@ static EglFrameStamp g_egl_frames[EGL_FRAME_HISTORY];
 static uint64_t g_egl_next_frame_id = 0;
 static int64_t  g_egl_pending_present_ns = 0;
 static bool     g_egl_timestamps_enabled = false;
-static EGLint   g_egl_guest_error = EGL_SUCCESS;
-static bool     g_egl_guest_error_set = false;
+static EGLint g_egl_guest_errors[sizeof g_dvm_native_stacks / sizeof g_dvm_native_stacks[0]];
 static bool     g_trace_egl_config_id_pending = false;
 
 static void egl_set_guest_error(EGLint e) {
-  g_egl_guest_error = e;
-  g_egl_guest_error_set = true;
+  if (g_current_tid < sizeof g_egl_guest_errors / sizeof g_egl_guest_errors[0])
+    g_egl_guest_errors[g_current_tid] = e;
 }
 
 static EglFrameStamp *egl_frame_by_id(uint64_t id) {
@@ -18065,6 +18103,7 @@ static const GuestExtEntry kExtEntryPoints[] = {
   { "GL_OES_EGL_image_external",           "glEGLImageTargetTexture2DOES" },
   { "GL_OES_EGL_image_external_essl3",     "glEGLImageTargetTexture2DOES" },
   { "GL_EXT_EGL_image_storage",            "glEGLImageTargetTexStorageEXT" },
+  { "GL_EXT_window_rectangles",            "glWindowRectanglesEXT" },
 };
 
 
@@ -18567,10 +18606,7 @@ static const char *egl_host_query_string(int name) {
 }
 
 static uint32_t egl_host_current_context(void) {
-  uint32_t cur = egl_ctx_for_tid(g_current_tid);
-  if (!cur) cur = (g_egl_ctx != EGL_NO_CONTEXT && g_egl_ctx_tab.empty())
-                    ? ARM_EGL_CONTEXT : 0u;
-  return cur;
+  return egl_ctx_for_tid(g_current_tid);
 }
 
 static uint32_t egl_host_create_window_surface(uint32_t config_handle,
@@ -18950,10 +18986,10 @@ extern "C" int arm_exec_egl_get_config_attrib(uint32_t cfg, int attr,
 }
 
 extern "C" int arm_exec_egl_get_error(void) {
-  if (g_egl_guest_error_set) {
-    g_egl_guest_error_set = false;
-    EGLint e = g_egl_guest_error;
-    g_egl_guest_error = EGL_SUCCESS;
+  if (g_current_tid < sizeof g_egl_guest_errors / sizeof g_egl_guest_errors[0] &&
+      g_egl_guest_errors[g_current_tid]) {
+    EGLint e = g_egl_guest_errors[g_current_tid];
+    g_egl_guest_errors[g_current_tid] = 0;
     return (int)e;
   }
   return (int)(g_egl_dpy != EGL_NO_DISPLAY ? eglGetError() : EGL_SUCCESS);
@@ -24708,7 +24744,7 @@ static bool jvm_class_is(struct jvm *jvm, uint32_t h, const char *needle) {
 // SVC dispatch.
 static void do_register_natives(ArmExecCtx &ctx,
                                 uint32_t klass_jobj,
-                                uint32_t methods_va, int32_t cnt) {
+                                GuestVA methods_va, int32_t cnt) {
   struct jvm *jvm = ctx.jvm;
   const char *klass_name = jvm_get_class_name(jvm, (jobject)(uintptr_t)klass_jobj);
   // A32 JNINativeMethod = 3×u32 (12 B); A64 = 3×u64 (24 B).
@@ -24736,7 +24772,18 @@ static void do_register_natives(ArmExecCtx &ctx,
     rn.name   = name;
     rn.sig = sig;
     rn.fn_va = fn_va;
-    ctx.natives.push_back(std::move(rn));
+    bool replaced=false;
+    for (size_t j=0; j<ctx.natives.size(); ++j) {
+      RegisteredNative *registered=&ctx.natives[j];
+      if (art_class_equal(registered->klass.c_str(),rn.klass.c_str()) &&
+          registered->name==rn.name && registered->sig==rn.sig) {
+        registered->fn_va=fn_va;
+        replaced=true;
+        break;
+      }
+    }
+    if (!replaced) ctx.natives.push_back(std::move(rn));
+    art_method_registered(ctx,klass_name,name,sig,fn_va);
     fprintf(stderr, "[arm_exec] RegisterNatives: %s.%s%s @ 0x%llx\n",
             klass_name ? klass_name : "?", name, sig,
             (unsigned long long)fn_va);
@@ -30153,9 +30200,247 @@ static SvcLeafFn svc_leaf_fn(uint32_t svc_no)
   return svc_info(svc_no).leaf;
 }
 
+static bool art_class_equal(const char *a, const char *b)
+{
+  if (!a || !b) return false;
+  for (; *a && *b; ++a,++b)
+    if ((*a=='.' ? '/' : *a) != (*b=='.' ? '/' : *b)) return false;
+  return *a==*b;
+}
+static GuestVA art_pointer(ArmExecCtx &ctx, uint32_t address)
+{ return ctx.is_arm64 ? a64_guest_va(address) : (GuestVA)address; }
+static GuestVA art_read_pointer(ArmExecCtx &ctx, GuestVA address)
+{
+  const uint8_t *p=ctx.mem.try_ptr(address,ctx.is_arm64 ? 8u : 4u);
+  if (!p) return 0;
+  return ctx.is_arm64 ? __atomic_load_n((const uint64_t *)p,__ATOMIC_ACQUIRE)
+                     : __atomic_load_n((const uint32_t *)p,__ATOMIC_ACQUIRE);
+}
+static void art_write_pointer(ArmExecCtx &ctx, GuestVA address, GuestVA value)
+{
+  uint8_t *p=ctx.mem.try_ptr(address,ctx.is_arm64 ? 8u : 4u);
+  if (!p) return;
+  if (ctx.is_arm64) __atomic_store_n((uint64_t *)p,(uint64_t)value,__ATOMIC_RELEASE);
+  else __atomic_store_n((uint32_t *)p,(uint32_t)value,__ATOMIC_RELEASE);
+}
+static uint32_t art_dex_image(ArmExecCtx &ctx, const unsigned char *source, size_t size)
+{
+  if (!source || !size || size>UINT32_MAX) return 0;
+  for (size_t i=0; i<ctx.art_dex_count; ++i)
+    if (ctx.art_dex[i].source==source && ctx.art_dex[i].size==size) return ctx.art_dex[i].address;
+  uint32_t address=arm_malloc(ctx,(uint32_t)size);
+  if (!address) return 0;
+  for (size_t i=0; i<ctx.art_dex_count; ++i) {
+    if (ctx.art_dex[i].source==source && ctx.art_dex[i].size==size) {
+      const uint32_t existing=ctx.art_dex[i].address;
+      arm_free(ctx,address);
+      return existing;
+    }
+  }
+  if (ctx.art_dex_count==ctx.art_dex_capacity) {
+    size_t capacity=ctx.art_dex_capacity ? ctx.art_dex_capacity*2 : 4;
+    ArtDexRecord *records=(ArtDexRecord *)realloc(ctx.art_dex,capacity*sizeof *records);
+    if (!records) { arm_free(ctx,address); return 0; }
+    ctx.art_dex=records; ctx.art_dex_capacity=capacity;
+  }
+  memcpy(ctx.mem.ptr(address),source,size);
+  ArtDexRecord *record=&ctx.art_dex[ctx.art_dex_count++];
+  record->source=source; record->size=size; record->address=address;
+  return address;
+}
+/* Android 12 ArtMethod: four 32-bit header words, then data and quick entry
+ * pointers. Methods come from page-sized linear-allocation slabs. */
+static GuestVA art_method_address(ArmExecCtx &ctx, JNIEnv *env, jmethodID method)
+{
+  const uint32_t id=(uint32_t)(uintptr_t)method;
+  if (!id) return 0;
+  for (size_t i=0; i<ctx.art_method_count; ++i)
+    if (ctx.art_methods[i].host_id==id) return art_pointer(ctx,ctx.art_methods[i].address);
+  struct dvm_jni_method_metadata info={};
+  const char *owner=nullptr, *name=nullptr, *signature=nullptr;
+  if (!dvm_jni_describe_method(env,method,&info) ||
+      !jvm_field_info(ctx.jvm,(jfieldID)method,&owner,&name,&signature)) return 0;
+  if (info.declaring_name) owner=info.declaring_name;
+  for (size_t i=0; i<ctx.art_method_count; ++i) {
+    const ArtMethodRecord *record=&ctx.art_methods[i];
+    if (art_class_equal(record->owner,owner) && !strcmp(record->name,name) &&
+        !strcmp(record->signature,signature)) return art_pointer(ctx,record->address);
+  }
+  GuestVA data=0;
+  if (info.access & 0x100u) {
+    data=ctx.is_arm64 ? arm64_exec_lookup_native_isig(owner,name,signature)
+                     : arm_exec_lookup_native_isig(owner,name,signature);
+  } else if (info.code_offset) {
+    const uint32_t image=art_dex_image(ctx,info.dex_data,info.dex_size);
+    if (!image || info.code_offset>=info.dex_size) return 0;
+    data=art_pointer(ctx,image+info.code_offset);
+  }
+  const uint32_t stride=ctx.is_arm64 ? 32u : 24u;
+  while (!ctx.art_pool || ctx.art_pool_used+stride>4096u) {
+    const uint32_t slab=arm_malloc(ctx,4096u);
+    if (!slab) return 0;
+    if (ctx.art_pool && ctx.art_pool_used+stride<=4096u) { arm_free(ctx,slab); continue; }
+    memset(ctx.mem.ptr(slab),0,4096u);
+    ctx.art_pool=slab; ctx.art_pool_used=0;
+  }
+  /* Allocations can re-enter native code; check identity again afterwards. */
+  for (size_t i=0; i<ctx.art_method_count; ++i) {
+    const ArtMethodRecord *record=&ctx.art_methods[i];
+    if (record->host_id==id || (art_class_equal(record->owner,owner) &&
+        !strcmp(record->name,name) && !strcmp(record->signature,signature)))
+      return art_pointer(ctx,record->address);
+  }
+  if (ctx.art_method_count==ctx.art_method_capacity) {
+    size_t capacity=ctx.art_method_capacity ? ctx.art_method_capacity*2 : 16;
+    ArtMethodRecord *records=(ArtMethodRecord *)realloc(ctx.art_methods,capacity*sizeof *records);
+    if (!records) return 0;
+    ctx.art_methods=records; ctx.art_method_capacity=capacity;
+  }
+  if (info.access & 0x100u)
+    data=ctx.is_arm64 ? arm64_exec_lookup_native_isig(owner,name,signature)
+                     : arm_exec_lookup_native_isig(owner,name,signature);
+  const uint32_t address=ctx.art_pool+ctx.art_pool_used;
+  ctx.art_pool_used+=stride;
+  GuestVA va=art_pointer(ctx,address);
+  ctx.mem.write32(va,info.declaring_class);
+  ctx.mem.write32(va+4,info.access);
+  ctx.mem.write32(va+8,info.dex_method_index);
+  ctx.mem.write32(va+12,info.method_index & 0xffffu);
+  art_write_pointer(ctx,va+16,data);
+  art_write_pointer(ctx,va+16+(ctx.is_arm64 ? 8u : 4u),
+                     art_pointer(ctx,TRAMP_BASE+SVC_ART_QUICK_INVOKE*TRAMP_STRIDE));
+  ArtMethodRecord *record=&ctx.art_methods[ctx.art_method_count++];
+  record->host_id=id; record->address=address;
+  record->owner=owner; record->name=name; record->signature=signature;
+  return va;
+}
+static void art_method_registered(ArmExecCtx &ctx, const char *owner, const char *name,
+                                   const char *signature, GuestVA function)
+{
+  for (size_t i=0; i<ctx.art_method_count; ++i) {
+    const ArtMethodRecord *record=&ctx.art_methods[i];
+    if (art_class_equal(record->owner,owner) && !strcmp(record->name,name) &&
+        !strcmp(record->signature,signature))
+      art_write_pointer(ctx,art_pointer(ctx,record->address)+16,function);
+  }
+}
+
+static GuestVA art_native_target(ArmExecCtx &ctx, const char *owner, const char *name,
+                                  const char *signature, GuestVA fallback)
+{
+  ArmLockGuard guard;
+  for (size_t i=0; i<ctx.art_method_count; ++i) {
+    const ArtMethodRecord *record=&ctx.art_methods[i];
+    if (art_class_equal(record->owner,owner) && !strcmp(record->name,name) &&
+        !strcmp(record->signature,signature))
+      return art_read_pointer(ctx,art_pointer(ctx,record->address)+16);
+  }
+  return fallback;
+}
+
+/* Quick arguments use a separate FP bank and a four-byte stack slot for
+ * every parameter, including parameters currently held in registers. */
+struct ArtQuickArguments { unsigned gp, fp, fp_double, stack_slot; GuestVA stack; };
+static uint64_t art_quick_argument(ArmExecCtx &ctx, std::array<uint64_t,16> &regs,
+                                    ArtQuickArguments *cursor, char kind)
+{
+  const bool wide=kind=='J' || kind=='D';
+  const GuestVA stack_address=cursor->stack+(ctx.is_arm64 ? 8u : 4u)+cursor->stack_slot*4u;
+  cursor->stack_slot+=wide ? 2u : 1u;
+  if (kind=='F' || kind=='D') {
+    if (ctx.is_arm64 && cursor->fp<8u) {
+      const uint64_t bits=g_svc_jit64->GetVector(cursor->fp++)[0];
+      return kind=='F' ? (uint32_t)bits : bits;
+    }
+    if (!ctx.is_arm64 && kind=='D' && cursor->fp_double+2u<=16u) {
+      const unsigned index=cursor->fp_double;
+      cursor->fp_double+=2u;
+      if (!(cursor->fp&1u) && cursor->fp<cursor->fp_double) cursor->fp=cursor->fp_double;
+      return (uint64_t)g_svc_jit32->ExtRegs()[index] |
+             ((uint64_t)g_svc_jit32->ExtRegs()[index+1u]<<32);
+    }
+    if (!ctx.is_arm64 && kind=='F' && cursor->fp<16u) {
+      const uint32_t bits=g_svc_jit32->ExtRegs()[cursor->fp++];
+      const unsigned next_double=(cursor->fp+1u)&~1u;
+      if (cursor->fp_double<next_double) cursor->fp_double=next_double;
+      if (!(cursor->fp&1u) && cursor->fp<cursor->fp_double) cursor->fp=cursor->fp_double;
+      return bits;
+    }
+  } else {
+    if (!ctx.is_arm64 && wide && (cursor->gp==1u || cursor->gp==3u)) ++cursor->gp;
+    const unsigned limit=ctx.is_arm64 ? 8u : 4u;
+    if (cursor->gp<limit) {
+      const unsigned gp=cursor->gp++;
+      if (ctx.is_arm64) return g_svc_args64[gp];
+      uint64_t bits=(uint32_t)regs[gp];
+      if (wide) bits|=(uint64_t)(uint32_t)regs[cursor->gp++]<<32;
+      return bits;
+    }
+  }
+  return wide ? ctx.mem.read64(stack_address) : ctx.mem.read32(stack_address);
+}
+static bool art_quick_invoke(ArmExecCtx &ctx, JNIEnv *env,
+                              std::array<uint64_t,16> &regs,
+                              union dvm_value *result, char *return_kind)
+{
+  const GuestVA address=ctx.is_arm64 ? g_svc_args64[0] : regs[0];
+  uint32_t method=0;
+  const char *signature=nullptr;
+  for (size_t i=0; i<ctx.art_method_count; ++i)
+    if (art_pointer(ctx,ctx.art_methods[i].address)==address) {
+      method=ctx.art_methods[i].host_id; signature=ctx.art_methods[i].signature; break;
+    }
+  if (!method || !signature || signature[0]!='(') return false;
+  const char *end=strchr(signature,')');
+  if (!end) return false;
+  *return_kind=end[1];
+  ArtQuickArguments cursor={1u,0u,0u,0u,ctx.is_arm64 ? g_svc_jit64->GetSP() : regs[13]};
+  dvm_ref self=0;
+  if (!(ctx.mem.read32(address+4)&0x8u)) self=(dvm_ref)art_quick_argument(ctx,regs,&cursor,'L');
+  union dvm_value args[LUNARIA_JNI_MAX_ARGS]={};
+  int count=0;
+  for (const char *p=signature+1; p<end;) {
+    if (count>=LUNARIA_JNI_MAX_ARGS) return false;
+    char kind=*p;
+    if (kind=='[') { kind='L'; while (p<end && *p=='[') ++p; }
+    if (p<end && *p=='L') { while (p<end && *p!=';') ++p; if (p<end) ++p; }
+    else if (p<end) ++p;
+    uint64_t bits=art_quick_argument(ctx,regs,&cursor,kind);
+    if (kind=='J' || kind=='D') memcpy(&args[count],&bits,8);
+    else { const uint32_t low=(uint32_t)bits; memcpy(&args[count],&low,4); }
+    ++count;
+  }
+  return dvm_jni_quick_invoke(env,(jmethodID)(uintptr_t)method,self,args,count,result);
+}
+
+/* Guest method IDs use ART's index-ID form: every non-null ID is tagged.
+ * Keeping raw object-table indices here made half of them look like native
+ * ArtMethod pointers to clients that distinguish pointer and index IDs. */
+static uint32_t jni_guest_method_id(jmethodID method)
+{
+  const uintptr_t id = (uintptr_t)method;
+  return id ? (uint32_t)((id << 1) | 1u) : 0u;
+}
+static uint32_t jni_host_method_id(GuestVA method)
+{
+  return (method & 1u) && (method >> 1) <= 65536u ? (uint32_t)(method >> 1) : 0u;
+}
+static unsigned jni_method_argument(uint32_t svc)
+{
+  if (svc == 9 || (svc >= 28 && svc <= 30) ||
+      (svc >= 34 && svc <= 63) || (svc >= 114 && svc <= 143)) return 2;
+  if (svc >= 64 && svc <= 93) return 3;
+  return 0;
+}
+
 static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                          std::array<uint64_t, 16> &regs) {
   GlDebugDelivery debug_delivery{ctx, regs};
+  const unsigned method_argument = jni_method_argument(svc_no);
+  if (method_argument) {
+    regs[method_argument] = jni_host_method_id(regs[method_argument]);
+    if (ctx.is_arm64) g_svc_args64[method_argument] = regs[method_argument];
+  }
   struct jvm *jvm = ctx.jvm;
   JNIEnv     *env = &jvm->env;
   GuestVA r0=regs[0], r1=regs[1], r2=regs[2], r3=regs[3];
@@ -34179,9 +34464,38 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     break;
   }
 
+  case SVC_PROCESS_SEND_SIGNAL:
+    /* JNI prefix: JNIEnv*, class, pid, signal. Android's void API ignores
+     * kill(2) errors, while signal delivery uses the ordinary guest model. */
+    if ((int32_t)r2>0) (void)guest_kill_process(ctx,(int32_t)r2,(int)r3);
+    ret32(0);
+    break;
+
+  case SVC_ART_QUICK_INVOKE: {
+    union dvm_value result={};
+    char kind='V';
+    const bool good=art_quick_invoke(ctx,env,regs,&result,&kind);
+    if (!good) { ret32(0); break; }
+    uint64_t bits=result.ju;
+    if (kind=='Z') bits=result.i!=0;
+    else if (kind=='B') bits=(uint32_t)(int32_t)(int8_t)result.i;
+    else if (kind=='C') bits=(uint16_t)result.i;
+    else if (kind=='S') bits=(uint32_t)(int32_t)(int16_t)result.i;
+    if (kind=='F' || kind=='D') {
+      if (ctx.is_arm64) g_svc_ret_fp=kind=='F' ? 4u : 8u;
+      else {
+        g_svc_jit32->ExtRegs()[0]=(uint32_t)bits;
+        if (kind=='D') g_svc_jit32->ExtRegs()[1]=(uint32_t)(bits>>32);
+      }
+    }
+    if (kind=='J' || kind=='D') ret64(bits);
+    else ret32((uint32_t)bits);
+    break;
+  }
+
   // 7: FromReflectedMethod
   case 7:
-    RET_OBJ(jvm->native.FromReflectedMethod(env, AS_OBJ(r1)));
+    ret32(jni_guest_method_id(jvm->native.FromReflectedMethod(env, AS_OBJ(r1))));
     break;
   // 8: FromReflectedField
   case 8:
@@ -34406,7 +34720,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     if (gm_diag++ < 120 || gm_hot || !gm || (mn && strstr(mn, "erify")))
       fprintf(stderr, "[arm_jni] GetMethodID(%s %s) cls=0x%" PRIx64 " -> 0x%x lr=0x%08x\n",
               mn ? mn : "?", ms ? ms : "?", r1, (uint32_t)(uintptr_t)gm, lr);
-    RET_OBJ(gm);
+    ret32(jni_guest_method_id(gm));
     break;
   }
 
@@ -35526,9 +35840,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
   case 100:
     ret32((uint32_t)jvm->native.GetIntField(env,AS_OBJ(r1),AS_FID(r2)));
     break;
-  case 101:
-    ret64((uint64_t)jvm->native.GetLongField(env,AS_OBJ(r1),AS_FID(r2)));
+  case 101: {
+    jobject object=AS_OBJ(r1);
+    jfieldID field=AS_FID(r2);
+    jlong value=jvm->native.GetLongField(env,object,field);
+    const char *owner=nullptr, *name=nullptr, *type=nullptr;
+    if (!value && jvm_field_info(jvm,field,&owner,&name,&type) &&
+        !strcmp(name,"artMethod") && !strcmp(type,"J") &&
+        dvm_jni_class_assignable(owner,"java/lang/reflect/Executable")) {
+      const GuestVA address=art_method_address(ctx,env,(jmethodID)object);
+      if (address) {
+        value=(jlong)address;
+        jvm->native.SetLongField(env,object,field,value);
+      } else if (!jvm->native.ExceptionCheck(env)) {
+        jvm_throw_new(jvm,"java/lang/OutOfMemoryError","ART method allocation");
+      }
+    }
+    ret64((uint64_t)value);
     break;
+  }
   case 102: {
     g_svc_ret_fp = 4;
     jfloat v = jvm->native.GetFloatField(env, AS_OBJ(r1), AS_FID(r2));
@@ -35603,8 +35933,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
   // 113: GetStaticMethodID
   case 113:
-    RET_OBJ(jvm->native.GetStaticMethodID(env, AS_CLASS(r1),
-                                          ARM_STR(r2), ARM_STR(r3)));
+    ret32(jni_guest_method_id(jvm->native.GetStaticMethodID(env, AS_CLASS(r1),
+                                          ARM_STR(r2), ARM_STR(r3))));
     break;
 
   // 114-143: CallStatic* stubs
@@ -36242,9 +36572,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     break;
 
   // 216: UnregisterNatives
-  case 216:
+  case 216: {
+    const char *owner=jvm_get_class_name(jvm,AS_CLASS(r1));
+    if (!owner) { ret32((uint32_t)JNI_ERR); break; }
+    for (size_t i=ctx.natives.size(); i>0; --i)
+      if (art_class_equal(ctx.natives[i-1].klass.c_str(),owner))
+        ctx.natives.erase(ctx.natives.begin()+(i-1));
+    for (size_t i=0; i<ctx.art_method_count; ++i) {
+      const ArtMethodRecord *record=&ctx.art_methods[i];
+      GuestVA address=art_pointer(ctx,record->address);
+      if (art_class_equal(record->owner,owner) && (ctx.mem.read32(address+4)&0x100u)) {
+        GuestVA function=ctx.is_arm64
+          ? arm64_exec_lookup_native_isig(record->owner,record->name,record->signature)
+          : arm_exec_lookup_native_isig(record->owner,record->name,record->signature);
+        art_write_pointer(ctx,address+16,function);
+      }
+    }
     ret32(0);
     break;
+  }
   // 217: MonitorEnter
   case 217:
     ret32((uint32_t)jvm->native.MonitorEnter(env, AS_OBJ(r1)));
@@ -39158,6 +39504,40 @@ aaudio_write_retry:
     ret32((uint32_t)ok);
     break;
   }
+  case SVC_EGL_GET_CONFIGS: {
+    const GuestVA output = argp_n(1), number = argp_n(3);
+    const int maximum = (int32_t)arg32(2);
+    if (argp_n(0) != ARM_EGL_DISPLAY) {
+      egl_set_guest_error(EGL_BAD_DISPLAY);
+      ret32(EGL_FALSE);
+      break;
+    }
+    if (!number || maximum < 0) {
+      egl_set_guest_error(EGL_BAD_PARAMETER);
+      ret32(EGL_FALSE);
+      break;
+    }
+    int32_t count = 0;
+    int ok = arm_exec_egl_get_configs(nullptr, 0, &count);
+    if (ok && output) {
+      const int capacity = count < maximum ? count : maximum;
+      uint32_t *handles = capacity ? (uint32_t *)malloc((size_t)capacity * sizeof *handles) : nullptr;
+      if (capacity && !handles) {
+        egl_set_guest_error(EGL_BAD_ALLOC);
+        ok = EGL_FALSE;
+      } else if (capacity) {
+        ok = arm_exec_egl_get_configs(handles, capacity, &count);
+        for (int i = 0; ok && i < count; ++i) {
+          if (ctx.is_arm64) ctx.mem.write64(output + (size_t)i * 8, handles[i]);
+          else ctx.mem.write32(output + (size_t)i * 4, handles[i]);
+        }
+      } else count = 0;
+      free(handles);
+    }
+    if (ok) ctx.mem.write32(number, (uint32_t)count);
+    ret32((uint32_t)ok);
+    break;
+  }
   case SVC_EGL_CHOOSECONFIG: {
     // eglChooseConfig(dpy, attribs, configs, config_size, num_configs) r0=dpy r1=attribs_va r2=configs_va.
     GuestVA num_va = ctx.is_arm64 ? regs[4]
@@ -39519,6 +39899,20 @@ aaudio_write_retry:
     if (g_egl_dpy != EGL_NO_DISPLAY && g_egl_surf != EGL_NO_SURFACE)
       ok = eglSurfaceAttrib(g_egl_dpy, g_egl_surf, attr, value);
     ret32((uint32_t)ok);
+    break;
+  }
+  case SVC_EGL_RELEASE_THREAD: {
+    if (egl_ctx_for_tid(g_current_tid) &&
+        !egl_host_make_current(0, 0, 0, lr)) {
+      ret32(EGL_FALSE);
+      break;
+    }
+    const EGLBoolean released = eglReleaseThread();
+    if (released) {
+      egl_note_bound(0, EGL_NO_SURFACE);
+      egl_set_guest_error(EGL_SUCCESS);
+    }
+    ret32(released);
     break;
   }
   case SVC_EGL_GETCURCTX: {
@@ -40292,9 +40686,8 @@ aaudio_write_retry:
   case SVC_GL3_GetInteger64i_v: {
     static auto f = (void (*)(GLenum, GLuint, int64_t *))host_gl_proc({ "glGetInteger64i_v" });
     const GuestVA p = argp_n(2);
-    int64_t v = 0;
-    if (f) f((GLenum)r0, (GLuint)r1, &v);
-    if (p) ctx.mem.write64(p, (uint64_t)v);
+    if (p) ctx.mem.write64(p, 0);
+    if (f && p) f((GLenum)r0, (GLuint)r1, (int64_t *)ctx.mem.ptr(p));
     break;
   }
   case SVC_GL3_GetUniformuiv: {
@@ -44259,11 +44652,13 @@ aaudio_write_retry:
     break;
   }
   case SVC_LIBC_FFLUSH: {
-    /* fflush(NULL) flushes every output stream. */
+    /* fflush(NULL) flushes every output stream, including standard streams. */
     if (!r0) {
+      for (int i = 1; i < 3; ++i)
+        if (FILE *f = standard_file(i)) fflush(f);
       std::lock_guard<std::mutex> guard(g_file_lock);
-      for (size_t i = 1; i < sizeof g_file_tab / sizeof *g_file_tab; ++i)
-        if (g_file_tab[i]) fflush(g_file_tab[i]);
+      for (uint32_t i = 1; i < g_file_capacity; ++i)
+        if (g_file_slots[i].stream) fflush(g_file_slots[i].stream);
       ret32(0);
       break;
     }
@@ -44278,6 +44673,15 @@ aaudio_write_retry:
   }
   case SVC_LIBC_FCLOSE: {
     const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+    const int standard = standard_file_index(ctx, fh);
+    if (standard >= 0) {
+      FILE *f = standard_file(standard);
+      int result = EOF;
+      if (f) { ArmLockDropped unlocked; result = fclose(f); }
+      g_stdio_closed |= 1u << standard;
+      ret32((uint32_t)result);
+      break;
+    }
     uint32_t idx = 0, gen = 0;
     bool stamped = false;
     if (fh) file_handle_parts(ctx, fh, &idx, &gen, &stamped);
@@ -49456,6 +49860,20 @@ fputws_done:
     { ArmLockDropped gl_unlocked; f((GLenum)arg32(0),(GLenum)arg32(1),(const void *)(uintptr_t)argp_n(2),(GLsizei)arg32(3),(GLsizei)arg32(4)); }
     break;
   }
+  case SVC_GL_EXT_WindowRectanglesEXT: {
+    typedef void (*pfn_t)(GLenum, GLsizei, const GLint *);
+    static pfn_t f = (pfn_t)host_gl_proc({"glWindowRectanglesEXT"});
+    if (!f) {
+      guest_gl_set_error(0x0502u);
+      break;
+    }
+    const GLint *boxes = argp_n(2) ? (const GLint *)ctx.mem.ptr(argp_n(2)) : nullptr;
+    {
+      ArmLockDropped gl_unlocked;
+      f((GLenum)arg32(0), (GLsizei)arg32(1), boxes);
+    }
+    break;
+  }
   case SVC_GL_EXT_TextureBarrierNV: {
     typedef void (*pfn_t)(void);
     static pfn_t f=(pfn_t)host_gl_proc({"glTextureBarrierNV"});
@@ -52484,6 +52902,8 @@ fputws_done:
   }
   case SVC_FILENO: {
     const GuestVA fh = ctx.is_arm64 ? g_svc_args64[0] : (GuestVA)r0;
+    const int standard = standard_file_index(ctx, fh);
+    if (standard >= 0) { ret32(standard_file(standard) ? (uint32_t)standard : ~0u); break; }
     if (ctx.is_arm64 && fh >= 256u) {
       ret32(ctx.mem.read32(fh + GFILE_FD));
       break;
@@ -55615,10 +56035,7 @@ pv_done:
     }
     const uint32_t handle = register_file(ctx, f, true);
     if (handle) g_popen_status[handle] = { owned, status };
-    else {
-      fclose(f);
-      free(owned);
-    }
+    else free(owned);
     retptr(guest_file_va(ctx, handle));
     break;
   }
@@ -59317,11 +59734,9 @@ mbsrtowcs_done:
     ret32((uint32_t)rc);
     break;
   }
-  /* eglGetCurrentDisplay(): the display the calling thread's context is on.
-   * Returning 0 reads as EGL_NO_DISPLAY, which makes a guest conclude it has
-   * no current context. */
+  /* The display belongs to the calling guest thread's current binding. */
   case SVC_EGL_GETCURDPY:
-    ret32(g_egl_dpy != EGL_NO_DISPLAY ? ARM_EGL_DISPLAY : 0u);
+    ret32(egl_ctx_for_tid(g_current_tid) ? ARM_EGL_DISPLAY : 0u);
     break;
   // glGetInteger64v(pname, GLint64 *params)
   case SVC_GL_GETINTEGER64V: {
@@ -62447,8 +62862,27 @@ static void build_misc_data_page(ArmExecCtx &ctx) {
   // SL_IID_* slots must each read back as a unique non-zero value (see the SL_IID_ case in the data-symbol synth).
   for (uint32_t va = misc_sl_iid(); va < misc_sl_iid_end(); va += sl_word(ctx))
     sl_store(ctx, va, sl_guest_ptr(ctx, va));
-  // Fake stdin/stdout/stderr / __sF blob (opaque FILE stand-ins)
   ctx.mem.map(misc_stdio(), 256u);
+  const uint32_t stdio_stride = ctx.is_arm64 ? 152u : 84u;
+  g_stdio_array = arm_malloc(ctx, 3u * stdio_stride);
+  g_stdio_closed = 0;
+  if (!g_stdio_array) { fprintf(stderr, "[stdio] allocation failed\n"); abort(); }
+  memset(ctx.mem.ptr(g_stdio_array), 0, 3u * stdio_stride);
+  for (uint32_t i = 0; i < 3; ++i) {
+    const uint32_t object = g_stdio_array + i * stdio_stride;
+    const uint32_t cell = misc_stdio() + i * 8u;
+    if (ctx.is_arm64) {
+      ctx.mem.write64(cell, a64_guest_va(object));
+      ctx.mem.write32(object + 16u, i ? 8u : 4u);
+      ctx.mem.write32(object + 20u, i);
+    } else {
+      ctx.mem.write32(cell, object);
+      const uint16_t flags = i ? 8u : 4u;
+      memcpy(ctx.mem.ptr(object + 12u), &flags, sizeof flags);
+      const uint16_t fd = (uint16_t)i;
+      memcpy(ctx.mem.ptr(object + FILE_SHIM_FD), &fd, sizeof fd);
+    }
+  }
   /* `environ` is a data symbol containing char **, not a function.  Never
    * expose the host environment (it contains macOS paths and launcher
    * internals); publish the small process environment an Android zygote
@@ -64498,16 +64932,28 @@ static bool jni_class_name_eq(const std::string &a, const char *b) {
 }
 
 // Resolve a native method the way a real JVM does.
+/* Framework natives are registered by Android's runtime, independently of
+ * application libraries. Keep their JNI entrypoints callable and reflectable. */
+static uint32_t framework_native_svc(const char *klass,const char *method,const char *sig)
+{
+  if (jni_class_name_eq(klass,"android/os/Process") && !strcmp(method,"sendSignal") &&
+      (!sig || !strcmp(sig,"(II)V"))) return SVC_PROCESS_SEND_SIGNAL;
+  return 0;
+}
+
 static uint32_t lookup_native_impl(const char *klass, const char *method,
                                    const char *sig, char *sig_out, int sig_max) {
   if (!g_ctx || !klass || !method) return 0;
+  ArmLockGuard guard;
   for (auto &rn : g_ctx->natives) {
-    if (jni_class_name_eq(rn.klass, klass) && rn.name == method) {
+    if (jni_class_name_eq(rn.klass, klass) && rn.name == method && (!sig || rn.sig == sig)) {
       if (sig_out && sig_max > 0)
         snprintf(sig_out, (size_t)sig_max, "%s", rn.sig.c_str());
       return rn.fn_va;
     }
   }
+  const uint32_t framework=framework_native_svc(klass,method,sig);
+  if (framework) return TRAMP_BASE+framework*TRAMP_STRIDE;
   // Implicit binding: short name first, then the long (overload) form.
   const std::string base = "Java_" + jni_mangle(klass) + "_" + jni_mangle(method);
   auto try_sym = [](const std::string &n) -> uint32_t {
@@ -64935,6 +65381,50 @@ extern "C" uint32_t arm_exec_strdup(const char *s) {
   if (!p) return 0;
   memcpy(p, s, n);
   return va;
+}
+
+extern "C" int arm_exec_runtime_read_file(const char *path, unsigned char **data,
+                                          size_t *size) {
+  *data = nullptr;
+  *size = 0;
+  if (!g_ctx || !g_ctx->is_arm64) return 0;
+  ArmLockGuard locked;
+  const uint64_t open_file = arm64_exec_lookup_export("lunaria_runtime_file_open");
+  const uint64_t close_file = arm64_exec_lookup_export("lunaria_runtime_file_close");
+  if (!open_file || !close_file) return 0;
+  const uint32_t name = arm_exec_strdup(path);
+  const uint32_t record = arm_malloc(*g_ctx, 24);
+  if (!name || !record) {
+    arm_free(*g_ctx, name);
+    arm_free(*g_ctx, record);
+    return -1;
+  }
+  int result = -1;
+  const int32_t opened = call_guest_cb64(*g_ctx, open_file, a64_guest_va(name),
+                                        a64_guest_va(record), 0, 0, nullptr, 0);
+  if (opened == 0) {
+    const GuestVA bytes = g_ctx->mem.read64(record);
+    const uint64_t length = g_ctx->mem.read64(record + 8);
+    const uint8_t *source = length <= SIZE_MAX
+      ? g_ctx->mem.try_ptr(bytes, (size_t)length) : nullptr;
+    if (lunaria_env("LUNARIA_TRACE_RUNTIME_FILE"))
+      fprintf(stderr, "[runtime-file] %s: data=%llx size=%llu mapped=%u readable=%d\n",
+              path, (unsigned long long)bytes, (unsigned long long)length,
+              g_ctx->mem.read32(record + 16), source != nullptr);
+    unsigned char *copy = source && length ? (unsigned char *)malloc((size_t)length) : nullptr;
+    if (copy) {
+      memcpy(copy, source, (size_t)length);
+      *data = copy;
+      *size = (size_t)length;
+      result = 1;
+    }
+    call_guest_cb64(*g_ctx, close_file, a64_guest_va(record), 0, 0, 0, nullptr, 0);
+  } else if (lunaria_env("LUNARIA_TRACE_RUNTIME_FILE")) {
+    fprintf(stderr, "[runtime-file] %s: open returned %lld\n", path, (long long)opened);
+  }
+  arm_free(*g_ctx, name);
+  arm_free(*g_ctx, record);
+  return result;
 }
 
 // ANativeActivity layout (32-bit NDK):.
@@ -73860,8 +74350,9 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
   if (!g_ctx || !klass || !method || !sig) return false;
 
   const bool a64 = g_ctx->is_arm64;
-  uint64_t fn = a64 ? arm64_exec_lookup_native(klass, method)
-                : (uint64_t)arm_exec_lookup_native(klass, method);
+  uint64_t fn = a64 ? arm64_exec_lookup_native_isig(klass, method, sig)
+                : (uint64_t)arm_exec_lookup_native_isig(klass, method, sig);
+  fn=art_native_target(*g_ctx,klass,method,sig,fn);
   if (!fn) return false;
 
   static std::set<std::string> declined;
@@ -74925,32 +75416,56 @@ extern "C" uint64_t arm64_exec_lookup_export(const char *sym) {
 
 // RegisterNatives table first, then JNI *implicit binding* against the loaded ELF exports.
 static uint64_t lookup_native64_impl(const char *klass, const char *method,
-                                     char *sig_out, int sig_max) {
+                                     const char *sig, char *sig_out, int sig_max) {
   if (!g_ctx || !klass || !method) return 0;
+  ArmLockGuard guard;
   for (const auto &rn : g_ctx->natives) {
-    if (jni_class_name_eq(rn.klass, klass) && rn.name == method) {
+    if (jni_class_name_eq(rn.klass, klass) && rn.name == method && (!sig || rn.sig == sig)) {
       if (sig_out && sig_max > 0)
         snprintf(sig_out, (size_t)sig_max, "%s", rn.sig.c_str());
       return rn.fn_va;
     }
   }
+  const uint32_t framework=framework_native_svc(klass,method,sig);
+  if (framework) return a64_guest_va(TRAMP_BASE+framework*TRAMP_STRIDE);
   const std::string base = "Java_" + jni_mangle(klass) + "_" + jni_mangle(method);
-  auto it = g_exported_syms64.find(base);
+  std::string symbol = base;
+  auto it = g_exported_syms64.find(symbol);
+  if (it == g_exported_syms64.end() && sig && *sig == '(') {
+    const char *end = strchr(sig, ')');
+    if (end) {
+      const std::string parameters(sig + 1, (size_t)(end - sig - 1));
+      symbol += "__" + jni_mangle(parameters.c_str());
+      it = g_exported_syms64.find(symbol);
+    }
+  }
   if (it == g_exported_syms64.end()) return 0;
   static std::set<std::string> logged;
-  if (logged.insert(base).second)
+  if (logged.insert(symbol).second)
     fprintf(stderr, "[jni] implicit binding %s -> 0x%llx\n",
-            base.c_str(), (unsigned long long)it->second);
+            symbol.c_str(), (unsigned long long)it->second);
+  if (sig && sig_out && sig_max > 0) snprintf(sig_out, (size_t)sig_max, "%s", sig);
   return it->second;
 }
 
+ArmExecCtx::~ArmExecCtx()
+{
+  free(art_methods);
+  free(art_dex);
+}
+
 extern "C" uint64_t arm64_exec_lookup_native(const char *klass, const char *method) {
-  return lookup_native64_impl(klass, method, nullptr, 0);
+  return lookup_native64_impl(klass, method, nullptr, nullptr, 0);
 }
 
 extern "C" uint64_t arm64_exec_lookup_native_sig(const char *klass, const char *method,
     char *sig_out, int sig_max) {
-  return lookup_native64_impl(klass, method, sig_out, sig_max);
+  return lookup_native64_impl(klass, method, nullptr, sig_out, sig_max);
+}
+
+extern "C" uint64_t arm64_exec_lookup_native_isig(const char *klass, const char *method,
+                                                 const char *sig) {
+  return lookup_native64_impl(klass, method, sig, nullptr, 0);
 }
 
 extern "C" uint64_t arm64_exec_env_va(void) {

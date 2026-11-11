@@ -912,6 +912,10 @@ uint32_t arm_exec_malloc(uint32_t size);
 /* Copy a host C string into guest memory (NUL-terminated).  Returns VA or 0. */
 uint32_t arm_exec_strdup(const char *s);
 
+/* Runtime file I/O through libartbase's guest ABI. Returns 0 when the guest
+ * backend is unavailable, 1 on success, -1 on error. The caller frees *data. */
+int arm_exec_runtime_read_file(const char *path, unsigned char **data, size_t *size);
+
 /* Build a guest ANativeActivity (+ callbacks) for UE4 NativeActivity entry.
  * Returns the activity VA, or 0 on failure.  `clazz` is a jobject handle. */
 uint32_t arm_exec_native_activity_create(uint32_t clazz_handle);
@@ -997,6 +1001,9 @@ void arm64_exec_threads_run_engine(int on);
 /* Like arm64_exec_lookup_native but also fills sig_out. */
 uint64_t arm64_exec_lookup_native_sig(const char *klass, const char *method,
                                       char *sig_out, int sig_max);
+/* Resolve the exact descriptor, including JNI's long overload name. */
+uint64_t arm64_exec_lookup_native_isig(const char *klass, const char *method,
+                                      const char *sig);
 
 /* Return the A64 JNIEnv* guest VA (ENV_SLOT64_BASE). */
 uint64_t arm64_exec_env_va(void);

@@ -1380,6 +1380,39 @@ static bool matrix_map_rect(struct dvm *vm, dvm_ref self,
         (m[0] == 0.f && m[4] == 0.f && m[1] != 0.f && m[3] != 0.f)));
 }
 
+/* android.opengl.Matrix uses column-major float[16] matrices. Preserve
+ * Java's per-element bounds behavior, including writes before an exception. */
+static bool gl_matrix_identity(struct dvm *vm, dvm_ref self,
+                                const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+  (void)self;
+  (void)out;
+  if (nargs < 2) return false;
+  if (!args[0].l) {
+    dvm__throw(vm,"java/lang/NullPointerException","matrix == null");
+    return false;
+  }
+  const uint32_t length = dvm_array_length(vm,args[0].l);
+  float *matrix = dvm_array_data(vm,args[0].l);
+  const int32_t offset = args[1].i;
+  for (int i = 0; i < 16; ++i) {
+    const int64_t index = (int64_t)offset + i;
+    if (index < 0 || index >= length) {
+      dvm__throw(vm,"java/lang/ArrayIndexOutOfBoundsException","matrix index out of bounds");
+      return false;
+    }
+    matrix[index] = 0.0f;
+  }
+  for (int i = 0; i < 16; i += 5) matrix[offset + i] = 1.0f;
+  return true;
+}
+static const struct rt_method rt_gl_matrix[] = {
+  M("<init>","()V",nop_void),
+  SM("setIdentityM","([FI)V",gl_matrix_identity),
+  M_END
+};
+
 static const struct rt_method rt_matrix[] = {
   M("<init>", "()V", matrix_init),
   M("<init>", "(Landroid/graphics/Matrix;)V", matrix_init),

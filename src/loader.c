@@ -2550,6 +2550,7 @@ main(int argc, const char *argv[])
       g_component_pool=NULL;
     }
     (void)process_exit_status(&ret);
+    luna_comp_stop();
     arm_exec_begin_shutdown();
     dvm_jni_shutdown();
     arm_exec_shutdown_engines();
@@ -2643,6 +2644,7 @@ main(int argc, const char *argv[])
       ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm64(&jvm);
       (void)process_exit_status(&ret);
     }
+    luna_comp_stop();
     arm_exec_begin_shutdown();
     dvm_jni_shutdown();
     arm_exec_shutdown_engines();
@@ -2756,6 +2758,7 @@ main(int argc, const char *argv[])
       ret=jni_ver < 0 ? EXIT_FAILURE : run_jni_game_arm(&jvm);
       (void)process_exit_status(&ret);
     }
+    luna_comp_stop();
     arm_exec_begin_shutdown();
     dvm_jni_shutdown();
     arm_exec_shutdown_engines();
@@ -2817,6 +2820,7 @@ main(int argc, const char *argv[])
     jvm_init(&jvm);
     entry.JNI_OnLoad.fun(&jvm.vm, NULL);
     ret = run_jni_game(&jvm);
+    luna_comp_stop();
     arm_exec_begin_shutdown();
     dvm_jni_shutdown();
     arm_exec_shutdown_engines();

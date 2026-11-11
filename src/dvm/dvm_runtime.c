@@ -224,6 +224,7 @@ RT_BUILTIN_DECL(view_get_visible_display_frame);
 RT_BUILTIN_DECL(view_request_layout);
 RT_BUILTIN_DECL(view_clear_focus);
 RT_BUILTIN_DECL(view_request_focus);
+RT_BUILTIN_DECL(view_restore_default_focus);
 RT_BUILTIN_DECL(view_has_focus);
 RT_BUILTIN_DECL(rect_width);
 RT_BUILTIN_DECL(text_get_line_count);
@@ -10045,16 +10046,39 @@ static bool loc_forLanguageTag(struct dvm *vm, dvm_ref self,
   (void)self;
   (void)nargs;
   const char *tag = dvm_string_utf8(vm, ARG(0).l);
-  char language[16] = "", country[16] = "";
-  if (tag) {
-    const char *sep = strpbrk(tag, "-_");
-    size_t ln = sep ? (size_t)(sep - tag) : strlen(tag);
-    if (ln >= sizeof language) ln = sizeof language - 1;
-    memcpy(language, tag, ln);
-    language[ln] = '\0';
-    if (sep) snprintf(country, sizeof country, "%s", sep + 1);
+  if (!tag) {
+    dvm__throw(vm, "java/lang/NullPointerException", "languageTag");
+    return false;
   }
-  RETL(locale_make(vm, language, country));
+  char language[16] = "", country[16] = "", script[5] = "";
+  size_t n = strcspn(tag, "-");
+  if (n < sizeof language) {
+    for (size_t i = 0; i < n; ++i)
+      language[i] = (char)tolower((unsigned char)tag[i]);
+  }
+  const char *p = tag + n;
+  if (*p) {
+    ++p;
+    n = strcspn(p, "-");
+    if (n == 4 && strspn(p, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") >= n) {
+      for (size_t i = 0; i < n; ++i)
+        script[i] = (char)(i ? tolower((unsigned char)p[i]) : toupper((unsigned char)p[i]));
+      p += n;
+      if (*p) ++p;
+    }
+    n = strcspn(p, "-");
+    if ((n == 2 && strspn(p, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") >= n) ||
+        (n == 3 && strspn(p, "0123456789") >= n)) {
+      for (size_t i = 0; i < n; ++i)
+        country[i] = (char)toupper((unsigned char)p[i]);
+    }
+  }
+  if (!strcmp(language, "und")) language[0] = 0;
+  dvm_ref locale = locale_make(vm, language, country);
+  if (!locale) return false;
+  union dvm_value value = { .l = dvm_new_string(vm, script) };
+  (void)dvm_set_field(vm, locale, "script", "Ljava/lang/String;", value);
+  RETL(locale);
 }
 
 static bool loc_getDefault(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -10128,6 +10152,16 @@ static bool loc_getVariant(struct dvm *vm, dvm_ref self, const union dvm_value *
   RETL(v.l ? v.l : dvm_new_string(vm, ""));
 }
 
+static bool loc_getScript(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  union dvm_value value = {0};
+  (void)dvm_get_field(vm, self, "script", "Ljava/lang/String;", &value);
+  RETL(value.l ? value.l : dvm_new_string(vm, ""));
+}
+
 static bool loc_getCountry(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
@@ -10170,8 +10204,10 @@ static bool loc_toLanguageTag(struct dvm *vm, dvm_ref self,
   (void)dvm_get_field(vm, self, "country", "Ljava/lang/String;", &c);
   const char *ls = l.l ? dvm_string_utf8(vm, l.l) : "";
   const char *cs = c.l ? dvm_string_utf8(vm, c.l) : "";
-  char buf[64];
-  if (cs && *cs) snprintf(buf, sizeof buf, "%s-%s", ls ? ls : "", cs);
+  const char *script = loc_field_utf8(vm, self, "script");
+  char buf[96];
+  if (*script) snprintf(buf, sizeof buf, "%s-%s%s%s", ls && *ls ? ls : "und", script, cs && *cs ? "-" : "", cs ? cs : "");
+  else if (cs && *cs) snprintf(buf, sizeof buf, "%s-%s", ls ? ls : "", cs);
   else           snprintf(buf, sizeof buf, "%s", ls ? ls : "");
   /* An empty language is "und" in BCP-47, never the empty string. */
   RETL(dvm_new_string(vm, buf[0] ? buf : "und"));
@@ -10226,7 +10262,7 @@ static bool loc_setDefault(struct dvm *vm, dvm_ref self,
 
 static const struct rt_field rt_locale_fields[] = {
   { "language", "Ljava/lang/String;" }, { "country", "Ljava/lang/String;" },
-  { "variant", "Ljava/lang/String;" }, F_END
+  { "variant", "Ljava/lang/String;" }, { "script", "Ljava/lang/String;" }, F_END
 };
 
 /* BEGIN GENERATED ISO LANGUAGES */
@@ -10429,27 +10465,15 @@ static bool lb_setLanguageTag(struct dvm *vm, dvm_ref self,
                               const union dvm_value *args, int nargs,
                               union dvm_value *out)
 {
-  const char *tag = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : "";
-  char language[16] = "", region[16] = "";
-  const char *p = tag;
-  size_t n = strcspn(p, "-_");
-  if (n < sizeof language) { memcpy(language, p, n); language[n] = 0; }
-  p += n;
-  while (*p) {
-    ++p;
-    n = strcspn(p, "-_");
-    /* subtags after the language: script (4 letters), region (2 letters or 3 digits) */
-    if (!*region && ((n == 2 && isalpha((unsigned char)p[0])) ||
-                     (n == 3 && isdigit((unsigned char)p[0]))) &&
-        n < sizeof region) {
-      memcpy(region, p, n);
-      region[n] = 0;
-    }
-    p += n;
+  union dvm_value locale = {0};
+  if (!loc_forLanguageTag(vm, 0, args, nargs, &locale)) return false;
+  const char *source[] = {"language", "country", "script", "variant"};
+  const char *target[] = {"language", "region", "script", "variant"};
+  for (unsigned i = 0; i < 4; ++i) {
+    union dvm_value value = {0};
+    (void)dvm_get_field(vm, locale.l, source[i], "Ljava/lang/String;", &value);
+    if (!lb_set_field(vm, self, target[i], value.l)) return false;
   }
-  if (!lb_set_field(vm, self, "language", dvm_new_string(vm, language)) ||
-      !lb_set_field(vm, self, "region", dvm_new_string(vm, region)))
-    return false;
   RETL(self);
 }
 
@@ -10477,11 +10501,36 @@ static bool lb_setVariant(struct dvm *vm, dvm_ref self,
   RETL(self);
 }
 
-/* Scripts and extensions are not modelled by Locale here; accept and keep. */
-static bool lb_self(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+static bool lb_setScript(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  const char *text = dvm_string_utf8(vm, ARG(0).l);
+  if (!text) {
+    dvm__throw(vm, "java/lang/NullPointerException", "script");
+    return false;
+  }
+  size_t length = strlen(text);
+  if (length && (length != 4 ||
+      strspn(text, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz") != 4)) {
+    dvm__throw(vm, "java/util/IllformedLocaleException", "Invalid script: %s", text);
+    return false;
+  }
+  char script[5] = "";
+  for (size_t i = 0; i < length; ++i)
+    script[i] = (char)(i ? tolower((unsigned char)text[i]) : toupper((unsigned char)text[i]));
+  if (!lb_set_field(vm, self, "script", dvm_new_string(vm, script))) return false;
+  RETL(self);
+}
+
+static bool lb_clear(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                     int nargs, union dvm_value *out)
 {
-  (void)vm; (void)args; (void)nargs;
+  (void)args;
+  (void)nargs;
+  const char *fields[] = {"language", "region", "variant", "script"};
+  for (unsigned i = 0; i < 4; ++i)
+    if (!lb_set_field(vm, self, fields[i], 0)) return false;
   RETL(self);
 }
 
@@ -10496,6 +10545,9 @@ static bool lb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   dvm_ref loc = locale_make(vm, l.l ? dvm_string_utf8(vm, l.l) : "",
                             r.l ? dvm_string_utf8(vm, r.l) : "");
   if (loc && v.l) (void)dvm_set_field(vm, loc, "variant", "Ljava/lang/String;", v);
+  union dvm_value script = {0};
+  (void)dvm_get_field(vm, self, "script", "Ljava/lang/String;", &script);
+  if (loc) (void)dvm_set_field(vm, loc, "script", "Ljava/lang/String;", script);
   RETL(loc);
 }
 
@@ -10505,15 +10557,15 @@ static const struct rt_method rt_locale_builder[] = {
   M("setLanguage", "(Ljava/lang/String;)Ljava/util/Locale$Builder;", lb_setLanguage),
   M("setRegion", "(Ljava/lang/String;)Ljava/util/Locale$Builder;", lb_setRegion),
   M("setVariant", "(Ljava/lang/String;)Ljava/util/Locale$Builder;", lb_setVariant),
-  M("setScript", "(Ljava/lang/String;)Ljava/util/Locale$Builder;", lb_self),
-  M("clear", "()Ljava/util/Locale$Builder;", lb_self),
+  M("setScript", "(Ljava/lang/String;)Ljava/util/Locale$Builder;", lb_setScript),
+  M("clear", "()Ljava/util/Locale$Builder;", lb_clear),
   M("build", "()Ljava/util/Locale;", lb_build),
   M_END,
 };
 
 static const struct rt_field rt_locale_builder_fields[] = {
   { "language", "Ljava/lang/String;" }, { "region", "Ljava/lang/String;" },
-  { "variant", "Ljava/lang/String;" }, F_END
+  { "variant", "Ljava/lang/String;" }, { "script", "Ljava/lang/String;" }, F_END
 };
 
 static const struct rt_method rt_locale[] = {
@@ -10532,6 +10584,7 @@ static const struct rt_method rt_locale[] = {
   loc_getDisplayCountry),
   M("getDisplayName", "()Ljava/lang/String;", loc_getDisplayName),
   M("getDisplayName", "(Ljava/util/Locale;)Ljava/lang/String;", loc_getDisplayName),
+  M("getScript", "()Ljava/lang/String;", loc_getScript),
   M("getVariant", "()Ljava/lang/String;", loc_getVariant),
   M("getCountry", "()Ljava/lang/String;", loc_getCountry),
   M("toString", "()Ljava/lang/String;", loc_toString),
@@ -10683,8 +10736,8 @@ static bool ll_getDefault(struct dvm *vm, dvm_ref self,
 
 static bool ll_same_locale(struct dvm *vm, dvm_ref a, dvm_ref b)
 {
-  static const char *const parts[3] = { "language", "country", "variant" };
-  for (int i = 0; i < 3; ++i) {
+  static const char *const parts[] = { "language", "country", "variant", "script" };
+  for (unsigned i = 0; i < sizeof parts / sizeof parts[0]; ++i) {
     union dvm_value x = { 0 }, y = { 0 };
     (void)dvm_get_field(vm, a, parts[i], "Ljava/lang/String;", &x);
     (void)dvm_get_field(vm, b, parts[i], "Ljava/lang/String;", &y);
@@ -49739,23 +49792,16 @@ static bool proc_getStartUptimeMillis(struct dvm *vm, dvm_ref self,
   RETJ(vm->process_start_uptime_ms);
 }
 
-/* Process.killProcess(pid): the calling process dies at once, the way SIGKILL
- * ends it -- no finalizers, no shutdown hooks.  GMS ends its own process this
- * way when its module configuration changes, and the next component it is asked
- * for starts a fresh process that reads the new configuration.  Another
- * process's pid is not ours to kill, so that is quietly nothing. */
+/* Android's Java wrapper calls the native sendSignal entrypoint, so native
+ * registration and instrumentation observe the same path as Java callers. */
 static bool proc_killProcess(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                              int nargs, union dvm_value *out)
 {
-  (void)vm;
   (void)self;
   (void)nargs;
-  if ((uint32_t)args[0].i == (uint32_t)arm_exec_guest_pid()) {
-    fprintf(stderr, "[process] killProcess(%d): this process ends\n", (int)args[0].i);
-    fflush(NULL);
-    _exit(128 + 9);
-  }
-  RETV();
+  struct dvm_method *method=dvm_lookup(vm,"android/os/Process","sendSignal","(II)V");
+  union dvm_value signal_args[2]={{.i=args[0].i},{.i=9}};
+  return method && dvm_call(vm,method,0,signal_args,2,out);
 }
 
 static const struct rt_method rt_process[] = {
@@ -49765,6 +49811,7 @@ static const struct rt_method rt_process[] = {
   SM("getUidForName", "(Ljava/lang/String;)I", proc_getGidForName),
   SM("myPid", "()I", proc_myPid),
   SM("killProcess", "(I)V", proc_killProcess),
+  { "sendSignal", "(II)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_STATIC | DEX_ACC_NATIVE },
   SM("myTid", "()I", proc_myTid),
   SM("myUid", "()I", proc_myUid),
   SM("myProcessName", "()Ljava/lang/String;", proc_myProcessName),
@@ -64280,6 +64327,7 @@ static const struct rt_method rt_view[] = {
   M("setOnScrollChangeListener", "(Landroid/view/View$OnScrollChangeListener;)V", view_set_scroll_listener),
   M("scrollTo", "(II)V", view_scroll_to),
   M("requestFocus", "()Z", view_request_focus),
+  M("restoreDefaultFocus", "()Z", view_restore_default_focus),
   M("hasFocus", "()Z", view_has_focus),
   M("isFocused", "()Z", view_has_focus),
   M("clearFocus", "()V", view_clear_focus),
@@ -68390,6 +68438,17 @@ static dvm_ref ui_first_focusable(struct dvm *vm, dvm_ref view, int depth)
     if (found) return found;
   }
   return 0;
+}
+
+static bool view_restore_default_focus(struct dvm *vm, dvm_ref self,
+                                       const union dvm_value *args, int nargs,
+                                       union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  dvm_ref target = ui_first_focusable(vm, self, 0);
+  if (!target) RETI(0);
+  return view_request_focus(vm, target, NULL, 0, out);
 }
 
 /* Activity.getCurrentFocus(): the view the window's focus is on.  When a
@@ -95578,7 +95637,7 @@ static const struct rt_class rt_classes[] = {
     rt_accessible_object, rt_accessible_fields, rt_iface_annotated
   },
   { "Ljava/lang/reflect/Executable;", "Ljava/lang/reflect/AccessibleObject;",
-    rt_executable, NULL, rt_iface_executable
+    rt_executable, rt_executable_fields, rt_iface_executable
   },
   { "Ljava/lang/reflect/Method;", "Ljava/lang/reflect/Executable;",
     rt_reflect_method, rt_method_fields, NULL
@@ -95943,6 +96002,7 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/graphics/ColorSpace$Named;", "Ljava/lang/Enum;", rt_enum_color_named, NULL, NULL, rt_color_named_sfields },
   { "Landroid/graphics/ColorSpace$Model;", "Ljava/lang/Enum;", rt_enum_color_model, NULL, NULL, rt_color_model_sfields },
   { "Landroid/graphics/ColorSpace$Rgb$TransferParameters;", "Ljava/lang/Object;", NULL, rt_color_transfer_fields, NULL },
+  { "Landroid/opengl/Matrix;", "Ljava/lang/Object;", rt_gl_matrix, NULL, NULL },
   { "Landroid/graphics/Matrix;", "Ljava/lang/Object;", rt_matrix,
     rt_matrix_fields, NULL
   },

@@ -38,6 +38,7 @@ static EGLNativeWindowType g_native;
 static atomic_bool g_active;
 static atomic_ullong g_frames;
 static pthread_t g_thread;
+static bool g_thread_started;
 
 /* Frame slots.  A slot is free, queued (the newest submitted frame, not yet
  * taken) or shown (what the compositor samples).
@@ -173,7 +174,7 @@ void luna_comp_submit(int w, int h, int swap_interval)
       until.tv_sec += 1;
       until.tv_nsec -= 1000000000;
     }
-    while (g_queued >= 0 &&
+    while (atomic_load(&g_active) && g_queued >= 0 &&
            pthread_cond_timedwait(&g_cv_guest, &g_mu, &until) != ETIMEDOUT) {
     }
   }
@@ -578,7 +579,7 @@ static void *comp_main(void *arg)
 
   bool have_frame = false;
   uint64_t last_draw = 0;
-  for (;;) {
+  while (atomic_load(&g_active)) {
     /* How long the picture may stay as it is: the boot card and the input
      * method's caret animate; a static screen needs nothing until the guest
      * or the UI changes it. */
@@ -602,6 +603,10 @@ static void *comp_main(void *arg)
         until.tv_nsec = (long)(ns % 1000000000ull);
         (void)pthread_cond_timedwait(&g_cv_comp, &g_mu, &until);
       }
+    }
+    if (!atomic_load(&g_active)) {
+      pthread_mutex_unlock(&g_mu);
+      break;
     }
     /* The safety wake is not itself damage. Keep the last scanout when no
      * producer, overlay animation or remote viewer needs a new frame. */
@@ -726,7 +731,23 @@ static void *comp_main(void *arg)
     atomic_fetch_add_explicit(&g_frames, 1, memory_order_relaxed);
     last_draw = now_ns();
   }
+  eglMakeCurrent(g_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   return NULL;
+}
+
+void luna_comp_stop(void)
+{
+  if (!g_thread_started) return;
+  atomic_store(&g_active, false);
+  pthread_mutex_lock(&g_mu);
+  g_wake = true;
+  pthread_cond_broadcast(&g_cv_comp);
+  pthread_cond_broadcast(&g_cv_guest);
+  pthread_mutex_unlock(&g_mu);
+  pthread_join(g_thread, NULL);
+  g_thread_started = false;
+  luna_overlay_set_hosted(false);
+  fprintf(stderr, "[compositor] stopped\n");
 }
 
 bool luna_comp_start(void *egl_display, void *egl_config, void *native_window)
@@ -765,6 +786,7 @@ bool luna_comp_start(void *egl_display, void *egl_config, void *native_window)
     luna_overlay_set_hosted(false);
     return false;
   }
-  pthread_detach(g_thread);
+  g_thread_started = true;
+  atexit(luna_comp_stop);
   return true;
 }

@@ -12891,6 +12891,8 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
   }
   dvm_ref stack[64] = { 0 }, root = 0;
   bool stack_view[64] = { false };   /* a view element (not <include>/<merge>) */
+  bool pending_focus[64] = { false };
+  unsigned consume_depth = 0;
   struct dvm_class *parser_class = dvm__class_by_desc(vm, "Landroid/content/res/XmlResourceParser;");
   dvm_ref parser = parser_class ? dvm_new_object(vm, parser_class) : 0;
   dvm_pin(vm,parser);
@@ -12903,7 +12905,10 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
     uint16_t type = ax_u16(b + pos), hs = ax_u16(b + pos + 2);
     uint32_t size = ax_u32(b + pos + 4);
     if (size < hs || pos + size > n) break;
-    if (type == 0x0102 && pos + 36 <= n) {
+    if (consume_depth) {
+      if (type == 0x0102) ++consume_depth;
+      else if (type == 0x0103) --consume_depth;
+    } else if (type == 0x0102 && pos + 36 <= n) {
       uint32_t name_i = ax_u32(b + pos + 20);
       const char *tag = name_i < nstrings ? strings[name_i] : NULL;
       uint16_t attr_start = ax_u16(b + pos + 24);
@@ -12930,7 +12935,12 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
       union dvm_value cursor = { .i = event_index }, event = { 0 };
       (void)dvm_set_field(vm, parser, "eventIndex", "I", cursor);
       (void)xml_parser_next(vm, parser, NULL, 0, &event);
-      if (tag && !strcmp(tag, "include")) {
+      if (tag && !strcmp(tag, "requestFocus") && sp && parent) {
+        /* rInflate defers the request until the containing view's children
+         * are complete, and consumes the directive's subtree as metadata. */
+        pending_focus[sp - 1] = true;
+        consume_depth = 1;
+      } else if (tag && !strcmp(tag, "include")) {
         /* The included layout is inflated into this group, so its root gets
          * its LayoutParams from the group (parseInclude()). */
         dvm_ref child = li_inflate_resource(vm,inflater,context,include,depth+1,
@@ -12975,6 +12985,7 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
           (void)dvm_set_field(vm, child, "id", "I", v);
         }
         if (sp < 64) {
+          pending_focus[sp] = false;
           stack_view[sp] = false;
           stack[sp++] = 0;
         }
@@ -12985,6 +12996,7 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
         dvm_unpin(vm,child);
       } else if (tag && !strcmp(tag, "merge")) {
         if (sp < 64) {
+          pending_focus[sp] = false;
           stack_view[sp] = false;
           stack[sp++] = parent;
         }
@@ -13035,6 +13047,7 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
           dvm_pin(vm,root);
         }
         if (sp < 64) {
+          pending_focus[sp] = false;
           stack_view[sp] = true;
           stack[sp++] = view;
         }
@@ -13042,6 +13055,12 @@ static dvm_ref li_inflate_resource(struct dvm *vm, dvm_ref inflater,dvm_ref cont
       }
     } else if (type == 0x0103 && sp) {
       --sp;
+      if (pending_focus[sp] && stack[sp]) {
+        struct dvm_method *focus = dvm_find_method(vm, dvm_object_class(vm, stack[sp]),
+                                                   "restoreDefaultFocus", "()Z");
+        union dvm_value ignored = { 0 };
+        if (focus && !dvm_call(vm, focus, stack[sp], NULL, 0, &ignored)) break;
+      }
       /* The inflater tells a view it is done once its children are in
        * (rInflate(): parent.onFinishInflate()). */
       if (stack_view[sp] && stack[sp]) {

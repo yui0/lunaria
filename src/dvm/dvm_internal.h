@@ -51,6 +51,7 @@ struct dvm_method {
   uint32_t access;
   struct dex_file *dex;
   struct dex_code code;
+  uint32_t dex_method_index, dex_code_offset;
   bool has_code;
   dvm_builtin_fn builtin;
   bool placeholder_warned; /* a no-op scaffold has reported itself once */

@@ -820,6 +820,9 @@ static const struct rt_method rt_accessible_object[]= {
   SM("setAccessible","([Ljava/lang/reflect/AccessibleObject;Z)V",ao_setAccessibleAll),
   M("isAccessible","()Z",ao_isAccessible),M_END
 };
+static const struct rt_field rt_executable_fields[] = {
+  { "artMethod", "J" }, F_END
+};
 static const struct rt_method rt_executable[]= {
   {"getName","()Ljava/lang/String;",NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT},
   M("isSynthetic","()Z",rf_isSynthetic), M("isVarArgs","()Z",rf_isVarArgs), M_END
@@ -2205,7 +2208,12 @@ static bool dexfile_open(struct dvm *vm, dvm_ref self, const char *guest_path)
         if (!loaded) break;
       }
     } else {
-      loaded = dvm_add_dex(vm, hp);
+      unsigned char *bytes = NULL;
+      size_t length = 0;
+      int runtime = arm_exec_runtime_read_file(guest_path, &bytes, &length);
+      if (runtime > 0) loaded = dvm_add_dex_memory(vm, bytes, length, guest_path);
+      else if (!runtime) loaded = dvm_add_dex(vm, hp);
+      free(bytes);
     }
   }
   if (!loaded) {

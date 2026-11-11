@@ -827,6 +827,23 @@ jobject dvm_jni_application_info(JNIEnv *env, jstring name, jint flags);
  * platform (see dvm_class_exists()).  What FindClass answers from. */
 bool dvm_jni_class_exists(const char *class_name);
 
+/* Runtime method metadata used by the guest's ART reflection view. */
+struct dvm_jni_method_metadata {
+  uint32_t declaring_class, access, dex_method_index, method_index;
+  const char *declaring_name;
+  const unsigned char *dex_data;
+  size_t dex_size;
+  uint32_t code_offset;
+};
+bool dvm_jni_describe_method(JNIEnv *env, jmethodID method,
+                              struct dvm_jni_method_metadata *out);
+/* Invoke an ART quick bridge using VM references, not JNI handles. */
+bool dvm_jni_quick_invoke(JNIEnv *env, jmethodID method, dvm_ref self,
+                           const union dvm_value *args, int nargs,
+                           union dvm_value *out);
+
+
+
 /* True when the APK's dex carries bytecode for this method (`sig` may be NULL
  * to match on the name alone).  A canned answer in the stub layer must never
  * take precedence over Java the APK actually ships: the app's own

@@ -2012,6 +2012,11 @@ enum SvcId : uint32_t {
   SVC_GL_EXT_MultiDrawArraysIndirectEXT,
   SVC_GL_EXT_MultiDrawElementsIndirectEXT,
   SVC_GL_EXT_TextureBarrierNV,
+  SVC_GL_EXT_WindowRectanglesEXT,
+  SVC_EGL_RELEASE_THREAD,
+  SVC_EGL_GET_CONFIGS,
+  SVC_ART_QUICK_INVOKE,
+  SVC_PROCESS_SEND_SIGNAL,
   SVC_TRAMP_TOTAL,
 };
 
