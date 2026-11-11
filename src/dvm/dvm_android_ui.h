@@ -9987,6 +9987,19 @@ static bool act_isTaskRoot(struct dvm *vm, dvm_ref self, const union dvm_value *
   RETI(act_index(self) == 0);
 }
 
+/* Android numbers tasks from 1; 0 is never a live task.  Task trackers
+ * (Repro, Firebase) take it as "no such task".  Every activity of this
+ * process runs in the one task the launcher created. */
+static bool act_getTaskId(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  RETI(1);
+}
+
 
 static bool fm_find(struct dvm *vm, dvm_ref self,
                     const union dvm_value *args, int nargs,
@@ -10384,6 +10397,7 @@ static const struct rt_method rt_activity[] = {
   M("setTitle", "(Ljava/lang/CharSequence;)V", act_setTitle),
   M("getTitle", "()Ljava/lang/CharSequence;", act_getTitle),
   M("isTaskRoot", "()Z", act_isTaskRoot),
+  M("getTaskId", "()I", act_getTaskId),
   M("moveTaskToBack", "(Z)Z", act_move_task_back),
   M("getActionBar", "()Landroid/app/ActionBar;", act_get_action_bar),
   M("onBackPressed", "()V", act_back_pressed),

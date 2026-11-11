@@ -1051,6 +1051,8 @@ int arm64_exec_glfw_should_close(void);
 
 /* Dump recent SVC ring for diagnostics. */
 void arm64_exec_svc_ring_dump(void);
+/* Print the calling guest thread's lr and frame-pointer chain on one line, tagged. */
+void arm_exec_log_guest_chain(const char *tag);
 /* Presents the guest itself drove through the EGL bridge.  The pump loop
  * watches this to notice that the guest has stopped producing frames. */
 uint64_t arm_exec_guest_swap_count(void);

@@ -11,10 +11,13 @@
  * * Format: https://source.android.com/docs/security/features/apksigning/v2
  * *         https://source.android.com/docs/security/features/apksigning/v3
  */
+#include <openssl/pkcs7.h>
 #include <openssl/x509.h>
+#include <zlib.h>
 #include "dvm/dvm.h"
 #include "lunaria_os.h"
 #include <limits.h>
+#include <strings.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -256,6 +259,125 @@ int dvm_apk_signers_read(const char *path, unsigned sdk,
   }
 done:
   free(value);
+  free(tail);
+  luna_fd_close(fd);
+  return result;
+}
+
+static unsigned le16(const unsigned char *p)
+{
+  return (unsigned)p[0] | (unsigned)p[1] << 8;
+}
+
+/* A META-INF signature block: META-INF/<name>.RSA, .DSA or .EC, directly in
+ * META-INF (the JAR signature file's PKCS#7 envelope). */
+static int v1_block_name(const unsigned char *name, size_t n)
+{
+  static const char prefix[] = "META-INF/";
+  size_t pl = sizeof prefix - 1;
+  if (n <= pl + 3 || memcmp(name, prefix, pl)) return 0;
+  for (size_t i = pl; i < n; ++i)
+    if (name[i] == '/') return 0;
+  const unsigned char *ext = memchr(name + pl, '.', n - pl);
+  if (!ext) return 0;
+  size_t el = (size_t)(name + n - ext);
+  static const char *const exts[] = { ".RSA", ".DSA", ".EC" };
+  for (size_t i = 0; i < sizeof exts / sizeof exts[0]; ++i)
+    if (el == strlen(exts[i]) && !strncasecmp((const char *)ext, exts[i], el))
+      return 1;
+  return 0;
+}
+
+STACK_OF(X509) *dvm_apk_v1_signers_read(const char *path)
+{
+  if (!path || !*path) return NULL;
+  int fd = luna_file_open(path, O_RDONLY | LUNA_FILE_CLOEXEC, 0);
+  if (fd < 0) return NULL;
+  unsigned char *tail = NULL, *dir = NULL, *raw = NULL, *blob = NULL;
+  STACK_OF(X509) *result = NULL;
+  luna_file_info info;
+  if (luna_file_fd_info(fd, &info) || info.size < 22) goto done;
+  size_t n = info.size < 65557 ? (size_t)info.size : 65557;
+  tail = malloc(n);
+  if (!tail || !read_at(fd, tail, n, (uint64_t)info.size - n)) goto done;
+  size_t eocd;
+  for (eocd = n - 22; ; --eocd) {
+    if (le32(tail + eocd) == 0x06054b50u &&
+        eocd + 22u + le16(tail + eocd + 20) == n)
+      break;
+    if (!eocd) goto done;
+  }
+  const unsigned char *end = tail + eocd;
+  uint64_t cd = le32(end + 16), cd_size = le32(end + 12);
+  unsigned entries = le16(end + 10);
+  if (cd_size > 64u * 1024 * 1024 || cd + cd_size > (uint64_t)info.size) goto done;
+  dir = malloc(cd_size ? (size_t)cd_size : 1);
+  if (!dir || !read_at(fd, dir, (size_t)cd_size, cd)) goto done;
+
+  size_t pos = 0;
+  for (unsigned i = 0; i < entries && !result; ++i) {
+    if (cd_size - pos < 46 || le32(dir + pos) != 0x02014b50u) break;
+    const unsigned char *h = dir + pos;
+    unsigned method = le16(h + 10);
+    uint32_t csize = le32(h + 20), usize = le32(h + 24);
+    unsigned nlen = le16(h + 28), xlen = le16(h + 30), clen = le16(h + 32);
+    uint32_t local = le32(h + 42);
+    if (cd_size - pos - 46 < (uint64_t)nlen + xlen + clen) break;
+    int wanted = v1_block_name(h + 46, nlen);
+    pos += 46u + nlen + xlen + clen;
+    /* A signature block is a few KiB; anything larger is not one. */
+    if (!wanted || usize == 0 || usize > 1024 * 1024 || csize > 1024 * 1024 ||
+        (method != 0 && method != 8))
+      continue;
+    unsigned char lh[30];
+    if (!read_at(fd, lh, sizeof lh, local) || le32(lh) != 0x04034b50u) continue;
+    uint64_t data = (uint64_t)local + 30u + le16(lh + 26) + le16(lh + 28);
+    raw = malloc(csize ? csize : 1);
+    if (!raw || !read_at(fd, raw, csize, data)) goto done;
+    const unsigned char *der = raw;
+    size_t der_len = csize;
+    if (method == 8) {
+      blob = malloc(usize);
+      if (!blob) goto done;
+      z_stream zs;
+      memset(&zs, 0, sizeof zs);
+      if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) goto done;
+      zs.next_in = raw;
+      zs.avail_in = csize;
+      zs.next_out = blob;
+      zs.avail_out = usize;
+      int rc = inflate(&zs, Z_FINISH);
+      size_t got = zs.total_out;
+      inflateEnd(&zs);
+      if (rc != Z_STREAM_END) {
+        free(blob);
+        blob = NULL;
+        free(raw);
+        raw = NULL;
+        continue;
+      }
+      der = blob;
+      der_len = got;
+    }
+    PKCS7 *p7 = d2i_PKCS7(NULL, &der, (long)der_len);
+    if (p7) {
+      STACK_OF(X509) *signers = PKCS7_get0_signers(p7, NULL, 0);
+      /* get0_signers allocates the stack but not the certificates. */
+      for (int k = 0; signers && k < sk_X509_num(signers); ++k)
+        X509_up_ref(sk_X509_value(signers, k));
+      if (signers && sk_X509_num(signers) > 0) result = signers;
+      else sk_X509_pop_free(signers, X509_free);
+      PKCS7_free(p7);
+    }
+    free(blob);
+    blob = NULL;
+    free(raw);
+    raw = NULL;
+  }
+done:
+  free(blob);
+  free(raw);
+  free(dir);
   free(tail);
   luna_fd_close(fd);
   return result;

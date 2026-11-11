@@ -9066,7 +9066,7 @@ static void a64_fill_signal_frame(ArmExecCtx &ctx, int sig, uint32_t target_tid,
   }
   {
     static int n = 0;
-    if (n++ < 16)
+    if (n++ < 16 || lunaria_env("LUNARIA_TRACE_SIG"))
       fprintf(stderr, "[sigframe] tid=%u sig=%d si=0x%llx uc=0x%llx "
                       "sp=0x%llx pc=0x%llx got=%d\n",
               target_tid, sig,
@@ -11858,6 +11858,15 @@ static inline CbWaitSlot *cb_wait_slot(void)
 #define g_cb_lock_wait             (cb_wait_slot()->lock)
 #define g_cb_resume_result_pending (cb_wait_slot()->resume_pending)
 #define g_cb_resume_result         (cb_wait_slot()->resume_result)
+/* Index into g_main_signal_frames of the handler that interrupted a callback
+ * wait which could not be suspended (a pthread_cond_wait or mutex park), or -1.
+ * The wait's result must reach the interrupted code through that frame's saved
+ * x0, not the live x0 the handler was entered with. */
+static thread_local int g_cb_signal_deferred = -1;
+/* sigsuspend() on a guest thread driven directly through JNI (UnityMain): the
+ * mask it replaced, restored when the handler that ends the wait returns. */
+static thread_local bool     g_dvm_sigsuspend_waiting = false;
+static thread_local uint64_t g_dvm_sigsuspend_old_mask = 0;
 static bool cb_lock_wait_try_grant(ArmExecCtx &ctx);
 static void cb_lock_wait_progress(ArmExecCtx &ctx, int depth);
 static void cb_lock_wait_reset(void);
@@ -12844,6 +12853,7 @@ static EGLSurface egl_host_surf(uint32_t handle) {
   return egl_resolve_guest_surface(handle);
 }
 
+static const char *egl_diag_host_role(void);
 static void egl_note_bound(uint32_t handle, EGLSurface surf, EGLSurface read) {
   if (handle != g_egl_bound_handle && lunaria_env("LUNARIA_TRACE_EGL")) {
     static int n = 0;
@@ -12920,8 +12930,20 @@ static void egl_sync_current_context(uint32_t tid) {
   if (g_egl_bound_handle == want && g_egl_bound_surf == want_s &&
       g_egl_bound_read_surf == want_read)
     return;
-  if (eglMakeCurrent(g_egl_dpy, want_s, want_read, ectx))
+  if (eglMakeCurrent(g_egl_dpy, want_s, want_read, ectx)) {
     egl_note_bound(want, want_s, want_read);
+  } else {
+    /* The context is current on another host thread (EGL_BAD_ACCESS): the
+     * guest thread is running somewhere other than the thread that owns GL,
+     * and every GL call it makes will find no context. */
+    static std::atomic<int> failures{0};
+    const EGLint err = eglGetError();
+    if (failures.fetch_add(1) < 16)
+      fprintf(stderr, "[egl] cannot bind ctx=0x%x for guest tid=%u on host "
+                      "thread %lu role=%s (err=0x%x, host_ctx=%p)\n",
+              want, tid, (unsigned long)pthread_self(), egl_diag_host_role(),
+              (unsigned)err, (void *)eglGetCurrentContext());
+  }
 }
 
 /* Bind EGL for a host->guest entry (JNI callback, etc.). Prefer the calling
@@ -15971,6 +15993,28 @@ static void gl_draw_census(const char *what, GLenum mode, GLsizei count) {
                   "mode=0x%x count=%d vp=%d,%d,%dx%d tex0=%d tid=%u\n",
           (unsigned long long)g_guest_egl_swap_count, what, fbo, att_tex, aw, ah,
           prog, mode, (int)count, vp[0], vp[1], vp[2], vp[3], tex0, g_current_tid);
+  /* LUNARIA_DRAW_PIXELS=1: what is in the bound framebuffer *before* this
+   * draw (so consecutive lines give each draw's contribution).  Answers "is
+   * the frame black because nothing drew, or because what drew is black". */
+  static const bool px_stats = lunaria_env("LUNARIA_DRAW_PIXELS") != nullptr;
+  if (px_stats && pfn_glReadPixels && vp[2] > 0 && vp[3] > 0 && vp[2] * vp[3] <= 4096 * 4096) {
+    std::vector<uint8_t> buf((size_t)vp[2] * (size_t)vp[3] * 4);
+    pfn_glReadPixels(vp[0], vp[1], vp[2], vp[3], 0x1908 /* RGBA */, 0x1401 /* UBYTE */,
+                     buf.data());
+    uint64_t lit = 0, opaque = 0, sum = 0;
+    for (size_t i = 0; i + 3 < buf.size(); i += 4) {
+      const unsigned rgb = buf[i] + buf[i + 1] + buf[i + 2];
+      if (rgb) ++lit;
+      if (buf[i + 3]) ++opaque;
+      sum += rgb;
+    }
+    GLint blend = pfn_glIsEnabled ? pfn_glIsEnabled(0x0BE2) : 0;
+    GLint cm[4] = {};
+    pfn_glGetIntegerv(0x0C23, cm);
+    fprintf(stderr, "[gl]   pixels-before-draw: lit=%llu alpha_nz=%llu rgbsum=%llu blend=%d cmask=%d%d%d%d\n",
+            (unsigned long long)lit, (unsigned long long)opaque, (unsigned long long)sum,
+            blend, cm[0], cm[1], cm[2], cm[3]);
+  }
 }
 
 // Log draws that hit the traced framebuffer inside the traced present window.
@@ -18442,9 +18486,11 @@ static int egl_host_make_current(uint32_t draw_h, uint32_t read_h,
     static int n = 0;
     if (n++ < 32 || lunaria_env("LUNARIA_TRACE_EGL"))
       fprintf(stderr, "[egl] makeCurrent ctx=0x%x(%p) draw=%s ok=%d "
-                      "err=0x%x tid=%u lr=0x%08x\n",
+                      "err=0x%x tid=%u lr=0x%08x host=%lu role=%s depth=%d\n",
               ctx_h, ectx, draw == EGL_NO_SURFACE ? "NO_SURFACE" : "window",
-              (int)ok, (unsigned)eglGetError(), g_current_tid, lr);
+              (int)ok, (unsigned)eglGetError(), g_current_tid, lr,
+              (unsigned long)pthread_self(), egl_diag_host_role(),
+              g_slice_depth);
   }
   return (int)ok;
 }
@@ -18611,6 +18657,26 @@ static uint32_t egl_host_create_window_surface(uint32_t config_handle,
     g_egl_surf = eglCreateWindowSurface(g_egl_dpy, cfg,
                                         g_egl_offscreen_win,
                                         surface_attrs.data());
+    if (g_egl_surf == EGL_NO_SURFACE && g_glfw) {
+      /* The bootstrap surface on this X window was only just destroyed.
+       * NVIDIA's EGL allows one surface per native window and releases it
+       * lazily, so a second eglCreateWindowSurface on the same window fails
+       * with EGL_BAD_ALLOC (Mesa tolerates it).  The window is unmapped and
+       * private to the guest, so move to a fresh one.  The old one is left
+       * for the X server to reap at exit: destroying it while the driver
+       * may still be tearing the old surface down is not safe. */
+      EGLNativeWindowType fresh = (EGLNativeWindowType)
+        luna_os_offscreen_window(g_glfw, g_fb_w, g_fb_h);
+      if (fresh) {
+        g_egl_surf = eglCreateWindowSurface(g_egl_dpy, cfg, fresh,
+                                            surface_attrs.data());
+        if (g_egl_surf != EGL_NO_SURFACE) {
+          g_egl_offscreen_win = fresh;
+          fprintf(stderr, "[arm_exec] guest window surface moved to a "
+                          "fresh unshown window\n");
+        }
+      }
+    }
     if (g_egl_surf == EGL_NO_SURFACE) {
       const EGLint error = eglGetError();
       fprintf(stderr, "[arm_exec] guest eglCreateWindowSurface on "
@@ -19036,6 +19102,14 @@ static thread_local bool g_a64_is_worker = false;
  * a worker" is not the same test: every dvm bytecode thread also passes it,
  * and each one that ran a slice would build an engine of its own. */
 static thread_local bool g_a64_is_pump = false;
+/* Set once the frame pump's host thread exists.  Before that, GL-owning
+ * guest threads have nowhere to be handed to. */
+static std::atomic<bool> g_a64_pump_started{false};
+/* Which kind of host thread is calling, for EGL ownership diagnostics: a
+ * context bound on one host thread cannot be bound on another. */
+static const char *egl_diag_host_role(void) {
+  return g_a64_is_pump ? "pump" : g_a64_is_worker ? "worker" : "other";
+}
 /* Set by the loader before the engine runs: UE (and similar) keep the game on
  * guest pthread workers; the host pump only calls schedule_threads(). */
 static bool g_a64_worker_engine = false;
@@ -33750,6 +33824,19 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                           "expected=0x%08" PRIx64 " word=0x%08x tid=%u lr=0x%08x\n",
                   (unsigned long long)fu_uaddr, r2,
                   ctx.mem.read32(fu_uaddr), g_current_tid, lr);
+        if (lunaria_env("LUNARIA_TRACE_MAINWAIT")) {
+          /* Each distinct futex a host-driven (JNI) guest thread waits on, once. */
+          static std::set<GuestVA> seen;
+          static int shown = 0;
+          if (shown < 300 && seen.insert(fu_uaddr).second) {
+            ++shown;
+            fprintf(stderr, "[mainwait] tid=%u futex=0x%llx expected=0x%08" PRIx64
+                            " word=0x%08x timed=%d lr=0x%08x\n", g_current_tid,
+                    (unsigned long long)fu_uaddr, r2, ctx.mem.read32(fu_uaddr),
+                    (int)(timeout_va != 0), lr);
+            arm_exec_log_guest_chain("mainwait");
+          }
+        }
         g_futex_wait_addrs[fu_uaddr]++;
         g_cb_lock_wait.kind = CbLockWait::Futex;
         g_cb_lock_wait.from_slice = g_slice_depth > 0;
@@ -39592,6 +39679,44 @@ aaudio_write_retry:
         ret32(~0u);
         break;
       }
+    }
+    /* A guest thread driven directly through JNI has neither a scheduler slot
+     * nor the main thread's id, and used to fall through to the immediate
+     * EINTR below.  Boehm's suspend handler loops "sigsuspend until the
+     * restart signal was seen", so that thread spun at millions of calls a
+     * second, held the execution lock most of the time and starved the
+     * collector that has to send the restart: stop-the-world never ended.
+     * Sleep, with the lock dropped, until a signal the temporary mask lets
+     * through is pending; the SVC return then enters its handler
+     * (Arm64Callbacks::take_main_signal). */
+    if (ctx.is_arm64 && !g_a64_is_worker && g_current_tid != 0 &&
+        g_current_tid < 4096 && g_dvm_native_stacks[g_current_tid].attached) {
+      const uint32_t self = g_current_tid;
+      uint64_t mask = guest_sigset_load(ctx, argp(0), sigset_is_wide(ctx, svc_no));
+      mask &= ~(1ull << (9 - 1));
+      mask &= ~(1ull << (19 - 1));
+      const uint64_t old_mask = signal_mask_load(self);
+      signal_mask_store(self, mask);
+      bool got = false;
+      while (!g_guest_quit.load(std::memory_order_relaxed) &&
+             !g_process_stopping.load(std::memory_order_relaxed)) {
+        if (g_dvm_pending_signals[self].load(std::memory_order_acquire) & ~mask) {
+          got = true;
+          break;
+        }
+        ArmLockDropped unlocked;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+      g_current_tid = self;
+      if (got) {
+        g_dvm_sigsuspend_waiting = true;
+        g_dvm_sigsuspend_old_mask = old_mask;
+      } else {
+        signal_mask_store(self, old_mask);
+      }
+      if (uint32_t eva = errno_va(ctx, self)) ctx.mem.write32(eva, EINTR);
+      ret32(~0u);
+      break;
     }
     if (ss_log++ < 5)
       fprintf(stderr, "[sigsuspend] r0=0x%08" PRIx64 " tid=%u -> -1/EINTR\n", r0, g_current_tid);
@@ -47735,6 +47860,26 @@ fputws_done:
     if (slot) {
       SlBufferQueue &q = g_sl_queues[slot];
       if (!q.itf) q.itf = self;
+      /* LUNARIA_TRACE_SLENQ: size, timing and zero content of every enqueued
+       * buffer, to tell "the guest enqueued silence" from "we read it early". */
+      if (lunaria_env("LUNARIA_TRACE_SLENQ")) {
+        static uint64_t last_ns = 0, n = 0;
+        const uint64_t nowns = host_mono_ns();
+        const uint8_t *d = ctx.mem.ptr(argp(1));
+        const unsigned bytes = (unsigned)arg32(2);
+        unsigned zf = 0, runs = 0, run = 0;
+        const unsigned fr = bytes / 4;
+        for (unsigned i = 0; d && i < fr; ++i) {
+          const bool z = !d[i * 4] && !d[i * 4 + 1] && !d[i * 4 + 2] && !d[i * 4 + 3];
+          if (z) { ++zf; ++run; } else { if (run >= 8) ++runs; run = 0; }
+        }
+        if (run >= 8) ++runs;
+        if (n++ < 400 || n % 200 == 0)
+          fprintf(stderr, "[slenq] #%llu +%.1fms buf=%#x bytes=%u zero_frames=%u zero_runs>=8:%u count=%u\n",
+                  (unsigned long long)n, last_ns ? (double)(nowns - last_ns) / 1e6 : 0.0,
+                  (unsigned)argp(1), bytes, zf, runs, q.pcm.count);
+        last_ns = nowns;
+      }
       /* OpenSL owns the pointer until its consumer has copied every
        * frame. A full host ring must leave the source queue intact. */
       ret32((uint32_t)luna_pcm_enqueue(&q.pcm, ctx.mem.ptr(argp(1)),
@@ -50510,9 +50655,9 @@ fputws_done:
     uint32_t target_tid = r0;
     int      sig        = (int)r1;
     static int pkill_log = 0;
-    if (pkill_log++ < 20)
-      fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x\n",
-              target_tid, sig, lr);
+    if (pkill_log++ < 20 || lunaria_env("LUNARIA_TRACE_SIG"))
+      fprintf(stderr, "[pthread_kill] target=0x%08x sig=%d lr=0x%08x sender=%u\n",
+              target_tid, sig, lr, g_current_tid);
 
     /* A pthread-directed signal belongs to the target's architectural
      * context.  Calling its handler here, on the sender's SVC stack, is a
@@ -50874,6 +51019,18 @@ fputws_done:
         futex_wait_addr_remove(fu_uaddr);
       } else if (ctx_innermost_is_cb()) {
         /* See the raw svc#0 path: a callback parks in its own record. */
+        if (lunaria_env("LUNARIA_TRACE_MAINWAIT")) {
+          static std::set<GuestVA> seen;
+          static int shown = 0;
+          if (shown < 300 && seen.insert(fu_uaddr).second) {
+            ++shown;
+            fprintf(stderr, "[mainwait] tid=%u futex=0x%llx expected=0x%08" PRIx64
+                            " word=0x%08x timed=%d lr=0x%08x (libc path)\n", g_current_tid,
+                    (unsigned long long)fu_uaddr, r3, ctx.mem.read32(fu_uaddr),
+                    (int)(timeout_va != 0), lr);
+            arm_exec_log_guest_chain("mainwait");
+          }
+        }
         g_futex_wait_addrs[fu_uaddr]++;
         g_cb_lock_wait.kind = CbLockWait::Futex;
         g_cb_lock_wait.from_slice = g_slice_depth > 0;
@@ -61918,24 +62075,93 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
     if (wanted > 256u) wanted = 256u;
     int32_t mix[256 * 2] {};
     int16_t pcm[256 * 2];
-    unsigned produced = luna_at_mix(mix, wanted, rate, channels);
+    /* LUNARIA_AUDIO_SKIP=aaudio,opensl,at: leave a source out of the mix (it
+     * still advances, so the guest keeps running) to hear or measure each one. */
+    static const char *skip_env = lunaria_env("LUNARIA_AUDIO_SKIP");
+    const bool skip_at = skip_env && strstr(skip_env, "at");
+    const bool skip_sl = skip_env && strstr(skip_env, "opensl");
+    const bool skip_aa = skip_env && strstr(skip_env, "aaudio");
+    unsigned produced = luna_at_mix(skip_at ? nullptr : mix, wanted, rate, channels);
+    unsigned sl_short = ~0u; /* fewest frames any playing OpenSL queue could supply */
     for (auto &kv : g_sl_queues) {
       SlBufferQueue &q = kv.second;
       if (q.play_state != 3u) continue;
       luna_pcm_mix(&q.pcm, nullptr, 0, rate, channels);
       luna_pcm_queue preview = q.pcm;
-      unsigned n = luna_pcm_mix(&preview, mix, wanted, rate, channels);
+      unsigned n = luna_pcm_mix(&preview, skip_sl ? nullptr : mix, wanted, rate, channels);
       if (n > produced) produced = n;
+      if (n < sl_short) sl_short = n;
     }
+    /* The chunk's length is the longest source.  A playing OpenSL queue that
+     * runs out partway through it contributes zeros for the rest of the
+     * chunk, and those zeros were being written to the card as if they were
+     * the stream: CRI keeps a single buffer queued and refills it from the
+     * callback, so every buffer end cut a 160-192 frame hole into the music
+     * (the "static").  End the chunk where the queue ends; the next pass
+     * delivers the callback and continues with the refilled buffer. */
+
     for(auto &kv:g_aaudio_streams) {
       auto &s=kv.second;
       s.update_state(now);
       if(!s.playing())continue;
-      unsigned n=s.mix(mix,wanted,rate,channels,false);
+      unsigned n=s.mix(skip_aa ? nullptr : mix,wanted,rate,channels,false);
       if(n>produced)produced=n;
       if(s.state==luna_aaudio::started && !n && s.frames_written && now>s.presentation_end_ns && !s.underflow) {
         ++s.xruns;
         s.underflow=true;
+      }
+    }
+    /* (see above) the chunk ends where a playing OpenSL queue ends, whatever
+     * the other sources could still supply. */
+    if (sl_short > 0 && sl_short < produced) produced = sl_short;
+    /* LUNARIA_TRACE_SLGAP: frames mixed while a playing OpenSL queue is empty
+     * (its contribution is silence the other sources then paper over). */
+    if (lunaria_env("LUNARIA_TRACE_SLGAP") && produced) {
+      static uint64_t gap_frames = 0, gap_nonotify = 0, gap_notified = 0, gap_waiting = 0,
+                      total = 0, last = 0, events = 0;
+      total += produced;
+      for (auto &kv : g_sl_queues) {
+        SlBufferQueue &q = kv.second;
+        if (q.play_state != 3u || q.pcm.count) continue;
+        gap_frames += produced;
+        ++events;
+        if (!notifications) gap_nonotify += produced;
+        else if (q.notified == q.pcm.retired) gap_waiting += produced; /* callback delivered, no enqueue yet */
+        else gap_notified += produced;                                  /* callback still owed */
+      }
+      const uint64_t tn = host_mono_ns();
+      if (tn - last >= 5'000'000'000ull) {
+        if (last)
+          fprintf(stderr, "[slgap] mixed %llu frames, %llu with an empty SL queue (%.1f%%), %llu events: "
+                          "in-guest-callback(no notify) %llu, cb delivered/awaiting enqueue %llu, cb still owed %llu\n",
+                  (unsigned long long)total, (unsigned long long)gap_frames,
+                  total ? 100.0 * (double)gap_frames / (double)total : 0.0, (unsigned long long)events,
+                  (unsigned long long)gap_nonotify, (unsigned long long)gap_waiting,
+                  (unsigned long long)gap_notified);
+        last = tn;
+        total = gap_frames = gap_nonotify = gap_notified = gap_waiting = events = 0;
+      }
+    }
+    /* A playing OpenSL queue that has run dry is not silence, it is a refill
+     * in flight: its owner (CRI) is re-enqueueing its one buffer from the
+     * callback this very pass owes it, or is inside it.  The mix timeline is
+     * the max over sources, so mixing on here spliced ~176 frames of zeros
+     * into the stream at every refill (an audible tick ~40 times a second)
+     * whenever another source — an idle AAudio stream is enough — kept the
+     * pass non-empty.  Hold the pass while the card still has a cushion; the
+     * next pass delivers the callback.  The grace bound keeps a player that
+     * stops enqueueing from freezing every other source. */
+    if (produced) {
+      static uint64_t starved_since = 0;
+      bool sl_empty = false;
+      for (auto &kv : g_sl_queues)
+        if (kv.second.play_state == 3u && !kv.second.pcm.count) sl_empty = true;
+      if (!sl_empty) {
+        starved_since = 0;
+      } else if (queued >= rate / 33u) {
+        const uint64_t tn = host_mono_ns();
+        if (!starved_since) starved_since = tn;
+        if (tn - starved_since < 60'000'000ull) break;
       }
     }
     if (!produced) {
@@ -61945,6 +62171,39 @@ static void drive_opensles_callbacks(ArmExecCtx &ctx) {
     for (unsigned i = 0; i < produced * channels; ++i) {
       int32_t v = mix[i];
       pcm[i] = (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+    }
+    /* LUNARIA_AUDIO_DUMP=<file>: the final 48 kHz s16 stereo stream, raw, and
+     * every 5 s one line saying how much of it clipped and who was playing. */
+    {
+      static FILE *dump = [] {
+        const char *p = lunaria_env("LUNARIA_AUDIO_DUMP");
+        return (p && *p) ? fopen(p, "wb") : nullptr;
+      }();
+      if (dump) {
+        static uint64_t frames = 0, clipped = 0, last = 0, peak = 0;
+        for (unsigned i = 0; i < produced * channels; ++i) {
+          const int32_t v = mix[i];
+          if (v < -32768 || v > 32767) ++clipped;
+          const uint64_t a = (uint64_t)(v < 0 ? -(int64_t)v : v);
+          if (a > peak) peak = a;
+        }
+        frames += produced;
+        fwrite(pcm, sizeof(int16_t) * channels, produced, dump);
+        const uint64_t tn = host_mono_ns();
+        if (tn - last >= 5'000'000'000ull) {
+          if (last) {
+            unsigned aa = 0;
+            for (auto &kv : g_aaudio_streams) if (kv.second.playing()) ++aa;
+            fprintf(stderr, "[audio-dump] %llu frames, %llu clipped samples, peak %llu, "
+                            "aaudio playing=%u opensl players=%zu\n",
+                    (unsigned long long)frames, (unsigned long long)clipped,
+                    (unsigned long long)peak, aa, g_sl_queues.size());
+          }
+          last = tn;
+          clipped = peak = 0;
+        }
+        fflush(dump);
+      }
     }
     int accepted = sink ? luna_os_audio_write(pcm, produced) : (int)produced;
     if (accepted <= 0) {
@@ -66754,6 +67013,9 @@ public:
          * saved_sigmask does. */
         g_main_waiting_signal = false;
         frame.old_mask = g_main_sigsuspend_old_mask;
+      } else if (g_dvm_sigsuspend_waiting) {
+        g_dvm_sigsuspend_waiting = false;
+        frame.old_mask = g_dvm_sigsuspend_old_mask;
       }
       ++*depth;
       uint64_t blocked = cur_mask | sa.mask;
@@ -66774,6 +67036,17 @@ public:
     jit64->SetRegister(30, restorer);
     jit64->SetSP(frame_sp);
     jit64->SetPC(handler);
+    if (!t) {
+      const int frame_ix = (int)*depth - 1;
+      const bool parked = g_cb_depth && !g_cb_lock_wait.from_slice &&
+                          g_cb_lock_wait.kind != CbLockWait::Idle;
+      if (parked) {
+        if (g_cb_signal_deferred < 0 || g_cb_signal_deferred >= frame_ix)
+          g_cb_signal_deferred = frame_ix;
+      } else if (g_cb_signal_deferred >= frame_ix) {
+        g_cb_signal_deferred = -1; /* stale: that handler has returned */
+      }
+    }
     return true;
   }
 
@@ -68420,7 +68693,17 @@ a64_hooks_done:
      * guest ForceQuit). Pin the guest thread to the pump for good, rewind the PC
      * onto the svc instruction and stop the slice: the arguments are still in
      * x0-x7, so the pump re-issues exactly this call on the engine that owns GL. */
-    if (svc_touches_gl(svc_no) && g_a64_is_worker) {
+    /* "Not on the pump" is the test, not "on a worker": a nested scheduler on
+     * some other host thread (a Java thread waiting inside a JNI call) also
+     * runs ordinary guest threads.  A thread that has released its GL binding
+     * is ordinary again, and if its next eglMakeCurrent ran there the context
+     * would be bound to that host thread for good; the pump then fails every
+     * later bind with EGL_BAD_ACCESS and glCreateShader answers 0.  Depth 0 is
+     * a direct JNI call with no scheduler to resume it, so it stays put. */
+    if (svc_touches_gl(svc_no) &&
+        (g_a64_is_worker ||
+         (!g_a64_is_pump && g_slice_depth > 0 &&
+          g_a64_pump_started.load(std::memory_order_acquire)))) {
       gl_tid_mark(g_current_tid, svc_no);
       jit64->SetPC(jit64->GetPC() - 4u);
       jit64->HaltExecution();
@@ -68572,6 +68855,19 @@ a64_hooks_done:
       return f;
     }();
     if (!out || !jit64 || !ctx) return;
+    /* LUNARIA_GUEST_STACKS_TID=<tid>: sample only that guest thread. */
+    static const uint32_t only_tid = [] {
+      const char *e = lunaria_env("LUNARIA_GUEST_STACKS_TID");
+      return e ? (uint32_t)strtoul(e, nullptr, 0) : 0u;
+    }();
+    if (only_tid && g_current_tid != only_tid) return;
+    /* LUNARIA_GUEST_STACKS_AFTER_S=<s>: stay silent for the first s seconds. */
+    static const uint64_t after_ns = [] {
+      const char *e = lunaria_env("LUNARIA_GUEST_STACKS_AFTER_S");
+      return (e ? (uint64_t)strtoull(e, nullptr, 0) : 0ull) * 1'000'000'000ull;
+    }();
+    static const uint64_t t_start = host_mono_ns();
+    if (after_ns && host_mono_ns() - t_start < after_ns) return;
     char line[1024];
     int n = snprintf(line, sizeof line, "%u %llx %llx", g_current_tid,
                      (unsigned long long)jit64->GetPC(),
@@ -68602,8 +68898,14 @@ a64_hooks_done:
       static const bool sampling = lunaria_env("LUNARIA_GUEST_STACKS") != nullptr;
       if (sampling) {
         thread_local uint64_t since = 0;
+        /* LUNARIA_GUEST_STACKS_EVERY=<insns>: sample interval (default 1M). */
+        static const uint64_t every = [] {
+          const char *e = lunaria_env("LUNARIA_GUEST_STACKS_EVERY");
+          const uint64_t v = e ? strtoull(e, nullptr, 0) : 0;
+          return v ? v : 1'000'000ull;
+        }();
         since += t;
-        if (since >= 1'000'000ull) {
+        if (since >= every) {
           since = 0;
           stack_sample();
         }
@@ -71306,7 +71608,18 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
     if (waiting) __atomic_sub_fetch(&g_callback_waiters, 1u, __ATOMIC_RELEASE);
     if (lock_abandon) break;
     if (g_cb_resume_result_pending) {
-      j.SetRegister(0, g_cb_resume_result);
+      /* A handler entered while this wait was parked is still running: x0 is
+       * its argument (the signal number), and the wait's result belongs to the
+       * code the handler interrupted.  Boehm's suspend handler aborts with
+       * "Bad signal in suspend_handler" when it sees the result instead. */
+      if (g_cb_signal_deferred >= 0 &&
+          (int)g_main_signal_depth > g_cb_signal_deferred) {
+        const GuestVA uc = g_main_signal_frames[g_cb_signal_deferred].uc;
+        if (uc) ctx.mem.write64(uc + A64_UC_REGS, g_cb_resume_result);
+      } else {
+        j.SetRegister(0, g_cb_resume_result);
+      }
+      g_cb_signal_deferred = -1;
       g_cb_resume_result_pending = false;
     }
     /* Guest code runs without the ARM execution lock, here as in a thread slice.
@@ -74759,6 +75072,7 @@ extern "C" void arm64_exec_threads_run_engine(int on) {
 
 extern "C" void arm64_exec_run_pending_threads(void) {
   g_a64_is_pump = true;   /* this is the frame pump's host thread */
+  g_a64_pump_started.store(true, std::memory_order_release);
   // During bootstrap, workers need long slices to finish Unity's thread-pool setup.
   if (!g_ctx || !g_ctx->jit64) return;
   uint64_t slice = env_ticks("LUNARIA_THREAD_TICKS", UINT64_MAX);
@@ -74917,7 +75231,135 @@ static void a64_dump_guest_backtrace(const char *what, uint32_t tid, uint64_t fp
   }
 }
 
+extern "C" void arm_exec_log_guest_chain(const char *tag) {
+  if (!g_svc_jit64 || !g_ctx) {
+    fprintf(stderr, "[chain] %s (no guest context)\n", tag ? tag : "");
+    return;
+  }
+  char line[1400];
+  int n = snprintf(line, sizeof line, "[chain] %s tid=%u lr=%llx", tag ? tag : "",
+                   g_current_tid, (unsigned long long)g_svc_jit64->GetRegister(30));
+  uint64_t fp = g_svc_jit64->GetRegister(29);
+  for (int depth = 0; depth < 40 && fp && !(fp & 7u) && n < (int)sizeof line - 24; ++depth) {
+    const uint8_t *frame = g_ctx->mem.try_ptr((GuestVA)fp, 16);
+    if (!frame) break;
+    uint64_t next, ret;
+    std::memcpy(&next, frame, 8);
+    std::memcpy(&ret, frame + 8, 8);
+    if (!ret) break;
+    n += snprintf(line + n, sizeof line - (size_t)n, " %llx", (unsigned long long)ret);
+    if (next <= fp) break;
+    fp = next;
+  }
+  fprintf(stderr, "%s\n", line);
+  /* Return addresses without frame pointers: guest stack words that point
+   * into guest code.  Raw values; the reader filters them against a library. */
+  {
+    char sl[1800];
+    int m = snprintf(sl, sizeof sl, "[stackscan] %s", tag ? tag : "");
+    const uint64_t sp = g_svc_jit64->GetSP();
+    int found = 0;
+    for (uint64_t off = 0; off < 0x3000 && found < 120 && m < (int)sizeof sl - 20; off += 8) {
+      const uint8_t *w = g_ctx->mem.try_ptr((GuestVA)(sp + off), 8);
+      if (!w) break;
+      uint64_t v;
+      std::memcpy(&v, w, 8);
+      if (v >= 0x700010000000ull && v < 0x700020000000ull && !(v & 3u)) {
+        m += snprintf(sl + m, sizeof sl - (size_t)m, " %llx", (unsigned long long)v);
+        ++found;
+      }
+    }
+    fprintf(stderr, "%s\n", sl);
+  }
+}
+
+/* LUNARIA_PEEK="<va>:<off1>[:<off2>...]": read a guest pointer at <va>, add each
+ * offset and dereference (64-bit) until the last, then print the 32 bytes there as
+ * ints.  Used to read IL2CPP static fields at a stall (class ptr -> +0xb8 -> field). */
+static void peek_il2cpp_statics(void) {
+  const char *e = lunaria_env("LUNARIA_PEEK");
+  if (!e || !g_ctx) return;
+  char buf[256];
+  snprintf(buf, sizeof buf, "%s", e);
+  unsigned long long va = 0;
+  std::vector<unsigned long long> offs;
+  char *save = nullptr;
+  bool first = true;
+  for (char *tok = strtok_r(buf, ":", &save); tok; tok = strtok_r(nullptr, ":", &save)) {
+    const unsigned long long v = strtoull(tok, nullptr, 16);
+    if (first) { va = v; first = false; } else offs.push_back(v);
+  }
+  uint64_t cur = va;
+  for (size_t i = 0; i < offs.size(); ++i) {
+    const uint8_t *w = g_ctx->mem.try_ptr((GuestVA)cur, 8);
+    if (!w) { fprintf(stderr, "[peek] unreadable at %#llx\n", (unsigned long long)cur); return; }
+    uint64_t ptr;
+    std::memcpy(&ptr, w, 8);
+    fprintf(stderr, "[peek] *(%#llx) = %#llx\n", (unsigned long long)cur, (unsigned long long)ptr);
+    cur = ptr + offs[i];
+    if (i + 1 < offs.size()) continue;
+  }
+  const uint8_t *w = g_ctx->mem.try_ptr((GuestVA)cur, 64);
+  if (!w) { fprintf(stderr, "[peek] unreadable at %#llx\n", (unsigned long long)cur); return; }
+  int32_t iv[16];
+  std::memcpy(iv, w, 64);
+  fprintf(stderr, "[peek] at %#llx:", (unsigned long long)cur);
+  for (int i = 0; i < 16; ++i) fprintf(stderr, " +%x=%d", i * 4, iv[i]);
+  fprintf(stderr, "\n");
+}
+
+/* LUNARIA_FINDOBJ=<class-global-va>[:<nwords>]: find live IL2CPP objects of one
+ * class by scanning the process's readable-writable mappings for the class
+ * pointer (guest VAs are host VAs here).  `class-global-va` is the guest
+ * address of the pointer-to-slot that il2cpp code uses to name the class; each
+ * hit prints the object's first <nwords> 32-bit words (offset 0x10 is a
+ * compiler-generated coroutine's `<>1__state`).  Diagnostics only. */
+static void find_il2cpp_objects(void) {
+  const char *e = lunaria_env("LUNARIA_FINDOBJ");
+  if (!e || !g_ctx) return;
+  unsigned long long gva = 0;
+  unsigned nwords = 24;
+  if (sscanf(e, "%llx:%u", &gva, &nwords) < 1) return;
+  if (nwords > 64) nwords = 64;
+  const uint8_t *w = g_ctx->mem.try_ptr((GuestVA)gva, 8);
+  if (!w) { fprintf(stderr, "[findobj] global unreadable\n"); return; }
+  uint64_t slot;
+  std::memcpy(&slot, w, 8);
+  const uint8_t *w2 = g_ctx->mem.try_ptr((GuestVA)slot, 8);
+  if (!w2) { fprintf(stderr, "[findobj] slot %#llx unreadable\n", (unsigned long long)slot); return; }
+  uint64_t klass;
+  std::memcpy(&klass, w2, 8);
+  fprintf(stderr, "[findobj] class pointer %#llx\n", (unsigned long long)klass);
+  FILE *m = fopen("/proc/self/maps", "r");
+  if (!m) return;
+  char line[512];
+  int hits = 0;
+  while (fgets(line, sizeof line, m) && hits < 8) {
+    unsigned long long lo, hi;
+    char perms[8] = {};
+    if (sscanf(line, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+    if (perms[0] != 'r' || perms[1] != 'w' || perms[3] != 'p') continue;
+    if (strstr(line, "[stack]") || strstr(line, ".so")) continue;
+    for (unsigned long long a = lo; a + 8 <= hi && hits < 8; a += 8) {
+      uint64_t v;
+      std::memcpy(&v, (const void *)a, 8);
+      if (v != klass) continue;
+      fprintf(stderr, "[findobj] object %#llx:", a);
+      for (unsigned i = 0; i < nwords && a + 4 * (i + 1) <= hi; ++i) {
+        int32_t x;
+        std::memcpy(&x, (const void *)(a + 4 * i), 4);
+        fprintf(stderr, " %x", (unsigned)x);
+      }
+      fprintf(stderr, "\n");
+      ++hits;
+    }
+  }
+  fclose(m);
+}
+
 extern "C" void arm64_exec_svc_ring_dump(void) {
+  peek_il2cpp_statics();
+  find_il2cpp_objects();
   /* Thread-only dumps are useful when the global ring is dominated by a
    * hot allocator call site.  This changes diagnostics only; scheduling
    * and guest state are untouched. */
