@@ -39627,11 +39627,14 @@ static struct lm_codec *codec_of(struct dvm *vm, dvm_ref self)
   return codec ? codec->backend : NULL;
 }
 
-/* A ByteBuffer over a fresh byte[] of `n` bytes. */
+/* A ByteBuffer over a fresh byte[] of `n` bytes.  MediaCodec's buffers are
+ * direct on a device, and native players (CRI's movie decoder) fetch the
+ * address with GetDirectBufferAddress() to fill them: a heap buffer answers
+ * NULL there and the player writes through it. */
 static dvm_ref media_new_bytebuffer(struct dvm *vm, int32_t n)
 {
   union dvm_value arg = { .i = n }, outv = { 0 };
-  if (!bb_allocate(vm, 0, &arg, 1, &outv)) return 0;
+  if (!bb_allocateDirect(vm, 0, &arg, 1, &outv)) return 0;
   /* A MediaCodec buffer is in the platform's native order, not Java's default
    * big-endian: audio sinks check for LITTLE_ENDIAN before taking PCM. */
   (void)dvm_set_field(vm, outv.l, "little", "Z", (union dvm_value) {
