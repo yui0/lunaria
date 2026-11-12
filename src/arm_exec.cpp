@@ -75616,6 +75616,18 @@ extern "C" int  arm64_exec_fb_width(void)                {
 extern "C" int  arm64_exec_fb_height(void)               {
   return arm_exec_fb_height();
 }
+/* The size an app asked its window's buffers to be (ANativeWindow_
+ * setBuffersGeometry), else the window's own.  On a device the compositor
+ * stretches such a buffer to the window, and Vulkan reports it as the
+ * surface's currentExtent; Unity's fixed-DPI scaling relies on this. */
+extern "C" int  arm64_exec_buffer_width(void)            {
+  const int w = __atomic_load_n(&g_anw_buf_w, __ATOMIC_RELAXED);
+  return w > 0 ? w : arm_exec_fb_width();
+}
+extern "C" int  arm64_exec_buffer_height(void)           {
+  const int h = __atomic_load_n(&g_anw_buf_h, __ATOMIC_RELAXED);
+  return h > 0 ? h : arm_exec_fb_height();
+}
 extern "C" void arm64_exec_touch_push(int a, float x, float y) {
   arm_exec_touch_push(a,x,y);
 }

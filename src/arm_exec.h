@@ -1046,6 +1046,9 @@ int arm64_exec_screenshot(const char *path);
 /* Window dimensions. */
 int arm64_exec_fb_width(void);
 int arm64_exec_fb_height(void);
+/* Buffer size the app requested for its window; the window size if none. */
+int arm64_exec_buffer_width(void);
+int arm64_exec_buffer_height(void);
 
 /* Touch input. */
 void arm64_exec_touch_push(int action, float x, float y);
