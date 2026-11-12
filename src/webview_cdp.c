@@ -554,7 +554,8 @@ int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page)
            "{\"id\":%u,\"sessionId\":\"%s\","
            "\"method\":\"Fetch.enable\","
            "\"params\":{\"patterns\":[{\"resourceType\":\"Document\"},"
-           "{\"urlPattern\":\"https://" LUNARIA_CDP_BRIDGE_HOST "/*\"}]}}",
+           "{\"urlPattern\":\"https://" LUNARIA_CDP_BRIDGE_HOST "/*\"},"
+           "{\"urlPattern\":\"file:///android_asset/*\"}]}}",
            page->next_id++, page->session_id);
   return lunaria_cdp_send(page->transport, command);
 }
@@ -562,6 +563,7 @@ int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page)
 static char *cdp_base64(const unsigned char *in, size_t n)
 {
   static const char t[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  if (n > SIZE_MAX - 2 || (n + 2) / 3 > (SIZE_MAX - 1) / 4) return NULL;
   char *out = malloc((n + 2) / 3 * 4 + 1), *w = out;
   if (!out) return NULL;
   for (size_t i = 0; i < n; i += 3) {
@@ -575,35 +577,45 @@ static char *cdp_base64(const unsigned char *in, size_t n)
   return out;
 }
 
-int lunaria_cdp_page_fetch_fulfill(struct lunaria_cdp_page *page, const char *request_id,
+static int cdp_fetch_response(struct lunaria_cdp_page *page,const char *request_id,
+                               const char *mime,const void *body,size_t length,int cors)
+{
+  if (!page || !page->transport || !page->session_id[0] || !request_id ||
+      !mime || (!body && length)) return -1;
+  char *quoted=lunaria_cdp_json_quote(request_id);
+  char *content_type=lunaria_cdp_json_quote(mime);
+  char *encoded=cdp_base64(body,length);
+  if (!quoted || !content_type || !encoded) {
+    free(quoted); free(content_type); free(encoded); return -1;
+  }
+  const size_t qlen=strlen(quoted),mlen=strlen(content_type),elen=strlen(encoded);
+  if (qlen>SIZE_MAX-320 || mlen>SIZE_MAX-320-qlen || elen>SIZE_MAX-320-qlen-mlen) {
+    free(quoted); free(content_type); free(encoded); return -1;
+  }
+  const size_t size=qlen+mlen+elen+320;
+  char *params=malloc(size);
+  if (!params) { free(quoted); free(content_type); free(encoded); return -1; }
+  snprintf(params,size,
+           "{\"requestId\":%s,\"responseCode\":200,\"responseHeaders\":["
+           "{\"name\":\"Content-Type\",\"value\":%s},"
+           "{\"name\":\"Cache-Control\",\"value\":\"no-store\"}%s],\"body\":\"%s\"}",
+           quoted,content_type,cors ? ",{\"name\":\"Access-Control-Allow-Origin\",\"value\":\"*\"}" : "",encoded);
+  int status=lunaria_cdp_page_command(page,"Fetch.fulfillRequest",params,NULL);
+  free(params); free(quoted); free(content_type); free(encoded);
+  return status;
+}
+
+int lunaria_cdp_page_fetch_response(struct lunaria_cdp_page *page,const char *request_id,
+                                     const char *mime,const void *body,size_t length)
+{
+  return cdp_fetch_response(page,request_id,mime,body,length,0);
+}
+
+int lunaria_cdp_page_fetch_fulfill(struct lunaria_cdp_page *page,const char *request_id,
                                    const char *body)
 {
-  if (!page || !page->transport || !page->session_id[0] || !request_id || !body) return -1;
-  char *quoted = lunaria_cdp_json_quote(request_id), *encoded = cdp_base64((const unsigned char *)body, strlen(body));
-  if (!quoted || !encoded) {
-    free(quoted);
-    free(encoded);
-    return -1;
-  }
-  size_t n = strlen(quoted) + strlen(encoded) + strlen(page->session_id) + 320;
-  char *command = malloc(n);
-  if (!command) {
-    free(quoted);
-    free(encoded);
-    return -1;
-  }
-  snprintf(command, n,
-           "{\"id\":%u,\"sessionId\":\"%s\",\"method\":\"Fetch.fulfillRequest\","
-           "\"params\":{\"requestId\":%s,\"responseCode\":200,\"responseHeaders\":["
-           "{\"name\":\"Content-Type\",\"value\":\"application/json\"},"
-           "{\"name\":\"Access-Control-Allow-Origin\",\"value\":\"*\"},"
-           "{\"name\":\"Cache-Control\",\"value\":\"no-store\"}],\"body\":\"%s\"}}",
-           page->next_id++, page->session_id, quoted, encoded);
-  int status = lunaria_cdp_send(page->transport, command);
-  free(command);
-  free(quoted);
-  free(encoded);
-  return status;
+  if (!body) return -1;
+  return cdp_fetch_response(page,request_id,"application/json",body,strlen(body),1);
 }
 
 int lunaria_cdp_page_fetch_continue(struct lunaria_cdp_page *page,

@@ -2259,25 +2259,22 @@ static const struct rt_method rt_x_file_observer[] = {
  * held in its natural position reports.  The layout, Configuration and
  * onConfigurationChanged follow from the display-size change in the UI tick,
  * exactly as for any other display change. */
-static int g_requested_orientation = -1;
 static int g_natural_landscape = -1;
 static bool act_set_requested_orientation(struct dvm *vm, dvm_ref self,
     const union dvm_value *args, int nargs,
     union dvm_value *out)
 {
-  (void)vm;
-  (void)self;
   (void)nargs;
   (void)out;
   const int o = ARG(0).i;
+  rt_set_int(vm,self,"requestedOrientation",o);
+  rt_set_int(vm,self,"requestedOrientationSet",1);
   const int w = rt_surface_w(), h = rt_surface_h();
   fprintf(stderr, "[orientation] setRequestedOrientation(%d) on a %dx%d window\n", o, w, h);
   if (w <= 0 || h <= 0) {
-    g_requested_orientation = o;
     RETV();
   }
   if (g_natural_landscape < 0) g_natural_landscape = w >= h;
-  g_requested_orientation = o;
   bool landscape;
   switch (o) {
   case 0:
@@ -2303,11 +2300,24 @@ static bool act_get_requested_orientation(struct dvm *vm, dvm_ref self,
     const union dvm_value *args, int nargs,
     union dvm_value *out)
 {
-  (void)vm;
-  (void)self;
   (void)args;
   (void)nargs;
-  RETI(g_requested_orientation);
+  if (rt_get_int(vm,self,"requestedOrientationSet"))
+    RETI(rt_get_int(vm,self,"requestedOrientation"));
+  /* The launcher's manifest request precedes any explicit request. It is
+   * distinct from the display's current physical orientation. */
+  const char *launcher=getenv("ANDROID_LAUNCH_ACTIVITY");
+  struct dvm_class *cls=dvm_object_class(vm,self);
+  const char *name=cls ? cls->name : NULL;
+  if (launcher && name) {
+    while (*launcher && *name && (*launcher==*name || (*launcher=='.' && *name=='/'))) {
+      ++launcher;
+      ++name;
+    }
+    const char *value=getenv("ANDROID_SCREEN_ORIENTATION");
+    if (!*launcher && !*name && value && *value) RETI((int)strtol(value,NULL,10));
+  }
+  RETI(-1);
 }
 
 static const struct rt_method rt_x_activity[] = {

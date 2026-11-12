@@ -240,6 +240,8 @@ dvm_ref dvm_new_string_n(struct dvm *vm, const char *utf8, size_t len);
 struct luna_touch_event;
 dvm_ref dvm_motion_event_new(struct dvm *vm, const struct luna_touch_event *sample);
 bool dvm_motion_event_read(struct dvm *vm, dvm_ref event, struct luna_touch_event *out);
+/* Refresh the current state of an event retained across the JNI boundary. */
+bool dvm_jni_motion_event_read(uint32_t host,struct luna_touch_event *out);
 bool dvm_ui_dispatch_touch(struct dvm *vm, const struct luna_touch_event *sample);
 
 /* Element kind is one of Z B C S I J F D L. */

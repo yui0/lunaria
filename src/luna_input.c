@@ -33,6 +33,19 @@ float luna_event_y(const luna_touch_event *e, int i)
   return i >= 0 && i < luna_event_count(e) ? (e->pointer_count ? e->pointers[i].y : e->y) : 0;
 }
 
+float luna_event_axis(const luna_touch_event *e,int axis,int index)
+{
+  if (index<0 || index>=luna_event_count(e)) return 0;
+  if (axis==0) return luna_event_x(e,index);
+  if (axis==1) return luna_event_y(e,index);
+  if (axis==2) {
+    int action=e->action&255;
+    return action==1 || action==3 || (action==6 && index==((e->action>>8)&255)) ? 0.f : 1.f;
+  }
+  /* This virtual touchscreen has no size/tilt/distance sensors. */
+  return 0.f;
+}
+
 int luna_touch_update(luna_touch_state *s, int id, int action, float x, float y,
                       long long now, luna_touch_event *out)
 {

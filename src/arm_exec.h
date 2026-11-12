@@ -426,6 +426,9 @@ int arm_exec_screenshot(const char *path);
  * or the device panel scaled by LUNARIA_SCALE if that or LUNARIA_DEVICE_SCREEN_*
  * is set — see lunaria_screen() in src/jvm/jni_stubs.c). */
 int arm_exec_fb_width(void);
+/* NativeWindow buffer geometry can differ from the display's dimensions. */
+bool arm_exec_native_window_size(uint64_t window, int *width, int *height);
+void arm_exec_native_window_ref(uint64_t window, int delta);
 /* Resolves an absolute guest path into the host path it names, applying the
  * guest's filesystem namespace (Android roots, external storage, app data).
  * Returns `path` itself when no rewrite applies, otherwise `buf`.  Callers
@@ -1046,9 +1049,6 @@ int arm64_exec_screenshot(const char *path);
 /* Window dimensions. */
 int arm64_exec_fb_width(void);
 int arm64_exec_fb_height(void);
-/* Buffer size the app requested for its window; the window size if none. */
-int arm64_exec_buffer_width(void);
-int arm64_exec_buffer_height(void);
 
 /* Touch input. */
 void arm64_exec_touch_push(int action, float x, float y);

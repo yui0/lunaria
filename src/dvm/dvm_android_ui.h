@@ -8161,14 +8161,17 @@ static bool li_from(struct dvm *vm, dvm_ref self,
   }
   return true;
 }
+static bool act_get_window(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out);
 static bool act_get_layout_inflater(struct dvm *vm, dvm_ref self,
                                     const union dvm_value *args, int nargs,
                                     union dvm_value *out)
 {
   (void)args;
   (void)nargs;
-  union dvm_value context = { .l = self };
-  return li_from(vm, 0, &context, 1, out);
+  union dvm_value window={0};
+  if (!act_get_window(vm,self,NULL,0,&window) || !window.l) return false;
+  return am_vcall(vm,window.l,"getLayoutInflater","()Landroid/view/LayoutInflater;",NULL,0,out);
 }
 
 static bool act_permission_result_run(struct dvm *vm, dvm_ref self,
@@ -8372,6 +8375,7 @@ static bool act_find_view_by_id(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_activity_fields[] = {
+  { "requestedOrientation", "I" }, { "requestedOrientationSet", "Z" },
   { "componentName", "Landroid/content/ComponentName;" },
   { "title", "Ljava/lang/CharSequence;" },
   { "contentView", "Landroid/view/View;" },
@@ -10606,6 +10610,29 @@ static bool li_set_factory(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+static bool li_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                     int nargs,union dvm_value *out)
+{
+  const bool copy=nargs==2;
+  dvm_ref context=nargs ? args[copy ? 1 : 0].l : 0;
+  if (!context || (copy && !args[0].l)) {
+    dvm__throw(vm,"java/lang/NullPointerException","null inflater constructor argument");
+    return false;
+  }
+  (void)dvm_set_field(vm,self,"context","Landroid/content/Context;",(union dvm_value){.l=context});
+  (void)dvm_set_field(vm,self,"mFactorySet","Z",(union dvm_value){.i=0});
+  if (copy) {
+    const char *fields[]={"mFactory","mFactory2","mPrivateFactory"};
+    const char *types[]={"Landroid/view/LayoutInflater$Factory;","Landroid/view/LayoutInflater$Factory2;","Landroid/view/LayoutInflater$Factory2;"};
+    for (int i=0;i<3;++i) {
+      union dvm_value factory={0};
+      (void)dvm_get_field(vm,args[0].l,fields[i],types[i],&factory);
+      (void)dvm_set_field(vm,self,fields[i],types[i],factory);
+    }
+  }
+  RETV();
+}
+
 static bool li_clone(struct dvm *vm, dvm_ref self,
                      const union dvm_value *args, int nargs,
                      union dvm_value *out)
@@ -10616,13 +10643,8 @@ static bool li_clone(struct dvm *vm, dvm_ref self,
   }
   union dvm_value made = { .l = li_new(vm, nargs ? ARG(0).l : 0) };
   if (!made.l) return false;
-  const char *fields[]= {"mFactory","mFactory2","mPrivateFactory"};
-  const char *types[]= {"Landroid/view/LayoutInflater$Factory;","Landroid/view/LayoutInflater$Factory2;","Landroid/view/LayoutInflater$Factory2;"};
-  for(int i=0; i<3; ++i) {
-    union dvm_value factory= {0};
-    (void)dvm_get_field(vm,self,fields[i],types[i],&factory);
-    if (i!=2 || factory.l) (void)dvm_set_field(vm,made.l,fields[i],types[i],factory);
-  }
+  union dvm_value constructor[2]={{.l=self},{.l=args[0].l}},ignored={0};
+  if (!li_init(vm,made.l,constructor,2,&ignored)) return false;
   RETL(made.l);
 }
 
@@ -13380,6 +13402,8 @@ static const struct rt_field rt_layout_inflater_fields[] = {
 };
 
 static const struct rt_method rt_layout_inflater[] = {
+  M("<init>","(Landroid/content/Context;)V",li_init),
+  M("<init>","(Landroid/view/LayoutInflater;Landroid/content/Context;)V",li_init),
   SM("from", "(Landroid/content/Context;)Landroid/view/LayoutInflater;", li_from),
   M("getContext", "()Landroid/content/Context;", li_get_context),
   M("getFactory", "()Landroid/view/LayoutInflater$Factory;", li_get_factory),

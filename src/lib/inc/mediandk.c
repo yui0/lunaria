@@ -32,6 +32,15 @@ typedef int32_t media_status_t;
 
 /* ---- AMediaFormat ---- */
 
+/* The real AMediaFormat implementation (src/luna_media_format.c) is linked
+ * into the host executable on every platform, and guest calls reach it
+ * through arm_exec's SVC layer.  Defining no-op copies here alongside it
+ * collides at link time, and these stubs also disagree with the NDK on the
+ * getter return type (int32_t vs bool).  Only the Linux runtime shim
+ * runtime/libmediandk.so -- built from this file without the macro below --
+ * still carries them, as a guest-side identity library. */
+#ifndef LUNARIA_MEDIA_FORMAT_HOST
+
 AMediaFormat *
 AMediaFormat_new(void)
 {
@@ -118,6 +127,8 @@ AMediaFormat_toString(AMediaFormat *fmt)
   (void)fmt;
   return "{}";
 }
+
+#endif /* LUNARIA_MEDIA_FORMAT_HOST */
 
 /* ---- AMediaCodec ---- */
 

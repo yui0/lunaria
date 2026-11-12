@@ -579,6 +579,7 @@ static luna_overlay_web_char_fn g_web_char_fn;
 static luna_overlay_web_key_fn g_web_key_fn;
 static luna_overlay_web_text_fn g_web_text_fn;
 static char g_web_pointer_capture[32];
+static bool g_web_pointer_framework;
 static char g_web_focus[32];
 static luna_overlay_frame_fn g_frame_fn;
 
@@ -1350,6 +1351,10 @@ static void overlay_drain_pointer(void)
   for (int i = 0; i < n; ++i) {
     bool framework_touch = false;
     if (g_web_pointer_fn && !luna_guest_paused()) {
+      if (batch[i].action == 1) {
+        g_web_pointer_capture[0] = 0;
+        g_web_pointer_framework = false;
+      }
       int hit = g_web_pointer_capture[0]
                 ? luna_get_element_by_id(g_web_pointer_capture)
                 : luna_element_at_point(batch[i].x, batch[i].y);
@@ -1358,7 +1363,18 @@ static void overlay_drain_pointer(void)
         LunaElement *h = hit >= 0 ? luna_element_at(hit) : NULL;
         fprintf(stderr, "[ovl-hit] act=%d %d,%d hit=%d id=%s cls=%s\n", batch[i].action, (int)batch[i].x, (int)batch[i].y, hit, h ? h->id : "-", h ? h->class_name : "-");
       }
-      for (int parent = hit; parent >= 0;
+      /* Capture belongs to the receiving window/root, which need not carry
+       * the raster child's touchview class. Do not hit-test that root again:
+       * MOVE/UP must reach it even after a redraw or outside its bounds. */
+      if (g_web_pointer_capture[0]) {
+        web_hit = true;
+        framework_touch = g_web_pointer_framework;
+        LunaElement *receiver = hit >= 0 ? luna_element_at(hit) : NULL;
+        if (receiver)
+          g_web_pointer_fn(receiver->id,
+                           (int)(batch[i].x - receiver->x), (int)(batch[i].y - receiver->y),
+                           batch[i].action, batch[i].event_ms);
+      } else for (int parent = hit; parent >= 0;
            parent = luna_element_parent(parent)) {
         LunaElement *e = luna_element_at(parent);
         if (e && e->id[0] == 'v' &&
@@ -1389,8 +1405,10 @@ static void overlay_drain_pointer(void)
               if (candidate && candidate->id[0] == 'v') receiver = candidate;
             }
           }
-          if (batch[i].action == 1)
+          if (batch[i].action == 1) {
             snprintf(g_web_pointer_capture,sizeof g_web_pointer_capture,"%s",receiver->id);
+            g_web_pointer_framework = framework_touch;
+          }
           if (g_web_pointer_capture[0])
             g_web_pointer_fn(receiver->id,
                              (int)(batch[i].x - receiver->x), (int)(batch[i].y - receiver->y),
@@ -1403,7 +1421,10 @@ static void overlay_drain_pointer(void)
         g_web_focus[0] = 0;
         pthread_mutex_unlock(&g_ptr_lock);
       }
-      if (batch[i].action == 0 || batch[i].action == 2) g_web_pointer_capture[0] = 0;
+      if (batch[i].action == 0 || batch[i].action == 2) {
+        g_web_pointer_capture[0] = 0;
+        g_web_pointer_framework = false;
+      }
     }
     /* A framework touch target owns the entire gesture. Sending the same
      * release through host click detection would also call performClick. */
@@ -1964,12 +1985,17 @@ consume:
     ++taken;
   }
   pthread_mutex_lock(&g_ptr_lock);
-  if (g_ptr_count < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
-    g_ptr_queue[g_ptr_count].x = x;
-    g_ptr_queue[g_ptr_count].y = y;
-    g_ptr_queue[g_ptr_count].action = action;
-    g_ptr_queue[g_ptr_count].event_ms = (long long)(overlay_ns()/1000000u);
-    ++g_ptr_count;
+  /* A presenting turn can only show the latest pointer position. Keeping
+   * every intervening MOVE makes a busy UI replay stale scroll positions and
+   * can fill the queue before UP arrives. Never merge gesture boundaries. */
+  int slot = g_ptr_count;
+  if (action < 0 && slot && g_ptr_queue[slot - 1].action < 0) --slot;
+  if (slot < (int)(sizeof g_ptr_queue / sizeof g_ptr_queue[0])) {
+    g_ptr_queue[slot].x = x;
+    g_ptr_queue[slot].y = y;
+    g_ptr_queue[slot].action = action;
+    g_ptr_queue[slot].event_ms = (long long)(overlay_ns()/1000000u);
+    if (slot == g_ptr_count) ++g_ptr_count;
   }
   pthread_mutex_unlock(&g_ptr_lock);
   luna_overlay_wake();

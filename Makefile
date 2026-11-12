@@ -629,7 +629,7 @@ $(BUILD_DIR)/luna_fnmatch.o: src/lib/musl/fnmatch.c src/lunaria_os.h src/luna_un
 
 # arm_exec.o: compiled with C++20 and dynarmic headers; linked into lunaria
 $(BUILD_DIR)/arm_exec.o: | $(BUILD_DIR)
-$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/lunaria_os.h src/luna_boot.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
+$(BUILD_DIR)/arm_exec.o: src/arm_exec.cpp src/arm_exec.h src/luna_native_codec.h src/luna_media_format.h src/luna_media_format_keys.h src/lunaria_os.h src/luna_boot.h src/arm.h src/svc_ids.h src/lib/guest.c src/jvm/jvm.h src/binary128.h src/linker64.h src/trace.h $(DYNARMIC_LIB)
 	$(CXX) -std=c++20 $(OPTFLAGS) -fPIC \
 	    $(SANITIZE) \
 	    $(DYNARMIC_INCS) \
@@ -709,6 +709,15 @@ $(BUILD_DIR)/stb_vorbis.o: src/lib/stb_vorbis.c
 $(BUILD_DIR)/luna_qfkey.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_qfkey.o: src/luna_qfkey.c src/luna_qfkey.h src/arm_exec.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/luna_qfkey.c -o $@
+
+$(BUILD_DIR)/luna_aac_encoder.o: src/luna_aac_encoder.c src/luna_aac_encoder.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/luna_aac_encoder.c -o $@
+
+$(BUILD_DIR)/luna_native_codec.o: src/luna_native_codec.c src/luna_native_codec.h src/luna_aac_encoder.h src/luna_media_format.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c src/luna_native_codec.c -o $@
+
+$(BUILD_DIR)/luna_media_format.o: src/luna_media_format.c src/luna_media_format.h src/luna_media_format_keys.h src/luna_media_format_keys.inc | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c src/luna_media_format.c -o $@
 
 $(BUILD_DIR)/luna_vulkan.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_vulkan.o: src/luna_vulkan.c src/luna_vulkan_cmds.h src/arm_exec.h src/luna_boot.h
@@ -812,7 +821,7 @@ symlink-file-test: test/symlink_file_test.c src/lunaria_file.c src/lunaria_file.
 
 $(BUILD_DIR)/arm_exec.o: src/lunaria_file.h src/lib/inc/log_assert.h
 
-LUNARIA_OBJECTS = $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
+LUNARIA_OBJECTS = $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_media_format.o $(BUILD_DIR)/luna_aac_encoder.o $(BUILD_DIR)/luna_native_codec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
 ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
 WINDOWS_STUBS = ANDROID LOG OPENSLES MEDIANDK
 WINDOWS_STUB_OBJECTS = $(addprefix $(BUILD_DIR)/stub_,$(addsuffix .o,$(WINDOWS_STUBS)))
@@ -820,6 +829,11 @@ $(BUILD_DIR)/stub_ANDROID.o: src/lib/inc/android.c
 $(BUILD_DIR)/stub_LOG.o: src/lib/inc/log.c src/lib/inc/log_assert.h
 $(BUILD_DIR)/stub_OPENSLES.o: src/lib/inc/opensles.c
 $(BUILD_DIR)/stub_MEDIANDK.o: src/lib/inc/mediandk.c
+# The exe links the real AMediaFormat implementation; the stub's no-op
+# copies would collide with it (and LTO would flag the return types).
+$(BUILD_DIR)/stub_MEDIANDK.o: src/lib/stub.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/lib -DLUNARIA_STUB_MEDIANDK \
+	    -DLUNARIA_MEDIA_FORMAT_HOST -c src/lib/stub.c -o $@
 $(WINDOWS_STUB_OBJECTS): src/trace.h src/lunaria_os.h
 $(BUILD_DIR)/stub_%.o: src/lib/stub.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Isrc/lib -DLUNARIA_STUB_$* -c src/lib/stub.c -o $@
@@ -850,7 +864,7 @@ $(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
 	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
+	    $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_media_format.o $(BUILD_DIR)/luna_aac_encoder.o $(BUILD_DIR)/luna_native_codec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(WINDOWS_STUB_OBJECTS) \
 	    $(HOST_DL_LIBS) -lpthread $(HOST_JVM_LIB) \
@@ -1087,6 +1101,10 @@ dvm-test: test/test_dvm test/dvm_test.dex $(OPENH264_SO)
 	LUNARIA_OPENH264="$${LUNARIA_OPENH264:-$(abspath $(OPENH264_SO))}" ./test/test_dvm test/dvm_test.dex $(DVM_DEX)
 
 .PHONY: platform-service-test
+.PHONY: tver-regression-test
+tver-regression-test: test/test_dvm
+	./test/test_dvm --tver-regression-test
+
 platform-service-test: test/test_dvm
 	./test/test_dvm --platform-service-test
 
@@ -1631,6 +1649,13 @@ package-data-path-test: lunaria test/libpackagepath64.so test/libpackagepath32.s
 	    ANDROID_FILES_DIR="$(abspath $(BUILD_DIR))/package-data/app/files" \
 	    LUNARIA_GUEST_ROOT="$(abspath $(BUILD_DIR))/package-data/root" \
 	    python3 test/run_guest_results.py test/libpackagepath64.so test/libpackagepath32.so
+
+$(eval $(call GUEST_ABI_TEST,jni_orientation,test/jni_orientation_test.c,$(ABI32_CC),-std=c11))
+.PHONY: jni-orientation-test
+jni-orientation-test: lunaria $(BUILD_DIR)/jni_orientation32.so $(BUILD_DIR)/jni_orientation64.so test/dvm_test.dex
+	@mkdir -p $(BUILD_DIR)/jni-orientation
+	@cp test/dvm_test.dex $(BUILD_DIR)/jni-orientation/classes.dex
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-orientation" ANDROID_LAUNCH_ACTIVITY=android.app.Activity ANDROID_SCREEN_ORIENTATION=1 python3 test/run_guest_results.py $(BUILD_DIR)/jni_orientation32.so $(BUILD_DIR)/jni_orientation64.so
 
 .PHONY: jni-context-path-test
 jni-context-path-test: lunaria test/libjnicontextpath.so test/libjnicontextpath-arm32.so test/dvm_test.dex
@@ -2263,6 +2288,26 @@ $(BUILD_DIR)/test_precise_abort: test/precise_abort_test.cpp $(DYNARMIC_LIB) | $
 .PHONY: precise-abort-test
 precise-abort-test: $(BUILD_DIR)/test_precise_abort
 	$(BUILD_DIR)/test_precise_abort
+
+$(BUILD_DIR)/ndk_media_format64.so: test/ndk_media_format_test.c src/luna_media_format.h src/luna_media_format_keys.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc \
+	    -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/ndk_media_format32.so: test/ndk_media_format_test.c src/luna_media_format.h src/luna_media_format_keys.h | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc \
+	    -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: ndk-media-format-test
+ndk-media-format-test: lunaria $(BUILD_DIR)/ndk_media_format64.so $(BUILD_DIR)/ndk_media_format32.so
+	LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/ndk_media_format64.so $(BUILD_DIR)/ndk_media_format32.so
+
+.PHONY: media-format-test
+media-format-test: $(BUILD_DIR)/media_format_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/media_format_test
+
+$(BUILD_DIR)/media_format_test: test/media_format_test.c src/luna_media_format.c src/luna_media_format.h src/luna_media_format_keys.h src/luna_media_format_keys.inc | $(BUILD_DIR)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc \
+	    test/media_format_test.c src/luna_media_format.c -o $@
 
 test/test_webview_cdp: test/test_webview_cdp.c src/webview_cdp.c src/webview_cdp.h
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
@@ -3637,3 +3682,91 @@ alooper-vsync-test: lunaria $(BUILD_DIR)/alooper_vsync32.so $(BUILD_DIR)/alooper
 .PHONY: jni-direct-buffer-race-test
 jni-direct-buffer-race-test: lunaria $(BUILD_DIR)/egl-thread/code/classes.dex $(BUILD_DIR)/jni_direct_buffer_race32.so $(BUILD_DIR)/jni_direct_buffer_race64.so
 	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/egl-thread/code" python3 test/run_guest_results.py $(BUILD_DIR)/jni_direct_buffer_race32.so $(BUILD_DIR)/jni_direct_buffer_race64.so
+
+.PHONY: aac-encoder-test native-codec-test
+aac-encoder-test: $(BUILD_DIR)/aac_encoder_test
+	ASAN_OPTIONS=detect_leaks=0 $<
+
+native-codec-test: $(BUILD_DIR)/native_codec_test
+	ASAN_OPTIONS=detect_leaks=0 $<
+
+$(BUILD_DIR)/aac_encoder_test: test/aac_encoder_test.c src/luna_aac_encoder.c src/luna_aac_encoder.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc test/aac_encoder_test.c src/luna_aac_encoder.c -ldl -lpthread -lm -o $@
+
+$(BUILD_DIR)/native_codec_test: test/native_codec_test.c src/luna_native_codec.c src/luna_aac_encoder.c src/luna_media_format.c src/luna_native_codec.h src/luna_aac_encoder.h src/luna_media_format.h src/luna_media_format_keys.h src/luna_media_format_keys.inc | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc test/native_codec_test.c src/luna_native_codec.c src/luna_aac_encoder.c src/luna_media_format.c -ldl -lpthread -lm -o $@
+
+$(BUILD_DIR)/ndk_media_codec64.so: test/ndk_media_codec_test.c src/luna_media_format.h src/luna_media_format_keys.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/ndk_media_codec32.so: test/ndk_media_codec_test.c src/luna_media_format.h src/luna_media_format_keys.h | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: ndk-media-codec-test
+ndk-media-codec-test: lunaria $(BUILD_DIR)/ndk_media_codec64.so $(BUILD_DIR)/ndk_media_codec32.so
+	LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/ndk_media_codec64.so $(BUILD_DIR)/ndk_media_codec32.so
+
+$(BUILD_DIR)/guest_log_buffer64.so: test/guest_log_buffer.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/guest_log_buffer32.so: test/guest_log_buffer.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: guest-log-buffer-test
+guest-log-buffer-test: lunaria $(BUILD_DIR)/guest_log_buffer64.so $(BUILD_DIR)/guest_log_buffer32.so
+	LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/guest_log_buffer64.so $(BUILD_DIR)/guest_log_buffer32.so
+	@set -e; for abi in 64 32; do \
+	    output="$(BUILD_DIR)/guest_log_buffer$$abi.out"; \
+	    rg -q -F 'b=3 p=5 t=buffer-test' "$$output"; \
+	    rg -q -F 'i=42 text=hello wide=123456789abcdef0 real=3.25 tail=73' "$$output"; \
+	    rg -q -F 'b=4 p=6 t=buffer-write] literal %s unchanged' "$$output"; \
+	    rg -q -F 't=write-test] literal %d unchanged' "$$output"; \
+	    rg -q -F 'i=42 wide=123456789abcdef0 real=3.25 tail=73' "$$output"; \
+	    echo "ARM$$abi liblog buffer/varargs: PASS"; \
+	done
+
+$(BUILD_DIR)/guest_motion_axis64.so: test/guest_motion_axis.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/guest_motion_axis32.so: test/guest_motion_axis.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: guest-motion-axis-test
+guest-motion-axis-test: lunaria $(BUILD_DIR)/guest_motion_axis64.so $(BUILD_DIR)/guest_motion_axis32.so test/abi_pkg/classes.dex test/abi_pkg/classes2.dex
+	ANDROID_PACKAGE_CODE_PATH="$(abspath test/abi_pkg)" LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/guest_motion_axis64.so $(BUILD_DIR)/guest_motion_axis32.so
+
+$(BUILD_DIR)/jni-array-writeback/code/classes.dex: test/make_jni_array_writeback_dex.py test/make_dex.py
+	python3 test/make_jni_array_writeback_dex.py $@
+
+$(BUILD_DIR)/jni_array_writeback64.so: test/jni_array_writeback_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/jni_array_writeback32.so: test/jni_array_writeback_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: jni-array-writeback-test
+jni-array-writeback-test: lunaria $(BUILD_DIR)/jni-array-writeback/code/classes.dex $(BUILD_DIR)/jni_array_writeback64.so $(BUILD_DIR)/jni_array_writeback32.so
+	ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-array-writeback/code" LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/jni_array_writeback64.so $(BUILD_DIR)/jni_array_writeback32.so
+
+$(BUILD_DIR)/upstream-43ef/code/classes.dex: test/make_upstream_43ef_dex.py test/make_dex.py
+	python3 test/make_upstream_43ef_dex.py $@
+
+$(BUILD_DIR)/upstream_43ef64.so: test/upstream_43ef_test.c | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/upstream_43ef32.so: test/upstream_43ef_test.c | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: upstream-43ef-test
+upstream-43ef-test: lunaria $(BUILD_DIR)/upstream-43ef/code/classes.dex $(BUILD_DIR)/upstream_43ef64.so $(BUILD_DIR)/upstream_43ef32.so
+	ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/upstream-43ef/code" LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/upstream_43ef64.so $(BUILD_DIR)/upstream_43ef32.so
+
+$(BUILD_DIR)/raster_jobs_test: test/raster_jobs_test.c src/luna_raster_jobs.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror $(DVM_TEST_SAN) -Isrc $< -lpthread -o $@
+
+.PHONY: raster-jobs-test raster-render-test
+raster-jobs-test: $(BUILD_DIR)/raster_jobs_test
+	$(BUILD_DIR)/raster_jobs_test
+
+raster-render-test: test/test_dvm
+	./test/test_dvm --raster-render-test

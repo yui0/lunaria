@@ -19,8 +19,10 @@ Android services to the host. A built-in Dalvik interpreter runs the app's `clas
 Open an `.apk`, `.xapk`, `.apks`, or `.aab` directly; extraction, split APKs, caching and per-account
 profiles are handled for you. WebView content uses Chrome/Chromium or the bundled [luna-browser](luna-browser/).
 
-**Demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Alchemia Story, Kikyu! Aeronaut (a 2013 ARM32 APK),
-Black Clover: Asta Fight, Kingdoms & Lords, other Unity and Unreal titles, and Java apps such as TVer (full-episode playback) and APKPure.
+**Demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Where Winds Meet (NetEase Messiah engine),
+Gakuen Idolmaster, Alchemia Story, Kikyu! Aeronaut (a 2013 ARM32 APK), Layton Brothers: Mystery Room,
+Black Clover: Asta Fight, Kingdoms & Lords, other Unity and Unreal titles, and Java apps such as
+TVer (full-episode playback), LINE and APKPure.
 See [Compatibility](#compatibility) for exact stages and limits.
 
 > [!IMPORTANT]
@@ -34,9 +36,9 @@ See [Compatibility](#compatibility) for exact stages and limits.
 <p align="center">
   <img src="shots/genshin-glide-coast.png" width="32%" alt="Genshin Impact: Lumine gliding over turquoise water toward a green coast at sunset">
   &nbsp;
-  <img src="shots/genshin-lisa.png" width="32%" alt="Genshin Impact: Lisa recounting the Four Winds in Japanese dialogue">
+  <img src="shots/cross-worlds-portal.png" width="32%" alt="Ni no Kuni: Cross Worlds, a glowing blue portal in a golden hall with characters and a familiar">
   &nbsp;
-  <img src="shots/cross-worlds-crystal.png" width="32%" alt="Ni no Kuni: Cross Worlds, a glowing blue crystal in an ornate hall">
+  <img src="shots/genshin-lisa.png" width="32%" alt="Genshin Impact: Lisa recounting the Four Winds in Japanese dialogue">
 </p>
 
 <p align="center"><sub>Genshin Impact 7.2.0 (Unity IL2CPP, arm64-v8a) · Ni no Kuni: Cross Worlds (Unreal Engine 4, arm64-v8a)</sub></p>
@@ -178,7 +180,11 @@ From a source build, use `./lunaria` in place of `lunaria`.
   ./lunaria --data-root /path/to/data --install-system GooglePlayServices.xapk   # headless install
   ```
 
-![Launcher](shots/launcher.png)
+<p align="center">
+  <img src="shots/launcher.png" width="48%" alt="The Lunaria graphical launcher with an app list and a drop target">
+  &nbsp;
+  <img src="shots/host-menu.png" width="48%" alt="The in-game host menu opened over Kikyu! Aeronaut: Back, Input, Display, Sound, WebView, Profile, Restart, and a Keyboard Controls submenu listing genshin.conf and crossworlds.conf">
+</p>
 
 <p align="center"><sub>The launcher · the in-game host menu is on right-click</sub></p>
 
@@ -216,16 +222,20 @@ See `lunaria.conf.sample` for the full set of package and service-host options.
 Lunaria runs app dex bytecode and implements Android views, layouts, text, resources and lifecycle on the host. **TVer 6.40.0** goes from the welcome screen through the home feed (with video tiles) into episode details, the ad break, and full-episode playback from its unmodified XAPK. Startup is heavy and a few screens keep layout gaps.
 
 <p align="center">
-  <img src="shots/tver-playback.png" width="30%" alt="TVer playing an episode of The Apothecary Diaries: the video frame above the episode title, broadcast dates, and Watch Later / Favorite buttons in Japanese">
+  <img src="shots/tver-playback.png" width="26%" alt="TVer playing an episode of The Apothecary Diaries: the video frame above the episode title, broadcast dates, and Watch Later / Favorite buttons in Japanese">
   &nbsp;
-  <img src="shots/tver-playback-portrait.png" width="30%" alt="TVer playing episode 54 of The Apothecary Diaries in portrait: Maomao peeking through a sliding door in the video frame above the episode details">
+  <img src="shots/tver-episode-portrait.png" width="26%" alt="TVer episode details in portrait: a pink-haired heroine in the video frame above episode 5, broadcast dates, and a favorite button">
   &nbsp;
-  <img src="shots/tver-welcome.png" width="14%" alt="TVer portrait welcome screen with program artwork and the consent button">
+  <img src="shots/tver-playback-portrait.png" width="26%" alt="TVer playing episode 54 of The Apothecary Diaries in portrait: Maomao peeking through a sliding door in the video frame above the episode details">
+  &nbsp;
+  <img src="shots/tver-welcome.png" width="12%" alt="TVer portrait welcome screen with program artwork and the consent button">
 </p>
 
-<p align="center"><sub>TVer 6.40.0 · landscape and portrait playback · welcome screen</sub></p>
+<p align="center"><sub>TVer 6.40.0 · landscape playback · episode details · portrait playback · welcome screen</sub></p>
 
 APKPure renders its store, app details and download manager (download progress observed; completed install not yet verified).
+**LINE 15.15.1** goes from the welcome screen into phone-number registration and the country-selection list
+(CollapsingToolbar + RecyclerView); scrolling, Back and edge-swipe gestures all work.
 
 ### Genshin Impact 7.2.0
 
@@ -249,7 +259,13 @@ Unity IL2CPP, `arm64-v8a`, **1024 × 576**. Google Play billing is not supported
   <img src="shots/genshin-swim.png" width="48%" alt="Genshin Impact: swimming at sunset outside Mondstadt, the quest marker still pointing toward the city">
 </p>
 
-<p align="center"><sub>Wings · Lisa joins · prologue · the Knights · lakeshore · swimming at dusk</sub></p>
+<p align="center">
+  <img src="shots/genshin-mondstadt.png" width="48%" alt="Genshin Impact: gliding high above Mondstadt, the whole city and the storm around the cathedral below">
+  &nbsp;
+  <img src="shots/genshin-paimon.png" width="48%" alt="Genshin Impact: Paimon pointing something out to Lumine, Japanese subtitle">
+</p>
+
+<p align="center"><sub>Wings · Lisa joins · prologue · the Knights · lakeshore · swimming at dusk · gliding above Mondstadt · Paimon points the way</sub></p>
 
 <details>
 <summary>Login, download, and settings</summary>
@@ -267,7 +283,7 @@ Unity IL2CPP, `arm64-v8a`, **1024 × 576**. Google Play billing is not supported
 </p>
 
 <p align="center">
-  <img src="shots/genshin-library.png" width="48%" alt="Genshin Impact: Jean in profile beside the library clock">
+  <img src="shots/genshin-jean.png" width="48%" alt="Genshin Impact: Jean and Lisa in the Knights' library">
   &nbsp;
   <img src="shots/genshin-language.png" width="48%" alt="Genshin Impact language settings in Japanese">
 </p>
@@ -315,6 +331,21 @@ Unreal Engine 4: login and server selection through character creation, the star
 
 </details>
 
+### Where Winds Meet (燕雲十六声)
+
+NetEase's open-world title runs on its own **Messiah engine** (`MessiahNativeActivity`, `libGame.so`,
+`arm64-v8a`). Protected DEX loading, the game's resource check, Japanese news, the
+NetEase / Google / Guest login choice, consent and guide screens, and character creation all
+render; gameplay is not yet reached. Along the way this title drove fixes for persistent GL buffer
+mappings, Java serialization (HashMap / ArrayList / arrays), WebView `loadDataWithBaseURL`,
+NDK MediaFormat and the AAC encoder.
+
+<p align="center">
+  <img src="shots/where-winds-meet.png" width="48%" alt="Where Winds Meet character creation: a young heroine in white-and-indigo hanfu, gender selector and 次へ button">
+</p>
+
+<p align="center"><sub>Character creation · the engine's own renderer draws on the host GPU</sub></p>
+
 ### More titles
 
 <p align="center">
@@ -346,6 +377,25 @@ Unreal Engine 4: login and server selection through character creation, the star
 </p>
 
 <p align="center"><sub>Disney Magic Kingdoms: content check, waiting on its servers · Trickcal Chibi+Go: server configuration loading (gameplay not yet reached)</sub></p>
+
+<p align="center">
+  <img src="shots/layton-brothers-title.png" width="48%" alt="Layton Brothers: Mystery Room title screen, the LEVEL-5 logo on a film strip with scenes from the game">
+  &nbsp;
+  <img src="shots/layton-brothers-dialogue.png" width="48%" alt="Layton Brothers: Mystery Room dialogue scene, two detectives talking in a station hallway, Japanese speech bubble">
+</p>
+
+<p align="center"><sub><a href="https://www.level5.co.jp/">Layton Brothers: Mystery Room</a>: a 2013 LEVEL-5 title whose Java UI is drawn entirely through the Android view layer</sub></p>
+
+<p align="center">
+  <img src="shots/bedrock-addons.png" width="30%" alt="A Flutter-based Minecraft Bedrock add-on manager showing Villager Soldier, Dragon Bedrock, Zombie Bedrock and Simple Magnets Bedrock add-ons">
+  &nbsp;
+  <img src="shots/gakumas-setup.png" width="34%" alt="Gakuen Idolmaster title screen during first setup, downloading resources at 26.61 percent">
+  &nbsp;
+  <img src="shots/gakumas-loading.png" width="26%" alt="Gakuen Idolmaster NOW LOADING screen with a chibi idol">
+</p>
+
+<p align="center"><sub>A Flutter-based Minecraft Bedrock add-on manager (startup, list and detail WebView) ·
+Gakuen Idolmaster 3.5.3: setup and consent screens, first asset download from the game CDN (Unity 6000.0 IL2CPP, Vulkan, CRI)</sub></p>
 
 <details>
 <summary>Open-source and sample titles</summary>
@@ -385,10 +435,13 @@ Results describe **what was actually observed** on particular builds and machine
 | Title | Engine / ABI | Current result |
 |---|---|---|
 | **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux: login, server and character selection, village, dialogue, voiced cutscenes, field gameplay; SharedPreferences persist. Apple Silicon: 5.04.12 reached the opening movie, 3D intro and terms dialog; later stages unverified. |
+| **Where Winds Meet** | NetEase Messiah · AArch64 XAPK | Title with resource download, Japanese news, login choice (NetEase / Google / Guest), consent and guide screens, character creation. Gameplay not yet reached; startup videos need Main/High H.264. |
+| **Gakuen Idolmaster 3.5.3** | Unity 6000.0 IL2CPP (Vulkan, CRI) · AArch64 XAPK | Setup and consent screens render; the first asset download from the game CDN starts (~806 MB observed). Gameplay not yet reached. |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening video completes, title screen appears, accepting the additional-patch prompt starts the download. |
 | **Genshin Impact 7.2.0** | Unity IL2CPP · AArch64 XAPK | Open world on Linux (prologue, Mondstadt, gliding). Login, server and audio settings survive restart; keyboard movement works; about 18–22 fps in the field and 30 fps in menus on one test host. Account WebView opens; Play billing unsupported. |
 | **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | Title, Japanese story scenes (landscape and portrait), character-creation room (2026-10-09). |
 | **Kikyu! Aeronaut** | native `armeabi` · ARM32 APK (2013) | Title screen draws and waits for Return. |
+| **Layton Brothers: Mystery Room** | Java / dex Android UI (2013) | Title screen and dialogue scenes render through the Android view layer. |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 / AArch64 | ARMv7: playable, reaches the main story scene. AArch64: main menu, recent checks reach language selection at about 70 fps. |
 | **FPSMobile** | Unreal Engine 4 · ARMv7 | FirstPersonExampleMap renders; 16,000+ swaps. |
 | **UnitySampleGame** | Unity · ARMv7 | Start opens the 3D gameplay scene. |
@@ -399,7 +452,9 @@ Results describe **what was actually observed** on particular builds and machine
 | **Disney Magic Kingdoms 12.1.1c** | Unity · ARMv7 XAPK | Content-verification screen draws; pauses asking its servers for an update. |
 | **Kingdoms & Lords** | Gameloft village builder | Island village, resource counters and dialogue render (2026-11-09); progression unverified. |
 | **TVer 6.40.0** | Java / dex Android UI | Welcome, home feed with playing tiles, episode details and main-feature playback. Heavy startup, some layout gaps. |
+| **LINE 15.15.1** | Java / dex Android UI | Welcome, phone-number registration and country selection (CollapsingToolbar + RecyclerView); scroll, Back and edge-swipe work. Authentication beyond registration not reached. |
 | **APKPure 3.20.8002** | Java / dex Android UI | Store, recommendations, details and download manager render; download progress observed, completed install unverified. |
+| **Minecraft Bedrock add-on manager** | Flutter (dex + Skia) · ARM32/ARM64 APK | Startup, START, add-on list and detail WebView; Back returns to the list. The detail CDN answers 404, so add-on content does not load. |
 | **Another Eden** | Native · ARMv7 XAPK | Existing-account load screen; loading the game aborts. |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono starts; rendering not yet working. |
 

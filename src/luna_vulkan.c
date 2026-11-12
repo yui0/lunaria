@@ -810,28 +810,46 @@ static void h_nothing(HostCallArgs *a, uintptr_t idx)
 
 /* ---- surfaces ------------------------------------------------------------ */
 
-/* Any non-zero handle will do: nothing but this file ever sees a surface. */
+struct lvk_surface { uint64_t window; };
+
 static void h_create_android_surface(HostCallArgs *a, uintptr_t idx)
 {
   (void)idx;
+  const VkAndroidSurfaceCreateInfoKHR *ci = (const void *)(uintptr_t)a->x[1];
   VkSurfaceKHR *out = (VkSurfaceKHR *)(uintptr_t)a->x[3];
-  if (out) *out = (VkSurfaceKHR)(uintptr_t)atomic_fetch_add(&g_fake_handle, 1);
+  struct lvk_surface *surface = calloc(1, sizeof *surface);
+  if (!surface) { a->ret = vk_ret(VK_ERROR_OUT_OF_HOST_MEMORY); return; }
+  surface->window = (uint64_t)(uintptr_t)ci->window;
+  arm_exec_native_window_ref(surface->window, 1);
+  *out = (VkSurfaceKHR)(uintptr_t)surface;
   a->ret = vk_ret(VK_SUCCESS);
 }
 
-static void frame_size(uint32_t *w, uint32_t *h)
+static void h_destroy_android_surface(HostCallArgs *a, uintptr_t idx)
 {
-  /* An app that shrank its buffers (Unity's fixed-DPI scale) gets the
-   * smaller extent; the compositor stretches the frame to the window. */
-  int fw = arm64_exec_buffer_width(), fh = arm64_exec_buffer_height();
-  *w = fw > 0 ? (uint32_t)fw : 1280u;
-  *h = fh > 0 ? (uint32_t)fh : 720u;
+  (void)idx;
+  struct lvk_surface *surface = (void *)(uintptr_t)a->x[1];
+  if (surface) {
+    arm_exec_native_window_ref(surface->window, -1);
+    free(surface);
+  }
+  a->ret = 0;
 }
 
-static void fill_caps(VkSurfaceCapabilitiesKHR *c)
+static bool frame_size(VkSurfaceKHR handle, uint32_t *w, uint32_t *h)
+{
+  const struct lvk_surface *surface = (const void *)(uintptr_t)handle;
+  int fw, fh;
+  if (!surface || !arm_exec_native_window_size(surface->window, &fw, &fh)) return false;
+  *w = (uint32_t)fw;
+  *h = (uint32_t)fh;
+  return true;
+}
+
+static bool fill_caps(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *c)
 {
   uint32_t w, h;
-  frame_size(&w, &h);
+  if (!frame_size(surface, &w, &h)) return false;
   memset(c, 0, sizeof *c);
   c->minImageCount = 2;
   c->maxImageCount = 4;
@@ -850,6 +868,7 @@ static void fill_caps(VkSurfaceCapabilitiesKHR *c)
                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                            VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                            VK_IMAGE_USAGE_SAMPLED_BIT;
+  return true;
 }
 
 static void h_surface_support(HostCallArgs *a, uintptr_t idx)
@@ -866,16 +885,17 @@ static void h_surface_caps(HostCallArgs *a, uintptr_t idx)
 {
   (void)idx;
   VkSurfaceCapabilitiesKHR *c = (VkSurfaceCapabilitiesKHR *)(uintptr_t)a->x[2];
-  if (c) fill_caps(c);
-  a->ret = vk_ret(VK_SUCCESS);
+  a->ret = vk_ret(c && fill_caps((VkSurfaceKHR)(uintptr_t)a->x[1], c)
+                   ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR);
 }
 
 static void h_surface_caps2(HostCallArgs *a, uintptr_t idx)
 {
   (void)idx;
+  const VkPhysicalDeviceSurfaceInfo2KHR *info = (const void *)(uintptr_t)a->x[1];
   VkSurfaceCapabilities2KHR *c = (VkSurfaceCapabilities2KHR *)(uintptr_t)a->x[2];
-  if (c) fill_caps(&c->surfaceCapabilities);
-  a->ret = vk_ret(VK_SUCCESS);
+  a->ret = vk_ret(c && info && fill_caps(info->surface, &c->surfaceCapabilities)
+                   ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR);
 }
 
 /* Four-byte formats only: the present path reads pixels back as RGBA. */
@@ -939,7 +959,10 @@ static void h_present_rects(HostCallArgs *a, uintptr_t idx)
 {
   (void)idx;
   VkRect2D r = { { 0, 0 }, { 0, 0 } };
-  frame_size(&r.extent.width, &r.extent.height);
+  if (!frame_size((VkSurfaceKHR)(uintptr_t)a->x[1], &r.extent.width, &r.extent.height)) {
+    a->ret = vk_ret(VK_ERROR_SURFACE_LOST_KHR);
+    return;
+  }
   a->ret = vk_ret(fill_array((uint32_t *)(uintptr_t)a->x[2],
                              (void *)(uintptr_t)a->x[3], &r, 1, sizeof r));
 }
@@ -1357,7 +1380,7 @@ static const struct {
   { "vkDestroyDebugReportCallbackEXT", h_nothing },
   { "vkDebugReportMessageEXT", h_nothing },
   { "vkCreateAndroidSurfaceKHR", h_create_android_surface },
-  { "vkDestroySurfaceKHR", h_nothing },
+  { "vkDestroySurfaceKHR", h_destroy_android_surface },
   { "vkGetPhysicalDeviceSurfaceSupportKHR", h_surface_support },
   { "vkGetPhysicalDeviceSurfaceCapabilitiesKHR", h_surface_caps },
   { "vkGetPhysicalDeviceSurfaceCapabilities2KHR", h_surface_caps2 },

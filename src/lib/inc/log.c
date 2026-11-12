@@ -49,3 +49,20 @@ __android_log_write(int prio, const char *tag, const char *text)
 {
   return __android_log_print(prio, tag, "%s", text);
 }
+
+/* Buffer selection is retained in the host log, as on the guest bridge. */
+int __android_log_buf_print(int buffer,int prio,const char *tag,const char *fmt,...)
+{
+  char message[1024];
+  va_list args;
+  va_start(args,fmt);
+  vsnprintf(message,sizeof message,fmt,args);
+  va_end(args);
+  fprintf(stderr,"[android_log b=%d p=%d t=%s] %s\n",buffer,prio,tag ? tag : "?",message);
+  return 1;
+}
+int __android_log_buf_write(int buffer,int prio,const char *tag,const char *text)
+{
+  fprintf(stderr,"[android_log b=%d p=%d t=%s] %s\n",buffer,prio,tag ? tag : "?",text ? text : "");
+  return 1;
+}

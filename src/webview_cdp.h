@@ -98,6 +98,10 @@ char *lunaria_cdp_json_string_at(const char *p);
 /* Requests to this host are the page's synchronous JavaScript-interface calls. */
 #define LUNARIA_CDP_BRIDGE_HOST "lunaria-bridge.invalid"
 int lunaria_cdp_page_enable_fetch(struct lunaria_cdp_page *page);
+/* Supplies inline document bytes at their original URL and origin. No CORS
+ * permissions are added; MIME and byte length are explicit. */
+int lunaria_cdp_page_fetch_response(struct lunaria_cdp_page *page,const char *request_id,
+                                     const char *mime,const void *body,size_t length);
 /* Answers a paused request with a 200 JSON body (CORS-open: the page is cross-origin). */
 int lunaria_cdp_page_fetch_fulfill(struct lunaria_cdp_page *page, const char *request_id,
                                    const char *body);

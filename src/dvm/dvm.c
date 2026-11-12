@@ -6864,6 +6864,7 @@ void dvm_destroy(struct dvm *vm)
   dvm_nsd_finish(vm);
   dvm_alarm_finish(vm);
   dvm_glsurface_finish(vm);
+  dvm_graphics_finish(vm);
   luna_fd_close(vm->io_cancel[0]);
   luna_fd_close(vm->io_cancel[1]);
 

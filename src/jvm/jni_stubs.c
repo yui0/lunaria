@@ -1841,7 +1841,7 @@ android_view_MotionEvent_getPressure(JNIEnv *env, jobject object, va_list args)
   assert(env && object);
   motion_trace("getPressure");
   const lunaria_touch_event *ev = motion_payload(env, object);
-  return (ev && ev->action != 1) ? 1.0f : 0.0f;
+  return luna_event_axis(ev,2,0);
 }
 
 jint
@@ -2990,11 +2990,6 @@ activity_follow_orientation(jint orientation)
   if (w <= 0 || h <= 0 || !((landscape && w < h) || (portrait && w > h)))
     return;
   int nw = h, nh = w;
-  /* A maximised landscape window turned upright would not fit the screen. */
-  if (nh > 1010) {
-    nw = (int)((long long)nw * 1010 / nh);
-    nh = 1010;
-  }
   fprintf(stderr, "[display] requested orientation %d: window %dx%d -> %dx%d\n",
           (int)orientation, w, h, nw, nh);
   arm_exec_request_view_resize(nw, nh);
@@ -3023,7 +3018,17 @@ activity_get_requested_orientation(jobject activity)
 
 void android_app_Activity_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
 {
-  (void)e;
+  /* The Java implementation also requests the display change. Keeping only
+   * the legacy cache makes a native request invisible to WindowManager. */
+  if (dvm_jni_mode() != DVM_JNI_OFF) {
+    jvalue out = {0};
+    va_list copy;
+    va_copy(copy, a);
+    bool handled = dvm_jni_invoke(e, "android/app/Activity", "setRequestedOrientation",
+                                  "(I)V", o, false, &copy, NULL, &out);
+    va_end(copy);
+    if (handled) return;
+  }
   activity_set_requested_orientation(o, va_arg(a, jint));
 }
 void java_lang_Object_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
@@ -3037,8 +3042,12 @@ void java_lang_Class_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
 
 jint android_app_Activity_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
 {
-  (void)e;
   (void)a;
+  if (dvm_jni_mode() != DVM_JNI_OFF) {
+    jvalue out = {0};
+    if (dvm_jni_invoke(e, "android/app/Activity", "getRequestedOrientation",
+                       "()I", o, false, NULL, NULL, &out)) return out.i;
+  }
   return activity_get_requested_orientation(o);
 }
 jint java_lang_Object_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
@@ -3954,4 +3963,53 @@ jint android_view_MotionEvent_findPointerIndex(JNIEnv *e, jobject o, va_list a)
   for (int i = 0; i < luna_event_count(ev); ++i)
     if (luna_event_id(ev, i) == id) return i;
   return -1;
+}
+
+/* Both getAxisValue overloads consume the same immutable MotionEvent payload
+ * as getX/getY, including multiple pointer indices and POINTER_UP. */
+static jfloat motion_axis_value(JNIEnv *env,jobject object,int axis,int index)
+{
+  const lunaria_touch_event *event=motion_payload(env,object);
+  if (index<0 || index>=luna_event_count(event)) {
+    jclass exception=(*env)->FindClass(env,"java/lang/IllegalArgumentException");
+    (*env)->ThrowNew(env,exception,"pointerIndex");
+    return 0;
+  }
+  return luna_event_axis(event,axis,index);
+}
+jfloat android_view_MotionEvent_getAxisValue__I(JNIEnv *env,jobject object,va_list args)
+{
+  return motion_axis_value(env,object,va_arg(args,int),0);
+}
+jfloat android_view_MotionEvent_getAxisValue__II(JNIEnv *env,jobject object,va_list args)
+{
+  int axis=va_arg(args,int),index=va_arg(args,int);
+  return motion_axis_value(env,object,axis,index);
+}
+jfloat android_view_MotionEvent_getPressure__I(JNIEnv *env,jobject object,va_list args)
+{
+  return motion_axis_value(env,object,2,va_arg(args,int));
+}
+
+/* Basic obtain overload: its first argument is a time, not a source object. */
+jobject android_view_MotionEvent_obtain__JJIFFI(JNIEnv *env,jclass cls,va_list args)
+{
+  (void)cls;
+  lunaria_touch_event event={0};
+  event.down_ms=va_arg(args,jlong);
+  event.event_ms=va_arg(args,jlong);
+  event.action=va_arg(args,int);
+  event.x=(float)va_arg(args,double);
+  event.y=(float)va_arg(args,double);
+  int meta=va_arg(args,int);
+  event.pointer_count=1;
+  event.pointers[0]=(luna_touch_point){.id=0,.x=event.x,.y=event.y};
+  jobject result=jvm_new_motion_event(jnienv_get_jvm(env),&event);
+  if (result) {
+    jclass type=(*env)->GetObjectClass(env,result);
+    jfieldID field=(*env)->GetFieldID(env,type,"metaState","I");
+    if (field) (*env)->SetIntField(env,result,field,meta);
+    (*env)->DeleteLocalRef(env,type);
+  }
+  return result;
 }

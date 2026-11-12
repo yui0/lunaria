@@ -1248,25 +1248,6 @@ inline uint32_t GL_STR_RING_BASE = 0x41020000u;
 constexpr uint32_t GL_STR_RING_SLOTS = 8u;
 constexpr uint32_t GL_STR_RING_SLOT  = 8192u; /* GL_EXTENSIONS can exceed 4 KiB */
 constexpr uint32_t GL_STR_RING_SIZE  = GL_STR_RING_SLOTS * GL_STR_RING_SLOT;
-/* Storage for a direct java.nio.ByteBuffer the bytecode VM allocated.
- *
- * A direct buffer's whole contract is that JNI can take its address:
- * GetDirectBufferAddress() has to answer with a pointer the guest can
- * dereference.  The VM's own arrays live in host memory the guest cannot
- * name, so a buffer it allocates is backed from this guest region instead.
- * A native that is handed 0 does not fail politely — Unity's UnityWebRequest
- * upload path takes its "how much is there in total" branch instead of its
- * "fill this buffer" one and loops for ever. */
-/* Direct-buffer payload is writable data that natives write through
- * (UnityWebRequest copies request and response bodies into it), so it must
- * overlap nothing else.  An old overlap with the pthread fast stubs replaced
- * them with response bytes.  The A64 layout moves it next to the other
- * runtime windows: at this A32 address it sat inside the A64 thread-stack
- * window, and the nineteenth pthread_create got a stack that was the first
- * direct buffer — Unity zeroed its request buffer over Tencent GME's
- * AK::BankManager frames and the next stack-guard check aborted. */
-inline uint32_t DIRECT_BB_BASE = 0x41200000u;
-constexpr uint32_t DIRECT_BB_SIZE = 0x00800000u;  /* 8 MiB */
 // Per-thread guest TLS pages (tpidr_el0), one 4 KiB page per guest tid.
 inline uint32_t TLS_WINDOW_BASE = 0x41030000u;
 inline uint32_t TLS_WINDOW_END  = 0x41040000u;
@@ -1385,7 +1366,6 @@ inline void guest_va_layout_arm64(void) {
   g_cb_slots        = CB_MAX_SLOTS;
   SENTINEL_ADDR     = 0x0E200000u; /* must not alias CB nest stacks */
   /* 0x0E300000: FAST_SYNC64_PAGE (arm_exec.cpp), 8 KiB of stubs. */
-  DIRECT_BB_BASE    = 0x0E400000u; /* .. 0x0EC00000, below MMAP_BASE */
   /* 0x0F000000..0x0F040000: RX host-call code (arm_exec.cpp). */
   // Guest thread stacks: [0x40000000, HEAP_BASE) — 256 MiB, i.
   THREAD_STACK_BASE = 0x40000000u;
@@ -1424,12 +1404,6 @@ inline uint32_t guest_clamp_write_n(uint32_t dst, uint32_t n) {
     end = (uint64_t)dst + n;
   }
   if (dst >= TRAMP_BASE && dst < STACK_BASE) {
-    /* Java's allocateDirect pool is writable payload in this window,
-     * not trampoline code. FMOD initializes its native audio buffer
-     * with memset; suppressing that write violates the buffer contract. */
-    if (dst >= DIRECT_BB_BASE && dst < DIRECT_BB_BASE + DIRECT_BB_SIZE)
-      return n < DIRECT_BB_BASE + DIRECT_BB_SIZE - dst ? n :
-             DIRECT_BB_BASE + DIRECT_BB_SIZE - dst;
     return 0;
   }
   // Do NOT clamp libc writes to mmap slab size (Unity Dynamic Heap bookkeeping).

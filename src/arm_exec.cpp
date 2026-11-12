@@ -465,6 +465,8 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 #include "dynarmic/interface/exclusive_monitor.h"
 
 extern "C" {
+#include "luna_media_format.h"
+#include "luna_native_codec.h"
 #include "arm_exec.h"
 #include "aaudio_stream.h"
 #include "luna_qfkey.h"
@@ -1614,7 +1616,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"fputc",                   SVC_FPUTC},
   {"__assert2",               SVC_ASSERT2},
   {"__android_log_vprint",    SVC_LOG_VPRINT},
-  {"__android_log_buf_write", SVC_LOG_WRITE},
+  {"__android_log_buf_write", SVC_LOG_BUF_WRITE},
+  {"__android_log_buf_print", SVC_LOG_BUF_PRINT},
 
   {"sincos",                  SVC_SINCOS},
   {"sincosf",                 SVC_SINCOSF},
@@ -2398,25 +2401,41 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"AMediaExtractor_getSampleTime",         SVC_RETM1_64},
   {"AMediaExtractor_readSampleData",        SVC_RETM1_64},
   {"AMediaExtractor_advance",               SVC_RET0},
-  {"AMediaFormat_getInt32",                 SVC_RET0},
-  {"AMediaFormat_getInt64",                 SVC_RET0},
-  {"AMediaFormat_getFloat",                 SVC_RET0},
-  {"AMediaFormat_getString",                SVC_RET0},
-  {"AMediaFormat_setInt32",                 SVC_RET0},
-  {"AMediaFormat_delete",                   SVC_RET0},
+  {"AMediaFormat_new", SVC_MF_NEW},
+  {"AMediaFormat_delete", SVC_MF_DELETE},
+  {"AMediaFormat_clear", SVC_MF_CLEAR},
+  {"AMediaFormat_copy", SVC_MF_COPY},
+  {"AMediaFormat_toString", SVC_MF_STRING},
+  {"AMediaFormat_setString", SVC_MF_SET_STRING},
+  {"AMediaFormat_getString", SVC_MF_GET_STRING},
+  {"AMediaFormat_setBuffer", SVC_MF_SET_BUFFER},
+  {"AMediaFormat_getBuffer", SVC_MF_GET_BUFFER},
+  {"AMediaFormat_setRect", SVC_MF_SET_RECT},
+  {"AMediaFormat_getRect", SVC_MF_GET_RECT},
+  {"AMediaFormat_getInt32", SVC_MF_GET_I32},
+  {"AMediaFormat_setInt32", SVC_MF_SET_I32},
+  {"AMediaFormat_getInt64", SVC_MF_GET_I64},
+  {"AMediaFormat_setInt64", SVC_MF_SET_I64},
+  {"AMediaFormat_getFloat", SVC_MF_GET_FLOAT},
+  {"AMediaFormat_setFloat", SVC_MF_SET_FLOAT},
+  {"AMediaFormat_getDouble", SVC_MF_GET_DOUBLE},
+  {"AMediaFormat_setDouble", SVC_MF_SET_DOUBLE},
+  {"AMediaFormat_getSize", SVC_MF_GET_SIZE},
+  {"AMediaFormat_setSize", SVC_MF_SET_SIZE},
+  {"AMediaCodec_createEncoderByType", SVC_MC_ENCODER},
   {"AMediaCodec_createDecoderByType",       SVC_RET0},
-  {"AMediaCodec_configure",                 SVC_MEDIA_UNSUPPORTED},
-  {"AMediaCodec_start",                     SVC_MEDIA_UNSUPPORTED},
-  {"AMediaCodec_stop",                      SVC_RET0},
-  {"AMediaCodec_flush",                     SVC_RET0},
-  {"AMediaCodec_delete",                    SVC_RET0},
-  {"AMediaCodec_dequeueInputBuffer",        SVC_RETM1_64},
-  {"AMediaCodec_dequeueOutputBuffer",       SVC_RETM1_64},
-  {"AMediaCodec_getInputBuffer",            SVC_RET0},
-  {"AMediaCodec_getOutputBuffer",           SVC_RET0},
-  {"AMediaCodec_getOutputFormat",           SVC_RET0},
-  {"AMediaCodec_queueInputBuffer",          SVC_MEDIA_UNSUPPORTED},
-  {"AMediaCodec_releaseOutputBuffer",       SVC_MEDIA_UNSUPPORTED},
+  {"AMediaCodec_configure", SVC_MC_CONFIGURE},
+  {"AMediaCodec_start", SVC_MC_START},
+  {"AMediaCodec_stop", SVC_MC_STOP},
+  {"AMediaCodec_flush", SVC_MC_FLUSH},
+  {"AMediaCodec_delete", SVC_MC_DELETE},
+  {"AMediaCodec_dequeueInputBuffer", SVC_MC_DEQUEUE_INPUT},
+  {"AMediaCodec_dequeueOutputBuffer", SVC_MC_DEQUEUE_OUTPUT},
+  {"AMediaCodec_getInputBuffer", SVC_MC_INPUT},
+  {"AMediaCodec_getOutputBuffer", SVC_MC_OUTPUT},
+  {"AMediaCodec_getOutputFormat", SVC_MC_OUTPUT_FORMAT},
+  {"AMediaCodec_queueInputBuffer", SVC_MC_QUEUE_INPUT},
+  {"AMediaCodec_releaseOutputBuffer", SVC_MC_RELEASE_OUTPUT},
   {"AMediaCodec_setOutputSurface",          SVC_MEDIA_UNSUPPORTED},
   {"AMediaDataSource_new",                  SVC_RET0},
   {"AMediaDataSource_delete",               SVC_RET0},
@@ -3067,6 +3086,7 @@ static bool usable_dynamic_definition(const char *name, const ln64_sym &symbol) 
 // Symbols resolved to a direct guest VA instead of an SVC trampoline
 static uint32_t g_stdio_array;
 static unsigned g_stdio_closed;
+static uint32_t media_format_key_va(const char *name);
 static uint32_t lookup_symbol_direct_va(const char *name) {
   if (uint32_t va = lookup_direct_va_static(name)) return va;
   /* Vulkan: host-call trampolines, when the bridge is on.  They live in the
@@ -3078,7 +3098,7 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
   if (uint32_t va = lookup_direct_va_fast32(name)) return va;
   if (strcmp(name, "__data_start") == 0 || strcmp(name, "data_start") == 0)
     return g_reloc_data_start ? g_reloc_data_start : LIBC_DATA;
-  if (strncmp(name, "AMEDIAFORMAT_KEY_", 17) == 0) return NOOP_RET0;
+  if (strncmp(name, "AMEDIAFORMAT_KEY_", 17) == 0) return media_format_key_va(name);
   // OpenSLES IIDs.  `SL_IID_ENGINE` and friends are declared.
   if (strncmp(name, "SL_IID_", 7) == 0) {
     static std::map<std::string, uint32_t> s_sl;
@@ -14247,12 +14267,24 @@ static void drive_ndk_choreographer(ArmExecCtx &ctx) {
   }
 }
 
-// glMapBufferRange shadows: host pointers can't be exposed to the guest.
+// A64 persistent mappings share driver storage in the guest address space.
+// Other mappings retain a shadow until flush/unmap.
 struct GlMappedBuf {
   void *host;
-  uint32_t gva, len, access;
+  GuestVA gva;
+  uint32_t len, access;
+  int shared;
 };
 static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name */
+static void gl_mapped_release(ArmExecCtx &ctx,GLuint buffer)
+{
+  auto found=g_gl_mapped.find(buffer);
+  if (found==g_gl_mapped.end()) return;
+  const GlMappedBuf *mapping=&found->second;
+  if (mapping->shared) a64_map_remove(mapping->gva,mapping->gva+mapping->len,false);
+  else arm_free(ctx,(uint32_t)mapping->gva);
+  g_gl_mapped.erase(found);
+}
 static thread_local std::map<uint32_t, uint32_t> g_gl_bound_bufs;   /* target -> buffer name */
 /* With a pixel-unpack buffer bound, GL interprets the pointer argument as a
  * byte offset into that buffer.  Translating it as guest memory corrupts or
@@ -16758,8 +16790,8 @@ static void glfw_fb_size_cb(GLFWwindow *window, int w, int h) {
    * ANativeWindow_getWidth/Height read it back out of that struct. */
   if (g_fake_anw_va && g_ctx) {
     const AnwLayout &L = anw_layout(g_ctx->is_arm64);
-    g_ctx->mem.write32(g_fake_anw_va + anw_geom_off(L, 0), (uint32_t)w);
-    g_ctx->mem.write32(g_fake_anw_va + anw_geom_off(L, 1), (uint32_t)h);
+    g_ctx->mem.write32(g_fake_anw_va + anw_geom_off(L, 0), (uint32_t)(g_anw_buf_w>0 ? g_anw_buf_w : w));
+    g_ctx->mem.write32(g_fake_anw_va + anw_geom_off(L, 1), (uint32_t)(g_anw_buf_h>0 ? g_anw_buf_h : h));
   }
 }
 
@@ -17455,6 +17487,30 @@ static void sink_window_release(ArmExecCtx &ctx, struct NativeSinkWindow *w) {
   arm_free(ctx,w->handle);
   free(w);
 }
+extern "C" bool arm_exec_native_window_size(uint64_t window, int *width, int *height) {
+  bool found=false;
+  arm_lock_acquire();
+  if (g_ctx && window && width && height) {
+    const uint32_t handle=native_handle(*g_ctx,window);
+    if (handle && (handle==g_fake_anw_va || sink_window_find(*g_ctx,window))) {
+      const AnwLayout *layout=&anw_layout(g_ctx->is_arm64);
+      *width=(int32_t)g_ctx->mem.read32(handle+anw_geom_off(*layout,0));
+      *height=(int32_t)g_ctx->mem.read32(handle+anw_geom_off(*layout,1));
+      found=*width>0 && *height>0;
+    }
+  }
+  arm_lock_release();
+  return found;
+}
+extern "C" void arm_exec_native_window_ref(uint64_t window, int delta) {
+  arm_lock_acquire();
+  if (g_ctx) {
+    struct NativeSinkWindow *w=sink_window_find(*g_ctx,window);
+    if (w && delta>0) ++w->references;
+    else if (w && delta<0) sink_window_release(*g_ctx,w);
+  }
+  arm_lock_release();
+}
 static void reader_image_delete(ArmExecCtx &ctx, struct NativeImage *image) {
   if (!image) return;
   struct NativeImage **link=&g_reader_images;
@@ -17495,6 +17551,124 @@ static void image_reader_notify(void *context, uint64_t sequence, bool closed) {
   reader->observed=sequence;
   pthread_mutex_unlock(&reader->mutex);
 }
+/* ABI adapter only; typed values and ownership live in the C MediaFormat. */
+struct NativeMediaFormat {
+  uint32_t handle;
+  AMediaFormat *format;
+  struct NativeMediaFormat *next;
+};
+static struct NativeMediaFormat *g_media_formats;
+struct NativeMediaKey { const char *value; uint32_t cell; struct NativeMediaKey *next; };
+static struct NativeMediaKey *g_media_keys;
+static void *native_media_allocate(void *,size_t size,uintptr_t *address)
+{
+  if (!g_ctx || size>UINT32_MAX) return nullptr;
+  uint32_t handle=arm_malloc(*g_ctx,(uint32_t)(size ? size : 1));
+  if (!handle) return nullptr;
+  *address=(uintptr_t)native_pointer(*g_ctx,handle);
+  return g_ctx->mem.ptr(handle);
+}
+static void native_media_release(void *,void *,uintptr_t address)
+{
+  if (g_ctx && address) arm_free(*g_ctx,native_handle(*g_ctx,(GuestVA)address));
+}
+static AMediaFormat *native_media_format(ArmExecCtx &ctx,GuestVA pointer)
+{
+  uint32_t handle=native_handle(ctx,pointer);
+  for (struct NativeMediaFormat *f=g_media_formats;f;f=f->next)
+    if (f->handle==handle) return f->format;
+  return nullptr;
+}
+static uint32_t native_media_format_new(ArmExecCtx &ctx)
+{
+  const struct luna_mf_allocator memory={nullptr,native_media_allocate,native_media_release};
+  AMediaFormat *format=luna_media_format_new(&memory);
+  struct NativeMediaFormat *f=(struct NativeMediaFormat *)calloc(1,sizeof *f);
+  uint32_t handle=format && f ? arm_malloc(ctx,4) : 0;
+  if (!handle) { AMediaFormat_delete(format); free(f); return 0; }
+  f->handle=handle; f->format=format; f->next=g_media_formats; g_media_formats=f;
+  return handle;
+}
+static int32_t native_media_format_delete(ArmExecCtx &ctx,GuestVA pointer)
+{
+  if (!pointer) return 0;
+  uint32_t handle=native_handle(ctx,pointer);
+  struct NativeMediaFormat **at=&g_media_formats;
+  while (*at && (*at)->handle!=handle) at=&(*at)->next;
+  if (!*at) return -10003;
+  struct NativeMediaFormat *f=*at;
+  *at=f->next;
+  int32_t status=AMediaFormat_delete(f->format);
+  arm_free(ctx,f->handle); free(f);
+  return status;
+}
+static uint32_t media_format_key_va(const char *name)
+{
+  const char *value=luna_media_format_key(name);
+  if (!value || !g_ctx) return 0;
+  for (struct NativeMediaKey *key=g_media_keys;key;key=key->next)
+    if (key->value==value) return key->cell;
+  struct NativeMediaKey *key=(struct NativeMediaKey *)calloc(1,sizeof *key);
+  if (!key) return 0;
+  const uint32_t width=g_ctx->is_arm64 ? 8u : 4u;
+  const size_t size=width+strlen(value)+1;
+  uint32_t cell=arm_malloc(*g_ctx,(uint32_t)size);
+  if (!cell) { free(key); return 0; }
+  memcpy(g_ctx->mem.ptr(cell+width),value,strlen(value)+1);
+  GuestVA address=native_pointer(*g_ctx,cell+width);
+  if (g_ctx->is_arm64) g_ctx->mem.write64(cell,address);
+  else g_ctx->mem.write32(cell,(uint32_t)address);
+  key->value=value; key->cell=cell; key->next=g_media_keys; g_media_keys=key;
+  return cell;
+}
+
+struct NativeCodec {
+  uint32_t handle;
+  struct lmc_codec *codec;
+  struct NativeCodec *next;
+};
+static struct NativeCodec *g_native_codecs;
+static struct NativeCodec *native_codec_find(ArmExecCtx &ctx,GuestVA pointer)
+{
+  uint32_t handle=native_handle(ctx,pointer);
+  for (struct NativeCodec *c=g_native_codecs;c;c=c->next) if (c->handle==handle) return c;
+  return nullptr;
+}
+static uint32_t native_codec_new(ArmExecCtx &ctx,const char *mime)
+{
+  const struct luna_mf_allocator memory={nullptr,native_media_allocate,native_media_release};
+  struct lmc_codec *codec=lmc_encoder(mime,&memory);
+  if (!codec) return 0;
+  struct NativeCodec *c=(struct NativeCodec *)calloc(1,sizeof *c);
+  uint32_t handle=c ? arm_malloc(ctx,4) : 0;
+  if (!handle) { lmc_delete(codec); free(c); return 0; }
+  c->handle=handle; c->codec=codec; c->next=g_native_codecs; g_native_codecs=c;
+  return handle;
+}
+struct NativeCodecWait {
+  uint32_t tid,handle,svc;
+  GuestVA sp;
+  uint64_t deadline;
+  bool output;
+  struct NativeCodecWait *next;
+};
+static struct NativeCodecWait *g_native_codec_waits;
+static int native_codec_ready(void *context)
+{
+  struct NativeCodecWait *wait=(struct NativeCodecWait *)context;
+  struct NativeCodec *c=g_ctx ? native_codec_find(*g_ctx,wait->handle) : nullptr;
+  return !c || (wait->output ? lmc_output_ready(c->codec) : lmc_input_ready(c->codec));
+}
+static uint32_t native_media_format_adopt(ArmExecCtx &ctx,AMediaFormat *format)
+{
+  if (!format) return 0;
+  struct NativeMediaFormat *f=(struct NativeMediaFormat *)calloc(1,sizeof *f);
+  uint32_t handle=f ? arm_malloc(ctx,4) : 0;
+  if (!handle) { AMediaFormat_delete(format); free(f); return 0; }
+  f->handle=handle; f->format=format; f->next=g_media_formats; g_media_formats=f;
+  return handle;
+}
+
 static void image_reader_destroy(ArmExecCtx &ctx, struct NativeReader *reader) {
   if (!reader) return;
   struct NativeReader **link=&g_image_readers;
@@ -24374,89 +24548,45 @@ static jobject jni_new_direct_buffer(ArmExecCtx &ctx, struct jvm *jvm,
   return bb;
 }
 
-/* A direct ByteBuffer for the bytecode VM.
- *
- * ByteBuffer.allocateDirect() promises memory JNI can address, and the VM's
- * arrays are host memory the guest cannot name.  Back the buffer from the
- * guest region reserved for exactly this (DIRECT_BB_BASE) and register it,
- * so GetDirectBufferAddress()/GetDirectBufferCapacity() answer the way the
- * platform's do.  The VM copies its array through the region around a native
- * call (see dvm_jni.c) — the two halves then read and write the same bytes.
- *
- * JNI locals return their guest span after the native call; global references
- * retain it.  A bump allocator exhausted this 8 MiB region after sixty-four
- * 128 KiB UnityWebRequest calls, leaving later callbacks without an address. */
-static bool g_direct_bb_mapped = false;
-static std::map<uint32_t, uint32_t> g_direct_bb_free;
-static std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> g_direct_bb_owned;
-
-static void direct_bb_free_span(uint32_t off, uint32_t len) {
-  auto next = g_direct_bb_free.lower_bound(off);
-  if (next != g_direct_bb_free.begin()) {
-    auto prev = std::prev(next);
-    if (prev->first + prev->second == off) {
-      off = prev->first;
-      len += prev->second;
-      g_direct_bb_free.erase(prev);
-    }
-  }
-  if (next != g_direct_bb_free.end() && off + len == next->first) {
-    len += next->second;
-    g_direct_bb_free.erase(next);
-  }
-  g_direct_bb_free.emplace(off, len);
-}
+/* Java-owned direct buffers use the ordinary guest heap. Their JNI handle
+ * owns the allocation until the last Java/native owner releases it. No
+ * separate address-space pool or artificial aggregate capacity is needed. */
+static std::unordered_map<uint32_t, uint32_t> g_direct_bb_owned;
 
 extern "C" uint32_t arm_exec_new_guest_direct_buffer(uint64_t cap,
     uint64_t *addr_out) {
   if (addr_out) *addr_out = 0;
-  if (!g_ctx || !g_ctx->jvm || !cap || cap>DIRECT_BB_SIZE) return 0;
-  cap = (cap + 15ull) & ~15ull;
-  uint32_t start;
-  {
-    std::lock_guard<std::mutex> lk(g_direct_bb_mx);
-    if (!g_direct_bb_mapped) {
-      g_ctx->mem.map(DIRECT_BB_BASE, DIRECT_BB_SIZE);
-      if (g_ctx->is_arm64)
-        a64_map_declare_backing(DIRECT_BB_BASE, DIRECT_BB_SIZE, 3u);
-      g_direct_bb_free.emplace(0, DIRECT_BB_SIZE);
-      g_direct_bb_mapped = true;
-    }
-    auto span = g_direct_bb_free.begin();
-    while (span != g_direct_bb_free.end() && span->second < cap) ++span;
-    if (span == g_direct_bb_free.end()) return 0;
-    start = span->first;
-    const uint32_t left = span->second - (uint32_t)cap;
-    g_direct_bb_free.erase(span);
-    if (left) g_direct_bb_free.emplace(start + (uint32_t)cap, left);
+  if (!g_ctx || !g_ctx->jvm || cap>INT32_MAX) return 0;
+  const uint32_t off=arm_malloc(*g_ctx,cap ? cap : 1u);
+  if (!off) return 0;
+  const GuestVA va=g_ctx->is_arm64 ? a64_guest_va(off) : (GuestVA)off;
+  struct jvm *jvm=g_ctx->jvm;
+  /* Object creation may enter Java. Neither the heap nor registry lock may
+   * be held while acquiring the interpreter lock. */
+  jobject bb=jni_new_direct_buffer(*g_ctx,jvm,&jvm->env,va,cap);
+  if (!bb) {
+    arm_free(*g_ctx,off);
+    return 0;
   }
-  const uint32_t off = DIRECT_BB_BASE + start;
-  const GuestVA va = g_ctx->is_arm64 ? a64_guest_va(off) : (GuestVA)off;
-  struct jvm *jvm = g_ctx->jvm;
-  JNIEnv *env = &jvm->env;
-  /* FindClass/AllocObject may enter Java and acquire GIL. Never carry the
-   * buffer registry lock into that transition: Java allocateDirect takes
-   * GIL first and then this lock. The span is reserved until publication. */
-  jobject bb = jni_new_direct_buffer(*g_ctx, jvm, env, va, cap);
   {
-    std::lock_guard<std::mutex> lk(g_direct_bb_mx);
-    if (!bb) {
-      direct_bb_free_span(start, (uint32_t)cap);
-      return 0;
-    }
-    g_direct_bb_owned[(uint32_t)(uintptr_t)bb] = { start, (uint32_t)cap };
+    std::lock_guard<std::mutex> locked(g_direct_bb_mx);
+    g_direct_bb_owned[(uint32_t)(uintptr_t)bb]=off;
   }
-  if (addr_out) *addr_out = (uint64_t)va;
+  if (addr_out) *addr_out=(uint64_t)va;
   return (uint32_t)(uintptr_t)bb;
 }
 
 extern "C" bool arm_exec_release_guest_direct_buffer(uint32_t handle) {
-  std::lock_guard<std::mutex> lk(g_direct_bb_mx);
-  auto it = g_direct_bb_owned.find(handle);
-  if (it == g_direct_bb_owned.end()) return false;
-  direct_bb_free_span(it->second.first, it->second.second);
-  g_direct_buffers.erase(handle);
-  g_direct_bb_owned.erase(it);
+  uint32_t off;
+  {
+    std::lock_guard<std::mutex> locked(g_direct_bb_mx);
+    auto it=g_direct_bb_owned.find(handle);
+    if (it==g_direct_bb_owned.end()) return false;
+    off=it->second;
+    g_direct_buffers.erase(handle);
+    g_direct_bb_owned.erase(it);
+  }
+  if (g_ctx) arm_free(*g_ctx,off);
   return true;
 }
 
@@ -29037,6 +29167,8 @@ static void svc_info_build(void)
   /* GLES entry points with scalar float parameters, at their prototype
    * position. glSampleCoverage(value, invert) puts the float first, so
    * `invert` moves up to the second slot, where the handler reads it. */
+  fp(SVC_MF_SET_FLOAT, 2, 1, FP_F32);
+  fp(SVC_MF_SET_DOUBLE, 2, 1, FP_F64_SPLIT);
   fp(SVC_GL32_MinSampleShading, 0, 1, FP_F32);
   fp(SVC_GL32_PrimitiveBoundingBox, 0, 8, FP_F32);
   fp(SVC_GL_ClearColor, 0, 4, FP_F32);
@@ -36802,24 +36934,33 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     dispatch_svc(ctx, SVC_ABORT, regs);
     break;
   }
-  case SVC_LOG_PRINT: {
-    const char *tag = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[1]) : ARM_STR(r1);
-    ArmVarArgs ap = make_arm_varargs(ctx, regs, 3, 13, false);
-    const char *fmt = ctx.is_arm64 ? ctx.mem.cstr(g_svc_args64[2]) : ARM_STR(r2);
-    std::string s = arm_vformat(ctx, fmt, ap);
-    fprintf(stderr, "[android_log p=%" PRIu64 " t=%s lr=0x%08x] %s\n",
-            r0, tag?tag:"?", lr, s.c_str());
-    wapi_trace_caller(ctx, regs, s.c_str());
-    ret32(0);
+  case SVC_LOG_PRINT:
+  case SVC_LOG_BUF_PRINT: {
+    const unsigned shift=svc_no==SVC_LOG_BUF_PRINT ? 1u : 0u;
+    const char *tag=ctx.mem.cstr(argp_n(shift+1));
+    const char *fmt=ctx.mem.cstr(argp_n(shift+2));
+    ArmVarArgs ap=make_arm_varargs(ctx,regs,shift+3,13,false);
+    std::string s=arm_vformat(ctx,fmt,ap);
+    if (s.size()>1023) s.resize(1023); /* Android LOG_BUF_SIZE includes NUL. */
+    if (shift) fprintf(stderr,"[android_log b=%d p=%d t=%s lr=0x%08x] %s\n",
+                       (int32_t)r0,(int32_t)r1,tag ? tag : "?",lr,s.c_str());
+    else fprintf(stderr,"[android_log p=%d t=%s lr=0x%08x] %s\n",
+                 (int32_t)r0,tag ? tag : "?",lr,s.c_str());
+    wapi_trace_caller(ctx,regs,s.c_str());
+    ret32(1);
     break;
   }
-  case SVC_LOG_WRITE: {
-    const char *tag = ARM_STR(r1);
-    const char *msg = ARM_STR(r2);
-    fprintf(stderr, "[android_log p=%" PRIu64 " t=%s] %s\n",
-            r0, tag?tag:"?", msg?msg:"");
-    wapi_trace_caller(ctx, regs, msg ? msg : "");
-    ret32(0);
+  case SVC_LOG_WRITE:
+  case SVC_LOG_BUF_WRITE: {
+    const unsigned shift=svc_no==SVC_LOG_BUF_WRITE ? 1u : 0u;
+    const char *tag=ctx.mem.cstr(argp_n(shift+1));
+    const char *msg=ctx.mem.cstr(argp_n(shift+2));
+    if (shift) fprintf(stderr,"[android_log b=%d p=%d t=%s] %s\n",
+                       (int32_t)r0,(int32_t)r1,tag ? tag : "?",msg ? msg : "");
+    else fprintf(stderr,"[android_log p=%d t=%s] %s\n",
+                 (int32_t)r0,tag ? tag : "?",msg ? msg : "");
+    wapi_trace_caller(ctx,regs,msg ? msg : "");
+    ret32(1);
     break;
   }
   case SVC_DLOPEN: {
@@ -37737,7 +37878,9 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
       ret32(ctx.mem.read32(w->handle+anw_geom_off(anw_layout(ctx.is_arm64),0)));
       break;
     }
-    // Always report the same size as DisplayMetrics / eglQuerySurface (g_fb).
+    /* WIDTH queries the consumer size; DEFAULT_WIDTH includes the producer's
+     * user dimensions (ANativeWindow_setBuffersGeometry), as Surface::query
+     * does on Android. Vulkan uses the latter. */
     ret32((uint32_t)arm_exec_fb_width());
     break;
   }
@@ -40508,6 +40651,7 @@ aaudio_write_retry:
       // GL semantics: deleting the currently bound buffer unbinds it
       for (uint32_t i = 0; i < r0; ++i) {
         uint32_t b = ctx.mem.read32(r1 + i*4);
+        gl_mapped_release(ctx,b);
         if (b == g_gl_bound_array_buf) g_gl_bound_array_buf = 0;
         if (b == g_gl_bound_elem_buf)  g_gl_bound_elem_buf  = 0;
       }
@@ -40671,8 +40815,9 @@ aaudio_write_retry:
     /* The guest sees the shadow buffer MapBufferRange handed out, never a host pointer. */
     const GuestVA p = argp_n(2);
     auto it = g_gl_mapped.find(gl_mapping_buffer((GLenum)r0));
-    const uint32_t gva = (r1 == 0x88BDu /* GL_BUFFER_MAP_POINTER */ && it != g_gl_mapped.end())
+    GuestVA gva = (r1 == 0x88BDu /* GL_BUFFER_MAP_POINTER */ && it != g_gl_mapped.end())
                          ? it->second.gva : 0u;
+    if (ctx.is_arm64 && gva && gva<A64_GUEST_SIZE) gva=a64_guest_va((BackingOffset)gva);
     if (p) {
       if (ctx.is_arm64) ctx.mem.write64(p, gva);
       else ctx.mem.write32(p, gva);
@@ -47358,6 +47503,233 @@ sigmask_done:
     ret32(0);
     break;
   }
+  case SVC_MC_ENCODER:
+    retptr(native_codec_new(ctx,r0 ? (const char *)ctx.mem.ptr(r0) : nullptr));
+    break;
+  case SVC_MC_DELETE: {
+    struct NativeCodec **at=&g_native_codecs;
+    uint32_t handle=native_handle(ctx,r0);
+    while (*at && (*at)->handle!=handle) at=&(*at)->next;
+    if (!*at) { ret32((uint32_t)-10003); break; }
+    struct NativeCodec *c=*at; *at=c->next;
+    lmc_delete(c->codec); arm_free(ctx,c->handle); free(c);
+    ret32(0); break;
+  }
+  case SVC_MC_CONFIGURE:
+  case SVC_MC_START:
+  case SVC_MC_STOP:
+  case SVC_MC_FLUSH:
+  case SVC_MC_QUEUE_INPUT:
+  case SVC_MC_RELEASE_OUTPUT: {
+    struct NativeCodec *c=native_codec_find(ctx,r0);
+    if (!c) { ret32((uint32_t)-10003); break; }
+    int result=-10002;
+    switch (svc_no) {
+    case SVC_MC_CONFIGURE:
+      result=(r2 || r3) ? -10002 : lmc_configure(c->codec,native_media_format(ctx,r1),arg32(4));
+      break;
+    case SVC_MC_START: result=lmc_start(c->codec); break;
+    case SVC_MC_STOP: result=lmc_stop(c->codec); break;
+    case SVC_MC_FLUSH: result=lmc_flush(c->codec); break;
+    case SVC_MC_RELEASE_OUTPUT: result=lmc_release_output(c->codec,(size_t)argp_n(1),r2!=0); break;
+    case SVC_MC_QUEUE_INPUT: {
+      uint64_t time=ctx.is_arm64 ? argp_n(4) : (uint64_t)arg32(4)|((uint64_t)arg32(5)<<32);
+      result=lmc_queue_input(c->codec,(size_t)argp_n(1),(size_t)argp_n(2),(size_t)argp_n(3),
+                              (int64_t)time,arg32(ctx.is_arm64 ? 5 : 6));
+      break;
+    }
+    }
+    ret32((uint32_t)result); break;
+  }
+  case SVC_MC_INPUT:
+  case SVC_MC_OUTPUT: {
+    struct NativeCodec *c=native_codec_find(ctx,r0);
+    size_t size=0; uintptr_t address=0;
+    if (c) {
+      if (svc_no==SVC_MC_INPUT) lmc_input(c->codec,(size_t)argp_n(1),&size,&address);
+      else lmc_output(c->codec,(size_t)argp_n(1),&size,&address);
+    }
+    if (r2) { if (ctx.is_arm64) ctx.mem.write64(r2,size); else ctx.mem.write32(r2,(uint32_t)size); }
+    retptr((GuestVA)address); break;
+  }
+  case SVC_MC_OUTPUT_FORMAT: {
+    struct NativeCodec *c=native_codec_find(ctx,r0);
+    retptr(native_media_format_adopt(ctx,c ? lmc_output_format(c->codec) : nullptr));
+    break;
+  }
+  case SVC_MC_DEQUEUE_INPUT:
+  case SVC_MC_DEQUEUE_OUTPUT: {
+    bool output=svc_no==SVC_MC_DEQUEUE_OUTPUT;
+    int64_t timeout=ctx.is_arm64 ? (int64_t)argp_n(output ? 2 : 1) :
+                    (int64_t)((uint64_t)(uint32_t)r2|((uint64_t)(uint32_t)r3<<32));
+    struct NativeCodecWait **link=&g_native_codec_waits;
+    while (*link && !((*link)->tid==g_current_tid && (*link)->sp==g_svc_sp64 && (*link)->svc==svc_no)) link=&(*link)->next;
+    struct NativeCodecWait *waiting=*link;
+    uint64_t now=host_mono_ns();
+    uint64_t deadline=waiting ? waiting->deadline : timeout<0 || (uint64_t)timeout>(UINT64_MAX-now)/1000 ?
+                      UINT64_MAX : now+(uint64_t)timeout*1000;
+    struct lmc_buffer_info info={0};
+    int result;
+    for (;;) {
+      struct NativeCodec *c=native_codec_find(ctx,r0);
+      result=!c ? -10003 : output ? (r1 ? lmc_dequeue_output(c->codec,&info) : -10004) : lmc_dequeue_input(c->codec);
+      if (result!=-1 || timeout==0 || host_mono_ns()>=deadline) break;
+      if (guest_net::can_park_current()) {
+        if (!waiting) {
+          waiting=(struct NativeCodecWait *)calloc(1,sizeof *waiting);
+          if (!waiting) { result=-10000; break; }
+          waiting->tid=g_current_tid; waiting->handle=native_handle(ctx,r0);
+          waiting->svc=svc_no; waiting->sp=g_svc_sp64; waiting->deadline=deadline;
+          waiting->output=output; waiting->next=g_native_codec_waits; g_native_codec_waits=waiting;
+        }
+        guest_net::GuestFdWait wait;
+        wait.ready=native_codec_ready; wait.ctx=waiting; wait.retry=true;
+        wait.deadline_ms=deadline==UINT64_MAX ? -1 : (int64_t)(deadline/1000000+(deadline%1000000!=0));
+        wait.what="MediaCodec dequeue"; wait.started_ms=wait.last_report_ms=guest_net::now_ms();
+        guest_net::g_fd_waits[g_current_tid]=std::move(wait);
+        if (ArmThread *thread=arm_thread_by_tid(g_current_tid)) thread->waiting_fds=true;
+        fd_deadline_republish(); g_svc_retry=true; g_yield_requested=true;
+        break;
+      }
+      guest_net::wait_slice();
+      usleep(50);
+    }
+    if (g_svc_retry) break;
+    if (waiting) {
+      link=&g_native_codec_waits;
+      while (*link && *link!=waiting) link=&(*link)->next;
+      if (*link) *link=waiting->next;
+      free(waiting);
+    }
+    if (output && result>=0) {
+      ctx.mem.write32(r1,(uint32_t)info.offset); ctx.mem.write32(r1+4,(uint32_t)info.size);
+      ctx.mem.write64(r1+8,(uint64_t)info.time_us); ctx.mem.write32(r1+16,info.flags);
+    }
+    if (ctx.is_arm64) ret64((uint64_t)(int64_t)result); else ret32((uint32_t)result);
+    break;
+  }
+  case SVC_MF_NEW:
+    retptr(native_media_format_new(ctx));
+    break;
+  case SVC_MF_DELETE:
+    ret32((uint32_t)native_media_format_delete(ctx,r0));
+    break;
+  case SVC_MF_CLEAR:
+    AMediaFormat_clear(native_media_format(ctx,r0));
+    ret32(0);
+    break;
+  case SVC_MF_COPY:
+    ret32((uint32_t)AMediaFormat_copy(native_media_format(ctx,r0),native_media_format(ctx,r1)));
+    break;
+  case SVC_MF_STRING: {
+    AMediaFormat *format=native_media_format(ctx,r0);
+    const char *text=AMediaFormat_toString(format);
+    retptr((GuestVA)luna_media_format_address(format,text));
+    break;
+  }
+  case SVC_MF_SET_STRING:
+    AMediaFormat_setString(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),
+                           (const char *)ctx.mem.ptr(r2));
+    ret32(0);
+    break;
+  case SVC_MF_GET_STRING: {
+    AMediaFormat *format=native_media_format(ctx,r0);
+    const char *text=nullptr;
+    bool ok=r2 && AMediaFormat_getString(format,(const char *)ctx.mem.ptr(r1),&text);
+    if (ok) {
+      GuestVA address=(GuestVA)luna_media_format_address(format,text);
+      if (ctx.is_arm64) ctx.mem.write64(r2,address); else ctx.mem.write32(r2,(uint32_t)address);
+    }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_BUFFER:
+    AMediaFormat_setBuffer(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),
+                           r2 ? ctx.mem.ptr(r2) : nullptr,(size_t)argp_n(3));
+    ret32(0); break;
+  case SVC_MF_GET_BUFFER: {
+    AMediaFormat *format=native_media_format(ctx,r0);
+    void *data=nullptr; size_t size=0;
+    bool ok=r2 && r3 && AMediaFormat_getBuffer(format,(const char *)ctx.mem.ptr(r1),&data,&size);
+    if (ok) {
+      GuestVA address=(GuestVA)luna_media_format_address(format,data);
+      if (ctx.is_arm64) { ctx.mem.write64(r2,address); ctx.mem.write64(r3,size); }
+      else { ctx.mem.write32(r2,(uint32_t)address); ctx.mem.write32(r3,(uint32_t)size); }
+    }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_RECT:
+    AMediaFormat_setRect(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),
+                         (int32_t)r2,(int32_t)r3,(int32_t)arg32(4),(int32_t)arg32(5));
+    ret32(0); break;
+  case SVC_MF_GET_RECT: {
+    int32_t l,t,r,b;
+    GuestVA right=argp_n(4),bottom=argp_n(5);
+    bool ok=r2 && r3 && right && bottom &&
+        AMediaFormat_getRect(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),&l,&t,&r,&b);
+    if (ok) { ctx.mem.write32(r2,(uint32_t)l); ctx.mem.write32(r3,(uint32_t)t);
+              ctx.mem.write32(right,(uint32_t)r); ctx.mem.write32(bottom,(uint32_t)b); }
+    ret32(ok); break;
+  }
+  case SVC_MF_GET_I32: {
+    int32_t value={0};
+    bool ok=r2 && AMediaFormat_getInt32(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),&value);
+    if (ok) { memcpy(ctx.mem.ptr(r2),&value,4); }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_I32: {
+    int32_t value;
+    value=(int32_t)r2;
+    AMediaFormat_setInt32(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),value);
+    ret32(0); break;
+  }
+  case SVC_MF_GET_I64: {
+    int64_t value={0};
+    bool ok=r2 && AMediaFormat_getInt64(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),&value);
+    if (ok) { memcpy(ctx.mem.ptr(r2),&value,8); }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_I64: {
+    int64_t value;
+    value=(int64_t)(ctx.is_arm64 ? argp_n(2) : (uint64_t)(uint32_t)r2|((uint64_t)(uint32_t)r3<<32));
+    AMediaFormat_setInt64(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),value);
+    ret32(0); break;
+  }
+  case SVC_MF_GET_FLOAT: {
+    float value={0};
+    bool ok=r2 && AMediaFormat_getFloat(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),&value);
+    if (ok) { memcpy(ctx.mem.ptr(r2),&value,4); }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_FLOAT: {
+    float value;
+    uint32_t bits=(uint32_t)r2; memcpy(&value,&bits,4);
+    AMediaFormat_setFloat(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),value);
+    ret32(0); break;
+  }
+  case SVC_MF_GET_DOUBLE: {
+    double value={0};
+    bool ok=r2 && AMediaFormat_getDouble(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),&value);
+    if (ok) { memcpy(ctx.mem.ptr(r2),&value,8); }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_DOUBLE: {
+    double value;
+    uint64_t bits=(uint64_t)(uint32_t)r2|((uint64_t)(uint32_t)r3<<32); memcpy(&value,&bits,8);
+    AMediaFormat_setDouble(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),value);
+    ret32(0); break;
+  }
+  case SVC_MF_GET_SIZE: {
+    size_t value={0};
+    bool ok=r2 && AMediaFormat_getSize(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),&value);
+    if (ok) { if (ctx.is_arm64) ctx.mem.write64(r2,(uint64_t)value); else ctx.mem.write32(r2,(uint32_t)value); }
+    ret32(ok); break;
+  }
+  case SVC_MF_SET_SIZE: {
+    size_t value;
+    value=(size_t)argp_n(2);
+    AMediaFormat_setSize(native_media_format(ctx,r0),(const char *)ctx.mem.ptr(r1),value);
+    ret32(0); break;
+  }
   case SVC_MEDIA_UNSUPPORTED:
     ret32((uint32_t)(int32_t)-10002 /* AMEDIA_ERROR_UNSUPPORTED */);
     break;
@@ -48988,6 +49360,16 @@ fputws_done:
       retptr(0u);
       break;
     }
+    /* Persistent CPU/GPU access requires one storage object, not a copy
+     * published only at unmap. A64 can address the driver mapping directly;
+     * register its exact lifetime and permissions in the ordinary guest VM. */
+    if (ctx.is_arm64 && (access&0x40u) && (GuestVA)(uintptr_t)host>=A64_GUEST_SIZE) {
+      const GuestVA address=(GuestVA)(uintptr_t)host;
+      a64_map_insert(address,address+len,(access&2u) ? 3u : 1u,false);
+      g_gl_mapped[buf]={host,address,len,access,1};
+      retptr(address);
+      break;
+    }
     uint32_t gva = arm_malloc(ctx, len ? len : 4u);
     if (!gva) {
       if (pfn_glUnmapBuffer) pfn_glUnmapBuffer((GLenum)r0);
@@ -48997,7 +49379,7 @@ fputws_done:
     }
     if (host && (access & 0x0001u) /* GL_MAP_READ_BIT */)
       memcpy(ctx.mem.ptr(gva), host, len);
-    g_gl_mapped[buf] = { host, gva, len, access };
+    g_gl_mapped[buf] = { host, gva, len, access, 0 };
     {
       static int n = 0;
       if (n++ < 24)
@@ -49039,7 +49421,7 @@ fputws_done:
       break;
     }
     if (host && (access & 0x0001u)) memcpy(ctx.mem.ptr(gva), host, len);
-    g_gl_mapped[buf] = { host, gva, len, access };
+    g_gl_mapped[buf] = { host, gva, len, access, 0 };
     {
       static int n = 0;
       if (n++ < 12)
@@ -49090,15 +49472,14 @@ fputws_done:
     if (it != g_gl_mapped.end()) {
       auto &m = it->second;
       // GL_MAP_WRITE_BIT without GL_MAP_FLUSH_EXPLICIT_BIT
-      if (m.host && (m.access & 0x0002u) && !(m.access & 0x0010u))
+      if (!m.shared && m.host && (m.access & 0x0002u) && !(m.access & 0x0010u))
         memcpy(m.host, ctx.mem.ptr(m.gva), m.len);
       static int n = 0;
       if (n++ < 24)
         fprintf(stderr, "[gl] UnmapBuffer target=0x%" PRIx64 " buf=%u len=%u "
                         "copied=%d\n", r0, it->first, m.len,
-                (m.host && (m.access & 0x0002u) && !(m.access & 0x0010u)) ? 1 : 0);
-      arm_free(ctx, m.gva);
-      g_gl_mapped.erase(it);
+                (!m.shared && m.host && (m.access & 0x0002u) && !(m.access & 0x0010u)) ? 1 : 0);
+      gl_mapped_release(ctx,it->first);
     }
     uint32_t result = 1u;
     if (pfn_glUnmapBuffer) {
@@ -49113,7 +49494,7 @@ fputws_done:
     if (it != g_gl_mapped.end()) {
       auto &m = it->second;
       uint32_t off = r1, len = r2;
-      if (m.host && off + len <= m.len)
+      if (!m.shared && m.host && off<=m.len && len<=m.len-off)
         memcpy((char*)m.host + off, ctx.mem.ptr(m.gva + off), len);
       static int n = 0;
       if (n++ < 24) {
@@ -49211,6 +49592,13 @@ fputws_done:
       GLsizei length = (GLsizei)arg32(3);
       ArmLockDropped gl_unlocked;
       pfn_glProgramBinary((GLuint)r0, (GLenum)r1, binary, length);
+      if (lunaria_env("LUNARIA_TRACE_GLSHADER") && pfn_glGetProgramiv) {
+        GLint linked=0,uniforms=0;
+        pfn_glGetProgramiv((GLuint)r0,0x8B82u,&linked);
+        pfn_glGetProgramiv((GLuint)r0,0x8B86u,&uniforms);
+        fprintf(stderr,"[glsh] ProgramBinary(prog=%u,format=0x%x,length=%d) linked=%d uniforms=%d\n",
+                (unsigned)r0,(unsigned)r1,(int)length,linked,uniforms);
+      }
     }
     break;
   }
@@ -51152,13 +51540,9 @@ fputws_done:
      * Share file I/O and kernel signal operations with raw svc#0, then
      * translate the kernel's -errno to libc -1/errno. In particular the
      * action/mask here use the kernel structure, not libc's sigaction. */
-    if ((ctx.is_arm64 && (nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
-                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u ||
-                          /* eventfd2, epoll_create1, epoll_ctl, epoll_pwait: mio's
-                           * Selector::new asks syscall(SYS_epoll_create1) first and,
-                           * on ENOSYS, takes a fallback that stores fcntl()'s 0 as the
-                           * epoll fd, so every later epoll_ctl fails with EINVAL. */
-                          nr==19u || nr==20u || nr==21u || nr==22u)) ||
+    if ((ctx.is_arm64 && (nr==19u || nr==20u || nr==21u || nr==22u ||
+                          nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
+                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u)) ||
         (!ctx.is_arm64 && (nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                            nr==90u || nr==91u || nr==125u || nr==192u || nr==219u || nr==220u || nr==323u || nr==329u ||
                            nr==37u || nr==174u || nr==175u || nr==268u))) {
@@ -51170,9 +51554,8 @@ fputws_done:
         kernel_regs[i]=arguments[i];
         g_svc_args64[i]=arguments[i];
       }
-      /* AArch64 nr 20 (epoll_create1) is renamed 2020 on the raw svc#0 path,
-       * because the shared switch's case 20 is getpid. */
-      kernel_regs[7]=(ctx.is_arm64 && nr==20u) ? 2020u : nr;
+      /* The shared raw dispatcher reserves 20 for A32 getpid. */
+      kernel_regs[7]=ctx.is_arm64 && nr==20u ? 2020u : nr;
       dispatch_svc(ctx,0,kernel_regs);
       g_svc_args64=saved_args;
       int64_t result=ctx.is_arm64 ? (int64_t)kernel_regs[0]
@@ -52547,9 +52930,10 @@ fputws_done:
     }
     ArmVarArgs ap = make_arm_varargs(ctx, regs, 0, 3, true);
     std::string s = arm_vformat(ctx, fmt, ap);
+    if (s.size()>1023) s.resize(1023);
     fprintf(stderr, "[android_log p=%" PRIu64 " t=%s lr=0x%08x] %s\n",
             r0, tag?tag:"?", lr, s.c_str());
-    ret32(0);
+    ret32(1);
     break;
   }
 
@@ -55450,29 +55834,33 @@ fputws_done:
       pv_fail(ESRCH);
       break;
     }
-    if (!liov || !riov || lcnt > 1024 || rcnt > 1024) {
+    if (lcnt > 1024 || rcnt > 1024 || argp_n(5)) {
       pv_fail(EINVAL);
+      break;
+    }
+    if (!lcnt || !rcnt) {
+      RET_SSIZE(0);
       break;
     }
 
     const uint32_t W = ctx.is_arm64 ? 8u : 4u;
+    /* Existence of a mapping does not imply read/write permission. Crash
+     * handlers deliberately probe PROT_NONE pages and holes between mappings. */
+    auto accessible = [&](GuestVA va, uint64_t n, uint32_t prot) {
+      if (!n) return true;
+      if (!va || n > SIZE_MAX) return false;
+      if (!ctx.is_arm64) return n <= 0x100000000ull - (uint64_t)va;
+      GuestVA fault;
+      return a64_access_fault_for_prot(va,(size_t)n,prot,&fault)==0;
+    };
+    if (!accessible(liov,lcnt*2u*W,1u) || !accessible(riov,rcnt*2u*W,1u)) {
+      pv_fail(EFAULT);
+      break;
+    }
     auto iov_at = [&](GuestVA base, uint64_t i, GuestVA *ba, uint64_t *len) {
       GuestVA at = base + (GuestVA)(i * 2ull * W);
       *ba  = (GuestVA)guest_net::get_ptr(ctx, at);
       *len = ctx.is_arm64 ? ctx.mem.read64(at + 8) : ctx.mem.read32((uint32_t)at + 4);
-    };
-    /* On A64 the guest's mappings are known exactly.  A32 is a flat
-     * arena, where every 32-bit address is backed, so there is nothing
-     * to reject and the answer is the same one the guest would get. */
-    auto readable = [&](GuestVA va, uint64_t n) {
-      if (!va || !n) return false;
-      if (!ctx.is_arm64) return (uint64_t)va + n <= 0x100000000ull;
-      /* Both ends: a range that starts inside a mapping and runs past
-       * it is exactly the case this call exists to report. */
-      GuestVA last = va + (GuestVA)(n - 1);
-      if (last < va) return false;                    /* wrapped */
-      return (a64_is_guest_va(va) || a64_mapped(va)) &&
-             (a64_is_guest_va(last) || a64_mapped(last));
     };
 
     uint64_t li = 0, ri = 0, loff = 0, roff = 0, moved = 0;
@@ -55492,7 +55880,7 @@ fputws_done:
         continue;
       }
       uint64_t n = std::min(ll - loff, rl - roff);
-      if (!readable(rb + roff, n)) {
+      if (!accessible(rb + roff,n,1u) || !accessible(lb + loff,n,2u)) {
         if (moved) break;      /* partial read: report what got through */
         pv_fail(EFAULT);
         goto pv_done;
@@ -57641,10 +58029,10 @@ mbsrtowcs_done:
         emp_va, /* mon_thousands_sep */ emp_va, /* mon_grouping      */
         emp_va, /* positive_sign     */ emp_va, /* negative_sign     */
       };
+      /* A64 pointers are full guest VAs; the heap hands out window offsets. */
       for (uint32_t k = 0; k < nptr; ++k) {
         if (ctx.is_arm64)
-          ctx.mem.write64((GuestVA)(base + k * psz),
-                          (uint64_t)values[k]);
+          ctx.mem.write64((GuestVA)(base + k * psz), a64_guest_va(values[k]));
         else
           ctx.mem.write32(base + k * psz, values[k]);
       }
@@ -57652,7 +58040,7 @@ mbsrtowcs_done:
       std::memset(ctx.mem.ptr(base + chars_off), 0x7F, 14);
       g_lconv_va = base;
     }
-    ret32(g_lconv_va);
+    retptr(g_lconv_va);
     break;
   }
   case SVC_SOCKETPAIR: {
@@ -75615,18 +76003,6 @@ extern "C" int  arm64_exec_fb_width(void)                {
 }
 extern "C" int  arm64_exec_fb_height(void)               {
   return arm_exec_fb_height();
-}
-/* The size an app asked its window's buffers to be (ANativeWindow_
- * setBuffersGeometry), else the window's own.  On a device the compositor
- * stretches such a buffer to the window, and Vulkan reports it as the
- * surface's currentExtent; Unity's fixed-DPI scaling relies on this. */
-extern "C" int  arm64_exec_buffer_width(void)            {
-  const int w = __atomic_load_n(&g_anw_buf_w, __ATOMIC_RELAXED);
-  return w > 0 ? w : arm_exec_fb_width();
-}
-extern "C" int  arm64_exec_buffer_height(void)           {
-  const int h = __atomic_load_n(&g_anw_buf_h, __ATOMIC_RELAXED);
-  return h > 0 ? h : arm_exec_fb_height();
 }
 extern "C" void arm64_exec_touch_push(int a, float x, float y) {
   arm_exec_touch_push(a,x,y);

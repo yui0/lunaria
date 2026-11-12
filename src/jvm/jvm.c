@@ -1769,6 +1769,34 @@ jvm_framework_super(const char *name)
   return NULL;
 }
 
+/* Prefer a signature-qualified host implementation before the legacy name.
+ * Overloads must not share a va_list decoder with different argument types. */
+static void *jvm_host_overload(const char *symbol,const char *signature)
+{
+  char name[768];
+  size_t used=strlen(symbol);
+  if (!signature || signature[0]!='(' || signature[1]==')' || used+3>=sizeof name) return NULL;
+  memcpy(name,symbol,used); name[used++]='_'; name[used++]='_';
+  for (const unsigned char *p=(const unsigned char *)signature+1;*p && *p!=')';++p) {
+    const char *escape=NULL;
+    if (*p=='_') escape="_1";
+    else if (*p==';') escape="_2";
+    else if (*p=='[') escape="_3";
+    else if (*p=='$') escape="_00024";
+    else if (*p>=128) return NULL; /* no non-ASCII names in host C stubs */
+    if (escape) {
+      size_t n=strlen(escape);
+      if (n>=sizeof name-used) return NULL;
+      memcpy(name+used,escape,n); used+=n;
+    } else {
+      if (used+1>=sizeof name) return NULL;
+      name[used++]=*p=='/' ? '_' : (char)*p;
+    }
+  }
+  name[used]=0;
+  return wrapper_create(name,luna_os_library_symbol(NULL,name));
+}
+
 static void*
 jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
 {
@@ -1790,12 +1818,7 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
   jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
 
   void *sym;
-  if (!strcmp(method.signature.data, "(I)F")) {
-    char indexed[260];
-    snprintf(indexed, sizeof indexed, "%s__I", symbol);
-    if ((sym = wrapper_create(indexed, luna_os_library_symbol(NULL, indexed))))
-      return sym;
-  }
+  if ((sym=jvm_host_overload(symbol,method.signature.data))) return sym;
   if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
     return sym;
 
@@ -1812,6 +1835,7 @@ jvm_wrap_method_uncached(struct jvm *jvm, jmethodID method_id)
         break;
       method.klass = jvm_make_class(jvm, super);
       jvm_form_symbol(jvm, &method, symbol, sizeof(symbol));
+      if ((sym=jvm_host_overload(symbol,method.signature.data))) return sym;
       if ((sym = wrapper_create(symbol, luna_os_library_symbol(NULL, symbol))))
         return sym;
       name = super;
@@ -1943,19 +1967,46 @@ jvm_dvm_try_nonvirtual(JNIEnv *env, jobject self, jmethodID method_id, bool is_s
  * to contain as if it were the ABI's argument-area bookkeeping, which segfaults
  * the moment a stub reads its first parameter.
  *
- * A jvalue is an 8-byte union, i.e. exactly the layout of the stack argument
- * area of a varargs frame.  So a real va_list can be built over the caller's
+ * A jvalue is an 8-byte union. Float and narrow integer entries first need
+ * C default argument promotions to form a host varargs frame.  So a real va_list can be built over the caller's
  * array by declaring the register save areas already exhausted and pointing the
  * overflow area at it; va_arg() then reads consecutive 8-byte slots, which is
  * what a jvalue array is. */
 struct jvm_va_wrap {
   va_list ap;
+  jvalue promoted[LUNARIA_JNI_MAX_ARGS];
 };
 
 static void
-jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
+jvm_va_from_jvalues(struct jvm_va_wrap *v,JNIEnv *env,jmethodID method,const jvalue *args)
 {
-  memset(v, 0, sizeof *v);
+  memset(&v->ap,0,sizeof v->ap);
+  struct jvm_object *object=jvm_get_object(jnienv_get_jvm(env),method);
+  const char *signature=object && object->type==JVM_OBJECT_METHOD ? object->method.signature.data : NULL;
+  if (args && signature && *signature=='(') {
+    const char *p=signature+1;
+    size_t index=0;
+    while (*p && *p!=')' && index<LUNARIA_JNI_MAX_ARGS) {
+      char kind=*p++;
+      v->promoted[index]=args[index];
+      switch (kind) {
+      case 'F': v->promoted[index].d=(double)args[index].f; break;
+      case 'Z': v->promoted[index].i=(int)args[index].z; break;
+      case 'B': v->promoted[index].i=(int)args[index].b; break;
+      case 'C': v->promoted[index].i=(int)args[index].c; break;
+      case 'S': v->promoted[index].i=(int)args[index].s; break;
+      case '[':
+        while (*p=='[') ++p;
+        if (*p!='L') { if (*p) ++p; break; }
+        ++p;
+        /* fall through */
+      case 'L': while (*p && *p!=';') ++p; if (*p) ++p; break;
+      default: break;
+      }
+      ++index;
+    }
+    args=v->promoted;
+  }
 #if defined(__APPLE__)
   /* Darwin defines va_list as a simple char pointer on both supported host
    * architectures.  Treating it as the Linux AArch64 four-field structure
@@ -1994,29 +2045,29 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v, const jvalue *args)
  * JVM_VA_HAS_ARGS — synthesising a real empty list would make those tests pass
  * and the stub read past the end of nothing. */
 #if defined(__aarch64__) && !defined(__APPLE__)
-#define JVM_CALL_A(f, T, C, p0, p1, args) \
+#define JVM_CALL_A(f, T, C, p0, p1, mid, args) \
    ((args) ? ({ struct jvm_va_wrap v_; \
-                jvm_va_from_jvalues(&v_, (args)); \
+                jvm_va_from_jvalues(&v_, (p0), (mid), (args)); \
                 ((T (*)(JNIEnv *, C, va_list))(f))((p0), (p1), v_.ap); }) \
            : ({ struct jvm_va_wrap v_; memset(&v_, 0, sizeof v_); \
                 ((T (*)(JNIEnv *, C, va_list))(f))((p0), (p1), v_.ap); }))
 
-#define JVM_CALL_NV_A(f, T, p0, p1, p2, args) \
+#define JVM_CALL_NV_A(f, T, p0, p1, p2, mid, args) \
    ((args) ? ({ struct jvm_va_wrap v_; \
-                jvm_va_from_jvalues(&v_, (args)); \
+                jvm_va_from_jvalues(&v_, (p0), (mid), (args)); \
                 ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }) \
            : ({ struct jvm_va_wrap v_; memset(&v_, 0, sizeof v_); \
                 ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }))
 #else
-#define JVM_CALL_A(f, T, C, p0, p1, args) \
+#define JVM_CALL_A(f, T, C, p0, p1, mid, args) \
    ((args) ? ({ struct jvm_va_wrap v_; \
-                jvm_va_from_jvalues(&v_, (args)); \
+                jvm_va_from_jvalues(&v_, (p0), (mid), (args)); \
                 ((T (*)(JNIEnv *, C, va_list))(f))((p0), (p1), v_.ap); }) \
            : ((T (*)(JNIEnv *, C, void *))(f))((p0), (p1), NULL))
 
-#define JVM_CALL_NV_A(f, T, p0, p1, p2, args) \
+#define JVM_CALL_NV_A(f, T, p0, p1, p2, mid, args) \
    ((args) ? ({ struct jvm_va_wrap v_; \
-                jvm_va_from_jvalues(&v_, (args)); \
+                jvm_va_from_jvalues(&v_, (p0), (mid), (args)); \
                 ((T (*)(JNIEnv *, jobject, jclass, va_list))(f))((p0), (p1), (p2), v_.ap); }) \
            : ((T (*)(JNIEnv *, jobject, jclass, void *))(f))((p0), (p1), (p2), NULL))
 #endif
@@ -2063,7 +2114,7 @@ JNIEnv_CallStaticVoidMethodA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
       return;
   }
   if (fp)
-    (void)JVM_CALL_A(fp, jobject, jclass, p0, p1, p3);
+    (void)JVM_CALL_A(fp, jobject, jclass, p0, p1, p2, p3);
 }
 
 static void
@@ -2108,7 +2159,7 @@ JNIEnv_CallVoidMethodA(JNIEnv* p0, jobject p1, jmethodID p2, jvalue* p3)
       return;
   }
   if (fp)
-    (void)JVM_CALL_A(fp, jobject, jobject, p0, p1, p3);
+    (void)JVM_CALL_A(fp, jobject, jobject, p0, p1, p2, p3);
 }
 
 static void
@@ -2153,7 +2204,7 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
       return;
   }
   if (fp)
-    (void)JVM_CALL_NV_A(fp, jobject, p0, p1, p2, p4);
+    (void)JVM_CALL_NV_A(fp, jobject, p0, p1, p2, p3, p4);
 }
 
 // N == Call method type convention (Long, Float, StaticLong, StaticFloat, etc...)
@@ -2186,7 +2237,7 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
          if (jvm_dvm_try(p0, (jobject)p1, method, ST, NULL, p3, &rv)) \
             return (T)rv.VF; \
       } \
-      return (fp ? JVM_CALL_A(fp, T, C, p0, p1, p3) : D); \
+      return (fp ? JVM_CALL_A(fp, T, C, p0, p1, method, p3) : D); \
    } \
    static T \
    JNIEnv_Call##N##Method(JNIEnv* p0, C p1, jmethodID method, ...) { \
@@ -2226,7 +2277,7 @@ JNIEnv_CallNonvirtualVoidMethodA(JNIEnv* p0, jobject p1, jclass p2, jmethodID p3
          if (jvm_dvm_try_nonvirtual(p0, p1, method, false, NULL, p4, &rv)) \
             return (T)rv.VF; \
       } \
-      return (fp ? JVM_CALL_NV_A(fp, T, p0, p1, p2, p4) : D); \
+      return (fp ? JVM_CALL_NV_A(fp, T, p0, p1, p2, method, p4) : D); \
    } \
    static T \
    JNIEnv_CallNonvirtual##N##Method(JNIEnv* p0, jobject p1, jclass p2, jmethodID method, ...) { \
@@ -3693,7 +3744,7 @@ jvm_motion_event_read(struct jvm *jvm, jobject object, lunaria_touch_event *out)
   struct jvm_object *o = jvm_get_object(jvm, object);
   if (!o || o->type != JVM_OBJECT_MOTION || !out)
     return false;
-  *out = o->motion;
+  if (!dvm_jni_motion_event_read((uint32_t)(uintptr_t)object,out)) *out=o->motion;
   return true;
 }
 

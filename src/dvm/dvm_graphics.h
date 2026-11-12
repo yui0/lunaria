@@ -20,6 +20,39 @@
  * written out once as PNG under the emulator's cache and the view that shows
  * it names that file — the overlay draws from files. */
 
+#include "luna_raster_jobs.h"
+
+void dvm_graphics_finish(struct dvm *vm)
+{
+  luna_raster_jobs_destroy(vm->raster_jobs);
+  vm->raster_jobs = NULL;
+  vm->raster_jobs_initialized = false;
+}
+
+static void canvas_run_rows(struct dvm *vm, luna_raster_rows_fn rows,
+                             void *context, const int limits[4], bool independent)
+{
+  if (limits[2] <= limits[0] || limits[3] <= limits[1]) return;
+  size_t pixels = (size_t)(limits[2] - limits[0]) * (size_t)(limits[3] - limits[1]);
+  if (!independent || pixels < 32768 || limits[3] - limits[1] < 16) {
+    rows(context, limits[1], limits[3]);
+    return;
+  }
+  if (!vm->raster_jobs_initialized) {
+    unsigned total = (unsigned)luna_os_cpu_count();
+    if (!total || total > 4) total = 4;
+    const char *configured = getenv("LUNARIA_RASTER_THREADS");
+    if (configured && *configured) {
+      char *end;
+      long value = strtol(configured, &end, 10);
+      if (!*end && value >= 0) total = value < 1 ? 1 : value > 4 ? 4 : (unsigned)value;
+    }
+    vm->raster_jobs = luna_raster_jobs_create(total - 1);
+    vm->raster_jobs_initialized = true;
+  }
+  luna_raster_jobs_run(vm->raster_jobs, rows, context, limits[1], limits[3]);
+}
+
 unsigned char *stbi_load_from_memory(const unsigned char *buf, int len,
                                      int *x, int *y, int *comp, int req);
 void stbi_image_free(void *p);
@@ -1477,6 +1510,7 @@ struct canvas_state {
   struct canvas_clip *clip;
   size_t count, capacity, clips, clip_capacity;
   bool clip_cache_valid,clip_simple;
+  size_t clip_prefix;
   float clip_bounds[4];
   bool query_clip_valid;
   int query_clip[4],query_width,query_height;
@@ -1660,6 +1694,7 @@ static void canvas_prepare_clip(struct canvas_state *s)
 {
   if(!s || s->clip_cache_valid) return;
   s->clip_simple=true;
+  s->clip_prefix=0;
   s->clip_bounds[0]=s->clip_bounds[1]=-INFINITY;
   s->clip_bounds[2]=s->clip_bounds[3]=INFINITY;
   for(size_t i=0; i<s->clips; ++i) {
@@ -1672,6 +1707,7 @@ static void canvas_prepare_clip(struct canvas_state *s)
     s->clip_bounds[1]=fmaxf(s->clip_bounds[1],clip->bounds[1]);
     s->clip_bounds[2]=fminf(s->clip_bounds[2],clip->bounds[2]);
     s->clip_bounds[3]=fminf(s->clip_bounds[3],clip->bounds[3]);
+    ++s->clip_prefix;
   }
   s->clip_cache_valid=true;
 }
@@ -1681,8 +1717,12 @@ static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
   canvas_prepare_clip(s);
   if(s && s->clip_simple) return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
                                    x<s->clip_bounds[2] && y<s->clip_bounds[3];
-  bool result=true;
-  for (size_t i=0; s && i<s->clips; ++i) {
+  /* Collapse the rectangular intersection prefix even when a later path
+   * makes the clip complex. Later UNION/XOR/REPLACE still see this result. */
+  bool result=!s || !s->clip_prefix ||
+              (x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
+               x<s->clip_bounds[2] && y<s->clip_bounds[3]);
+  for (size_t i=s ? s->clip_prefix : 0; s && i<s->clips; ++i) {
     const struct canvas_clip *c=&s->clip[i];
     bool inside;
     if(c->simple) {
@@ -2401,6 +2441,66 @@ static inline uint32_t gradient_lut_sample(const struct canvas_shader *s,const u
   return lut[(int)(t*(GRADIENT_LUT-1)+.5f)];
 }
 
+struct canvas_path_rows {
+  struct canvas_state *state;
+  struct rt_bitmap *dst;
+  struct canvas_shader shader;
+  const float *inverse, *bounds;
+  const unsigned char *mask;
+  const uint32_t *lut;
+  int limits[4], width, height, mode;
+  float scale;
+  uint32_t color;
+  bool device_coverage, solid, use_lut;
+};
+static void canvas_path_rows_draw(void *context, int begin, int end)
+{
+  const struct canvas_path_rows *job = context;
+  struct canvas_state *state = job->state;
+  struct rt_bitmap *dst = job->dst;
+  const struct canvas_shader shader = job->shader;
+  const float *inverse = job->inverse, *bounds = job->bounds;
+  const unsigned char *mask = job->mask;
+  const uint32_t *lut = job->lut;
+  const int *limits = job->limits;
+  const int width = job->width, height = job->height, mode = job->mode;
+  const float scale = job->scale;
+  const uint32_t color = job->color;
+  const bool device_coverage = job->device_coverage, solid = job->solid, use_lut = job->use_lut;
+  const bool simple_clip = state->clip_simple, opaque_dst = !dst->has_alpha;
+  const float *cb = state->clip_bounds;
+  const unsigned solid_alpha = color >> 24;
+  for(int y=begin; y<end; ++y) {
+    if(simple_clip && !(y+.5f>=cb[1] && y+.5f<cb[3])) continue;
+    for(int x=limits[0]; x<limits[2]; ++x) {
+      if(simple_clip ? !(x+.5f>=cb[0] && x+.5f<cb[2]) : !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
+      float lx,ly;
+      mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
+      float u=x+.5f,v=y+.5f;
+      if(!device_coverage) {
+        u=lx*scale-bounds[0];
+        v=ly*scale-bounds[1];
+      }
+      if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
+      unsigned coverage=mask[4*((size_t)(int)v*width+(int)u)+3];
+      if(!coverage) continue;
+      size_t index=(size_t)y*dst->w+x;
+      if(solid && coverage==255 && solid_alpha==255) {
+        /* An opaque, fully covered pixel: SRC_OVER replaces it, and
+         * DST_IN (a rounded-corner mask) leaves it as it is. */
+        if(mode==3) {
+          dst->px[index]=color;
+          continue;
+        }
+        if(mode==6 && !opaque_dst) continue;
+      }
+      uint32_t sample=solid ? color : use_lut ? gradient_lut_sample(&shader,lut,lx,ly)
+                      : canvas_shader_sample(&shader,lx,ly,color);
+      dst->px[index]=canvas_blend(sample,dst->px[index],mode,coverage,opaque_dst);
+    }
+  }
+}
+
 static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,uint32_t color,
                               int style,float stroke,int cap,int join,float miter,bool aa,
                               dvm_ref paint,union dvm_value *out)
@@ -2490,45 +2590,19 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
   }
   /* A rectangular clip is a bounds test; only a complex one needs the per-pixel query. */
   canvas_prepare_clip(state);
-  const bool simple_clip=state->clip_simple;
-  const float *cb=state->clip_bounds;
   const bool solid=!shader.gradient && !shader.bitmap;
-  const bool opaque_dst=!dst->has_alpha;
   uint32_t lut[GRADIENT_LUT];
   const bool use_lut=!solid && shader.gradient && !shader.bitmap && shader.gradient->type==0 &&
                      shader.gradient->count>=2 && shader.gradient->colors &&
                      (long)(limits[2]-limits[0])*(limits[3]-limits[1])>=2048;
   if(use_lut) gradient_lut_build(&shader,lut);
-  const unsigned solid_alpha=color>>24;
-  for(int y=limits[1]; y<limits[3]; ++y) {
-    if(simple_clip && !(y+.5f>=cb[1] && y+.5f<cb[3])) continue;
-    for(int x=limits[0]; x<limits[2]; ++x) {
-      if(simple_clip ? !(x+.5f>=cb[0] && x+.5f<cb[2]) : !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
-      float lx,ly;
-      mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
-      float u=x+.5f,v=y+.5f;
-      if(!device_coverage) {
-        u=lx*scale-bounds[0];
-        v=ly*scale-bounds[1];
-      }
-      if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
-      unsigned coverage=mask[4*((size_t)(int)v*width+(int)u)+3];
-      if(!coverage) continue;
-      size_t index=(size_t)y*dst->w+x;
-      if(solid && coverage==255 && solid_alpha==255) {
-        /* An opaque, fully covered pixel: SRC_OVER replaces it, and
-         * DST_IN (a rounded-corner mask) leaves it as it is. */
-        if(mode==3) {
-          dst->px[index]=color;
-          continue;
-        }
-        if(mode==6 && !opaque_dst) continue;
-      }
-      uint32_t sample=solid ? color : use_lut ? gradient_lut_sample(&shader,lut,lx,ly)
-                      : canvas_shader_sample(&shader,lx,ly,color);
-      dst->px[index]=canvas_blend(sample,dst->px[index],mode,coverage,opaque_dst);
-    }
-  }
+  struct canvas_path_rows job = {
+    .state=state, .dst=dst, .shader=shader, .inverse=inverse, .bounds=bounds,
+    .mask=mask, .lut=lut, .width=width, .height=height, .mode=mode, .scale=scale,
+    .color=color, .device_coverage=device_coverage, .solid=solid, .use_lut=use_lut
+  };
+  memcpy(job.limits, limits, sizeof limits);
+  canvas_run_rows(vm, canvas_path_rows_draw, &job, limits, shader.bitmap != dst);
   if(!mask_cached) free(mask);
   if(cprof) {
     struct timespec c1;
@@ -3017,7 +3091,7 @@ static inline uint32_t blit_lerp(uint32_t a, uint32_t b, unsigned w)
 static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *dst,
                                const int subset[4], const float inverse[9],
                                const float clip[4], int x0, int y0, int x1, int y1,
-                               bool filter, unsigned paint_alpha)
+                               bool filter, unsigned paint_alpha, struct canvas_state *clip_state)
 {
   /* Pixel centres inside the clip, and the source rectangle in destination x. */
   /* An unclipped axis has infinite bounds: compare as floats before casting. */
@@ -3058,7 +3132,7 @@ static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *ds
    * blends two source rows once (vrow), and each pixel then blends two texels
    * of that row, two channels per 32-bit multiply. */
   const bool separable = filter && !src_alpha;
-  const bool copy_rows = !src_alpha && paint_alpha == 255 && du == one &&
+  const bool copy_rows = !clip_state && !src_alpha && paint_alpha == 255 && du == one &&
                          col[0].inside && col[cols - 1].inside && col[0].exact;
   uint32_t stack_row[2048], *vrow = stack_row;
   if (separable && src->w > 2048) vrow = malloc((size_t)src->w * sizeof *vrow);
@@ -3091,6 +3165,7 @@ static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *ds
       vr = vrow;
     }
     for (int x = x0; x < x1; ++x) {
+      if (clip_state && !canvas_clip_contains(clip_state,x+.5f,y+.5f)) continue;
       const struct blit_col *c = &col[x - x0];
       if (!c->inside) continue;
       uint32_t s;
@@ -3148,6 +3223,77 @@ static void canvas_blit_scaled(const struct rt_bitmap *src, struct rt_bitmap *ds
  * (given as an object, or as nine floats when the caller has only a
  * translation and so has no Matrix to hand) or from a source rectangle into a
  * destination rectangle. */
+struct canvas_bitmap_rows {
+  struct canvas_state *state;
+  const struct rt_bitmap *src;
+  struct rt_bitmap *dst;
+  const float *inverse;
+  const int *subset;
+  struct color_filter_state filter_state;
+  int x0, x1, mode;
+  bool filtered;
+  float paint_alpha;
+  const float *clip;
+  bool scaled;
+};
+static void canvas_bitmap_rows_draw(void *context, int begin, int end)
+{
+  const struct canvas_bitmap_rows *job = context;
+  if (job->scaled) {
+    canvas_blit_scaled(job->src,job->dst,job->subset,job->inverse,job->clip,
+                       job->x0,begin,job->x1,end,job->filtered,
+                       (unsigned)lroundf(job->paint_alpha*255.f),
+                       job->state->clip_simple ? NULL : job->state);
+    return;
+  }
+  struct canvas_state *state = job->state;
+  const struct rt_bitmap *src = job->src;
+  struct rt_bitmap *dst = job->dst;
+  const float *inverse = job->inverse;
+  const int *subset = job->subset;
+  const struct color_filter_state filter_state = job->filter_state;
+  const int x0 = job->x0, x1 = job->x1, mode = job->mode;
+  const float paint_alpha = job->paint_alpha;
+  for (int y=begin; y<end; ++y) for (int x=x0; x<x1; ++x) {
+      if (!canvas_clip_contains(state,x+0.5f,y+0.5f)) continue;
+      float sx, sy;
+      float w = inverse[6]*(x+0.5f) + inverse[7]*(y+0.5f) + inverse[8];
+      if (!w) continue;
+      mat_map(inverse, x+0.5f, y+0.5f, &sx, &sy);
+      if (!isfinite(sx) || !isfinite(sy) || sx < subset[0] || sy < subset[1] || sx >= subset[2] || sy >= subset[3]) continue;
+      float sample[4];
+      canvas_sample(src, sx, sy, job->filtered, subset, sample);
+      for (int i = 0; i < 4; ++i) sample[i] *= paint_alpha;
+      if(filter_state.active) {
+        uint32_t input=(uint32_t)lroundf(sample[3]*255)<<24;
+        if(sample[3]>0)for(int i=0; i<3; ++i)input|=(uint32_t)lroundf(fmaxf(0,fminf(1,sample[i]/sample[3]))*255)<<(16-8*i);
+        uint32_t filtered=color_filter_pixel(&filter_state,input);
+        sample[3]=(filtered>>24)/255.f;
+        for(int i=0; i<3; ++i)sample[i]=((filtered>>(16-8*i))&255)/255.f*sample[3];
+      }
+      uint32_t *pixel = &dst->px[(size_t)y * dst->w + x], old = *pixel;
+      if(mode!=3) {
+        uint32_t source=(uint32_t)lroundf(sample[3]*255)<<24;
+        if(sample[3]>0) for(int c=0; c<3; ++c)
+            source|=(uint32_t)lroundf(fmaxf(0,fminf(1,sample[c]/sample[3]))*255)<<(16-8*c);
+        *pixel=canvas_blend(source,old,mode,255,!dst->has_alpha);
+        continue;
+      }
+      float da = dst->has_alpha ? (float)(old >> 24) / 255.f : 1.f;
+      float alpha = sample[3] + da*(1-sample[3]);
+      uint32_t result = (uint32_t)lroundf(alpha*255.f) << 24;
+      for (int c = 0; c < 3; ++c) {
+        int shift = 16-8*c;
+        float value = sample[c] + (float)((old >> shift) & 255)/255.f * da*(1-sample[3]);
+        int channel = alpha > 0 ? (int)lroundf(value/alpha*255.f) : 0;
+        if (channel > 255) channel = 255;
+        if (channel < 0) channel = 0;
+        result |= (uint32_t)channel << shift;
+      }
+      *pixel = result;
+    }
+}
+
 static bool canvas_draw_bitmap_with(struct dvm *vm, dvm_ref self, dvm_ref bitmap,
                                     dvm_ref src_rect, dvm_ref dest_rect, dvm_ref matrix,
                                     const float *fixed, dvm_ref paint, bool rectangle,
@@ -3248,57 +3394,24 @@ static bool canvas_draw_bitmap_with(struct dvm *vm, dvm_ref self, dvm_ref bitmap
       y1=(int)ceilf(fminf(y1,fmaxf(0,max_y)));
     }
   }
-  /* The ordinary case -- an image scaled and translated onto a rectangular
-   * clip, drawn source-over with no colour filter -- needs no per-pixel
-   * matrix, clip query or float blend: the source row and column are linear
+  /* An image scaled and translated, drawn source-over with no colour filter,
+   * needs no per-pixel matrix or float blend: its source row and column are linear
    * in the destination, so they are stepped in 16.16 fixed point and the
-   * pixel is blended in integers.  Everything else takes the general loop. */
+   * pixel is blended in integers. Complex clips retain their exact per-pixel
+   * membership check. Everything else takes the general loop. */
   canvas_prepare_clip(state);
-  if (state->clip_simple && mode==3 && !filter_state.active &&
-      transform[1]==0 && transform[3]==0 && transform[6]==0 && transform[7]==0 && transform[8]==1) {
-    canvas_blit_scaled(src,dst,subset,inverse,state->clip_bounds,x0,y0,x1,y1,
-                       (flags.i&2)!=0,(unsigned)lroundf(paint_alpha*255.f));
-    goto drawn;
-  }
-  for (int y=y0; y<y1; ++y) for (int x=x0; x<x1; ++x) {
-      if (!canvas_clip_contains(state,x+0.5f,y+0.5f)) continue;
-      float sx, sy;
-      float w = inverse[6]*(x+0.5f) + inverse[7]*(y+0.5f) + inverse[8];
-      if (!w) continue;
-      mat_map(inverse, x+0.5f, y+0.5f, &sx, &sy);
-      if (!isfinite(sx) || !isfinite(sy) || sx < subset[0] || sy < subset[1] || sx >= subset[2] || sy >= subset[3]) continue;
-      float sample[4];
-      canvas_sample(src, sx, sy, (flags.i & 2) != 0, subset, sample);
-      for (int i = 0; i < 4; ++i) sample[i] *= paint_alpha;
-      if(filter_state.active) {
-        uint32_t input=(uint32_t)lroundf(sample[3]*255)<<24;
-        if(sample[3]>0)for(int i=0; i<3; ++i)input|=(uint32_t)lroundf(fmaxf(0,fminf(1,sample[i]/sample[3]))*255)<<(16-8*i);
-        uint32_t filtered=color_filter_pixel(&filter_state,input);
-        sample[3]=(filtered>>24)/255.f;
-        for(int i=0; i<3; ++i)sample[i]=((filtered>>(16-8*i))&255)/255.f*sample[3];
-      }
-      uint32_t *pixel = &dst->px[(size_t)y * dst->w + x], old = *pixel;
-      if(mode!=3) {
-        uint32_t source=(uint32_t)lroundf(sample[3]*255)<<24;
-        if(sample[3]>0) for(int c=0; c<3; ++c)
-            source|=(uint32_t)lroundf(fmaxf(0,fminf(1,sample[c]/sample[3]))*255)<<(16-8*c);
-        *pixel=canvas_blend(source,old,mode,255,!dst->has_alpha);
-        continue;
-      }
-      float da = dst->has_alpha ? (float)(old >> 24) / 255.f : 1.f;
-      float alpha = sample[3] + da*(1-sample[3]);
-      uint32_t result = (uint32_t)lroundf(alpha*255.f) << 24;
-      for (int c = 0; c < 3; ++c) {
-        int shift = 16-8*c;
-        float value = sample[c] + (float)((old >> shift) & 255)/255.f * da*(1-sample[3]);
-        int channel = alpha > 0 ? (int)lroundf(value/alpha*255.f) : 0;
-        if (channel > 255) channel = 255;
-        if (channel < 0) channel = 0;
-        result |= (uint32_t)channel << shift;
-      }
-      *pixel = result;
-    }
-drawn:
+  const bool scaled = mode==3 && !filter_state.active &&
+      transform[1]==0 && transform[3]==0 && transform[6]==0 && transform[7]==0 && transform[8]==1;
+  const float bounds[4] = {(float)x0,(float)y0,(float)x1,(float)y1};
+  struct canvas_bitmap_rows job = {
+    .state=state, .src=src, .dst=dst, .inverse=inverse, .subset=subset,
+    .filter_state=filter_state, .x0=x0, .x1=x1, .mode=mode,
+    .filtered=(flags.i & 2) != 0, .paint_alpha=paint_alpha,
+    .scaled=scaled, .clip=state->clip_simple ? state->clip_bounds : bounds
+  };
+  const int scan[4] = {x0,y0,x1,y1};
+  canvas_run_rows(vm, canvas_bitmap_rows_draw, &job, scan, true);
+
   if (src == &snapshot) free(snapshot.px);
   ++dst->gen;
   RETV();

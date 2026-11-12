@@ -220,6 +220,8 @@ struct dvm_network_callback {
   bool online;
 };
 struct dvm {
+  struct luna_raster_jobs *raster_jobs;
+  bool raster_jobs_initialized;
   dvm_ref application_class_loader, bootstrap_class_loader;
   dvm_ref legacy_http_class_loader;
   uint64_t field_cache_generation;
@@ -728,6 +730,7 @@ void dvm_alarm_poll(struct dvm *vm);
 void dvm_alarm_poll_at(struct dvm *vm, int64_t wall_ms, int64_t elapsed_ms);
 void dvm_alarm_finish(struct dvm *vm);
 void dvm_nsd_finish(struct dvm *vm);
+void dvm_graphics_finish(struct dvm *vm);
 /* Called by dvm.c when a class has no dex definition, before falling back to
  * the host stubs.  Returns NULL when the runtime has no built-in for it. */
 struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc);

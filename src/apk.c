@@ -1888,6 +1888,28 @@ static int android_system_fonts(const char *root)
   if(n<0 || (size_t)n>=sizeof xml || path_join(path,sizeof path,root,"system/etc/fonts.xml")) return -1;
   return android_font_write(path,xml,(size_t)n);
 }
+/* A device ships its platform libraries as ELF files in /system/lib64, and
+ * apps read them (the machine type in libc's header is the usual ABI probe).
+ * Alias the real bionic images the runtime loads using the portable .sym.
+ * representation, so the file the guest opens is the library it runs. */
+static int android_system_libs(const char *root)
+{
+  const char *sys = getenv("LUNARIA_SYSLIB_DIR");
+  if (!sys || !*sys) return 0;
+  char dir[PATH_MAX], src[PATH_MAX], dst[PATH_MAX];
+  if (path_join(dir, sizeof dir, root, "system/lib64") || mkdirs(dir)) return -1;
+  static const char *const libs[] = {"libc.so", "libm.so", "libz.so"};
+  for (unsigned i = 0; i < sizeof libs / sizeof libs[0]; ++i) {
+    luna_file_info info;
+    if (path_join(src, sizeof src, sys, libs[i]) || path_join(dst, sizeof dst, dir, libs[i])) return -1;
+    if (luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) continue;
+    if (!luna_file_infoat(LUNA_AT_FDCWD, dst, &info, LUNA_AT_NOFOLLOW) &&
+        luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0)) return -1;
+    if (luna_symlink_create(src, dst))
+      return apk_error("cannot install system library %s: %s", dst, strerror(errno));
+  }
+  return 0;
+}
 static bool suffix(const char *s, const char *ext);
 
 /* Read the launcher's display inputs before creating its first window.
@@ -2285,7 +2307,7 @@ static int profile_storage(const char *root, const char *package, const char *pr
     return -1;
   /* Like the app directories above, the device filesystem belongs to the
    * selected profile. exec retains the previous launch's environment. */
-  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path) || android_system_fonts(path))
+  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path) || android_system_fonts(path) || android_system_libs(path))
     return -1;
   return env_set("LUNARIA_PROFILE", profile, true);
 }

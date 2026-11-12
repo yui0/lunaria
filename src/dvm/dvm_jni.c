@@ -336,7 +336,9 @@ bool dvm_jni_release_idle_wrapper(struct dvm *vm, dvm_ref ref, uint32_t host)
   forget_wrapper(host, ref);
   (*env)->DeleteGlobalRef(env, (jobject)(uintptr_t)host);
   dvm_unpin(vm, ref);
-  dvm__discard_temporary(vm, ref);
+  /* This VM has no tracing collector. Java fields may still refer to the
+   * object after native code lets go: keep its fields, releasing only the
+   * JNI binding. Explicitly freeing it here would invalidate those fields. */
   static unsigned long long released;
   if (++released % 5000 == 0)
     fprintf(stderr, "[dvm-jni] released %llu idle wrappers\n", released);
@@ -669,7 +671,7 @@ static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
 {
   uint32_t len = 0;
   uint8_t *src = dvm_buffer_bytes(vm, r, &len);
-  if (!src || !len) return 0;
+  if (!src) return 0;
 
   uint32_t handle = dvm_external_handle(vm, r);
   if (!handle) {
@@ -777,6 +779,11 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
         object->length && object->data)
       ARRAY_REGION(env, Get, object->elem_kind, o, (jsize)object->length, object->data);
     return known;
+  }
+  struct luna_touch_event motion;
+  if (jvm_motion_event_read(jnienv_get_jvm(env),o,&motion)) {
+    dvm_ref event=dvm_motion_event_new(vm,&motion);
+    return event ? bind_payload(vm,env,event,o) : 0;
   }
   dvm_ref arr = host_array_to_dvm(vm, env, o);
   if (arr) return arr;
@@ -983,6 +990,8 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
   if (dvm_buffer_is_direct(vm, r)) {
     uint32_t bb = dvm_direct_buffer_to_host(vm, r);
     if (bb) return (jobject)(uintptr_t)bb;
+    jvm_throw_new(jnienv_get_jvm(env), "java/lang/OutOfMemoryError", "direct buffer storage");
+    return NULL;
   }
   /* Each time a Java object crosses into native code the native side gets a
    * reference of its own (JNI: every returned or passed object is a new local
@@ -1939,12 +1948,23 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
   }
   if (getenv("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent"))
     fprintf(stderr, "[motion-jni] nativeInjectEvent returned %d\n", ret.z);
-  /* The native may have written into a direct buffer's guest region; the
-   * bytes have to be back in the VM's array before bytecode reads them
-   * again (UnityWebRequest's upload loop reads array() on the next line). */
-  for (int i = 0; i < nargs && i < LUNARIA_JNI_MAX_ARGS; ++i)
-    if (args[i].l && dvm_buffer_is_direct(vm, args[i].l))
-      dvm_direct_buffer_from_host(vm, args[i].l);
+  /* Native writes must be visible when Java resumes. In a nested JNI call
+   * (native -> Java -> native), the outer call will also export the Java
+   * array: leaving its old snapshot here would erase the native writes. */
+  for (int i = 0; i < nargs && i < LUNARIA_JNI_MAX_ARGS; ++i) {
+    char parameter[256];
+    if (!dvm__sig_param(sig,i,parameter,sizeof parameter)) break;
+    if (!args[i].l || (parameter[0]!='L' && parameter[0]!='[')) continue;
+    if (dvm_buffer_is_direct(vm,args[i].l)) {
+      dvm_direct_buffer_from_host(vm,args[i].l);
+    } else if (parameter[0]=='[' && parameter[1]!='L' && parameter[1]!='[') {
+      struct dvm_object *array=dvm__obj(vm,args[i].l);
+      if (jargs[i].l && array && array->kind==DVM_OBJ_ARRAY &&
+          array->elem_kind!='L' && array->data && array->length)
+        ARRAY_REGION(env,Get,array->elem_kind,jargs[i].l,
+                     (jsize)array->length,array->data);
+    }
+  }
 
 
   ++g_native_calls;
@@ -3035,4 +3055,15 @@ void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity)
             "[dvm] UnityPlayer.currentActivity := host 0x%x → @%x (%s)\n",
             (unsigned)(uintptr_t)activity, act, ok ? "ok" : "no-field");
   dvm_gil_leave_to_guest(vm, cookie);
+}
+
+bool dvm_jni_motion_event_read(uint32_t host,struct luna_touch_event *out)
+{
+  struct dvm *vm=atomic_load_explicit(&g_ready_vm,memory_order_acquire);
+  if (!vm || !host || !out) return false;
+  unsigned cookie=dvm_gil_enter_from_guest(vm);
+  dvm_ref ref=find_wrapper(host);
+  bool valid=ref && dvm_motion_event_read(vm,ref,out);
+  dvm_gil_leave_to_guest(vm,cookie);
+  return valid;
 }

@@ -1542,6 +1542,7 @@ static void cipher_state_destroy(void *data)
 }
 static void cipher_state_clear(struct dvm *vm, dvm_ref self)
 {
+  (void)dvm_set_field(vm,self,"bufferedBytes","I",(union dvm_value){.i=0});
   struct dvm_object *object = dvm__obj(vm, self);
   if (object && object->data) {
     cipher_state_destroy(object->data);
@@ -1930,7 +1931,7 @@ static bool cipher_update_bytes(struct dvm *vm, dvm_ref self,
 }
 static bool cipher_commit_update(struct dvm *vm,dvm_ref self,
                                  EVP_CIPHER_CTX *next,bool buffered,
-                                 const uint8_t *input,uint32_t length)
+                                 const uint8_t *input,uint32_t length,int written)
 {
   if(buffered) {
     union dvm_value old= {0};
@@ -1949,7 +1950,9 @@ static bool cipher_commit_update(struct dvm *vm,dvm_ref self,
     union dvm_value value= {.l=joined};
     return dvm_set_field(vm,self,"pending","[B",value);
   }
+  int64_t remaining=(int64_t)rt_get_int(vm,self,"bufferedBytes")+length-written;
   cipher_state_clear(vm,self);
+  (void)dvm_set_field(vm,self,"bufferedBytes","I",(union dvm_value){.i=(int32_t)remaining});
   struct dvm_object *object=dvm__obj(vm,self);
   object->data=next;
   object->data_destroy=cipher_state_destroy;
@@ -1997,7 +2000,7 @@ static bool cipher_update_buffers(struct dvm *vm,dvm_ref self,
     dvm__throw(vm,"javax/crypto/ShortBufferException","output buffer too small");
     return false;
   }
-  if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)(il-ip))) {
+  if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)(il-ip),written)) {
     free(bytes);
     EVP_CIPHER_CTX_free(next);
     return false;
@@ -2037,7 +2040,7 @@ static bool cipher_update_array(struct dvm *vm,dvm_ref self,
     EVP_CIPHER_CTX_free(next);
     return false;
   }
-  if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)length)) {
+  if(!cipher_commit_update(vm,self,next,buffered,input,(uint32_t)length,written)) {
     EVP_CIPHER_CTX_free(next);
     return false;
   }
@@ -2165,7 +2168,7 @@ static bool cipher_doFinal_into(struct dvm *vm, dvm_ref self,
       return cipher_fail(vm,"cannot preserve cipher state");
     }
   }
-  union dvm_value aad= {0},pending= {0};
+  union dvm_value aad= {0},pending= {0},buffered= {.i=rt_get_int(vm,self,"bufferedBytes")};
   (void)dvm_get_field(vm,self,"aad","[B",&aad);
   (void)dvm_get_field(vm,self,"pending","[B",&pending);
   union dvm_value bytes = { 0 };
@@ -2186,6 +2189,7 @@ static bool cipher_doFinal_into(struct dvm *vm, dvm_ref self,
     object->data_destroy=saved?cipher_state_destroy:NULL;
     (void)dvm_set_field(vm,self,"aad","[B",aad);
     (void)dvm_set_field(vm,self,"pending","[B",pending);
+    (void)dvm_set_field(vm,self,"bufferedBytes","I",buffered);
     dvm__throw(vm, "javax/crypto/ShortBufferException", "output buffer too small");
     return false;
   }
@@ -4004,7 +4008,7 @@ static const struct rt_field rt_cipher_fields[] = {
   { "provider", "Ljava/security/Provider;" },
   { "transform", "Ljava/lang/String;" }, { "opmode", "I" },
   { "key", "Ljava/lang/Object;" }, { "iv", "[B" },
-  { "aad", "[B" }, { "pending", "[B" },
+  { "aad", "[B" }, { "pending", "[B" }, { "bufferedBytes", "I" },
   { "algorithm", "Ljava/lang/String;" }, F_END
 };
 
@@ -4148,32 +4152,55 @@ static const struct rt_method rt_key_factory[] = {
  * Auth) size their output arrays from it, so answering 0 from a stub made the
  * signed-in user fail to be saved and the game lose its login on restart.
  * A GCM tag is 16 bytes (every caller here uses the 128-bit one). */
-static bool cipher_getOutputSize(struct dvm *vm, dvm_ref self,
-                                 const union dvm_value *args, int nargs,
+static bool cipher_getOutputSize(struct dvm *vm,dvm_ref self,
+                                 const union dvm_value *args,int nargs,
                                  union dvm_value *out)
 {
   (void)nargs;
-  const int32_t input = ARG(0).i;
-  if (input < 0) {
-    dvm__throw(vm, "java/lang/IllegalArgumentException", "negative input length");
+  int operation=rt_get_int(vm,self,"opmode");
+  if (operation<JCE_ENCRYPT || operation>JCE_UNWRAP) {
+    dvm__throw(vm,"java/lang/IllegalStateException","cipher is not initialized");
     return false;
   }
-  union dvm_value transform = {0}, pending = {0};
-  (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
-  (void)dvm_get_field(vm, self, "pending", "[B", &pending);
-  char alg[128], mode[128], pad[128];
-  cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
-               mode, sizeof mode, pad, sizeof pad);
-  const bool encrypting = rt_get_int(vm, self, "opmode") == JCE_ENCRYPT ||
-                          rt_get_int(vm, self, "opmode") == JCE_WRAP;
-  int64_t total = (int64_t)input + (pending.l ? (int64_t)dvm_array_length(vm, pending.l) : 0);
-  if (!strcasecmp(mode, "GCM")) {
-    total = encrypting ? total + 16 : (total > 16 ? total - 16 : 0);
-  } else if (encrypting && !strcasecmp(alg, "AES") && strcasecmp(pad, "NoPadding") &&
-             strcasecmp(mode, "CTR")) {
-    total = (total / 16 + 1) * 16;
+  int32_t input=ARG(0).i;
+  if (input<0) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","negative input length");
+    return false;
   }
-  RETI((int32_t)(total > INT32_MAX ? INT32_MAX : total));
+  union dvm_value transform={0},pending={0};
+  (void)dvm_get_field(vm,self,"transform","Ljava/lang/String;",&transform);
+  (void)dvm_get_field(vm,self,"pending","[B",&pending);
+  char alg[128],mode[128],pad[128];
+  cipher_parse(dvm_string_utf8(vm,transform.l),alg,sizeof alg,mode,sizeof mode,pad,sizeof pad);
+  bool encrypting=operation==JCE_ENCRYPT || operation==JCE_WRAP;
+  int64_t total=(int64_t)input+rt_get_int(vm,self,"bufferedBytes")+
+                (pending.l ? (int64_t)dvm_array_length(vm,pending.l) : 0);
+  if (!strcasecmp(alg,"RSA")) {
+    union dvm_value key={0},kind={0};
+    (void)dvm_get_field(vm,self,"key","Ljava/lang/Object;",&key);
+    (void)dvm_get_field(vm,key.l,"kind","I",&kind);
+    uint32_t length=0;
+    const uint8_t *cursor=key_bytes(vm,key.l,&length);
+    EVP_PKEY *pkey=!cursor ? NULL : kind.i==2 ? d2i_PUBKEY(NULL,&cursor,length) : d2i_AutoPrivateKey(NULL,&cursor,length);
+    if (!pkey) return cipher_fail(vm,"cannot read the RSA key");
+    int size=EVP_PKEY_get_size(pkey);
+    EVP_PKEY_free(pkey);
+    RETI(size);
+  }
+  if (!strcasecmp(mode,"GCM")) {
+    /* Matches this provider's 128-bit authentication tag. */
+    total=encrypting ? total+16 : (total>16 ? total-16 : 0);
+  } else {
+    int block=!strcasecmp(alg,"AES") ? 16 :
+              (!strcasecmp(alg,"DES") || !strcasecmp(alg,"DESede") || !strcasecmp(alg,"TripleDES")) ? 8 : 1;
+    if (encrypting && block>1 && strcasecmp(pad,"NoPadding") && strcasecmp(mode,"CTR"))
+      total=(total/block+1)*block;
+  }
+  if (total>INT32_MAX) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","cipher output too large");
+    return false;
+  }
+  RETI((int32_t)total);
 }
 
 static const struct rt_method rt_cipher[] = {

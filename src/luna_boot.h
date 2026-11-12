@@ -142,6 +142,8 @@ int luna_event_count(const luna_touch_event *);
 int luna_event_id(const luna_touch_event *, int index);
 float luna_event_x(const luna_touch_event *, int index);
 float luna_event_y(const luna_touch_event *, int index);
+/* Axes of the virtual touchscreen; pressure is normalized to [0,1]. */
+float luna_event_axis(const luna_touch_event *, int axis, int index);
 #define LUNA_KEYMAP_BUTTONS 8
 #define LUNA_KEY_POINTS 4      /* contacts one key can press at the same time */
 #define LUNA_KEYMAP_MACROS 8
