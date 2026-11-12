@@ -2854,6 +2854,7 @@ static uint32_t g_fast64_gettid_va       = 0;
 static uint32_t g_fast64_pthread_self_va = 0;
 static uint32_t g_fast64_clock_gettime_va = 0;
 static uint32_t g_fast64_errno_va        = 0;
+static uint32_t g_svc_ret_follow_tid     = 0xffffffffu;
 static uint32_t g_fast64_atoi_va         = 0;
 static uint32_t g_fast64_atol_va         = 0;
 static uint32_t g_fast64_atoll_va        = 0;
@@ -28729,7 +28730,7 @@ static bool svc_lockfree_compute(uint32_t no) {
     std::vector<bool> t(SVC_TRAMP_TOTAL, false);
     const char *diag[] = {
       "LUNARIA_TRACE_MEMMOVE", "LUNARIA_TRACE_STRCPY", "LUNARIA_WATCH64_STR",
-      "LUNARIA_WRANGE", "LUNARIA_ALLOC_WATCH", "LUNARIA_TRACE_SVC",
+      "LUNARIA_WRANGE", "LUNARIA_ALLOC_WATCH", "LUNARIA_TRACE_SVC", "LUNARIA_TRACE_SVC_RET",
       "LUNARIA_SVC_HISTO", "LUNARIA_WATCH64",
       /* The allocator diagnostics keep their own call-site tables. */
       "LUNARIA_TRACE_ALLOC_VA", "LUNARIA_TRACE_HEAP",
@@ -69323,6 +69324,43 @@ a64_hooks_done:
     }
     /* The second half of a two-register result (div_t/ldiv_t). */
     if (g_svc_ret_x1) jit64->SetRegister(1, regs32[1]);
+
+    /* LUNARIA_TRACE_SVC_RET=<tid>|all: every SVC the thread makes, with the
+     * value the guest gets back and its errno.  LUNARIA_TRACE_SVC prints the
+     * arguments only; this is the other half, for finding which call hands
+     * the guest an unexpected -EINVAL. */
+    if (const char *want = lunaria_env("LUNARIA_TRACE_SVC_RET")) {
+      /* "eventfd": follow whichever thread called epoll_create or eventfd last. */
+      if (svc_no == SVC_EVENTFD || svc_no == SVC_NET_EPOLL_CREATE) g_svc_ret_follow_tid = g_current_tid;
+      if (!strcmp(want, "all") ||
+          (!strcmp(want, "eventfd") && g_svc_ret_follow_tid == (uint32_t)g_current_tid) ||
+          (want[0] >= '0' && want[0] <= '9' && (unsigned)atoi(want) == (unsigned)g_current_tid)) {
+        /* LUNARIA_TRACE_SVC_RET_NAMES=a,b,c keeps only calls with those names. */
+        if (const char *names = lunaria_env("LUNARIA_TRACE_SVC_RET_NAMES")) {
+          const char *nm = svc_symbol_name(svc_no);
+          const size_t nl = nm ? strlen(nm) : 0;
+          bool hit = false;
+          for (const char *q = names; *q && nl;) {
+            const char *e = strchr(q, ',');
+            const size_t l = e ? (size_t)(e - q) : strlen(q);
+            if (l == nl && !strncmp(q, nm, l)) { hit = true; break; }
+            q += l + (e ? 1 : 0);
+            if (!e) break;
+          }
+          if (!hit) goto svc_ret_done;
+        }
+        const uint64_t ret = jit64->GetRegister(0);
+        uint32_t eno = 0;
+        if (const uint32_t eva = errno_va(*ctx, g_current_tid))
+          eno = ctx->mem.read32(eva);
+        fprintf(stderr, "[svc-ret] tid=%u %u(%s) x0=0x%llx x1=0x%llx x2=0x%llx lr=0x%llx -> %lld errno=%u\n",
+                (unsigned)g_current_tid, svc_no, svc_symbol_name(svc_no),
+                (unsigned long long)x0, (unsigned long long)x1,
+                (unsigned long long)x2, (unsigned long long)x30,
+                (long long)ret, eno);
+      }
+    }
+    svc_ret_done:;
 
     /* A signal sent to the main thread is taken on the way out of the
      * syscall, after the result is in x0: the handler's return resumes
