@@ -51152,7 +51152,12 @@ fputws_done:
      * translate the kernel's -errno to libc -1/errno. In particular the
      * action/mask here use the kernel structure, not libc's sigaction. */
     if ((ctx.is_arm64 && (nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
-                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u)) ||
+                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u ||
+                          /* eventfd2, epoll_create1, epoll_ctl, epoll_pwait: mio's
+                           * Selector::new asks syscall(SYS_epoll_create1) first and,
+                           * on ENOSYS, takes a fallback that stores fcntl()'s 0 as the
+                           * epoll fd, so every later epoll_ctl fails with EINVAL. */
+                          nr==19u || nr==20u || nr==21u || nr==22u)) ||
         (!ctx.is_arm64 && (nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                            nr==90u || nr==91u || nr==125u || nr==192u || nr==219u || nr==220u || nr==323u || nr==329u ||
                            nr==37u || nr==174u || nr==175u || nr==268u))) {
@@ -51164,7 +51169,9 @@ fputws_done:
         kernel_regs[i]=arguments[i];
         g_svc_args64[i]=arguments[i];
       }
-      kernel_regs[7]=nr;
+      /* AArch64 nr 20 (epoll_create1) is renamed 2020 on the raw svc#0 path,
+       * because the shared switch's case 20 is getpid. */
+      kernel_regs[7]=(ctx.is_arm64 && nr==20u) ? 2020u : nr;
       dispatch_svc(ctx,0,kernel_regs);
       g_svc_args64=saved_args;
       int64_t result=ctx.is_arm64 ? (int64_t)kernel_regs[0]
