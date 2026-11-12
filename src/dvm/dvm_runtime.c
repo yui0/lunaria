@@ -40029,11 +40029,49 @@ static bool mc_queueInput(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+/* The BufferInfo objects dequeueOutputBuffer() has been handed, newest last.
+ * CRI makes a new one per frame and drops its own handle after reading the
+ * result; the JNI bridge's wrapper then keeps each alive for ever unless it is
+ * released (see dvm_jni_release_idle_wrapper).  Each entry remembers the host
+ * handle so a recycled heap slot is not mistaken for it. */
+#define MC_INFO_RECENT 32
+static struct { dvm_ref ref; uint32_t host; } g_mc_infos[MC_INFO_RECENT];
+
+static void mc_release_idle_infos(struct dvm *vm, dvm_ref current)
+{
+  struct dvm_class *info_class = dvm__class_by_desc(vm, "Landroid/media/MediaCodec$BufferInfo;");
+  if (current && info_class) {
+    struct dvm_object *o = dvm__obj(vm, current);
+    bool known = false;
+    for (int i = 0; i < MC_INFO_RECENT; ++i)
+      known |= g_mc_infos[i].ref == current && g_mc_infos[i].host == (o ? o->host_handle : 0);
+    if (o && o->host_handle && o->cls == info_class && !known) {
+      int slot = 0;
+      for (int i = 0; i < MC_INFO_RECENT; ++i)
+        if (!g_mc_infos[i].ref) { slot = i; break; }
+      g_mc_infos[slot].ref = current;
+      g_mc_infos[slot].host = o->host_handle;
+    }
+  }
+  for (int i = 0; i < MC_INFO_RECENT; ++i) {
+    if (!g_mc_infos[i].ref || g_mc_infos[i].ref == current) continue;
+    struct dvm_object *o = dvm__obj(vm, g_mc_infos[i].ref);
+    /* Forget entries that are already gone or now name something else. */
+    if (!o || o->cls != info_class || o->host_handle != g_mc_infos[i].host) {
+      g_mc_infos[i].ref = 0;
+      continue;
+    }
+    if (dvm_jni_release_idle_wrapper(vm, g_mc_infos[i].ref, g_mc_infos[i].host))
+      g_mc_infos[i].ref = 0;
+  }
+}
+
 static bool mc_dequeueOutput(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
 {
   (void)nargs;
+  mc_release_idle_infos(vm, ARG(0).l);
   struct rt_codec *codec=codec_require(vm,self,1u<<MC_EXECUTING);
   if(!codec) return false;
   if(codec->asynchronous) {
