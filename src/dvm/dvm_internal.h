@@ -444,6 +444,8 @@ void dvm__throwable_capture(struct dvm *vm, dvm_ref throwable);
 /* A non-escaping builtin may discard its newly imported JNI copies. */
 bool dvm__builtin_borrows_jni_payloads(const struct dvm_method *method);
 void dvm__discard_temporary(struct dvm *vm,dvm_ref ref);
+/* Drop the JNI bridge's wrapper for a native-made object once native code has let go of it. */
+bool dvm_jni_release_idle_wrapper(struct dvm *vm, dvm_ref ref, uint32_t host);
 void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...);
 void dvm__warn_placeholder(struct dvm *vm);
 /* The builtin whose body is running, for the handful of handlers bound to

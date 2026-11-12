@@ -312,6 +312,37 @@ static void borrowed_import_end(struct dvm *vm,JNIEnv *env,
   if(scope->items!=scope->local)free(scope->items);
 }
 
+/* The JNI bridge gives every native-made object it sees as an argument a
+ * wrapper with a global reference of its own (see wrapper_for), which lives as
+ * long as the DVM object does.  For an object the app makes per call (CRI
+ * allocates a MediaCodec.BufferInfo for every decoded frame) that is a
+ * reference leak: one per frame, until the 65536-slot object table is full.
+ *
+ * Release the wrapper once nothing but its own reference is left, that is once
+ * native code has deleted its handle.  `host` is the handle the wrapper was
+ * bound to when it was recorded; it is checked against the object so a stale
+ * `ref` (the heap slot reused for something else) is never released.  Same
+ * steps, and the same guards, as the end of a borrowed-import scope. */
+bool dvm_jni_release_idle_wrapper(struct dvm *vm, dvm_ref ref, uint32_t host)
+{
+  JNIEnv *env = current_env();
+  struct dvm_object *object = ref ? dvm__obj(vm, ref) : NULL;
+  if (!env || !object || !host || object->pins != 1 ||
+      object->host_handle != host || find_wrapper(host) != ref)
+    return false;
+  if (jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) != 1)
+    return false;
+  object->host_handle = 0;
+  forget_wrapper(host, ref);
+  (*env)->DeleteGlobalRef(env, (jobject)(uintptr_t)host);
+  dvm_unpin(vm, ref);
+  dvm__discard_temporary(vm, ref);
+  static unsigned long long released;
+  if (++released % 5000 == 0)
+    fprintf(stderr, "[dvm-jni] released %llu idle wrappers\n", released);
+  return true;
+}
+
 static void bridge_record(jobject handle, dvm_ref source, bool direct)
 {
   struct bridge_frame *f = g_bridge_frame;

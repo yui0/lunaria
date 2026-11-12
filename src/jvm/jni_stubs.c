@@ -2974,6 +2974,32 @@ activity_orientation_init(void)
   g_activity_orientation_initialized = true;
 }
 
+/* A device turns its display when an app locks the orientation; a desktop
+ * window does not, so the app would keep a portrait surface it has just asked
+ * to leave (Gakumas switches to landscape for its download screen and shows
+ * black until the surface changes shape).  Reshape the window instead and let
+ * the usual surface-changed path tell the app. */
+static void
+activity_follow_orientation(jint orientation)
+{
+  const bool landscape = orientation == 0 || orientation == 6 ||
+                         orientation == 8 || orientation == 11;
+  const bool portrait = orientation == 1 || orientation == 7 ||
+                        orientation == 9 || orientation == 12;
+  const int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+  if (w <= 0 || h <= 0 || !((landscape && w < h) || (portrait && w > h)))
+    return;
+  int nw = h, nh = w;
+  /* A maximised landscape window turned upright would not fit the screen. */
+  if (nh > 1010) {
+    nw = (int)((long long)nw * 1010 / nh);
+    nh = 1010;
+  }
+  fprintf(stderr, "[display] requested orientation %d: window %dx%d -> %dx%d\n",
+          (int)orientation, w, h, nw, nh);
+  arm_exec_request_view_resize(nw, nh);
+}
+
 static void
 activity_set_requested_orientation(jobject activity, jint orientation)
 {
@@ -2981,6 +3007,7 @@ activity_set_requested_orientation(jobject activity, jint orientation)
   const uintptr_t index = (uintptr_t)activity;
   if (index < JNI_ACTIVITY_MAX)
     g_activity_orientation[index] = (int16_t)orientation;
+  activity_follow_orientation(orientation);
 }
 
 static jint

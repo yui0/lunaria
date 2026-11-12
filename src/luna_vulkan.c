@@ -821,7 +821,9 @@ static void h_create_android_surface(HostCallArgs *a, uintptr_t idx)
 
 static void frame_size(uint32_t *w, uint32_t *h)
 {
-  int fw = arm64_exec_fb_width(), fh = arm64_exec_fb_height();
+  /* An app that shrank its buffers (Unity's fixed-DPI scale) gets the
+   * smaller extent; the compositor stretches the frame to the window. */
+  int fw = arm64_exec_buffer_width(), fh = arm64_exec_buffer_height();
   *w = fw > 0 ? (uint32_t)fw : 1280u;
   *h = fh > 0 ? (uint32_t)fh : 720u;
 }

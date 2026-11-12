@@ -4143,6 +4143,39 @@ static const struct rt_method rt_key_factory[] = {
   M_END,
 };
 
+/* Cipher.getOutputSize(inputLen): how many bytes the next doFinal() may
+ * produce for that much more input.  Callers (Tink, as shipped in Firebase
+ * Auth) size their output arrays from it, so answering 0 from a stub made the
+ * signed-in user fail to be saved and the game lose its login on restart.
+ * A GCM tag is 16 bytes (every caller here uses the 128-bit one). */
+static bool cipher_getOutputSize(struct dvm *vm, dvm_ref self,
+                                 const union dvm_value *args, int nargs,
+                                 union dvm_value *out)
+{
+  (void)nargs;
+  const int32_t input = ARG(0).i;
+  if (input < 0) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", "negative input length");
+    return false;
+  }
+  union dvm_value transform = {0}, pending = {0};
+  (void)dvm_get_field(vm, self, "transform", "Ljava/lang/String;", &transform);
+  (void)dvm_get_field(vm, self, "pending", "[B", &pending);
+  char alg[128], mode[128], pad[128];
+  cipher_parse(dvm_string_utf8(vm, transform.l), alg, sizeof alg,
+               mode, sizeof mode, pad, sizeof pad);
+  const bool encrypting = rt_get_int(vm, self, "opmode") == JCE_ENCRYPT ||
+                          rt_get_int(vm, self, "opmode") == JCE_WRAP;
+  int64_t total = (int64_t)input + (pending.l ? (int64_t)dvm_array_length(vm, pending.l) : 0);
+  if (!strcasecmp(mode, "GCM")) {
+    total = encrypting ? total + 16 : (total > 16 ? total - 16 : 0);
+  } else if (encrypting && !strcasecmp(alg, "AES") && strcasecmp(pad, "NoPadding") &&
+             strcasecmp(mode, "CTR")) {
+    total = (total / 16 + 1) * 16;
+  }
+  RETI((int32_t)(total > INT32_MAX ? INT32_MAX : total));
+}
+
 static const struct rt_method rt_cipher[] = {
   SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Cipher;",
   cipher_getInstance),
@@ -4166,6 +4199,7 @@ static const struct rt_method rt_cipher[] = {
   M("updateAAD", "([BII)V", cipher_updateAAD),
   M("getIV", "()[B", cipher_getIV),
   M("getBlockSize", "()I", cipher_getBlockSize),
+  M("getOutputSize", "(I)I", cipher_getOutputSize),
   M("getProvider", "()Ljava/security/Provider;", cipher_getProvider),
   M("getAlgorithm", "()Ljava/lang/String;", key_getAlgorithm),
   M_END,

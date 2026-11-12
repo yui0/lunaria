@@ -2854,6 +2854,7 @@ static uint32_t g_fast64_gettid_va       = 0;
 static uint32_t g_fast64_pthread_self_va = 0;
 static uint32_t g_fast64_clock_gettime_va = 0;
 static uint32_t g_fast64_errno_va        = 0;
+static uint32_t g_svc_ret_follow_tid     = 0xffffffffu;
 static uint32_t g_fast64_atoi_va         = 0;
 static uint32_t g_fast64_atol_va         = 0;
 static uint32_t g_fast64_atoll_va        = 0;
@@ -28729,7 +28730,7 @@ static bool svc_lockfree_compute(uint32_t no) {
     std::vector<bool> t(SVC_TRAMP_TOTAL, false);
     const char *diag[] = {
       "LUNARIA_TRACE_MEMMOVE", "LUNARIA_TRACE_STRCPY", "LUNARIA_WATCH64_STR",
-      "LUNARIA_WRANGE", "LUNARIA_ALLOC_WATCH", "LUNARIA_TRACE_SVC",
+      "LUNARIA_WRANGE", "LUNARIA_ALLOC_WATCH", "LUNARIA_TRACE_SVC", "LUNARIA_TRACE_SVC_RET",
       "LUNARIA_SVC_HISTO", "LUNARIA_WATCH64",
       /* The allocator diagnostics keep their own call-site tables. */
       "LUNARIA_TRACE_ALLOC_VA", "LUNARIA_TRACE_HEAP",
@@ -51152,7 +51153,12 @@ fputws_done:
      * translate the kernel's -errno to libc -1/errno. In particular the
      * action/mask here use the kernel structure, not libc's sigaction. */
     if ((ctx.is_arm64 && (nr==50u || nr==55u || nr==129u || nr==63u || nr==64u || nr==57u || nr==90u ||
-                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u)) ||
+                          nr==131u || nr==134u || nr==135u || nr==232u || nr==233u || nr==34u || nr==38u ||
+                          /* eventfd2, epoll_create1, epoll_ctl, epoll_pwait: mio's
+                           * Selector::new asks syscall(SYS_epoll_create1) first and,
+                           * on ENOSYS, takes a fallback that stores fcntl()'s 0 as the
+                           * epoll fd, so every later epoll_ctl fails with EINVAL. */
+                          nr==19u || nr==20u || nr==21u || nr==22u)) ||
         (!ctx.is_arm64 && (nr==95u || nr==133u || nr==207u || nr==3u || nr==4u || nr==6u || nr==184u ||
                            nr==90u || nr==91u || nr==125u || nr==192u || nr==219u || nr==220u || nr==323u || nr==329u ||
                            nr==37u || nr==174u || nr==175u || nr==268u))) {
@@ -51164,7 +51170,9 @@ fputws_done:
         kernel_regs[i]=arguments[i];
         g_svc_args64[i]=arguments[i];
       }
-      kernel_regs[7]=nr;
+      /* AArch64 nr 20 (epoll_create1) is renamed 2020 on the raw svc#0 path,
+       * because the shared switch's case 20 is getpid. */
+      kernel_regs[7]=(ctx.is_arm64 && nr==20u) ? 2020u : nr;
       dispatch_svc(ctx,0,kernel_regs);
       g_svc_args64=saved_args;
       int64_t result=ctx.is_arm64 ? (int64_t)kernel_regs[0]
@@ -69317,6 +69325,43 @@ a64_hooks_done:
     /* The second half of a two-register result (div_t/ldiv_t). */
     if (g_svc_ret_x1) jit64->SetRegister(1, regs32[1]);
 
+    /* LUNARIA_TRACE_SVC_RET=<tid>|all: every SVC the thread makes, with the
+     * value the guest gets back and its errno.  LUNARIA_TRACE_SVC prints the
+     * arguments only; this is the other half, for finding which call hands
+     * the guest an unexpected -EINVAL. */
+    if (const char *want = lunaria_env("LUNARIA_TRACE_SVC_RET")) {
+      /* "eventfd": follow whichever thread called epoll_create or eventfd last. */
+      if (svc_no == SVC_EVENTFD || svc_no == SVC_NET_EPOLL_CREATE) g_svc_ret_follow_tid = g_current_tid;
+      if (!strcmp(want, "all") ||
+          (!strcmp(want, "eventfd") && g_svc_ret_follow_tid == (uint32_t)g_current_tid) ||
+          (want[0] >= '0' && want[0] <= '9' && (unsigned)atoi(want) == (unsigned)g_current_tid)) {
+        /* LUNARIA_TRACE_SVC_RET_NAMES=a,b,c keeps only calls with those names. */
+        if (const char *names = lunaria_env("LUNARIA_TRACE_SVC_RET_NAMES")) {
+          const char *nm = svc_symbol_name(svc_no);
+          const size_t nl = nm ? strlen(nm) : 0;
+          bool hit = false;
+          for (const char *q = names; *q && nl;) {
+            const char *e = strchr(q, ',');
+            const size_t l = e ? (size_t)(e - q) : strlen(q);
+            if (l == nl && !strncmp(q, nm, l)) { hit = true; break; }
+            q += l + (e ? 1 : 0);
+            if (!e) break;
+          }
+          if (!hit) goto svc_ret_done;
+        }
+        const uint64_t ret = jit64->GetRegister(0);
+        uint32_t eno = 0;
+        if (const uint32_t eva = errno_va(*ctx, g_current_tid))
+          eno = ctx->mem.read32(eva);
+        fprintf(stderr, "[svc-ret] tid=%u %u(%s) x0=0x%llx x1=0x%llx x2=0x%llx lr=0x%llx -> %lld errno=%u\n",
+                (unsigned)g_current_tid, svc_no, svc_symbol_name(svc_no),
+                (unsigned long long)x0, (unsigned long long)x1,
+                (unsigned long long)x2, (unsigned long long)x30,
+                (long long)ret, eno);
+      }
+    }
+    svc_ret_done:;
+
     /* A signal sent to the main thread is taken on the way out of the
      * syscall, after the result is in x0: the handler's return resumes
      * the caller with it. */
@@ -75570,6 +75615,18 @@ extern "C" int  arm64_exec_fb_width(void)                {
 }
 extern "C" int  arm64_exec_fb_height(void)               {
   return arm_exec_fb_height();
+}
+/* The size an app asked its window's buffers to be (ANativeWindow_
+ * setBuffersGeometry), else the window's own.  On a device the compositor
+ * stretches such a buffer to the window, and Vulkan reports it as the
+ * surface's currentExtent; Unity's fixed-DPI scaling relies on this. */
+extern "C" int  arm64_exec_buffer_width(void)            {
+  const int w = __atomic_load_n(&g_anw_buf_w, __ATOMIC_RELAXED);
+  return w > 0 ? w : arm_exec_fb_width();
+}
+extern "C" int  arm64_exec_buffer_height(void)           {
+  const int h = __atomic_load_n(&g_anw_buf_h, __ATOMIC_RELAXED);
+  return h > 0 ? h : arm_exec_fb_height();
 }
 extern "C" void arm64_exec_touch_push(int a, float x, float y) {
   arm_exec_touch_push(a,x,y);

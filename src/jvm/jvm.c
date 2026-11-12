@@ -545,6 +545,20 @@ static void jvm_array_release_refs(struct jvm *jvm, struct jvm_object *o)
   }
 }
 
+static bool jvm_class_is(struct jvm *jvm, jclass cls, const char *name);
+
+/* An object the app allocates for every call and only ever uses as a plain
+ * data holder: MediaCodec.dequeueOutputBuffer()'s out parameter.  CRI makes
+ * one per decoded frame, and pinning each for the life of the process filled
+ * the 65536-slot object table after about 64000 frames (a few minutes of the
+ * Gakumas title movie) and crashed the game. */
+static bool
+jvm_object_is_per_call_holder(struct jvm *jvm, const struct jvm_object *o)
+{
+  return o->type == JVM_OBJECT_OPAQUE && o->this_klass &&
+         jvm_class_is(jvm, o->this_klass, "android/media/MediaCodec$BufferInfo");
+}
+
 /* Drop a reference (DeleteLocalRef / DeleteGlobalRef).  Only arrays and
  * strings release their slot: those are the handle types an app allocates per
  * call, and unlike classes, methods and the opaque singleton stubs nothing
@@ -566,7 +580,8 @@ jvm_deref_object(struct jvm *jvm, jobject object)
   }
   if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
       o->type != JVM_OBJECT_MOTION &&
-      !(o->type == JVM_OBJECT_OPAQUE && o->bridge_owned)) {
+      !(o->type == JVM_OBJECT_OPAQUE && o->bridge_owned) &&
+      !jvm_object_is_per_call_holder(jvm, o)) {
     o->refs = 1; /* pinned for the process lifetime */
     jvm_meta_unlock();
     return;
