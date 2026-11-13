@@ -576,15 +576,57 @@ static bool o_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   RETV();
 }
 
+/* String is immutable: decode once rather than rewalking a JSON document
+ * for every length/charAt query. Mutable CharSequences keep their own path. */
+static bool string_index(struct dvm *vm, struct dvm_object *o)
+{
+  if (o->string_index_ready) return true;
+  bool ascii = true;
+  for (uint32_t i = 0; i < o->utf8_len; ++i)
+    if ((unsigned char)o->utf8[i] >= 128) {
+      ascii = false;
+      break;
+    }
+  size_t count = ascii ? o->utf8_len : jcs_wtf8_to_utf16(o->utf8, o->utf8_len, NULL);
+  uint16_t *units = NULL;
+  if (!ascii && count) {
+    units = malloc(count * sizeof *units);
+    if (!units) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "String UTF-16 index");
+      return false;
+    }
+    (void)jcs_wtf8_to_utf16(o->utf8, o->utf8_len, units);
+  }
+  o->string_units = units;
+  o->string_length = (uint32_t)count;
+  o->string_index_ready = true;
+  return true;
+}
+
 static bool o_hashCode(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                        int nargs, union dvm_value *out)
 {
   (void)args;
   (void)nargs;
+  struct dvm_object *o = dvm__obj(vm, self);
+  if (o && o->kind == DVM_OBJ_STRING && o->utf8 && !o->builder_capacity) {
+    /* String.hashCode is specified over UTF-16 code units, and app code stores
+     * it in tables.  A String is immutable, so the value is kept. */
+    if (!o->string_hash_ready) {
+      if (!string_index(vm, o)) return false;
+      uint32_t h = 0;
+      if (o->string_units)
+        for (uint32_t i = 0; i < o->string_length; ++i) h = h * 31u + o->string_units[i];
+      else
+        for (uint32_t i = 0; i < o->utf8_len; ++i) h = h * 31u + (unsigned char)o->utf8[i];
+      o->string_hash = (int32_t)h;
+      o->string_hash_ready = true;
+    }
+    RETI(o->string_hash);
+  }
   size_t len = 0;
   const char *s = sdata(vm, self, &len);
   if (s) {
-    /* String.hashCode is specified, and app code stores it in tables. */
     int32_t h = 0;
     for (size_t i = 0; i < len; ++i)
       h = (int32_t)((uint32_t)h * 31u + (unsigned char)s[i]);
@@ -601,12 +643,13 @@ static bool o_equals(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   const char *a = sdata(vm, self, &la), *b = sdata(vm, other, &lb);
   if (a && b) {
     int equal = la == lb && !memcmp(a, b, la);
-    const char *pkg = getenv("ANDROID_PACKAGE_NAME");
-    if (dvm__env("LUNARIA_DVM_TRACE") && pkg &&
-        (!strcmp(a, pkg) || !strcmp(b, pkg)))
-      fprintf(stderr,
-              "[dvm] String.equals pkg probe: @%x \"%s\" == @%x \"%s\" -> %d\n",
-              self, a, other, b, equal);
+    if (dvm__env("LUNARIA_DVM_TRACE")) {
+      const char *pkg = getenv("ANDROID_PACKAGE_NAME");
+      if (pkg && (!strcmp(a, pkg) || !strcmp(b, pkg)))
+        fprintf(stderr,
+                "[dvm] String.equals pkg probe: @%x \"%s\" == @%x \"%s\" -> %d\n",
+                self, a, other, b, equal);
+    }
     RETI(equal ? 1 : 0);
   }
   RETI(self == other ? 1 : 0);
@@ -869,6 +912,7 @@ static bool s_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   free(o->string_units);
   o->string_units = NULL;
   o->string_index_ready = false;
+  o->string_hash_ready = false;
   o->utf8 = NULL;
   o->utf8_len = 0;
 
@@ -958,6 +1002,7 @@ static bool s_init_hibyte(struct dvm *vm, dvm_ref self,
   free(o->string_units);
   o->string_units = NULL;
   o->string_index_ready = false;
+  o->string_hash_ready = false;
   o->utf8 = NULL;
   o->utf8_len = 0;
   if (!a || a->kind != DVM_OBJ_ARRAY || !a->data) {
@@ -1005,33 +1050,6 @@ static int32_t s_utf16_len(const char *s, size_t len)
     ++n;
   }
   return n;
-}
-
-/* String is immutable: decode once rather than rewalking a JSON document
- * for every length/charAt query. Mutable CharSequences keep their own path. */
-static bool string_index(struct dvm *vm, struct dvm_object *o)
-{
-  if (o->string_index_ready) return true;
-  bool ascii = true;
-  for (uint32_t i = 0; i < o->utf8_len; ++i)
-    if ((unsigned char)o->utf8[i] >= 128) {
-      ascii = false;
-      break;
-    }
-  size_t count = ascii ? o->utf8_len : jcs_wtf8_to_utf16(o->utf8, o->utf8_len, NULL);
-  uint16_t *units = NULL;
-  if (!ascii && count) {
-    units = malloc(count * sizeof *units);
-    if (!units) {
-      dvm__throw(vm, "java/lang/OutOfMemoryError", "String UTF-16 index");
-      return false;
-    }
-    (void)jcs_wtf8_to_utf16(o->utf8, o->utf8_len, units);
-  }
-  o->string_units = units;
-  o->string_length = (uint32_t)count;
-  o->string_index_ready = true;
-  return true;
 }
 
 static bool s_length(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -1362,24 +1380,38 @@ static bool s_compareToIgnoreCase(struct dvm *vm, dvm_ref self,
  * handle, and reading a reference as a char code truncates it.  The overload is
  * known at registration time, so pass it in. */
 /* One code point as UTF-8, the encoding every string in this VM is kept in. */
-static size_t utf8_encode_char(unsigned ch, char out[5])
+/* One UTF-8 encoder for the whole runtime: writes 1-4 bytes of `cp` to `out`
+ * (no terminator) and returns the count.  A UTF-16 unit, surrogates included,
+ * is passed as is and takes at most three bytes. */
+static size_t utf8_encode(char *out, uint32_t cp)
 {
-  if (ch < 0x80) {
-    out[0] = (char)ch;
-    out[1] = '\0';
+  if (cp < 0x80) {
+    out[0] = (char)cp;
     return 1;
   }
-  if (ch < 0x800) {
-    out[0] = (char)(0xc0 | (ch >> 6));
-    out[1] = (char)(0x80 | (ch & 0x3f));
-    out[2] = '\0';
+  if (cp < 0x800) {
+    out[0] = (char)(0xc0 | (cp >> 6));
+    out[1] = (char)(0x80 | (cp & 0x3f));
     return 2;
   }
-  out[0] = (char)(0xe0 | (ch >> 12));
-  out[1] = (char)(0x80 | ((ch >> 6) & 0x3f));
-  out[2] = (char)(0x80 | (ch & 0x3f));
-  out[3] = '\0';
-  return 3;
+  if (cp < 0x10000) {
+    out[0] = (char)(0xe0 | (cp >> 12));
+    out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
+    out[2] = (char)(0x80 | (cp & 0x3f));
+    return 3;
+  }
+  out[0] = (char)(0xf0 | (cp >> 18));
+  out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
+  out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
+  out[3] = (char)(0x80 | (cp & 0x3f));
+  return 4;
+}
+
+static size_t utf8_encode_char(unsigned ch, char out[5])
+{
+  const size_t n = utf8_encode(out, ch);
+  out[n] = '\0';
+  return n;
 }
 
 /* First index >= from at which needle[0..nn) occurs in hay[0..hn), or -1.  The
@@ -7364,6 +7396,13 @@ struct rt_map {
   uint32_t cap, size, ci, sorted, mod_count;
   struct dvm_class *enum_type;
   dvm_ref views[3];
+  /* Lookup index over the entries, built the first time a map of MAP_INDEX_MIN
+   * or more entries is searched: open addressing, each slot the position of an
+   * entry plus one (0 is empty).  It serves only plain insertion-ordered maps
+   * and only keys whose equality is decided here (see map_key_hash); a removal
+   * drops it, an append extends it. */
+  uint32_t *index;
+  uint32_t index_cap;
   struct {
     dvm_ref k, v, node;
   } e[];
@@ -7395,6 +7434,114 @@ static bool map_key_eq(struct dvm *vm, const struct rt_map *mp, dvm_ref a,
   return key_eq(vm, a, b);
 }
 
+#define MAP_INDEX_MIN 16u
+
+static void map_index_drop(struct rt_map *map)
+{
+  free(map->index);
+  map->index = NULL;
+  map->index_cap = 0;
+}
+
+/* The hash of a key whose equality map_find_key can decide without running
+ * guest code, matching key_eq() exactly: a String is equal to a String with the
+ * same bytes, and an object whose equals() is Object's is equal to itself only.
+ * A key that overrides equals() (Integer, a dex value class) has no hash here
+ * and is found by the linear scan, as before. */
+static bool map_key_hash(struct dvm *vm, dvm_ref key, uint32_t *hash)
+{
+  if (!key) {
+    *hash = 0;
+    return true;
+  }
+  const struct dvm_object *object = dvm__obj(vm, key);
+  uint32_t h;
+  if (object && object->kind == DVM_OBJ_STRING) {
+    if (!object->utf8) return false;       /* key_eq() never matches such a string */
+    h = 2166136261u;
+    for (size_t i = 0; i < object->utf8_len; ++i)
+      h = (h ^ (uint8_t)object->utf8[i]) * 16777619u;
+  } else {
+    struct dvm_class *c = dvm_object_class(vm, key);
+    struct dvm_method *equals = c
+                                ? dvm_find_method(vm, c, "equals", "(Ljava/lang/Object;)Z") : NULL;
+    if (equals && equals->cls && strcmp(equals->cls->name, "java/lang/Object"))
+      return false;
+    h = (uint32_t)key * 2654435761u;
+  }
+  *hash = h ^ (h >> 15);
+  return true;
+}
+
+/* Whether two keys that both have a hash are equal, as key_eq() decides it. */
+static bool map_hashed_key_eq(struct dvm *vm, dvm_ref a, dvm_ref b)
+{
+  if (a == b) return true;
+  if (!a || !b) return false;
+  const struct dvm_object *ao = dvm__obj(vm, a), *bo = dvm__obj(vm, b);
+  return ao && bo && ao->kind == DVM_OBJ_STRING && bo->kind == DVM_OBJ_STRING &&
+         ao->utf8_len == bo->utf8_len && !memcmp(ao->utf8, bo->utf8, ao->utf8_len);
+}
+
+static void map_index_insert(uint32_t *index, uint32_t cap, uint32_t hash,
+                             uint32_t position)
+{
+  uint32_t slot = hash & (cap - 1u);
+  while (index[slot]) slot = (slot + 1u) & (cap - 1u);
+  index[slot] = position + 1u;
+}
+
+/* Indexes every hashable entry.  Four slots per entry, so that appends have
+ * room for as many again before the next rebuild. */
+static bool map_index_build(struct dvm *vm, struct rt_map *map)
+{
+  uint32_t cap = 64;
+  while (cap < map->size * 4u) cap *= 2u;
+  uint32_t *index = calloc(cap, sizeof *index);
+  if (!index) return false;
+  for (uint32_t i = 0; i < map->size; ++i) {
+    uint32_t hash;
+    if (map_key_hash(vm, map->e[i].k, &hash)) map_index_insert(index, cap, hash, i);
+  }
+  map->index = index;
+  map->index_cap = cap;
+  return true;
+}
+
+/* The entry at `position` was just appended. */
+static void map_index_appended(struct dvm *vm, struct rt_map *map, uint32_t position)
+{
+  if (!map->index) return;
+  uint32_t hash;
+  if (map->sorted || map->ci || map->enum_type || position + 1u != map->size ||
+      (map->size + 1u) * 2u > map->index_cap) {
+    map_index_drop(map);
+    return;
+  }
+  if (map_key_hash(vm, map->e[position].k, &hash))
+    map_index_insert(map->index, map->index_cap, hash, position);
+}
+
+/* The position of `key` in a plain map, using the index.  `handled` is false
+ * when the key or the map is not one the index serves. */
+static int64_t map_index_find(struct dvm *vm, struct rt_map *map, dvm_ref key,
+                              bool *handled)
+{
+  uint32_t hash;
+  *handled = false;
+  if (map->size < MAP_INDEX_MIN || map->sorted || map->ci || map->enum_type ||
+      !map_key_hash(vm, key, &hash))
+    return -1;
+  if (!map->index && !map_index_build(vm, map)) return -1;
+  *handled = true;
+  for (uint32_t slot = hash & (map->index_cap - 1u); map->index[slot];
+       slot = (slot + 1u) & (map->index_cap - 1u)) {
+    const uint32_t position = map->index[slot] - 1u;
+    if (map_hashed_key_eq(vm, key, map->e[position].k)) return position;
+  }
+  return -1;
+}
+
 /* equals() may run guest code which grows or clears this map, including
  * while a blocking call hands the interpreter lock to another thread. Never
  * retain the reallocatable table across that call. */
@@ -7410,6 +7557,11 @@ static int64_t map_find_key(struct dvm *vm, dvm_ref self, dvm_ref key)
       bool exact;
       if (!tree_map_lower_bound(vm, self, key, &at, &exact)) return -1;
       return exact ? (int64_t)at : -1;
+    }
+    if (map) {
+      bool handled;
+      const int64_t found = map_index_find(vm, map, key, &handled);
+      if (handled) return found;
     }
   }
   for (uint32_t i = 0;; ++i) {
@@ -7436,6 +7588,7 @@ static int64_t map_find_key(struct dvm *vm, dvm_ref self, dvm_ref key)
 }
 
 static void map_destroy(void *data) {
+  if (data) free(((struct rt_map *)data)->index);
   free(data);
 }
 
@@ -7447,7 +7600,7 @@ static bool map_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)out;
   struct dvm_object *o = dvm__obj(vm, self);
   if (!o) RETV();
-  free(o->data);
+  map_destroy(o->data);
   o->data = calloc(1, sizeof(struct rt_map) + 8 * sizeof(*((struct rt_map *)0)->e));
   o->data_destroy = map_destroy;
   if (o->data) ((struct rt_map *)o->data)->cap = 8;
@@ -7560,6 +7713,7 @@ static bool map_put(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   mp->e[position].node = 0;
   ++mp->size;
   ++mp->mod_count;
+  map_index_appended(vm, mp, position);
   dvm_pin(vm, ARG(0).l);
   dvm_pin(vm, ARG(1).l);
   RETL(0);
@@ -7618,6 +7772,7 @@ static dvm_ref map_erase_at(struct dvm *vm, dvm_ref self, uint32_t index)
             (mp->size - index - 1) * sizeof mp->e[0]);
     --mp->size;
     ++mp->mod_count;
+    map_index_drop(mp);
     return old;
   }
   return 0;
@@ -7663,6 +7818,7 @@ static bool map_clear(struct dvm *vm, dvm_ref self, const union dvm_value *args,
       }
     mp->size = 0;
     ++mp->mod_count;
+    map_index_drop(mp);
   }
   RETV();
 }
@@ -28136,23 +28292,6 @@ static bool writer_write_string(struct dvm *vm, dvm_ref self,
   return st_write_array(vm, stream, &arg, 1, out);
 }
 
-static size_t writer_encode_utf8(char *dst, uint32_t cp)
-{
-  if (cp < 0x80) {
-    dst[0] = (char)cp;
-    return 1;
-  }
-  if (cp < 0x800) {
-    dst[0] = (char)(0xc0u | (cp >> 6));
-    dst[1] = (char)(0x80u | (cp & 0x3fu));
-    return 2;
-  }
-  dst[0] = (char)(0xe0u | (cp >> 12));
-  dst[1] = (char)(0x80u | ((cp >> 6) & 0x3fu));
-  dst[2] = (char)(0x80u | (cp & 0x3fu));
-  return 3;
-}
-
 /* Hand one finished string to whichever sink this writer has: StringWriter
  * keeps it in its own StringBuilder storage, every other Writer passes it down
  * the delegate/stream chain. */
@@ -28188,7 +28327,7 @@ static bool writer_write_chars(struct dvm *vm, dvm_ref self,
   const uint16_t *src = a->data;
   size_t used = 0;
   for (int32_t i = 0; i < len; ++i)
-    used += writer_encode_utf8(buf + used, src[off + i]);
+    used += utf8_encode(buf + used, src[off + i]);
   buf[used] = '\0';
   dvm_ref string = dvm_new_string_n(vm, buf, used);
   free(buf);
@@ -28207,7 +28346,7 @@ static bool writer_write_int(struct dvm *vm, dvm_ref self,
 {
   (void)nargs;
   char buf[4];
-  size_t used = writer_encode_utf8(buf, (uint16_t)(ARG(0).i & 0xffff));
+  size_t used = utf8_encode(buf, (uint16_t)(ARG(0).i & 0xffff));
   return writer_emit(vm, self, dvm_new_string_n(vm, buf, used), out);
 }
 
@@ -32980,25 +33119,8 @@ static int jp_next_clean(struct jparse *j)
 
 static void utf8_put(struct rt_bytes *b, uint32_t cp)
 {
-  uint8_t t[4];
-  int n = 0;
-  if (cp < 0x80) {
-    t[n++] = (uint8_t)cp;
-  }
-  else if (cp < 0x800) {
-    t[n++] = (uint8_t)(0xc0 | (cp >> 6));
-    t[n++] = (uint8_t)(0x80 | (cp & 0x3f));
-  } else if (cp < 0x10000) {
-    t[n++] = (uint8_t)(0xe0 | (cp >> 12));
-    t[n++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3f));
-    t[n++] = (uint8_t)(0x80 | (cp & 0x3f));
-  } else {
-    t[n++] = (uint8_t)(0xf0 | (cp >> 18));
-    t[n++] = (uint8_t)(0x80 | ((cp >> 12) & 0x3f));
-    t[n++] = (uint8_t)(0x80 | ((cp >> 6) & 0x3f));
-    t[n++] = (uint8_t)(0x80 | (cp & 0x3f));
-  }
-  bytes_append(b, t, (size_t)n);
+  char t[4];
+  bytes_append(b, t, utf8_encode(t, cp));
 }
 
 static bool jp_hex4(const char *p, uint32_t *out)
@@ -61504,6 +61626,8 @@ static bool view_set_background(struct dvm *vm, dvm_ref self,
   if(!view_replace_drawable_callback(vm,self,previous.l,v.l)) return false;
   (void)dvm_set_field(vm, self, "background",
                       "Landroid/graphics/drawable/Drawable;", v);
+  /* A previous setBackgroundColor must not outlive a replacement Drawable. */
+  rt_set_int(vm,self,"backgroundColor",0);
   struct dvm_class *nc =
     dvm__class_by_desc(vm, "Landroid/graphics/drawable/NinePatchDrawable;");
   struct dvm_class *oc = v.l ? dvm_object_class(vm, v.l) : NULL;
@@ -61528,7 +61652,25 @@ static bool view_set_background(struct dvm *vm, dvm_ref self,
   RETV();
 }
 VIEW_GET_L(view_get_background, "background", "Landroid/graphics/drawable/Drawable;")
-VIEW_SET_I(view_set_background_color, "backgroundColor")
+static bool view_set_background_color(struct dvm *vm,dvm_ref self,
+                                      const union dvm_value *args,int nargs,
+                                      union dvm_value *out)
+{
+  (void)nargs;
+  union dvm_value previous={0};
+  dvm_get_field(vm,self,"background","Landroid/graphics/drawable/Drawable;",&previous);
+  dvm_ref background=previous.l;
+  if (background && ui_is_a(vm,background,"android/graphics/drawable/ColorDrawable")) {
+    if (!am_vcall(vm,background,"setColor","(I)V",args,1,out)) return false;
+    ui_invalidate_view(vm,self,NULL,0);
+    RETV();
+  }
+  background=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/drawable/ColorDrawable"));
+  union dvm_value ignored={0};
+  if (!background || !am_vcall(vm,background,"<init>","(I)V",args,1,&ignored)) return false;
+  union dvm_value value={.l=background};
+  return view_set_background(vm,self,&value,1,out);
+}
 /* setBackgroundResource(): the resource id is kept, and an XML drawable is
  * built the way getDrawable() builds it. */
 static dvm_ref drawable_from_resource(struct dvm *vm, uint32_t id, unsigned depth, dvm_ref theme);
@@ -68622,6 +68764,8 @@ static const struct rt_method rt_restrictions_manager[] = {
   M("hasRestrictionsProvider", "()Z", dpm_false),
   M_END,
 };
+
+#include "dvm_shortcut.h"
 
 /* ShortcutManager: the launcher is the emulator's own, so pinned and manifest
  * shortcuts are empty; dynamic shortcuts are kept so an app reads back what
@@ -79783,17 +79927,6 @@ static const struct rt_method rt_statfs[] = {
  * so this is the real polynomial rather than a placeholder. */
 static const struct rt_field rt_crc32_fields[] = { { "value", "J" }, F_END };
 
-static uint32_t crc32_bytes(uint32_t crc, const uint8_t *p, size_t n)
-{
-  crc = ~crc;
-  for (size_t i = 0; i < n; ++i) {
-    crc ^= p[i];
-    for (int k = 0; k < 8; ++k)
-      crc = (crc >> 1) ^ (0xedb88320u & (uint32_t)-(int32_t)(crc & 1u));
-  }
-  return ~crc;
-}
-
 static bool crc32_update(struct dvm *vm, dvm_ref self,
                          const union dvm_value *args, int nargs,
                          union dvm_value *out)
@@ -79813,10 +79946,10 @@ static bool crc32_update(struct dvm *vm, dvm_ref self,
       if (off > n) off = n;
       if (len > n - off) len = n - off;
     }
-    if (p) crc = crc32_bytes(crc, p + off, len);
+    if (p) crc = (uint32_t)crc32(crc, p + off, len);
   } else if (nargs >= 1) {
     uint8_t b = (uint8_t)ARG(0).i;
-    crc = crc32_bytes(crc, &b, 1);
+    crc = (uint32_t)crc32(crc, &b, 1);
   }
   v.j = (int64_t)(uint64_t)crc;
   (void)dvm_set_field(vm, self, "value", "J", v);
@@ -91480,7 +91613,7 @@ static char *pw_text_of(struct dvm *vm, const union dvm_value *args, int nargs,
     return strdup(ARG(0).i ? "true" : "false");
   case 'C': {
     char u[8];
-    size_t n = writer_encode_utf8(u, (uint32_t)(ARG(0).i & 0xffff));
+    size_t n = utf8_encode(u, (uint32_t)(ARG(0).i & 0xffff));
     u[n] = '\0';
     return strdup(u);
   }
@@ -91505,7 +91638,7 @@ static char *pw_text_of(struct dvm *vm, const union dvm_value *args, int nargs,
     char *outp = malloc((size_t)a->length * 3 + 1);
     size_t k = 0;
     for (uint32_t i = 0; outp && i < a->length; ++i)
-      k += writer_encode_utf8(outp + k, ((uint16_t *)a->data)[i]);
+      k += utf8_encode(outp + k, ((uint16_t *)a->data)[i]);
     if (outp) outp[k] = '\0';
     return outp;
   }
@@ -91551,7 +91684,7 @@ static bool pw_write(struct dvm *vm, dvm_ref self,
   const char *sig = builtin_sig();
   if (sig && sig[1] == 'I') {
     char u[8];
-    size_t k = writer_encode_utf8(u, (uint32_t)(ARG(0).i & 0xffff));
+    size_t k = utf8_encode(u, (uint32_t)(ARG(0).i & 0xffff));
     (void)pw_emit(vm, self, u, k);
     RETV();
   }
@@ -94230,8 +94363,6 @@ static const struct rt_method rt_x_activity_sender[] = {
   M_END,
 };
 
-#include "dvm_extras_platform.h"
-
 struct rt_extra {
   const char *desc;
   const struct rt_method *methods;
@@ -95120,7 +95251,7 @@ static const struct rt_class rt_classes[] = {
   { "Ljava/net/URLEncoder;", "Ljava/lang/Object;", rt_urlencoder, NULL, NULL },
   { "Ljava/net/URLDecoder;", "Ljava/lang/Object;", rt_urldecoder, NULL, NULL },
   { "Ljava/util/Arrays;", "Ljava/lang/Object;", rt_arrays, NULL, NULL },
-  { "Ljava/util/UUID;", "Ljava/lang/Object;", rt_uuid, rt_uuid_fields, NULL },
+  { "Ljava/util/UUID;", "Ljava/lang/Object;", rt_uuid, rt_uuid_fields, rt_iface_serializable },
   { "Ljava/util/Optional;", "Ljava/lang/Object;", rt_optional, rt_optional_fields, NULL },
   { "Ljava/util/stream/Stream;", "Ljava/lang/Object;", rt_stream, rt_stream_fields, NULL },
   { "Ljava/util/stream/IntStream;", "Ljava/lang/Object;", rt_int_stream, rt_stream_fields, NULL },
@@ -95782,6 +95913,9 @@ static const struct rt_class rt_classes[] = {
     NULL, NULL
   },
   { "Ljava/time/DateTimeException;", "Ljava/lang/RuntimeException;", NULL, NULL, NULL },
+  { "Ljava/time/Clock;", "Ljava/lang/Object;", rt_clock, NULL, NULL },
+  { "Ljava/time/Clock$SystemClock;", "Ljava/time/Clock;", rt_system_clock,
+    rt_system_clock_fields, rt_iface_serializable },
   { "Ljava/time/Instant;", "Ljava/lang/Object;", rt_instant,
     rt_temporal_fields, NULL
   },
@@ -97153,6 +97287,10 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/content/RestrictionsManager;", "Ljava/lang/Object;", rt_restrictions_manager, NULL, NULL },
   { "Landroid/content/pm/ShortcutManager;", "Ljava/lang/Object;", rt_shortcut_manager,
     rt_shortcut_manager_fields, NULL },
+  { "Landroid/content/pm/ShortcutInfo;", "Ljava/lang/Object;", rt_shortcut_info,
+    rt_shortcut_fields, rt_iface_parcelable },
+  { "Landroid/content/pm/ShortcutInfo$Builder;", "Ljava/lang/Object;", rt_shortcut_builder,
+    rt_shortcut_fields, NULL },
   { "Ldalvik/system/BlockGuard;", "Ljava/lang/Object;", rt_block_guard, NULL, NULL },
   { "Ldalvik/system/BlockGuard$Policy;", "Ljava/lang/Object;", rt_block_guard_policy, NULL, NULL, NULL, true },
   { "Ldalvik/system/BlockGuard$1;", "Ljava/lang/Object;", rt_block_guard_lax, NULL, rt_iface_block_guard_policy },

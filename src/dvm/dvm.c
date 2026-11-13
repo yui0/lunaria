@@ -499,16 +499,9 @@ struct dvm_intern {
  * Class registry
  * ------------------------------------------------------------------------ */
 
-static uint32_t str_hash(const char *s)
-{
-  uint32_t h = 2166136261u;
-  for (; *s; ++s) h = (h ^ (uint8_t)*s) * 16777619u;
-  return h;
-}
-
 dvm_ref dvm__intern(struct dvm *vm, const char *utf8)
 {
-  const uint32_t hash = str_hash(utf8);
+  const uint32_t hash = dvm_str_hash(utf8);
   if (vm->interns_cap) {
     unsigned slot = hash & (unsigned)(vm->interns_cap - 1);
     while (vm->interns[slot].ref) {
@@ -558,7 +551,7 @@ dvm_ref dvm__intern(struct dvm *vm, const char *utf8)
 
 static struct dvm_class *class_lookup(struct dvm *vm, const char *desc)
 {
-  uint32_t h = str_hash(desc) % DVM_CLASS_HASH;
+  uint32_t h = dvm_str_hash(desc) % DVM_CLASS_HASH;
   for (struct dvm_class *c = vm->class_hash[h]; c; c = c->hash_next)
     if (!strcmp(c->desc, desc)) return c;
   return NULL;
@@ -590,7 +583,7 @@ static struct dvm_class *class_register(struct dvm *vm, const char *desc)
     return NULL;
   }
 
-  uint32_t h = str_hash(desc) % DVM_CLASS_HASH;
+  uint32_t h = dvm_str_hash(desc) % DVM_CLASS_HASH;
   c->hash_next = vm->class_hash[h];
   vm->class_hash[h] = c;
 
@@ -3032,7 +3025,7 @@ L_1f: { /* check-cast */
           fprintf(stderr, "[dvm] check-cast at %s.%s%s pc=%u: %s to %s\n",
                   m->cls->name, m->name, m->sig ? m->sig : "",
                   fr->pc, o->cls ? o->cls->name : "?", t->name);
-          if (getenv("LUNARIA_DVM_CASTVAL") && o->cls && !strcmp(o->cls->name, "java/lang/String")) {
+          if (dvm__env("LUNARIA_DVM_CASTVAL") && o->cls && !strcmp(o->cls->name, "java/lang/String")) {
             const char *sv = dvm_string_utf8(vm, r[AA(u0)]);
             fprintf(stderr, "[dvm]   value=%.200s\n", sv ? sv : "?");
           }
@@ -5108,7 +5101,7 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
   size_t stack_remaining = (vm->depth & 3) == 0 ? luna_os_stack_remaining() : SIZE_MAX - 1;
   if (stack_remaining < 64u * 1024u ||
       (stack_remaining == SIZE_MAX && vm->depth >= DVM_MAX_FRAMES)) {
-    if (getenv("LUNARIA_DVM_STACK")) {
+    if (dvm__env("LUNARIA_DVM_STACK")) {
       unsigned depth = 0;
       for (const struct dvm_call_frame *f = vm->invoke_frame;
            f && depth <= (unsigned)vm->depth + 1u; f = f->previous, ++depth) {
@@ -6825,7 +6818,7 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
    * on a device.  dvm_set_step_limit() sets one for diagnosis. */
   vm->step_limit = 0;
 
-  const char *t = getenv("LUNARIA_DVM_TRACE");
+  const char *t = dvm__env("LUNARIA_DVM_TRACE");
   if (t) vm->trace = atoi(t);
 
   dvm_runtime_install(vm);
@@ -6844,7 +6837,7 @@ struct dvm *dvm_create(const struct dvm_hooks *hooks)
    * first so the order still holds).  The Java side and the guest CPU then
    * run at the same time on different host threads.
    * LUNARIA_DVM_GIL_HOLD=1 restores the old behaviour for comparison. */
-  if (getenv("LUNARIA_DVM_GIL_HOLD")) {
+  if (dvm__env("LUNARIA_DVM_GIL_HOLD")) {
     fprintf(stderr, "[dvm] pump holds the interpreter lock "
                     "(LUNARIA_DVM_GIL_HOLD)\n");
     dvm_gil_acquire(vm);

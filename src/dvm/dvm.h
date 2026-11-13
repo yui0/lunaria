@@ -761,6 +761,15 @@ static inline uint16_t dex_u16_at(const struct dex_file *d, size_t off)
   return v;
 }
 
+/* FNV-1a over a NUL-terminated string: the one hash behind the class registry,
+ * the intern table and each dex file's descriptor index. */
+static inline uint32_t dvm_str_hash(const char *s)
+{
+  uint32_t h = 2166136261u;
+  for (; *s; ++s) h = (h ^ (uint8_t)*s) * 16777619u;
+  return h;
+}
+
 size_t dex_uleb(const struct dex_file *d, size_t off, uint32_t *out);
 size_t dex_sleb(const struct dex_file *d, size_t off, int32_t *out);
 

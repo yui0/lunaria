@@ -467,6 +467,7 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 extern "C" {
 #include "luna_media_format.h"
 #include "luna_native_codec.h"
+#include "file_read_cache.h"
 #include "arm_exec.h"
 #include "aaudio_stream.h"
 #include "luna_qfkey.h"
@@ -3075,7 +3076,7 @@ static bool usable_dynamic_definition(const char *name, const ln64_sym &symbol) 
   const char *path = ln64_module_path(symbol.owner);
   const char *base = path ? std::strrchr(path, '/') : nullptr;
   base = base ? base + 1 : path;
-  const char *dir = std::getenv("LUNARIA_SYSLIB_DIR");
+  const char *dir = lunaria_env("LUNARIA_SYSLIB_DIR");
   const size_t len = dir ? std::strlen(dir) : 0;
   const bool pure = base && (!std::strcmp(base, "libc-pure.so") ||
                              (len && !std::strcmp(base, "libc.so") &&
@@ -6438,6 +6439,40 @@ static const char *synthetic_proc_path(const char *path) {
 static std::map<std::string, uint32_t> g_exported_syms;
 // A64 exports are architectural 64-bit guest VAs.
 static std::map<std::string, GuestVA> g_exported_syms64;
+/* Entry points the Java->native bridge has already resolved, keyed by
+ * "<arch><class>\0<method>\0<signature>".  Resolving a native costs a scan of
+ * the registered natives and, for an implicitly bound one, building and looking
+ * up its mangled Java_... name; Unity and UE call the same few every frame.
+ * Only successful answers are kept.  Everything that can change an answer
+ * (RegisterNatives, UnregisterNatives, a module going away) calls
+ * natives_changed(); the table is touched only with the execution lock held. */
+struct ResolvedNative {
+  uint64_t va;
+  std::string sig;
+};
+static std::unordered_map<std::string, ResolvedNative> g_resolved_natives;
+static inline void natives_changed() { g_resolved_natives.clear(); }
+/* The key is built in a reused buffer so a hit allocates nothing. */
+static const std::string &resolved_native_key(char arch, const char *klass,
+                                              const char *method, const char *sig) {
+  static thread_local std::string key;
+  key.assign(1, arch);
+  key.append(klass).push_back('\0');
+  key.append(method).push_back('\0');
+  if (sig) key.append(sig);
+  else key.push_back('\1');
+  return key;
+}
+/* Copies a cached hit out the way the lookups do; false when there is none. */
+static bool resolved_native_hit(const std::string &key, uint64_t *va,
+                                char *sig_out, int sig_max) {
+  const auto it = g_resolved_natives.find(key);
+  if (it == g_resolved_natives.end()) return false;
+  if (sig_out && sig_max > 0 && !it->second.sig.empty())
+    snprintf(sig_out, (size_t)sig_max, "%s", it->second.sig.c_str());
+  *va = it->second.va;
+  return true;
+}
 static bool g_ln64_inited = false;
 bool g_guest_bionic_loaded = false;
 
@@ -14940,13 +14975,27 @@ static bool egl_strict(void)
 static constexpr int GL_ES_ADVERTISED_MAX_MINOR = 2;
 static int g_gl_ctx_major = 0, g_gl_ctx_minor = 0;
 
+/* A context's version never changes, so the answer is remembered per thread for
+ * the context that is current there, and dropped when any context is destroyed
+ * (a later one may be handed the same handle at a different level). */
+static std::atomic<unsigned> g_gl_ctx_destroyed{0};
+static thread_local struct { EGLContext ctx; unsigned destroyed; int major, minor; } t_gl_ctx_version;
+
 /* Read the live context without changing its pending GL error.  The version
  * string exists on ES 2 as well, unlike the integer version queries. */
 static void gl_probe_context_version(void)
 {
-  /* Not cached: a title creates several contexts at different levels (UE4
-   * brings up an ES 2.0 launch context before its ES 3 rendering one), and the
-   * answer belongs to whichever is current now. */
+  /* A title creates several contexts at different levels (UE4 brings up an
+   * ES 2.0 launch context before its ES 3 rendering one), and the answer
+   * belongs to whichever is current now. */
+  const EGLContext current = eglGetCurrentContext();
+  const unsigned destroyed = g_gl_ctx_destroyed.load(std::memory_order_relaxed);
+  if (current != EGL_NO_CONTEXT && t_gl_ctx_version.ctx == current &&
+      t_gl_ctx_version.destroyed == destroyed) {
+    g_gl_ctx_major = t_gl_ctx_version.major;
+    g_gl_ctx_minor = t_gl_ctx_version.minor;
+    return;
+  }
   int major = 0, minor = 0;
   const char *version = pfn_glGetString
                         ? (const char *)pfn_glGetString(0x1F02 /* GL_VERSION */) : nullptr;
@@ -14974,6 +15023,7 @@ static void gl_probe_context_version(void)
   }
   g_gl_ctx_major = major;
   g_gl_ctx_minor = minor;
+  t_gl_ctx_version = { current, destroyed, major, minor };
 }
 
 static bool guest_gl_version_integer(GLenum name, GLint *value)
@@ -18716,8 +18766,10 @@ static int egl_host_destroy_context(uint32_t h) {
       h - ARM_EGL_CTXTAB_BASE < g_egl_ctx_tab.size()) {
     EGLContext dead = g_egl_ctx_tab[h - ARM_EGL_CTXTAB_BASE];
     g_egl_ctx_tab[h - ARM_EGL_CTXTAB_BASE] = EGL_NO_CONTEXT;
-    if (dead != EGL_NO_CONTEXT && dead != g_egl_ctx)
+    if (dead != EGL_NO_CONTEXT && dead != g_egl_ctx) {
+      g_gl_ctx_destroyed.fetch_add(1, std::memory_order_relaxed);
       eglDestroyContext(g_egl_dpy, dead);
+    }
   }
   for (auto it = g_egl_tid_ctx.begin(); it != g_egl_tid_ctx.end();) {
     if (it->second != h) {
@@ -18813,8 +18865,10 @@ static uint32_t egl_host_create_window_surface(uint32_t config_handle,
                      EGL_NO_CONTEXT);
     if (g_egl_surf != EGL_NO_SURFACE)
       eglDestroySurface(g_egl_dpy, g_egl_surf);
-    if (g_egl_ctx != EGL_NO_CONTEXT)
+    if (g_egl_ctx != EGL_NO_CONTEXT) {
+      g_gl_ctx_destroyed.fetch_add(1, std::memory_order_relaxed);
       eglDestroyContext(g_egl_dpy, g_egl_ctx);
+    }
     g_egl_surf = EGL_NO_SURFACE;
     g_egl_ctx = EGL_NO_CONTEXT;
     egl_note_bound(0u, EGL_NO_SURFACE);
@@ -21614,52 +21668,6 @@ extern "C" const char *arm_exec_apk_entry_path(const char *name) {
  * APK dir, …), openFileDescriptor returns that FD instead of dumping the
  * whole buffer into a temp file.  Large assets stay unbuffered until
  * getBuffer/read forces a materialize — matching AASSET_MODE_RANDOM/STREAMING. */
-/* Immutable asset read-ahead. The reader uses positional I/O; this cache
- * changes neither its descriptor's cursor nor the caller's seek position. */
-struct luna_read_cache {
-  unsigned char *bytes;
-  uint64_t offset;
-  size_t valid;
-};
-typedef ptrdiff_t (*luna_read_at_fn)(void *, void *, size_t, uint64_t);
-#define LUNA_READ_CACHE_BYTES (64u * 1024u)
-static inline void luna_read_cache_clear(struct luna_read_cache *cache)
-{
-  free(cache->bytes);
-  memset(cache, 0, sizeof *cache);
-}
-static inline ptrdiff_t luna_read_cache_read(struct luna_read_cache *cache,
-    luna_read_at_fn reader, void *context, uint64_t offset, uint64_t length,
-    void *destination, size_t count)
-{
-  if (offset >= length || !count) return 0;
-  uint64_t remaining = length - offset;
-  if (remaining < count) count = (size_t)remaining;
-  if (count >= LUNA_READ_CACHE_BYTES)
-    return reader(context, destination, count, offset);
-  if (!cache->bytes) cache->bytes = (unsigned char *)malloc(LUNA_READ_CACHE_BYTES);
-  if (!cache->bytes) return reader(context, destination, count, offset);
-  size_t done = 0;
-  while (done < count) {
-    if (offset < cache->offset || offset - cache->offset >= cache->valid) {
-      size_t request = length - offset < LUNA_READ_CACHE_BYTES
-                       ? (size_t)(length - offset) : LUNA_READ_CACHE_BYTES;
-      ptrdiff_t received = reader(context, cache->bytes, request, offset);
-      /* The reader may overwrite the old bytes before returning an error. */
-      cache->valid = 0;
-      if (received <= 0) return done ? (ptrdiff_t)done : received;
-      cache->offset = offset;
-      cache->valid = (size_t)received;
-    }
-    size_t index = (size_t)(offset - cache->offset);
-    size_t available = cache->valid - index;
-    size_t take = count - done < available ? count - done : available;
-    memcpy((unsigned char *)destination + done, cache->bytes + index, take);
-    offset += take;
-    done += take;
-  }
-  return (ptrdiff_t)done;
-}
 struct GuestAsset {
   std::vector<uint8_t> data;
   uint32_t buf_va = 0;
@@ -24914,6 +24922,7 @@ static void do_register_natives(ArmExecCtx &ctx,
       }
     }
     if (!replaced) ctx.natives.push_back(std::move(rn));
+    natives_changed();
     art_method_registered(ctx,klass_name,name,sig,fn_va);
     fprintf(stderr, "[arm_exec] RegisterNatives: %s.%s%s @ 0x%llx\n",
             klass_name ? klass_name : "?", name, sig,
@@ -28789,6 +28798,10 @@ static inline void gl_tid_unmark(uint32_t tid) {
 static inline void gl_tid_mark(uint32_t tid, uint32_t svc) {
   if (tid >= GL_TID_BITS) return;
   const uint64_t bit = 1ull << (tid % 64);
+  /* Every GL call of a pinned thread comes through here: a plain load keeps the
+   * shared word read-only once the mark is set, where fetch_or would take the
+   * cache line exclusively on each call. */
+  if (g_gl_tids[tid / 64].load(std::memory_order_relaxed) & bit) return;
   if (g_gl_tids[tid / 64].fetch_or(bit, std::memory_order_relaxed) & bit)
     return;
   /* Pinning costs a thread its share of the engine pool while it lasts, so say
@@ -30610,6 +30623,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
   /* LUNARIA_SVC_TIME=1: wall time spent inside each SVC handler (host side,
    * blocking included), top offenders every 10 s. */
+  static const bool svc_time_on = lunaria_env("LUNARIA_SVC_TIME") != nullptr;
   struct SvcTimer {
     uint32_t no;
     uint64_t t0;
@@ -30643,7 +30657,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 bv / 1e3 / (double)std::max<uint64_t>(1, calls[best].load()));
       }
     }
-  } svc_timer(svc_no, lunaria_env("LUNARIA_SVC_TIME") != nullptr);
+  } svc_timer(svc_no, svc_time_on);
   // LUNARIA_SVC_HISTO: count SVCs by number; dump the top offenders every N.
   static const bool svc_histo = lunaria_env("LUNARIA_SVC_HISTO") != nullptr;
   if (svc_histo) {
@@ -36711,6 +36725,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     for (size_t i=ctx.natives.size(); i>0; --i)
       if (art_class_equal(ctx.natives[i-1].klass.c_str(),owner))
         ctx.natives.erase(ctx.natives.begin()+(i-1));
+    natives_changed();
     for (size_t i=0; i<ctx.art_method_count; ++i) {
       const ArtMethodRecord *record=&ctx.art_methods[i];
       GuestVA address=art_pointer(ctx,record->address);
@@ -41650,11 +41665,12 @@ aaudio_write_retry:
     if (pfn_glUniformMatrix4fv && r3) {
       const GLfloat *m = (const GLfloat*)ctx.mem.ptr(r3);
       static int mm4log = 0;
-      int mm4lim = 16;
-      if (const char *e = lunaria_env("LUNARIA_TRACE_MATRIX"))
-        mm4lim = atoi(e);
+      static const char *const trace_matrix = lunaria_env("LUNARIA_TRACE_MATRIX");
+      static const bool trace_cam = lunaria_env("LUNARIA_TRACE_CAM") != nullptr;
+      static const bool trace_gldraw = lunaria_env("LUNARIA_TRACE_GLDRAW") != nullptr;
+      const int mm4lim = trace_matrix ? atoi(trace_matrix) : 16;
       // Track camera-like VPs (fy≈1.05) and floor-UI MVPs (m11≈0, m21≠0).
-      if (lunaria_env("LUNARIA_TRACE_CAM") && (int)r0 == 0) {
+      if (trace_cam && (int)r0 == 0) {
         float m11 = m[5], m21 = m[6], m13 = m[13], m23 = m[14];
         static float prev_m13 = 0, prev_m21 = 0;
         static int cam_n = 0;
@@ -41681,8 +41697,7 @@ aaudio_write_retry:
           ++cam_n;
         }
       }
-      if ((lunaria_env("LUNARIA_TRACE_GLDRAW") || lunaria_env("LUNARIA_TRACE_MATRIX")) &&
-          mm4log++ < mm4lim) {
+      if ((trace_gldraw || trace_matrix) && mm4log++ < mm4lim) {
         fprintf(stderr, "[gl] UniformMatrix4fv loc=%d cnt=%" PRIu64 " tr=%" PRIu64 ":\n", (int)r0, r1, r2);
         for (int row = 0; row < 4; ++row)
           fprintf(stderr, "  %9.4f %9.4f %9.4f %9.4f\n",
@@ -41816,7 +41831,7 @@ aaudio_write_retry:
        * their sizes.  "the movie is decoded but not on screen" comes
        * down to which texture the movie quad reads, and there is no
        * other way to find that out from this side. */
-      if (getenv("LUNARIA_TRACE_MEDIA_DRAW")) {
+      if (lunaria_env("LUNARIA_TRACE_MEDIA_DRAW")) {
         static int nmd = 0;
         if (nmd++ < 200) {
           GLint fb = 0;
@@ -64186,6 +64201,7 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
       [path](const LoadedRegion &region) {
         return region.path == path;
       }), g_loaded_regions.end());
+      natives_changed();
       g_module_phdrs.erase(std::remove_if(g_module_phdrs.begin(), g_module_phdrs.end(),
       [base_addr](const ModulePhdr &module) {
         return module.load_bias == base_addr;
@@ -65337,10 +65353,9 @@ static uint32_t framework_native_svc(const char *klass,const char *method,const 
   return 0;
 }
 
-static uint32_t lookup_native_impl(const char *klass, const char *method,
+static uint32_t lookup_native_uncached(const char *klass, const char *method,
                                    const char *sig, char *sig_out, int sig_max) {
   if (!g_ctx || !klass || !method) return 0;
-  ArmLockGuard guard;
   for (auto &rn : g_ctx->natives) {
     if (jni_class_name_eq(rn.klass, klass) && rn.name == method && (!sig || rn.sig == sig)) {
       if (sig_out && sig_max > 0)
@@ -65370,6 +65385,26 @@ static uint32_t lookup_native_impl(const char *klass, const char *method,
     if (sig_out && sig_max > 0 && sig) snprintf(sig_out, (size_t)sig_max, "%s", sig);
   }
   return va;
+}
+
+static uint32_t lookup_native_impl(const char *klass, const char *method,
+                                   const char *sig, char *sig_out, int sig_max) {
+  if (!g_ctx || !klass || !method) return 0;
+  ArmLockGuard guard;
+  const std::string &key = resolved_native_key('3', klass, method, sig);
+  uint64_t cached;
+  if (resolved_native_hit(key, &cached, sig_out, sig_max)) return (uint32_t)cached;
+  char resolved_sig[512] = "";
+  const uint32_t found = lookup_native_uncached(klass, method, sig, resolved_sig,
+                                                (int)sizeof resolved_sig);
+  if (found) {
+    if (sig_out && sig_max > 0 && resolved_sig[0])
+      snprintf(sig_out, (size_t)sig_max, "%s", resolved_sig);
+    ResolvedNative &entry = g_resolved_natives[key];
+    entry.va = found;
+    entry.sig = resolved_sig;
+  }
+  return found;
 }
 
 extern "C" uint32_t arm_exec_lookup_native(const char *klass, const char *method) {
@@ -69409,7 +69444,8 @@ a64_hooks_done:
     }
     const A64SoftFpAbi *softfp = svc_attr.softfp;
 
-    if (lunaria_env("LUNARIA_TRACE_SVC")) {
+    static const bool trace_svc64 = lunaria_env("LUNARIA_TRACE_SVC") != nullptr;
+    if (trace_svc64) {
       fprintf(stderr, "[svc64] %u x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx lr=0x%llx\n",
               svc_no, (unsigned long long)x0, (unsigned long long)x1,
               (unsigned long long)x2, (unsigned long long)x3, (unsigned long long)x30);
@@ -69459,7 +69495,8 @@ a64_hooks_done:
     if (svc_no == 0) {
       uint64_t x8 = jit64->GetRegister(8);
       uint32_t nr = (uint32_t)x8;
-      if (lunaria_env("LUNARIA_TRACE_RAW_HOT") && nr < 512u) {
+      static const bool trace_raw_hot = lunaria_env("LUNARIA_TRACE_RAW_HOT") != nullptr;
+      if (trace_raw_hot && nr < 512u) {
         static uint64_t hot[512] = {};
         const uint64_t n = ++hot[nr];
         if (n == 100000u || (n % 1000000u) == 0u)
@@ -69488,7 +69525,8 @@ a64_hooks_done:
        * answering it with the guest's pid. */
       else if (nr == 20u) nr = 2020u; /* epoll_create1 */
       regs32[7] = nr;
-      if (lunaria_env("LUNARIA_TRACE_SVC0") && nr != 240u && nr != 224u) {
+      static const bool trace_svc0 = lunaria_env("LUNARIA_TRACE_SVC0") != nullptr;
+      if (trace_svc0 && nr != 240u && nr != 224u) {
         static int n = 0;
         static const int cap =
           lunaria_env("LUNARIA_TRACE_SVC0_CAP")
@@ -69511,7 +69549,7 @@ a64_hooks_done:
     g_svc_jit64  = jit64;
     g_svc_sp64   = jit64->GetSP();
     g_svc_fp64   = jit64->GetRegister(29);
-    const bool trace_recreate_svc = lunaria_env("LUNARIA_TRACE_RECREATE_SVC") != nullptr;
+    static const bool trace_recreate_svc = lunaria_env("LUNARIA_TRACE_RECREATE_SVC") != nullptr;
     if (trace_recreate_svc)
       fprintf(stderr, "[recreate-svc] enter no=%u(%s) lr=%llx pc=%llx x0=%llx x1=%llx tls=%llx rem=%llu total=%llu\n",
               svc_no, svc_symbol_name(svc_no),
@@ -74083,6 +74121,7 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
       [path](const LoadedRegion &region) {
         return region.path == path;
       }), g_loaded_regions.end());
+      natives_changed();
       g_module_phdrs.erase(std::remove_if(g_module_phdrs.begin(), g_module_phdrs.end(),
       [guest_base](const ModulePhdr &module) {
         return module.load_bias == guest_base;
@@ -75848,10 +75887,9 @@ extern "C" uint64_t arm64_exec_lookup_export(const char *sym) {
 }
 
 // RegisterNatives table first, then JNI *implicit binding* against the loaded ELF exports.
-static uint64_t lookup_native64_impl(const char *klass, const char *method,
+static uint64_t lookup_native64_uncached(const char *klass, const char *method,
                                      const char *sig, char *sig_out, int sig_max) {
   if (!g_ctx || !klass || !method) return 0;
-  ArmLockGuard guard;
   for (const auto &rn : g_ctx->natives) {
     if (jni_class_name_eq(rn.klass, klass) && rn.name == method && (!sig || rn.sig == sig)) {
       if (sig_out && sig_max > 0)
@@ -75879,6 +75917,26 @@ static uint64_t lookup_native64_impl(const char *klass, const char *method,
             symbol.c_str(), (unsigned long long)it->second);
   if (sig && sig_out && sig_max > 0) snprintf(sig_out, (size_t)sig_max, "%s", sig);
   return it->second;
+}
+
+static uint64_t lookup_native64_impl(const char *klass, const char *method,
+                                     const char *sig, char *sig_out, int sig_max) {
+  if (!g_ctx || !klass || !method) return 0;
+  ArmLockGuard guard;
+  const std::string &key = resolved_native_key('6', klass, method, sig);
+  uint64_t cached;
+  if (resolved_native_hit(key, &cached, sig_out, sig_max)) return cached;
+  char resolved_sig[512] = "";
+  const uint64_t found = lookup_native64_uncached(klass, method, sig, resolved_sig,
+                                                  (int)sizeof resolved_sig);
+  if (found) {
+    if (sig_out && sig_max > 0 && resolved_sig[0])
+      snprintf(sig_out, (size_t)sig_max, "%s", resolved_sig);
+    ResolvedNative &entry = g_resolved_natives[key];
+    entry.va = found;
+    entry.sig = resolved_sig;
+  }
+  return found;
 }
 
 ArmExecCtx::~ArmExecCtx()

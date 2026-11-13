@@ -3105,9 +3105,7 @@ static const char *zone_id_text(struct dvm *vm, dvm_ref zone, char buf[64])
   struct dvm_class *c = dvm_object_class(vm, zone), *off = dvm__class_by_desc(vm, "Ljava/time/ZoneOffset;");
   if (c && off && dvm__class_assignable(vm, c, off)) {
     int32_t t = zone_offset_seconds(vm, zone);
-    if (!t) return strcpy(buf, "Z");
-    int a = t < 0 ? -t : t;
-    snprintf(buf, 64, "%c%02d:%02d", t < 0 ? '-' : '+', a / 3600, a / 60 % 60);
+    jt_offset_text(buf,64,t);
     return buf;
   }
   union dvm_value id = {0};
@@ -3128,14 +3126,28 @@ static bool zoneid_of(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     return false;
   }
   if (!strcmp(id, "Z") || id[0] == '+' || id[0] == '-') {
-    int sign = id[0] == '-' ? -1 : 1, h = 0, m = 0;
-    const char *p = id[0] == 'Z' ? id + 1 : id + 1;
-    if (id[0] != 'Z' && !(iso_digits(&p, 2, &h) && (*p != ':' || (++p, 1)) &&
-                          (!*p || iso_digits(&p, 2, &m)) && !*p)) {
+    int sign = id[0] == '-' ? -1 : 1, h = 0, m = 0, s = 0;
+    const char *p = id + 1;
+    bool valid=true;
+    if (id[0]!='Z') {
+      size_t length=strlen(p);
+      valid=iso_digits(&p,length==1 ? 1 : 2,&h);
+      bool colon=*p==':';
+      if (*p && valid) {
+        if (colon) ++p;
+        valid=iso_digits(&p,2,&m);
+      }
+      if (*p && valid) {
+        if (colon) { if (*p==':') ++p; else valid=false; }
+        if (valid) valid=iso_digits(&p,2,&s);
+      }
+      valid=valid && !*p && m<60 && s<60 && h<=18 && (h!=18 || (!m && !s));
+    }
+    if (!valid) {
       dvm__throw(vm, "java/time/DateTimeException", "Invalid ID for ZoneOffset: %s", id);
       return false;
     }
-    RETL(zone_offset_new(vm, sign * (h * 3600 + m * 60)));
+    RETL(zone_offset_new(vm, sign * (h * 3600 + m * 60 + s)));
   }
   /* A region id is Area/Location (or a short name such as UTC/GMT): letters, digits, / _ - + only. */
   bool valid = *id != 0;
@@ -3172,6 +3184,57 @@ static bool zoneid_getId(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)nargs;
   char buf[64];
   RETL(dvm_new_string(vm, zone_id_text(vm, self, buf)));
+}
+
+static bool ldt_ofInstant(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  if (!ARG(0).l || !ARG(1).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "instant and zone are required");
+    return false;
+  }
+  int64_t seconds = jt_seconds(vm, ARG(0).l);
+  int32_t offset;
+  struct dvm_class *cls = dvm_object_class(vm, ARG(1).l);
+  if (dvm__class_assignable(vm, cls, dvm_find_class(vm, "java/time/ZoneOffset"))) {
+    offset = zone_offset_seconds(vm, ARG(1).l);
+  } else {
+    char zone[64];
+    zone_id_text(vm, ARG(1).l, zone);
+#ifdef _WIN32
+    if (seconds > INT64_MAX / 1000 || seconds < INT64_MIN / 1000) {
+      dvm__throw(vm, "java/time/DateTimeException", "instant outside host zone database range");
+      return false;
+    }
+    offset = time_offset(seconds * 1000, zone);
+#else
+    time_t epoch = (time_t)seconds;
+    struct tm local;
+    arm_exec_timezone_lock();
+    const char *old = getenv("TZ");
+    char *saved = old ? strdup(old) : NULL;
+    if (old && !saved) {
+      arm_exec_timezone_unlock();
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "timezone");
+      return false;
+    }
+    setenv("TZ", zone, 1);
+    tzset();
+    bool valid = localtime_r(&epoch, &local) != NULL;
+    if (saved) { setenv("TZ", saved, 1); free(saved); }
+    else unsetenv("TZ");
+    tzset();
+    arm_exec_timezone_unlock();
+    if (!valid) {
+      dvm__throw(vm, "java/time/DateTimeException", "instant outside host zone database range");
+      return false;
+    }
+    offset = (int32_t)local.tm_gmtoff;
+#endif
+  }
+  if (!jt_local_range(vm, seconds, offset)) return false;
+  RETL(jt_new_parts(vm, "Ljava/time/LocalDateTime;", seconds, jt_nano(vm, ARG(0).l), offset));
 }
 
 /* withZoneSameInstant(zone): same instant, the offset that zone has then. */
@@ -3236,6 +3299,93 @@ static const struct rt_method rt_zone_id[] = {
 };
 static const struct rt_field rt_zone_id_fields[] = { { "id", "Ljava/lang/String;" }, F_END };
 
+/* SystemClock reads wall time, independently of the zone used to interpret it. */
+static bool clock_system(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  if (!ARG(0).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "zone");
+    return false;
+  }
+  dvm_ref clock = dvm_new_object(vm, dvm_find_class(vm, "java/time/Clock$SystemClock"));
+  if (!clock) return false;
+  dvm_set_field(vm, clock, "zone", "Ljava/time/ZoneId;", ARG(0));
+  RETL(clock);
+}
+
+static bool clock_system_default(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                 int nargs, union dvm_value *out)
+{
+  union dvm_value zone = {0};
+  if (!zoneid_systemDefault(vm, self, args, nargs, &zone)) return false;
+  return clock_system(vm, 0, &zone, 1, out);
+}
+
+static bool clock_system_utc(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                             int nargs, union dvm_value *out)
+{
+  (void)self; (void)args; (void)nargs;
+  union dvm_value zone = { .l = zone_offset_new(vm, 0) };
+  return clock_system(vm, 0, &zone, 1, out);
+}
+
+static bool clock_get_zone(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  return dvm_get_field(vm, self, "zone", "Ljava/time/ZoneId;", out);
+}
+
+static bool clock_with_zone(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                            int nargs, union dvm_value *out)
+{
+  union dvm_value zone = {0};
+  if (!ARG(0).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "zone");
+    return false;
+  }
+  if (!clock_get_zone(vm, self, NULL, 0, &zone)) return false;
+  char old_id[64], new_id[64];
+  if (!strcmp(zone_id_text(vm, zone.l, old_id), zone_id_text(vm, ARG(0).l, new_id)))
+    RETL(self);
+  return clock_system(vm, 0, args, nargs, out);
+}
+
+static bool clock_millis(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  (void)vm; (void)self; (void)args; (void)nargs;
+  RETJ(now_millis());
+}
+
+static bool clock_instant(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)self; (void)args; (void)nargs;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  RETL(jt_new_parts(vm, "Ljava/time/Instant;", ts.tv_sec, ts.tv_nsec, 0));
+}
+
+static const struct rt_method rt_clock[] = {
+  M("<init>", "()V", nop_void),
+  SM("systemDefaultZone", "()Ljava/time/Clock;", clock_system_default),
+  SM("systemUTC", "()Ljava/time/Clock;", clock_system_utc),
+  SM("system", "(Ljava/time/ZoneId;)Ljava/time/Clock;", clock_system),
+  M_END
+};
+static const struct rt_method rt_system_clock[] = {
+  M("getZone", "()Ljava/time/ZoneId;", clock_get_zone),
+  M("withZone", "(Ljava/time/ZoneId;)Ljava/time/Clock;", clock_with_zone),
+  M("millis", "()J", clock_millis),
+  M("instant", "()Ljava/time/Instant;", clock_instant),
+  M_END
+};
+static const struct rt_field rt_system_clock_fields[] = {
+  { "zone", "Ljava/time/ZoneId;" }, F_END
+};
+
 static const struct rt_method rt_zone_offset[] = {
   SM("ofHours", "(I)Ljava/time/ZoneOffset;", zoff_ofHours),
   SM("ofTotalSeconds", "(I)Ljava/time/ZoneOffset;", zoff_ofTotalSeconds),
@@ -3270,7 +3420,92 @@ static const struct rt_method rt_offset_date_time[] = {
 static const struct rt_field rt_zoned_fields[] = {
   { "seconds", "J" }, { "nano", "I" }, { "offset", "I" }, { "zone", "Ljava/lang/String;" }, F_END
 };
+static bool zdt_of(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                    int nargs,union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  if (!ARG(7).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","zone"); return false;
+  }
+  if (ARG(3).i<0 || ARG(3).i>23 || ARG(4).i<0 || ARG(4).i>59 ||
+      ARG(5).i<0 || ARG(5).i>59 || ARG(6).i<0 || ARG(6).i>999999999) {
+    dvm__throw(vm,"java/time/DateTimeException","invalid local time"); return false;
+  }
+  union dvm_value date={0};
+  if (!ld_of(vm,0,args,3,&date)) return false;
+  int64_t wall=jt_seconds(vm,date.l)+(int64_t)ARG(3).i*3600+ARG(4).i*60+ARG(5).i;
+  int64_t seconds;
+  int32_t offset;
+  char id[64];
+  zone_id_text(vm,ARG(7).l,id);
+  struct dvm_class *zone_class=dvm_object_class(vm,ARG(7).l);
+  if (dvm__class_assignable(vm,zone_class,dvm_find_class(vm,"java/time/ZoneOffset"))) {
+    offset=zone_offset_seconds(vm,ARG(7).l);
+    seconds=wall-offset;
+  } else {
+    struct cal_zone_context zone={0};
+    snprintf(zone.id,sizeof zone.id,"%s",id);
+    zone.fixed=cal_fixed_id(zone.id,&zone.offset);
+    if (zone.fixed) {
+      offset=zone.offset/1000;
+      seconds=wall-offset;
+    } else {
+      /* Calendar's common zone resolver selects the earlier instant in an
+       * overlap and preserves minutes by shifting forward across a gap. */
+      if (wall<INT64_MIN/1000+172800 || wall>INT64_MAX/1000-172800) {
+        dvm__throw(vm,"java/time/DateTimeException","local time outside host zone database range"); return false;
+      }
+      int64_t millis;
+      int32_t raw,dst;
+      if (!cal_host_resolve(&zone,wall*1000,1,0,true,&millis) ||
+          !cal_host_offset(&zone,millis,&raw,&dst)) {
+        dvm__throw(vm,"java/time/DateTimeException","cannot resolve local time in zone"); return false;
+      }
+      seconds=lc_floor(millis,1000);
+      offset=(raw+dst)/1000;
+    }
+  }
+  if (!jt_local_range(vm,seconds,offset)) return false;
+  dvm_ref value=jt_new_parts(vm,"Ljava/time/ZonedDateTime;",seconds,ARG(6).i,offset);
+  if (!value) return false;
+  dvm_set_field(vm,value,"zone","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,id)});
+  RETL(value);
+}
+
+static bool ldt_atZone(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                        int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  int64_t wall=jt_seconds(vm,self)+jt_offset(vm,self);
+  int64_t day=lc_floor(wall,86400),year;
+  unsigned month,date;
+  lc_day_civil(day+LC_EPOCH_JD,true,&year,&month,&date);
+  int time=(int)(wall-day*86400);
+  union dvm_value fields[8]={{.i=(int32_t)year},{.i=(int32_t)month},{.i=(int32_t)date},
+    {.i=time/3600},{.i=time/60%60},{.i=time%60},{.i=jt_nano(vm,self)},ARG(0)};
+  return zdt_of(vm,0,fields,8,out);
+}
+
+static bool ldt_minusDays(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                           int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  int64_t wall=jt_seconds(vm,self)+jt_offset(vm,self);
+  int64_t day=lc_floor(wall,86400),days=ARG(0).j;
+  if ((days>0 && day<INT64_MIN+days) || (days<0 && day>INT64_MAX+days)) {
+    dvm__throw(vm,"java/lang/ArithmeticException","epoch day overflow"); return false;
+  }
+  int64_t result=day-days;
+  if (result<lc_civil_day(-999999999,1,1,true)-LC_EPOCH_JD ||
+      result>lc_civil_day(999999999,12,31,true)-LC_EPOCH_JD) {
+    dvm__throw(vm,"java/time/DateTimeException","local date-time out of range"); return false;
+  }
+  int64_t seconds=result*86400+(wall-day*86400)-jt_offset(vm,self);
+  RETL(jt_new_parts(vm,"Ljava/time/LocalDateTime;",seconds,jt_nano(vm,self),jt_offset(vm,self)));
+}
+
 static const struct rt_method rt_zoned_date_time[] = {
+  SM("of","(IIIIIIILjava/time/ZoneId;)Ljava/time/ZonedDateTime;",zdt_of),
   SM("now", "()Ljava/time/ZonedDateTime;", zdt_now),
   SM("parse", "(Ljava/lang/CharSequence;)Ljava/time/ZonedDateTime;", zdt_parse),
   M("withZoneSameInstant", "(Ljava/time/ZoneId;)Ljava/time/ZonedDateTime;", zdt_withZoneSameInstant),
@@ -3295,6 +3530,9 @@ static const struct rt_method rt_zoned_date_time[] = {
 };
 
 static const struct rt_method rt_local_date_time[] = {
+  M("atZone","(Ljava/time/ZoneId;)Ljava/time/ZonedDateTime;",ldt_atZone),
+  M("minusDays","(J)Ljava/time/LocalDateTime;",ldt_minusDays),
+  SM("ofInstant", "(Ljava/time/Instant;Ljava/time/ZoneId;)Ljava/time/LocalDateTime;", ldt_ofInstant),
   M("toLocalDate", "()Ljava/time/LocalDate;", ldt_toLocalDate),
   SM("now", "()Ljava/time/LocalDateTime;", ldt_now),
   SM("ofEpochSecond", "(JILjava/time/ZoneOffset;)Ljava/time/LocalDateTime;", ldt_ofEpochSecond),
@@ -3311,6 +3549,7 @@ static const struct rt_method rt_local_date_time[] = {
   M("format", "(Ljava/time/format/DateTimeFormatter;)Ljava/lang/String;",
   jt_format),
   M("compareTo", "(Ljava/time/LocalDateTime;)I", jt_compareTo),
+  M("compareTo", "(Ljava/time/chrono/ChronoLocalDateTime;)I", jt_compareTo),
   M("compareTo", "(Ljava/lang/Object;)I", jt_compareTo),
   M("isBefore", "(Ljava/time/chrono/ChronoLocalDateTime;)Z", jt_isBefore),
   M("isAfter", "(Ljava/time/chrono/ChronoLocalDateTime;)Z", jt_isAfter),

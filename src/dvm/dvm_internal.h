@@ -150,6 +150,8 @@ struct dvm_object {
   uint16_t *string_units; /* lazy immutable String index; NULL for ASCII */
   uint32_t string_length;
   bool string_index_ready;
+  bool string_hash_ready;  /* string_hash is valid; an immutable String only */
+  int32_t string_hash;
 
   /* arrays */
   uint32_t length;

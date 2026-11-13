@@ -1130,7 +1130,7 @@ bool dvm_proxy_try_invoke(struct dvm *vm, dvm_ref self, struct dvm_class *cls,
   }
 
   struct dvm_class *hc = dvm_object_class(vm, hv.l);
-  if (getenv("LUNARIA_DVM_PROXY"))
+  if (dvm__env("LUNARIA_DVM_PROXY"))
     fprintf(stderr, "[proxy] invoke %s.%s%s handler=%s@%u\n",
             decl && decl->name ? decl->name : "?", name, sig,
             hc && hc->name ? hc->name : "?", hv.l);
@@ -1201,7 +1201,7 @@ static bool proxy_newProxyInstance(struct dvm *vm, dvm_ref self,
   union dvm_value v = { .l = handler };
   (void)dvm_set_field(vm, obj, "h", "Ljava/lang/reflect/InvocationHandler;",
                       v);
-  if (getenv("LUNARIA_DVM_PROXY"))
+  if (dvm__env("LUNARIA_DVM_PROXY"))
     fprintf(stderr, "[proxy] newProxyInstance %s ifaces=%u h=%u -> %u\n",
             pc->name, dvm_array_length(vm, ifaces), handler, obj);
   RETL(obj);
@@ -5283,6 +5283,8 @@ static bool props_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     }
     memcpy(cloned,original,bytes);
     memset(cloned->views,0,sizeof cloned->views);
+    cloned->index=NULL;
+    cloned->index_cap=0;
     cloned->mod_count=0;
     for(uint32_t i=0; i<cloned->size; ++i) {
       cloned->e[i].node=0;

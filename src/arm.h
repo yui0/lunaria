@@ -374,6 +374,11 @@ struct A64RangeCache {
   uint64_t gen = 0;
 };
 inline thread_local A64RangeCache t_a64_cache[8];
+/* The span answer depends on where the mapping *ends*, which an insert that
+ * merges neighbours or an mprotect that splits one changes without unmapping a
+ * byte, so it is validated against g_a64_maps_gen (every change) and not the
+ * unmap generation above. */
+inline thread_local A64RangeCache t_a64_span_cache[4];
 
 // Caller holds g_a64_maps_mu (either way).
 inline const A64Mapping *a64_find_locked(GuestVA va) {
@@ -421,9 +426,19 @@ inline bool a64_executable(GuestVA va) {
 // Bytes mapped contiguously from `va`, or 0 when `va` itself is unmapped.
 inline size_t a64_mapped_span(GuestVA va) {
   va = a64_mapping_va(va);
+  /* Read before the lookup: an entry stored with this generation then never
+   * describes a table newer than the generation it claims. */
+  const uint64_t gen = g_a64_maps_gen.load(std::memory_order_acquire);
+  A64RangeCache &c = t_a64_span_cache[(va >> 21) & 3u];
+  if (gen == c.gen && va >= c.lo && va < c.hi)
+    return (size_t)(c.hi - va);
   std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
   const A64Mapping *m = a64_find_locked(va);
-  return m ? (size_t)(m->hi - va) : 0u;
+  if (!m) return 0u;
+  c.lo  = m->lo;
+  c.hi  = m->hi;
+  c.gen = gen;
+  return (size_t)(m->hi - va);
 }
 
 /* True when every byte in [va, va+len) has the requested guest permission.

@@ -211,10 +211,10 @@ static bool x_if_str_in(struct dvm *vm, dvm_ref list, const char *s, bool fold)
 
 static const char *x_if_field_for(const char *name)
 {
-  if (strstr(name, "Action")) return "actions";
-  if (strstr(name, "Categor")) return "categories";
-  if (strstr(name, "Scheme")) return "schemes";
-  if (strstr(name, "Type")) return "types";
+  if (strstr(name, "Action") || !strcmp(name, "actionsIterator")) return "actions";
+  if (strstr(name, "Categor") || !strcmp(name, "categoriesIterator")) return "categories";
+  if (strstr(name, "Scheme") || !strcmp(name, "schemesIterator")) return "schemes";
+  if (strstr(name, "Type") || !strcmp(name, "typesIterator")) return "types";
   if (strstr(name, "Authorit")) return "authorities";
   return "paths";
 }
@@ -543,10 +543,36 @@ static bool x_if_match(struct dvm *vm, dvm_ref self, const union dvm_value *args
   RETI(dm);
 }
 
+static bool x_if_copy(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                      int nargs, union dvm_value *out)
+{
+  (void)nargs;
+  if (!ARG(0).l) {
+    dvm__throw(vm, "java/lang/NullPointerException", "source");
+    return false;
+  }
+  for (const struct rt_field *field = rt_intent_filter_fields; field->name; ++field) {
+    union dvm_value value = {0};
+    if (!dvm_get_field(vm, ARG(0).l, field->name, field->type, &value)) return false;
+    if (value.l && !strcmp(field->type, "Ljava/util/List;")) {
+      struct rt_list *source = list_of(vm, value.l);
+      dvm_ref copy = coll_new_list(vm, "Ljava/util/ArrayList;");
+      if (!source || !copy) return false;
+      for (uint32_t i = 0; i < source->size; ++i) {
+        union dvm_value item = { .l = source->items[i] }, ignored = {0};
+        if (!list_add(vm, copy, &item, 1, &ignored)) return false;
+      }
+      value.l = copy;
+    }
+    if (!dvm_set_field(vm, self, field->name, field->type, value)) return false;
+  }
+  RETV();
+}
+
 static const struct rt_method rt_x_intent_filter[] = {
   M("<init>", "()V", empty_void),
   M("<init>", "(Ljava/lang/String;)V", x_if_add),
-  M("<init>", "(Landroid/content/IntentFilter;)V", empty_void),
+  M("<init>", "(Landroid/content/IntentFilter;)V", x_if_copy),
   M("addAction", "(Ljava/lang/String;)V", x_if_add), M("hasAction", "(Ljava/lang/String;)Z", x_if_has),
   M("countActions", "()I", x_if_count), M("getAction", "(I)Ljava/lang/String;", x_if_get),
   M("actionsIterator", "()Ljava/util/Iterator;", x_if_iterator),

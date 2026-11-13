@@ -444,7 +444,7 @@ static dvm_ref wrapper_for(struct dvm *vm, JNIEnv *env,
 
   /* A miss means this host handle was never the far side of a VM object, so
    * whatever instance state the VM holds for it is about to be invisible. */
-  if (getenv("LUNARIA_TRACE_FIELDS")) {
+  if (dvm__env("LUNARIA_TRACE_FIELDS")) {
     static int n;
     if (n++ < 64)
       fprintf(stderr, "[dvm] no VM object behind host handle 0x%x (%s) — "
@@ -850,7 +850,7 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
         if (r) dvm_pin(vm, r);
         return r;
       }
-      if (getenv("LUNARIA_TRACE_CLASS_FLOW"))
+      if (dvm__env("LUNARIA_TRACE_CLASS_FLOW"))
         fprintf(stderr, "[classflow] host Class %s lacks a VM definition\n", described);
     }
   }
@@ -888,7 +888,7 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
                                             "Ljava/lang/String;");
     jboolean grant_value = grant ? (*env)->GetBooleanField(env, o, grant) : JNI_FALSE;
     jobject authority_value = authority ? (*env)->GetObjectField(env, o, authority) : NULL;
-    if (getenv("LUNARIA_TRACE_FIELDS"))
+    if (dvm__env("LUNARIA_TRACE_FIELDS"))
       fprintf(stderr, "[dvm] ProviderInfo import host=%p grant=%d authority=%p\n",
               (void *)o, (int)grant_value, (void *)authority_value);
     dvm_ref r = wrapper_for(vm, env, cn, (uint32_t)(uintptr_t)o);
@@ -1027,7 +1027,7 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
   }
 
   struct dvm_class *c = dvm_object_class(vm, r);
-  if (getenv("LUNARIA_TRACE_JNI")) {
+  if (dvm__env("LUNARIA_TRACE_JNI")) {
     struct dvm_object *raw = dvm__obj(vm, r);
     fprintf(stderr, "[dvm-jni] non-payload object ref=0x%x kind=%d class=%s\n",
             r, raw ? (int)raw->kind : -1,
@@ -1136,7 +1136,7 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
 
   jclass cls = (*env)->FindClass(env, c ? c->name : "java/lang/Object");
   jobject o = (*env)->AllocObject(env, cls);
-  if (getenv("LUNARIA_TRACE_FIELDS")) {
+  if (dvm__env("LUNARIA_TRACE_FIELDS")) {
     static int n;
     if (n++ < 96)
       fprintf(stderr, "[dvm] to_jobject @%x (%s) -> host 0x%x\n", r,
@@ -1407,7 +1407,7 @@ static bool pm_query_package(struct dvm *vm, const union dvm_value *args,
   /* A package the caller cannot see is, to that caller, not installed --
      the same NameNotFoundException a device raises. */
   const bool visible = found && lunaria_android_package_visible(record) != 0;
-  if (getenv("LUNARIA_TRACE_PM"))
+  if (dvm__env("LUNARIA_TRACE_PM"))
     fprintf(stderr, "[pm] query %s found=%d visible=%d\n",
             want ? want : "<null>", found, visible);
   return visible;
@@ -1919,7 +1919,7 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
   jvalue ret;
   memset(&ret, 0, sizeof ret);
   jobject jself = self ? to_jobject(vm, env, self) : NULL;
-  if (getenv("LUNARIA_TRACE_UNITY_MSG") && !strcmp(method, "nativeUnitySendMessage") && nargs >= 3) {
+  if (dvm__env("LUNARIA_TRACE_UNITY_MSG") && !strcmp(method, "nativeUnitySendMessage") && nargs >= 3) {
     uint32_t blen = args[2].l ? dvm_array_length(vm, args[2].l) : 0;
     const uint8_t *bytes = args[2].l ? dvm_array_data(vm, args[2].l) : NULL;
     const char *go = args[0].l ? dvm_string_utf8(vm, args[0].l) : "?";
@@ -1927,7 +1927,7 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
     fprintf(stderr, "[unity-msg] %s.%s(%u bytes): %.*s\n", go ? go : "?", fn ? fn : "?",
             blen, blen > 120 ? 120 : (int)blen, bytes ? (const char *)bytes : "");
   }
-  if (getenv("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent") && nargs) {
+  if (dvm__env("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent") && nargs) {
     lunaria_touch_event event = {0};
     bool valid = jvm_motion_event_read(jnienv_get_jvm(env), jargs[0].l, &event);
     fprintf(stderr, "[motion-jni] arg=%p valid=%d action=%d xy=%.1f,%.1f time=%lld down=%lld\n",
@@ -1946,7 +1946,7 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
     bridge_end(vm, env, &frame);
     return false;
   }
-  if (getenv("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent"))
+  if (dvm__env("LUNARIA_TOUCH_DIAG") && !strcmp(method, "nativeInjectEvent"))
     fprintf(stderr, "[motion-jni] nativeInjectEvent returned %d\n", ret.z);
   /* Native writes must be visible when Java resumes. In a nested JNI call
    * (native -> Java -> native), the outer call will also export the Java
@@ -2287,7 +2287,7 @@ static bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const cha
     /* Not in any dex: the caller falls back to its stub.  Worth seeing when
      * a title is not behaving, because it says exactly which Java the
      * emulator is *not* running. */
-    if (getenv("LUNARIA_DVM_TRACE"))
+    if (dvm__env("LUNARIA_DVM_TRACE"))
       fprintf(stderr, "[dvm] miss %s.%s%s\n", class_name, method,
               sig ? sig : "");
     g_env = saved;
@@ -2335,7 +2335,7 @@ static bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const cha
    * parses comes from native code across the stub layer's handle table, and
    * a wrong one there produces a failure inside the helper's own parser —
    * far from the call that supplied it. */
-  if (getenv("LUNARIA_TRACE_CLASS_FLOW") &&
+  if (dvm__env("LUNARIA_TRACE_CLASS_FLOW") &&
       strstr(class_name, "ReflectionHelper")) {
     fprintf(stderr, "[classflow] -> %s.%s%s", class_name, method, msig ? msig : "");
     for (int i = 0; i < nargs; ++i) {
@@ -2510,7 +2510,7 @@ bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
   const char *cls = NULL, *name = NULL, *type = NULL;
   if (!jvm_field_info(jnienv_get_jvm(env), field, &cls, &name, &type))
     return false;
-  if (getenv("LUNARIA_TRACE_FIELDS")) {
+  if (dvm__env("LUNARIA_TRACE_FIELDS")) {
     static int n;
     if (n++ < 200)
       fprintf(stderr, "[dvm] %s field %s.%s:%s (dex=%d)\n",
@@ -2530,7 +2530,7 @@ bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
    * answer. */
   dvm_ref self = find_wrapper((uint32_t)(uintptr_t)obj);
   if (!self) return false;
-  if (getenv("LUNARIA_TRACE_FIELDS")) {
+  if (dvm__env("LUNARIA_TRACE_FIELDS")) {
     static int n;
     if (n++ < 96)
       fprintf(stderr, "[dvm] field host 0x%x -> @%x\n",
@@ -2577,7 +2577,7 @@ bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
 
   union dvm_value v = { 0 };
   if (!dvm_get_field(vm, self, name, type, &v)) return false;
-  if (getenv("LUNARIA_TRACE_FIELDS") && type[0] == 'L') {
+  if (dvm__env("LUNARIA_TRACE_FIELDS") && type[0] == 'L') {
     static int n;
     if (n++ < 128)
       fprintf(stderr, "[dvm]   %s.%s on @%x = \"%s\"\n", cls, name, self,
@@ -2635,7 +2635,7 @@ bool dvm_jni_static_field_locked(JNIEnv *env, jclass cls_ref, jfieldID field, bo
   if (!jvm_field_info(jnienv_get_jvm(env), field, &cls, &name, &type))
     return false;
   (void)cls_ref; /* the field id already names the class it belongs to */
-  if (getenv("LUNARIA_TRACE_FIELDS")) {
+  if (dvm__env("LUNARIA_TRACE_FIELDS")) {
     static int n;
     if (n++ < 200)
       fprintf(stderr, "[dvm] %s static field %s.%s:%s (dex=%d)\n",

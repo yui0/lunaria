@@ -32,7 +32,7 @@ typedef int32_t media_status_t;
 
 /* ---- AMediaFormat ---- */
 
-/* The real AMediaFormat implementation (src/luna_media_format.c) is linked
+/* The real AMediaFormat implementation (src/luna_media_codec.c) is linked
  * into the host executable on every platform, and guest calls reach it
  * through arm_exec's SVC layer.  Defining no-op copies here alongside it
  * collides at link time, and these stubs also disagree with the NDK on the

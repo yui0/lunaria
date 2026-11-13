@@ -5129,6 +5129,14 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
    * emitting an HTML label would shape and wrap the text a second time. */
   const bool text_view=ui_is_a(vm,view,"android/widget/TextView");
   bool custom=text_view;
+  /* A Drawable supplied directly has no resource path for the HTML image
+   * shortcut. Render non-bitmap ImageView content through onDraw, including
+   * vectors, selectors and their state/tint/scale transforms. */
+  if (ui_is_a(vm,view,"android/widget/ImageView")) {
+    dvm_ref drawable=ui_obj(vm,view,"drawable","Landroid/graphics/drawable/Drawable;");
+    dvm_ref background=ui_obj(vm,view,"background","Landroid/graphics/drawable/Drawable;");
+    if (background || (drawable && !ui_obj(vm,drawable,"bitmap","Landroid/graphics/Bitmap;"))) custom=true;
+  }
   for(size_t i=0; i<sizeof hooks/sizeof *hooks; ++i) {
     struct dvm_method *m=cls ? dvm_find_method(vm,cls,hooks[i],"(Landroid/graphics/Canvas;)V") : NULL;
     if (m && m->has_code) custom=true;

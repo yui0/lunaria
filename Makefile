@@ -566,25 +566,10 @@ DVM_SRC = src/apkpure.c src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_SRC += src/luna_process_ipc.c src/luna_certs.c
-DVM_HDR = src/jvm/jvm.h src/dvm/dvm_parcel.h src/dvm/dvm_lib.h src/luna_boot.h src/dvm/dvm_lib.h src/lunaria_file.h src/simplewebp.h src/luna_unicode.h src/unicode/character_data.h src/dvm/dvm.h src/dvm/dvm.h src/dvm/dvm_internal.h \
-          src/dvm/dvm_net.h src/lunaria_os.h src/dvm/dvm_media.h src/dvm/dvm.h \
-          src/dvm/dvm_lib.h src/dvm/dvm_lib.h src/dvm/locale_names.h src/dvm/date_symbols_data.h src/dvm/framework.h \
-          src/webview_cdp.h
-DVM_HDR += src/luna_certs.h
-DVM_HDR += src/unicode/breaks.h src/unicode/break_data.h
-DVM_HDR += src/dvm/dvm_lib.h src/dvm/calendar_data.h
-DVM_HDR += src/dvm/date_time_patterns_data.h src/dvm/dvm_extras_android.h
-DVM_HDR += src/unicode/bidi_data.h src/dvm/dvm_reflect.h src/dvm/dvm_android_ui.h src/dvm/dvm_graphics.h src/dvm/dvm_text.h src/dvm/dvm_time.h src/dvm/dvm_crypto.h
-DVM_HDR += src/dvm/dvm_videoview.h
-DVM_HDR += src/dvm/dvm_sax.h src/dvm/dvm_dom.h src/dvm/dvm_vector.h
-DVM_HDR += src/dvm/time_standalone_months.h src/dvm/date_symbols_data.h src/dvm/framework.h
-DVM_HDR += src/dvm/dvm_http_message.h src/dvm/dvm_http_client.h
-DVM_HDR += src/dvm/dvm_nio_file.h
-DVM_HDR += src/dvm/platform_classes.h
 # Every header under src/ is an input of the emulator: dvm_runtime.c is a unity
 # build that #includes the dvm_*.h family, so a hand-kept list silently misses new
 # ones (an edited header then did not rebuild libjvm.so).  Track them all.
-DVM_HDR += $(wildcard src/*.h src/dvm/*.h src/jvm/*.h src/unicode/*.h)
+DVM_HDR = $(wildcard src/*.h src/dvm/*.h src/jvm/*.h src/unicode/*.h)
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
 # table, so the two have to be in one object.
@@ -710,14 +695,8 @@ $(BUILD_DIR)/luna_qfkey.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_qfkey.o: src/luna_qfkey.c src/luna_qfkey.h src/arm_exec.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/luna_qfkey.c -o $@
 
-$(BUILD_DIR)/luna_aac_encoder.o: src/luna_aac_encoder.c src/luna_aac_encoder.h src/lunaria_os.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/luna_aac_encoder.c -o $@
-
-$(BUILD_DIR)/luna_native_codec.o: src/luna_native_codec.c src/luna_native_codec.h src/luna_aac_encoder.h src/luna_media_format.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c src/luna_native_codec.c -o $@
-
-$(BUILD_DIR)/luna_media_format.o: src/luna_media_format.c src/luna_media_format.h src/luna_media_format_keys.h src/luna_media_format_keys.inc | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c src/luna_media_format.c -o $@
+$(BUILD_DIR)/luna_media_codec.o: src/luna_media_codec.c src/luna_aac_encoder.h src/luna_native_codec.h src/luna_media_format.h src/luna_media_format_keys.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/luna_media_codec.c -o $@
 
 $(BUILD_DIR)/luna_vulkan.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_vulkan.o: src/luna_vulkan.c src/luna_vulkan_cmds.h src/arm_exec.h src/luna_boot.h
@@ -728,7 +707,6 @@ $(BUILD_DIR)/loader.o: | $(BUILD_DIR)
 $(BUILD_DIR)/loader.o: src/loader.c src/arm_exec.h src/arm.h src/jvm/jvm.h src/jvm/jni.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/loader.c -o $@
 
-LUNA_UI_DIR ?= src/luna-ui
 # luna_overlay.o: the emulator's own UI surface, backed by luna-ui.  Built with
 # the project's own warning set relaxed — luna-ui.h is a 680 KB single-header
 # library from another tree, and its diagnostics are not this build's to fix.
@@ -821,7 +799,7 @@ symlink-file-test: test/symlink_file_test.c src/lunaria_file.c src/lunaria_file.
 
 $(BUILD_DIR)/arm_exec.o: src/lunaria_file.h src/lib/inc/log_assert.h
 
-LUNARIA_OBJECTS = $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_media_format.o $(BUILD_DIR)/luna_aac_encoder.o $(BUILD_DIR)/luna_native_codec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
+LUNARIA_OBJECTS = $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_media_codec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ)
 ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
 WINDOWS_STUBS = ANDROID LOG OPENSLES MEDIANDK
 WINDOWS_STUB_OBJECTS = $(addprefix $(BUILD_DIR)/stub_,$(addsuffix .o,$(WINDOWS_STUBS)))
@@ -864,7 +842,7 @@ $(LUNARIA_BIN): $(LUNARIA_OBJECTS) $(HOST_LINK_ALIASES) $(libs)
 	$(CXX) -std=c++20 $(WINDOWS_CRT_FLAGS) $(WINDOWS_ENTRY_FLAGS) $(OPTFLAGS) $(HOST_EXPORT) \
 	    $(SANITIZE) \
 	    $(LUNARIA_LIBDIRS) $(HOST_RPATH) $(LDFLAGS) \
-	    $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_media_format.o $(BUILD_DIR)/luna_aac_encoder.o $(BUILD_DIR)/luna_native_codec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
+	    $(BUILD_DIR)/apk.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_vulkan.o $(BUILD_DIR)/luna_media_codec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/linker64.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/stb_vorbis.o $(BUILD_DIR)/luna_host.o $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) \
 	    $(DYNARMIC_LIBS) \
 	    $(WINDOWS_STUB_OBJECTS) \
 	    $(HOST_DL_LIBS) -lpthread $(HOST_JVM_LIB) \
@@ -891,8 +869,7 @@ luna-browser-test: luna-browser test/test_webview_cdp_host
 	./test/test_webview_cdp_host luna-browser/luna-browser $${TMPDIR:-/tmp}/lunaria-luna-browser-test
 
 clean:
-	$(RM) $(bins) $(BUILD_DIR)/apk.o $(BUILD_DIR)/arm_exec.o $(BUILD_DIR)/luna_qfkey.o $(BUILD_DIR)/binary128.o $(BUILD_DIR)/luna_fnmatch.o $(BUILD_DIR)/arm.o $(BUILD_DIR)/loader.o $(BUILD_DIR)/lunaria_os.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
-	    $(BUILD_DIR)/stb_vorbis.o libdl.so libpthread.so
+	$(RM) $(bins) $(LUNARIA_OBJECTS) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o libdl.so libpthread.so
 	$(RM) -r runtime
 	$(RM) test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
 	$(RM) test/test_audio_clock test/test_pcm_queue test/test_boot_card test/test_keymap test/test_motion_event test/libkeymapguest.so test/libkeymapndk.so test/libslqueuetest.so
@@ -910,7 +887,7 @@ HOST_ELF_REGRESSION = $(if $(filter Darwin,$(LUNA_OS_NAME)),,host-elf-test)
 test-host:
 	$(MAKE) message-pattern-test
 	$(MAKE) app-sdk-test
-	$(MAKE) apk-launcher-test unity-reflection-test host-memory-test host-file-test host-socket-test host-timer-test host-pattern-test $(HOST_ELF_REGRESSION) run-queue-test deadline-heap-test heap-core-test pixels-test charset-test unicode-test regex-test dex-reader-test dvm-test pcm-queue-test webview-cdp-test
+	$(MAKE) apk-launcher-test unity-reflection-test host-memory-test host-file-test host-socket-test host-timer-test host-pattern-test $(HOST_ELF_REGRESSION) run-queue-test deadline-heap-test heap-core-test pixels-test charset-test unicode-test regex-test dex-reader-test dvm-test pcm-queue-test webview-cdp-test file-read-cache-test
 
 test-sync:
 	@set -e; for target in sleep-test futex-test mutex-test mutex-wake-test cond-timeout-test timerfd-test guest-signal-test thread-start-test lock-test gil-test sched-test sched-fair-test primary-mutex-test icache-sync-test atfork-test; do \
@@ -986,7 +963,7 @@ test/test_dvm: test/declared_click_tests.h test/locale_iso_tests.h test/sonic_ap
 	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 .PHONY: runtime-shutdown-test
-test/test_dvm: test/pending_intent_tests.h test/choice_format_tests.h test/message_format_tests.h test/xml_namespace_fixture.h
+test/test_dvm: test/pending_intent_tests.h test/choice_format_tests.h test/message_format_tests.h test/xml_namespace_fixture.h test/shortcut_tests.h test/zoned_factory_tests.h test/mac_provider_tests.h
 test/test_dvm: test/player_event_tests.h test/player_fixture.h
 test/test_dvm: test/videoview_tests.h test/video_fixture.h
 test/test_dvm: test/touch_transform_tests.h
@@ -2305,9 +2282,9 @@ ndk-media-format-test: lunaria $(BUILD_DIR)/ndk_media_format64.so $(BUILD_DIR)/n
 media-format-test: $(BUILD_DIR)/media_format_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/media_format_test
 
-$(BUILD_DIR)/media_format_test: test/media_format_test.c src/luna_media_format.c src/luna_media_format.h src/luna_media_format_keys.h src/luna_media_format_keys.inc | $(BUILD_DIR)
-	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc \
-	    test/media_format_test.c src/luna_media_format.c -o $@
+$(BUILD_DIR)/media_format_test: test/media_format_test.c src/luna_media_codec.c src/luna_media_format.h src/luna_media_format_keys.h src/luna_aac_encoder.h src/luna_native_codec.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc \
+	    test/media_format_test.c src/luna_media_codec.c -ldl -lpthread -lm -o $@
 
 test/test_webview_cdp: test/test_webview_cdp.c src/webview_cdp.c src/webview_cdp.h
 	$(CC) -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
@@ -3690,11 +3667,11 @@ aac-encoder-test: $(BUILD_DIR)/aac_encoder_test
 native-codec-test: $(BUILD_DIR)/native_codec_test
 	ASAN_OPTIONS=detect_leaks=0 $<
 
-$(BUILD_DIR)/aac_encoder_test: test/aac_encoder_test.c src/luna_aac_encoder.c src/luna_aac_encoder.h src/lunaria_os.h | $(BUILD_DIR)
-	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc test/aac_encoder_test.c src/luna_aac_encoder.c -ldl -lpthread -lm -o $@
+$(BUILD_DIR)/aac_encoder_test: test/aac_encoder_test.c src/luna_media_codec.c src/luna_aac_encoder.h src/luna_native_codec.h src/luna_media_format.h src/luna_media_format_keys.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc test/aac_encoder_test.c src/luna_media_codec.c -ldl -lpthread -lm -o $@
 
-$(BUILD_DIR)/native_codec_test: test/native_codec_test.c src/luna_native_codec.c src/luna_aac_encoder.c src/luna_media_format.c src/luna_native_codec.h src/luna_aac_encoder.h src/luna_media_format.h src/luna_media_format_keys.h src/luna_media_format_keys.inc | $(BUILD_DIR)
-	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc test/native_codec_test.c src/luna_native_codec.c src/luna_aac_encoder.c src/luna_media_format.c -ldl -lpthread -lm -o $@
+$(BUILD_DIR)/native_codec_test: test/native_codec_test.c src/luna_media_codec.c src/luna_native_codec.h src/luna_aac_encoder.h src/luna_media_format.h src/luna_media_format_keys.h src/lunaria_os.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra -Werror -Wpedantic $(DVM_TEST_SAN) -Isrc test/native_codec_test.c src/luna_media_codec.c -ldl -lpthread -lm -o $@
 
 $(BUILD_DIR)/ndk_media_codec64.so: test/ndk_media_codec_test.c src/luna_media_format.h src/luna_media_format_keys.h | $(BUILD_DIR)
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
@@ -3770,3 +3747,10 @@ raster-jobs-test: $(BUILD_DIR)/raster_jobs_test
 
 raster-render-test: test/test_dvm
 	./test/test_dvm --raster-render-test
+
+$(BUILD_DIR)/file_read_cache_test: test/file_read_cache_test.c src/file_read_cache.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -g -Wall -Wextra -Werror $(DVM_TEST_SAN) -Isrc $< -o $@
+
+.PHONY: file-read-cache-test
+file-read-cache-test: $(BUILD_DIR)/file_read_cache_test
+	$(BUILD_DIR)/file_read_cache_test

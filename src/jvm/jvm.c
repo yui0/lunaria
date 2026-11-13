@@ -1612,7 +1612,9 @@ JNIEnv_IsInstanceOf(JNIEnv* p0, jobject p1, jclass p2)
   const char *oc = jvm_get_object(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1)->this_klass)->klass.name.data;
   const char *tc = jvm_get_object(jnienv_get_jvm(p0), p2)->klass.name.data;
   verbose("%s instanceof %s", oc, tc);
-  if (getenv("LUNARIA_TOUCH_DIAG") && (strstr(oc, "Event") || strstr(tc, "Event")))
+  static int touch_diag = -1;
+  if (touch_diag < 0) touch_diag = getenv("LUNARIA_TOUCH_DIAG") != NULL;
+  if (touch_diag && (strstr(oc, "Event") || strstr(tc, "Event")))
     fprintf(stderr, "[motion-jni] instanceof %s -> %s = %d\n", oc, tc,
             jvm_name_eq(oc, tc) || jvm_name_assignable(oc, tc));
 

@@ -2300,12 +2300,37 @@ static bool mac_getInstance(struct dvm *vm, dvm_ref self,
     dvm__throw(vm, "java/lang/NullPointerException", "algorithm");
     return false;
   }
+  dvm_ref provider=security_builtin_provider(vm);
+  if (nargs>1) {
+    if (!ARG(1).l) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","Missing provider"); return false;
+    }
+    if (strstr(builtin_sig(),"Ljava/security/Provider;")) provider=ARG(1).l;
+    else {
+      const char *name=dvm_string_utf8(vm,ARG(1).l);
+      if (!name || !*name) {
+        dvm__throw(vm,"java/lang/IllegalArgumentException","Missing provider"); return false;
+      }
+      union dvm_value selected={0};
+      if (!security_registered_provider(vm,0,args+1,1,&selected)) return false;
+      if (!selected.l) {
+        dvm__throw(vm,"java/security/NoSuchProviderException","%s",name); return false;
+      }
+      provider=selected.l;
+    }
+    if (provider!=security_builtin_provider(vm)) {
+      dvm__throw(vm,"java/security/NoSuchAlgorithmException","No Mac service in the specified provider"); return false;
+    }
+  }
   if (!mac_type(alg)) {
     dvm__throw(vm, "java/security/NoSuchAlgorithmException", "%s", alg);
     return false;
   }
   dvm_ref m = dvm_new_object(vm, dvm__class_by_desc(vm, "Ljavax/crypto/Mac;"));
-  if (m) (void)dvm_set_field(vm, m, "algorithm", "Ljava/lang/String;", ARG(0));
+  if (m) {
+    dvm_set_field(vm, m, "algorithm", "Ljava/lang/String;", ARG(0));
+    dvm_set_field(vm, m, "provider", "Ljava/security/Provider;", (union dvm_value){.l=provider});
+  }
   RETL(m);
 }
 static bool mac_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -4233,10 +4258,13 @@ static const struct rt_method rt_cipher[] = {
 };
 
 static const struct rt_field rt_mac_fields[] = {
-  { "algorithm", "Ljava/lang/String;" }, F_END
+  { "algorithm", "Ljava/lang/String;" }, { "provider", "Ljava/security/Provider;" }, F_END
 };
 static const struct rt_method rt_mac[] = {
   SM("getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;", mac_getInstance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/security/Provider;)Ljavax/crypto/Mac;", mac_getInstance),
+  SM("getInstance", "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;", mac_getInstance),
+  M("getProvider", "()Ljava/security/Provider;", cipher_getProvider),
   M("init", "(Ljava/security/Key;)V", mac_init),
   M("update", "([B)V", mac_update),
   M("update", "([BII)V", mac_update),

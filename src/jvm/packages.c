@@ -634,19 +634,6 @@ int lunaria_android_package_find(const char *name,
   return 0;
 }
 
-/* The device's own filesystem is laid out by the system, not by the app that
- * happens to be running, so this does not go through the guest's credentials. */
-static void host_mkdir_p(char *path)
-{
-  for (char *p = path + 1; *p; ++p) {
-    if (*p != '/') continue;
-    *p = '\0';
-    (void)luna_file_mkdir(path, 0755);
-    *p = '/';
-  }
-  (void)luna_file_mkdir(path, 0755);
-}
-
 /* A package learned at run time (the caller of a Binder transaction is an
  * installed package, and the Play Store looks it up by uid and reads its
  * signing certificate from its APK).  `host_apk` is where that package's APK
@@ -688,7 +675,9 @@ int lunaria_android_package_install(const char *name, uint32_t uid, const char *
   slash = strrchr(dir, '/');
   if (!slash || slash == dir) return 1;
   *slash = '\0';
-  host_mkdir_p(dir);
+  /* The device's own filesystem is laid out by the system, not by the app that
+   * happens to be running, so this does not go through the guest's credentials. */
+  mkdir_p(dir);
   (void)unlink(host);
   if (luna_file_symlink(host_apk, host) != 0)
     fprintf(stderr, "[pm] cannot show %s at %s: %s\n", host_apk, host, strerror(errno));

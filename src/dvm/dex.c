@@ -368,16 +368,6 @@ char *dex_proto_signature_alloc(struct dex_file *d, uint32_t proto_idx)
   return sig;
 }
 
-static uint32_t dex_desc_hash(const char *s)
-{
-  uint32_t h = 2166136261u;                 /* FNV-1a */
-  for (; *s; ++s) {
-    h ^= (unsigned char)*s;
-    h *= 16777619u;
-  }
-  return h;
-}
-
 static const char *dex_class_desc(struct dex_file *d, uint32_t i)
 {
   return dex_type(d, dex_u32_at(d, d->class_defs_off + (size_t)i * 32u));
@@ -394,7 +384,7 @@ int dex_find_class(struct dex_file *d, const char *descriptor)
       for (uint32_t i = 0; i < d->class_defs_size; ++i) {
         const char *t = dex_class_desc(d, i);
         if (!t) continue;
-        uint32_t m = cap - 1u, k = dex_desc_hash(t) & m;
+        uint32_t m = cap - 1u, k = dvm_str_hash(t) & m;
         while (h[k]) k = (k + 1u) & m;
         h[k] = i + 1u;
       }
@@ -403,7 +393,7 @@ int dex_find_class(struct dex_file *d, const char *descriptor)
     }
   }
   if (d->cls_hash) {
-    uint32_t m = d->cls_hash_cap - 1u, k = dex_desc_hash(descriptor) & m;
+    uint32_t m = d->cls_hash_cap - 1u, k = dvm_str_hash(descriptor) & m;
     while (d->cls_hash[k]) {
       uint32_t i = d->cls_hash[k] - 1u;
       const char *t = dex_class_desc(d, i);

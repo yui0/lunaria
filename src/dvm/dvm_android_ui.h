@@ -9494,7 +9494,7 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
       free(descriptor);
     }
   }
-  if (getenv("LUNARIA_TRACE_ACCOUNTS") && (!cls || !cls->dex))
+  if (dvm__env("LUNARIA_TRACE_ACCOUNTS") && (!cls || !cls->dex))
   {
     fprintf(stderr, "[activity] cannot start: resolved=%u class=%s dex=%u\n", (unsigned)resolved.l,
             cls ? cls->name : "(none)", cls ? (unsigned)(cls->dex != NULL) : 0u);
@@ -9540,7 +9540,7 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
   };
   fprintf(stderr, "[activity] start %s%s\n", cls->name,
           for_result ? " (for result)" : "");
-  if (getenv("LUNARIA_TRACE_ACCOUNTS")) {
+  if (dvm__env("LUNARIA_TRACE_ACCOUNTS")) {
     union dvm_value extras = { 0 }, keys = { 0 }, text = { 0 };
     if (intent_getExtras(vm, intent, NULL, 0, &extras) && extras.l &&
         am_vcall(vm, extras.l, "keySet", "()Ljava/util/Set;", NULL, 0, &keys) && keys.l)
@@ -9583,7 +9583,7 @@ static bool act_finish(struct dvm *vm, dvm_ref self, const union dvm_value *args
   (void)dvm_get_field(vm, self, "finishing", "Z", &finishing);
   if (finishing.i) RETV();
   finishing.i = 1;
-  if (getenv("LUNARIA_TRACE_FINISH")) {
+  if (dvm__env("LUNARIA_TRACE_FINISH")) {
     struct dvm_class *fc = dvm_object_class(vm, self);
     fprintf(stderr, "[activity] finish() on %s, called from:", fc && fc->name ? fc->name : "?");
     for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 16; --i, ++shown) {
@@ -12745,6 +12745,12 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
       union dvm_value theme = {0};
       if (!view_drawable_theme(vm, view, &theme)) return;
       dvm_ref d = argb ? 0 : drawable_from_resource(vm, data, 0, theme.l);
+      if (!d && !argb && data && !dvm_exception(vm)) {
+        union dvm_value input[2]={{.i=(int32_t)data},theme},resolved={0},resources={0};
+        if (!am_vcall(vm,view,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources)) return;
+        if (!res_get_drawable(vm,resources.l,input,2,&resolved)) return;
+        d=resolved.l;
+      }
       if (d) {
         union dvm_value bg = { .l = d };
         (void)dvm_set_field(vm, view, "background",
@@ -17001,6 +17007,13 @@ static void ui_emit_window_box(struct dvm *vm, struct ui_buf *css, dvm_ref windo
    * without it everything the views leave unpainted is the framebuffer. */
   char window_bg[64] = "";
   int32_t bg_argb = 0;
+  if (dvm__env("LUNARIA_UI_TREE")) {
+    dvm_ref owner=ui_obj(vm,window,"window","Landroid/view/Window;");
+    dvm_ref bg=ui_obj(vm,owner,"background","Landroid/graphics/drawable/Drawable;");
+    fprintf(stderr,"[tree-window] ref=%u theme=%08x flags=%08x floating=%d background=%s color=%08x\n",
+            window,(unsigned)ui_int(vm,window,"themeResId"),(unsigned)(lp?ui_int(vm,lp,"flags"):0),
+            floating,bg?dvm_class_name(dvm_object_class(vm,bg)):"null",(unsigned)(bg?ui_int(vm,bg,"color"):0));
+  }
   if (!ui_window_floating(vm, window) && ui_is_a(vm, window, "android/app/Activity") &&
       ((ui_theme_color(ui_int(vm, window, "themeResId"), 0x01010054u, &bg_argb)) ||
        /* The theme chain ends in a platform theme this runtime has no style
@@ -17062,6 +17075,11 @@ static void ui_dump_tree(struct dvm *vm, dvm_ref view, unsigned depth)
             (unsigned)ui_int(vm, view, "imageResource"),
             dr ? dvm_class_name(dvm_object_class(vm, dr)) : "null");
   }
+  dvm_ref background=ui_obj(vm,view,"background","Landroid/graphics/drawable/Drawable;");
+  if (background || ui_int(vm,view,"backgroundColor"))
+    fprintf(stderr,"[tree-background] ref=%u color=%08x drawable=%s drawableColor=%08x\n",
+            view,(unsigned)ui_int(vm,view,"backgroundColor"),background?dvm_class_name(dvm_object_class(vm,background)):"null",
+            (unsigned)(background?ui_int(vm,background,"color"):0));
   dvm_ref source=ui_obj(vm,view,"text","Ljava/lang/CharSequence;");
   if(source) {
     const char *text=ui_text_of(vm,view);
@@ -17129,7 +17147,7 @@ static void ui_rebuild(struct dvm *vm)
   }
   const bool pixels_only = g_ui_pixels_only;
   g_ui_pixels_only = false;
-  if (getenv("LUNARIA_TRACE_REBUILD")) {
+  if (dvm__env("LUNARIA_TRACE_REBUILD")) {
     static unsigned long n[8];
     static time_t last;
     ++n[0];
@@ -17155,7 +17173,7 @@ static void ui_rebuild(struct dvm *vm)
   }
   {
     static int tm = -1;
-    if (tm < 0) tm = getenv("LUNARIA_TRACE_REBUILD") != NULL;
+    if (tm < 0) tm = dvm__env("LUNARIA_TRACE_REBUILD") != NULL;
     if (pixels_only && !g_ui_measure_dirty && g_ui_captured_complete && g_ui_ncaptured &&
         (!g_ui_damage.any || ui_damage_inside_captured()) && !g_ui_damage.full) {
       struct timespec t0, t1;
