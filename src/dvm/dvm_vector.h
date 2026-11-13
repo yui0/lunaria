@@ -19,23 +19,17 @@ static bool vector_capacity_set(struct dvm *vm,dvm_ref self,uint32_t capacity)
 {
   struct dvm_object *o=dvm__obj(vm,self);
   struct rt_list *old=o?o->data:NULL;
-  if (!o || capacity>INT32_MAX || capacity>(SIZE_MAX-sizeof(struct rt_list))/sizeof(dvm_ref)) {
+  if (!o || capacity>INT32_MAX) {
     dvm__throw(vm,"java/lang/OutOfMemoryError","Vector capacity");
     return false;
   }
   uint32_t previous=old?old->cap:0;
-  struct rt_list *next=realloc(old,sizeof *next+(size_t)capacity*sizeof(dvm_ref));
+  struct rt_list *next=list_resize(o,old,capacity);
   if(!next) {
     dvm__throw(vm,"java/lang/OutOfMemoryError","Vector storage");
     return false;
   }
-  if(!old) {
-    next->size=0;
-    next->mod_count=0;
-  }
   if(capacity>previous)memset(next->items+previous,0,(size_t)(capacity-previous)*sizeof(dvm_ref));
-  next->cap=capacity;
-  o->data=next;
   return true;
 }
 static bool vector_reserve(struct dvm *vm,dvm_ref self,uint32_t needed)
@@ -85,10 +79,7 @@ static bool vector_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   struct dvm_object *o=dvm__obj(vm,self);
   struct rt_list *old=list_of(vm,self);
   for(uint32_t i=0; old && i<old->size; ++i)dvm_unpin(vm,old->items[i]);
-  if(o) {
-    free(o->data);
-    o->data=NULL;
-  }
+  if(o) list_release(o);
   dvm__set_field_from(vm,self,dvm_find_class(vm,"java/util/Vector"),"capacityIncrement","I",(union dvm_value) {
     .i=increment
   });

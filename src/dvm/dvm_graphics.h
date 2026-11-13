@@ -20,7 +20,6 @@
  * written out once as PNG under the emulator's cache and the view that shows
  * it names that file — the overlay draws from files. */
 
-#include "luna_raster_jobs.h"
 
 void dvm_graphics_finish(struct dvm *vm)
 {
@@ -373,6 +372,66 @@ static const char *image_mime(const uint8_t *d, size_t n)
   return NULL;
 }
 
+/* PNG npTc stores Res_png_9patch integers in network order. The Java
+ * byte[] uses native order, with offsets into its own serialized storage. */
+static uint32_t bitmap_png_u32(const uint8_t *p)
+{
+  return (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 | (uint32_t)p[2]<<8 | p[3];
+}
+static bool bitmap_png_ninepatch(struct dvm *vm,dvm_ref bitmap,const uint8_t *png,
+                                 size_t length,int width,int height,int outw,int outh)
+{
+  if(length<8 || memcmp(png,"\x89PNG\r\n\x1a\n",8)) return true;
+  for(size_t at=8;at<=length && length-at>=12;) {
+    uint32_t n=bitmap_png_u32(png+at);
+    if(n>length-at-12) return true;
+    const uint8_t *chunk=png+at+8;
+    if(!memcmp(png+at+4,"npTc",4)) {
+      if(n<32) return true;
+      unsigned nx=chunk[1],ny=chunk[2],colors=chunk[3];
+      size_t size=32+4*(nx+ny+colors);
+      if(!nx || !ny || (nx&1) || (ny&1) || n!=size) return true;
+      /* Reject divisions outside the decoded bitmap before scaling them. */
+      for(unsigned axis=0;axis<2;++axis) {
+        unsigned count=axis ? ny : nx,offset=axis ? nx : 0;
+        uint32_t previous=0,limit=axis ? height : width;
+        for(unsigned i=0;i<count;++i) {
+          uint32_t value=bitmap_png_u32(chunk+32+4*(offset+i));
+          if(value>limit || (i && value<=previous)) return true;
+          previous=value;
+        }
+      }
+      dvm_pin(vm,bitmap);
+      dvm_ref array=dvm_new_array(vm,'B',NULL,(uint32_t)size);
+      dvm_unpin(vm,bitmap);
+      if(!array) return false;
+      uint8_t *native=dvm_array_data(vm,array);
+      memcpy(native,chunk,size);
+      native[0]=1;
+      uint32_t offsets[]={32,32+4*nx,32+4*(nx+ny)};
+      memcpy(native+4,&offsets[0],4);
+      memcpy(native+8,&offsets[1],4);
+      memcpy(native+28,&offsets[2],4);
+      for(size_t i=12;i<size;i+=4) {
+        if(i==28) continue;
+        uint32_t value=bitmap_png_u32(chunk+i);
+        if(i<28 && (int32_t)value>=0) {
+          int source=i<20 ? width : height,target=i<20 ? outw : outh;
+          value=(uint32_t)(((uint64_t)value*target+source/2)/source);
+        } else if(i>=32 && i<32+4*(nx+ny)) {
+          int source=i<32+4*nx ? width : height,target=i<32+4*nx ? outw : outh;
+          value=(uint32_t)(((uint64_t)value*target+source/2)/source);
+        }
+        memcpy(native+i,&value,4);
+      }
+      (void)dvm_set_field(vm,bitmap,"ninePatchChunk","[B",(union dvm_value){.l=array});
+      return true;
+    }
+    at+=(size_t)n+12;
+  }
+  return true;
+}
+
 /* Decodes encoded image bytes.  `src_density` is the density the bytes were
  * made for (0 when unknown / not a resource); with inScaled the result is
  * scaled to the target density, as decodeResource does.  Returns 0 with no
@@ -457,6 +516,7 @@ static dvm_ref bitmap_decode(struct dvm *vm, const uint8_t *data, size_t len,
   bm->is_mutable = opts && rt_get_int(vm, opts, "inMutable");
   if (ow == w && oh == h) {
     if (target > 0) bm->density = target;
+    if(!bitmap_png_ninepatch(vm,full,data,len,w,h,w,h)) return 0;
     return full;
   }
   dvm_pin(vm, full);
@@ -468,6 +528,7 @@ static dvm_ref bitmap_decode(struct dvm *vm, const uint8_t *data, size_t len,
     rb->is_mutable = bm->is_mutable;
     if (target > 0) rb->density = target;
   }
+  if(r && !bitmap_png_ninepatch(vm,r,data,len,w,h,ow,oh)) return 0;
   return r;
 }
 
@@ -1494,6 +1555,11 @@ struct canvas_save {
   unsigned alpha;
   int mode;
 };
+enum render_dep_kind { RENDER_DEP_NODE, RENDER_DEP_BITMAP, RENDER_DEP_OBJECT };
+struct render_dep {
+  dvm_ref ref;
+  enum render_dep_kind kind;
+};
 struct render_command {
   struct dvm_method *method; /* NULL: an immutable shaped text run. */
   union dvm_value args[8];
@@ -1509,11 +1575,35 @@ struct canvas_state {
   struct rt_bitmap *target;
   struct canvas_clip *clip;
   size_t count, capacity, clips, clip_capacity;
-  bool clip_cache_valid,clip_simple;
+  bool clip_cache_valid,clip_simple,clip_tail_intersect;
   size_t clip_prefix;
   float clip_bounds[4];
   bool query_clip_valid;
   int query_clip[4],query_width,query_height;
+  /* The canvas a View is captured on is the one a window's renderer hands its
+   * views, which is hardware accelerated: an app that asks (Compose does, to
+   * choose between recording a layer into a RenderNode and drawing it again each
+   * time) is told so. */
+  bool accelerated;
+  /* A display list is immutable once recorded; `serial` names it, and the scan
+   * of its commands (render_list_scan) is done once.  `deps` are the live
+   * objects it draws from, whose own state decides whether replaying it again
+   * would give the same pixels. */
+  uint64_t serial;
+  bool scanned, unsafe;
+  struct render_dep *deps;
+  size_t ndeps;
+  /* A capture clears its bitmap only when something is about to draw on it, so
+   * a replay of a RenderNode tree identical to the previous capture's can leave
+   * the picture the bitmap already holds.  See canvas_draw_render_node. */
+  bool tracking, defer_clear, clear_partial;
+  int clear_area[4];
+  unsigned direct_ops, replays;
+  int replay_depth;
+  bool cur_sig_ok, last_sig_ok;
+  uint64_t cur_sig, last_sig;
+  uint32_t last_gen;
+  struct rt_bitmap *last_dst;
 };
 
 static void canvas_layer_free(struct rt_bitmap *layer)
@@ -1531,6 +1621,7 @@ static void canvas_destroy(void *data)
   for(size_t i=0; i<s->clips; ++i) free(s->clip[i].mask);
   for(size_t i=0; i<s->command_count; ++i) free(s->commands[i].text.glyphs);
   free(s->commands);
+  free(s->deps);
   for(size_t i=0; i<s->count; ++i) if(s->saved[i].layer) canvas_layer_free(s->saved[i].layer);
   free(s->saved);
   free(s->clip);
@@ -1551,13 +1642,38 @@ static struct canvas_state *canvas_state(struct dvm *vm, dvm_ref self)
 
 /* Native layers share device coordinates with the base bitmap. No temporary
  * Java Bitmap is created, and native storage is released on restore/reset. */
-static struct rt_bitmap *canvas_bitmap(struct dvm *vm,dvm_ref self)
+/* The bitmap a canvas draws on, for callers that only need its size. */
+static struct rt_bitmap *canvas_bitmap_peek(struct dvm *vm,dvm_ref self)
 {
   struct canvas_state *state=canvas_state(vm,self);
   if(state && state->target) return state->target;
   union dvm_value bitmap= {0};
   dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&bitmap);
   return bitmap_of(vm,bitmap.l);
+}
+/* The clear a capture put off (see canvas_state::defer_clear). */
+static void canvas_settle(struct canvas_state *s,struct rt_bitmap *bm)
+{
+  if(!s || !s->defer_clear || !bm) return;
+  s->defer_clear=false;
+  if(s->clear_partial) {
+    const int *a=s->clear_area;
+    for(int y=a[1]; y<a[3]; ++y)
+      memset(bm->px+(size_t)y*bm->w+a[0],0,(size_t)(a[2]-a[0])*sizeof *bm->px);
+  } else memset(bm->px,0,(size_t)bm->w*bm->h*sizeof *bm->px);
+  ++bm->gen;
+}
+/* The bitmap a canvas is about to draw on.  Anything that rasterises asks for it
+ * here, which is what makes a deferred clear safe: nothing can draw before it. */
+static struct rt_bitmap *canvas_bitmap(struct dvm *vm,dvm_ref self)
+{
+  struct canvas_state *state=canvas_state(vm,self);
+  struct rt_bitmap *bm=canvas_bitmap_peek(vm,self);
+  if(state && bm) {
+    if(state->tracking && !state->replay_depth) ++state->direct_ops;
+    canvas_settle(state,bm);
+  }
+  return bm;
 }
 static void canvas_restore_layer(struct dvm *,dvm_ref,struct canvas_state *,struct canvas_save *);
 
@@ -1709,10 +1825,35 @@ static void canvas_prepare_clip(struct canvas_state *s)
     s->clip_bounds[3]=fminf(s->clip_bounds[3],clip->bounds[3]);
     ++s->clip_prefix;
   }
+  /* Past the rectangular prefix, a clip made only of intersections (a rounded
+   * corner mask over a rectangle is the usual one) is inside exactly when every
+   * member is: no operation switch, and the first miss decides. */
+  s->clip_tail_intersect=true;
+  for(size_t i=s->clip_prefix; i<s->clips; ++i)
+    if(s->clip[i].operation!=1) {
+      s->clip_tail_intersect=false;
+      break;
+    }
   s->clip_cache_valid=true;
 }
 
-static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
+/* Whether the pixel centre (x, y) is inside one clip, ignoring how it combines. */
+static inline bool canvas_clip_member(const struct canvas_clip *c,float x,float y)
+{
+  if(c->simple)
+    return x>=c->bounds[0] && y>=c->bounds[1] && x<c->bounds[2] && y<c->bounds[3];
+  if(c->mask) {
+    int px=(int)floorf(x)-c->mask_x,py=(int)floorf(y)-c->mask_y;
+    return px>=0 && py>=0 && px<c->mask_width && py<c->mask_height &&
+           c->mask[4*((size_t)py*c->mask_width+px)+3]!=0;
+  }
+  float lx=0,ly=0;
+  if (!c->singular) mat_map(c->inverse,x,y,&lx,&ly);
+  return !c->singular && isfinite(lx) && isfinite(ly) &&
+         lx>=c->rect[0] && lx<c->rect[2] && ly>=c->rect[1] && ly<c->rect[3];
+}
+
+static bool canvas_clip_contains_general(struct canvas_state *s, float x, float y)
 {
   canvas_prepare_clip(s);
   if(s && s->clip_simple) return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
@@ -1722,21 +1863,15 @@ static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
   bool result=!s || !s->clip_prefix ||
               (x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
                x<s->clip_bounds[2] && y<s->clip_bounds[3]);
+  if(s && s->clip_tail_intersect) {
+    if(!result) return false;
+    for(size_t i=s->clip_prefix; i<s->clips; ++i)
+      if(!canvas_clip_member(&s->clip[i],x,y)) return false;
+    return true;
+  }
   for (size_t i=s ? s->clip_prefix : 0; s && i<s->clips; ++i) {
     const struct canvas_clip *c=&s->clip[i];
-    bool inside;
-    if(c->simple) {
-      inside=x>=c->bounds[0] && y>=c->bounds[1] && x<c->bounds[2] && y<c->bounds[3];
-    } else if(c->mask) {
-      int px=(int)floorf(x)-c->mask_x,py=(int)floorf(y)-c->mask_y;
-      inside=px>=0 && py>=0 && px<c->mask_width && py<c->mask_height &&
-             c->mask[4*((size_t)py*c->mask_width+px)+3]!=0;
-    } else {
-      float lx=0,ly=0;
-      if (!c->singular) mat_map(c->inverse,x,y,&lx,&ly);
-      inside=!c->singular && isfinite(lx) && isfinite(ly) &&
-             lx>=c->rect[0] && lx<c->rect[2] && ly>=c->rect[1] && ly<c->rect[3];
-    }
+    const bool inside=canvas_clip_member(c,x,y);
     switch(c->operation) {
     case 0:
       result=result && !inside;
@@ -1759,6 +1894,27 @@ static bool canvas_clip_contains(struct canvas_state *s, float x, float y)
     }
   }
   return result;
+}
+
+/* The test every pixel of every raster loop makes.  A rectangular clip and a
+ * clip of intersections only (rectangles and path masks) are answered here, in
+ * the caller's loop; anything else, or a clip not prepared yet, takes the
+ * general route above. */
+static inline bool canvas_clip_contains(struct canvas_state *s, float x, float y)
+{
+  if(s && s->clip_cache_valid) {
+    if(s->clip_simple)
+      return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
+             x<s->clip_bounds[2] && y<s->clip_bounds[3];
+    if(s->clip_tail_intersect) {
+      if(!(x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
+           x<s->clip_bounds[2] && y<s->clip_bounds[3])) return false;
+      for(size_t i=s->clip_prefix; i<s->clips; ++i)
+        if(!canvas_clip_member(&s->clip[i],x,y)) return false;
+      return true;
+    }
+  }
+  return canvas_clip_contains_general(s,x,y);
 }
 
 /* Intersections cannot affect pixels outside their mapped bounds. Differences
@@ -1847,7 +2003,7 @@ static bool canvas_get_clip_bounds(struct dvm *vm,dvm_ref self,
   struct canvas_state *s=canvas_state(vm,self);
   if(!s) return false;
   struct rt_bitmap viewport= {.w=s->viewport_width,.h=s->viewport_height};
-  struct rt_bitmap *bm=canvas_bitmap(vm,self);
+  struct rt_bitmap *bm=canvas_bitmap_peek(vm,self);
   if(!bm && s->recording) bm=&viewport;
   int device[4],edges[4]= {0};
   float matrix[9],inverse[9],local[4]= {0};
@@ -1985,7 +2141,7 @@ static bool canvas_clip_rect(struct dvm *vm, dvm_ref self,
   s->clip[s->clips++]=clip;
   s->clip_cache_valid=false;
   s->query_clip_valid=false;
-  struct rt_bitmap *bm=canvas_bitmap(vm,self);
+  struct rt_bitmap *bm=canvas_bitmap_peek(vm,self);
   struct rt_bitmap viewport= {.w=s->viewport_width,.h=s->viewport_height};
   if(!bm && s->recording) bm=&viewport;
   if (bm) {
@@ -2002,6 +2158,20 @@ static uint32_t canvas_src_over(uint32_t src,uint32_t dst,bool opaque)
   unsigned sa=src>>24,da=opaque ? 255 : dst>>24;
   if (sa==255) return src;
   if (!sa) return opaque ? dst|0xff000000u : dst;
+  /* Over a fully transparent pixel the divisor is sa*255 and each channel
+   * divides out to itself: the result is the source, exactly. */
+  if (!da) return src;
+  if (da==255) {
+    /* Over an opaque pixel the divisor is sa*255+255*(255-sa) = 65025 whatever
+     * sa is, and the result alpha is 255: the same arithmetic as below with a
+     * constant the compiler turns into a multiply. */
+    uint32_t result=0xff000000u;
+    for(int shift=0; shift<=16; shift+=8) {
+      unsigned value=((src>>shift)&255)*sa*255+((dst>>shift)&255)*255*(255-sa);
+      result|=((value+32512)/65025)<<shift;
+    }
+    return result;
+  }
   unsigned alpha=sa*255+da*(255-sa);
   uint32_t result=((alpha+127)/255)<<24;
   for(int shift=0; shift<=16; shift+=8) {
@@ -2329,8 +2499,8 @@ struct mask_cache_entry {
   size_t bytes;
   uint64_t used;
 };
-#define MASK_CACHE_ENTRIES 24
-#define MASK_CACHE_BYTES (24u<<20)
+#define MASK_CACHE_ENTRIES 96
+#define MASK_CACHE_BYTES (32u<<20)
 #define MASK_CACHE_MAX_ENTRY (4u<<20)
 static struct mask_cache_entry g_mask_cache[MASK_CACHE_ENTRIES];
 static size_t g_mask_cache_bytes;
@@ -2470,19 +2640,43 @@ static void canvas_path_rows_draw(void *context, int begin, int end)
   const bool simple_clip = state->clip_simple, opaque_dst = !dst->has_alpha;
   const float *cb = state->clip_bounds;
   const unsigned solid_alpha = color >> 24;
+  /* Only a scale and a translation: then x does not reach y or the other way
+   * round (inverse[1] and [3] are zero, so those terms add an exact zero), the
+   * row's y-side is one value, and so is the mask row it reads. */
+  const bool axis = inverse[1]==0.0f && inverse[3]==0.0f && inverse[6]==0.0f &&
+                    inverse[7]==0.0f && inverse[8]==1.0f;
   for(int y=begin; y<end; ++y) {
     if(simple_clip && !(y+.5f>=cb[1] && y+.5f<cb[3])) continue;
+    float row_ly=0;
+    const unsigned char *row_mask=NULL;
+    if(axis) {
+      const float row_y=y+.5f;
+      row_ly=inverse[3]*0.0f+inverse[4]*row_y+inverse[5];
+      const float row_v=device_coverage ? row_y : row_ly*scale-bounds[1];
+      if(!isfinite(row_v) || row_v<0 || row_v>=height) continue;
+      row_mask=mask+4*(size_t)(int)row_v*width;
+    }
     for(int x=limits[0]; x<limits[2]; ++x) {
       if(simple_clip ? !(x+.5f>=cb[0] && x+.5f<cb[2]) : !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
       float lx,ly;
-      mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
-      float u=x+.5f,v=y+.5f;
-      if(!device_coverage) {
-        u=lx*scale-bounds[0];
-        v=ly*scale-bounds[1];
+      unsigned coverage;
+      if(axis) {
+        const float column_x=x+.5f;
+        lx=inverse[0]*column_x+inverse[1]*0.0f+inverse[2];
+        ly=row_ly;
+        const float u=device_coverage ? column_x : lx*scale-bounds[0];
+        if(!isfinite(u) || u<0 || u>=width) continue;
+        coverage=row_mask[4*(size_t)(int)u+3];
+      } else {
+        mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
+        float u=x+.5f,v=y+.5f;
+        if(!device_coverage) {
+          u=lx*scale-bounds[0];
+          v=ly*scale-bounds[1];
+        }
+        if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
+        coverage=mask[4*((size_t)(int)v*width+(int)u)+3];
       }
-      if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
-      unsigned coverage=mask[4*((size_t)(int)v*width+(int)u)+3];
       if(!coverage) continue;
       size_t index=(size_t)y*dst->w+x;
       if(solid && coverage==255 && solid_alpha==255) {
@@ -2680,7 +2874,7 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
   if(!path) return false;
   struct canvas_state *state=canvas_state(vm,self);
   if(!state) return false;
-  struct rt_bitmap *bitmap=canvas_bitmap(vm,self);
+  struct rt_bitmap *bitmap=canvas_bitmap_peek(vm,self);
   struct rt_bitmap viewport= {.w=state->viewport_width,.h=state->viewport_height};
   if(!bitmap && state->recording) bitmap=&viewport;
   if(!bitmap || bitmap->w<=0 || bitmap->h<=0) RETI(0);
@@ -2729,7 +2923,17 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
       shifted[5]-=(float)y0;
     }
   }
-  clip.mask=luna_path_mask(path,clip.mask_width,clip.mask_height,shifted,0,0,0,0,4,false);
+  /* The same rounded clips come back every frame, so the mask is rasterised once
+   * and the clip takes a copy: the cache may evict its own while this one lives
+   * on in the canvas state. */
+  bool mask_shared=false;
+  unsigned char *built=canvas_mask_cached(path,clip.mask_width,clip.mask_height,shifted,0,0,0,0,4,false,&mask_shared);
+  if(built && mask_shared) {
+    const size_t bytes=(size_t)clip.mask_width*(size_t)clip.mask_height*4u;
+    clip.mask=malloc(bytes);
+    if(clip.mask) memcpy(clip.mask,built,bytes);
+  }
+  else clip.mask=built;
   if(!clip.mask) {
     dvm__throw(vm,"java/lang/OutOfMemoryError","Path clip");
     return false;
@@ -3429,6 +3633,18 @@ static bool canvas_draw_bitmap(struct dvm *vm, dvm_ref self,
 }
 
 /* A recording canvas (RenderNode, Picture) stores calls instead of drawing. */
+static bool canvas_is_accelerated(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  const struct canvas_state *state=canvas_state(vm,self);
+  static int enabled=-1;
+  if(enabled<0) {
+    const char *value=getenv("LUNARIA_HWACC");
+    enabled=!(value && !strcmp(value,"0"));      /* LUNARIA_HWACC=0: the software path, for comparing */
+  }
+  RETI(state && state->accelerated && enabled);
+}
 bool canvas_is_recording(struct dvm *vm, dvm_ref self)
 {
   const struct canvas_state *state=canvas_state(vm,self);
@@ -3857,7 +4073,7 @@ static const struct rt_method rt_canvas[] = {
   M("setBitmap", "(Landroid/graphics/Bitmap;)V", canvas_set_bitmap),
   M("getWidth", "()I", canvas_size), M("getHeight", "()I", canvas_size),
   M("getDensity", "()I", canvas_size),
-  M("isHardwareAccelerated", "()Z", ret_false),
+  M("isHardwareAccelerated", "()Z", canvas_is_accelerated),
   M("getMatrix", "()Landroid/graphics/Matrix;", canvas_matrix),
   M("getMatrix", "(Landroid/graphics/Matrix;)V", canvas_matrix),
   M("setMatrix", "(Landroid/graphics/Matrix;)V", canvas_matrix),
@@ -4087,7 +4303,7 @@ static const struct rt_field rt_render_node_fields[]= {
   {"left","I"},{"top","I"},{"right","I"},{"bottom","I"},
   {"translationX","F"},{"translationY","F"},{"scaleX","F"},{"scaleY","F"},
   {"rotationZ","F"},{"pivotX","F"},{"pivotY","F"},{"pivotExplicit","Z"},
-  {"clipToBounds","Z"},
+  {"clipToBounds","Z"},{"alpha","F"},
   {"outline","Landroid/graphics/Outline;"},{"clipToOutline","Z"},
   {"hasOverlappingRendering","Z"},{"usesCompositingLayer","Z"},F_END
 };
@@ -4104,6 +4320,9 @@ static bool render_node_init(struct dvm *vm,dvm_ref self,const union dvm_value *
   dvm_set_field(vm,self,"clipToBounds","Z",(union dvm_value) {
     .i=1
   });
+  dvm_set_field(vm,self,"alpha","F",(union dvm_value) {
+    .f=1
+  });
   RETV();
 }
 static float render_node_float(struct dvm *vm,dvm_ref self,const char *field)
@@ -4111,6 +4330,20 @@ static float render_node_float(struct dvm *vm,dvm_ref self,const char *field)
   union dvm_value value= {0};
   dvm_get_field(vm,self,field,"F",&value);
   return value.f;
+}
+/* RenderNode.setAlpha / getAlpha: how opaque the node and everything it draws
+ * is.  Compose fades a layer in and out with it, and keeps the layer it is
+ * fading away at zero until it is dropped. */
+static bool render_node_alpha(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  const float old=render_node_float(vm,self,"alpha");
+  if(!strcmp(builtin_name(),"getAlpha")) RETF(old);
+  const float value=fminf(fmaxf(args[0].f,0.f),1.f);
+  dvm_set_field(vm,self,"alpha","F",(union dvm_value) {
+    .f=value
+  });
+  RETI(old!=value);
 }
 static void render_node_pivot(struct dvm *vm,dvm_ref self,float *x,float *y)
 {
@@ -4204,6 +4437,7 @@ static bool render_node_position(struct dvm *vm,dvm_ref self,const union dvm_val
   }
   RETI(changed);
 }
+static uint64_t g_recording_serial;
 static bool render_node_record(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value current= {0},list= {0};
@@ -4226,6 +4460,7 @@ static bool render_node_record(struct dvm *vm,dvm_ref self,const union dvm_value
     struct canvas_state *state=canvas_state(vm,canvas);
     if(!state) return false;
     state->recording=state->recording_active=true;
+    state->serial=++g_recording_serial;
     state->viewport_width=nargs ? args[0].i : (int32_t)((uint32_t)rt_get_int(vm,self,"right")-(uint32_t)rt_get_int(vm,self,"left"));
     state->viewport_height=nargs ? args[1].i : (int32_t)((uint32_t)rt_get_int(vm,self,"bottom")-(uint32_t)rt_get_int(vm,self,"top"));
     dvm_set_field(vm,self,"recording","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
@@ -4254,7 +4489,7 @@ static bool render_node_clip(struct dvm *vm,dvm_ref self,const union dvm_value *
   dvm_set_field(vm,self,"clipToBounds","Z",args[0]);
   RETI((old.i!=0)!=(args[0].i!=0));
 }
-static bool canvas_draw_render_node(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+static bool canvas_replay_render_node(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)nargs;
   dvm_ref node=args[0].l;
@@ -4284,14 +4519,31 @@ static bool canvas_draw_render_node(struct dvm *vm,dvm_ref self,const union dvm_
     };
     good=am_vcall(vm,self,"clipRect","(IIII)Z",rect,4,&ignored);
   }
+  bool clipped_away=false;
   if(good && rt_get_int(vm,node,"clipToOutline")) {
-    union dvm_value outline= {0};
+    union dvm_value outline= {0},empty= {0};
     dvm_get_field(vm,node,"outline","Landroid/graphics/Outline;",&outline);
-    if(outline.l) good=x_clip_to_outline(vm,self,outline.l);
+    /* An outline that was set and is empty clips everything (a node with no
+     * outline at all does not clip).  Compose parks an item it does not want
+     * drawn, such as the copy of a sticky header that is not stuck, in a node
+     * of no size with exactly this. */
+    if(outline.l && am_vcall(vm,outline.l,"isEmpty","()Z",NULL,0,&empty) && empty.i) clipped_away=true;
+    else if(outline.l) good=x_clip_to_outline(vm,self,outline.l);
   }
   float replay_base[9];
   canvas_read_matrix(vm,self,replay_base);
-  for(size_t i=0; good && i<recording->command_count; ++i) {
+  const float alpha=render_node_float(vm,node,"alpha");
+  const bool invisible=alpha<=0.f || clipped_away;
+  if(good && !invisible && alpha<1.f) {
+    /* Everything the node draws is faded together, so it goes through a layer. */
+    union dvm_value layer[]= {{.f=0},{.f=0},
+      {.f=(float)((uint32_t)rt_get_int(vm,node,"right")-(uint32_t)rt_get_int(vm,node,"left"))},
+      {.f=(float)((uint32_t)rt_get_int(vm,node,"bottom")-(uint32_t)rt_get_int(vm,node,"top"))},
+      {.i=(int32_t)lroundf(alpha*255.f)}
+    };
+    good=am_vcall(vm,self,"saveLayerAlpha","(FFFFI)I",layer,5,&ignored);
+  }
+  for(size_t i=0; good && !invisible && i<recording->command_count; ++i) {
     struct render_command *command=&recording->commands[i];
     if(!command->method) {
       good=canvas_text_run(vm,self,command->args[0].l,&command->text,
@@ -4320,6 +4572,240 @@ static bool canvas_draw_render_node(struct dvm *vm,dvm_ref self,const union dvm_
   if(!good || !restored) return false;
   RETV();
 }
+
+
+/* ---- Skipping a redraw that would repeat the last one -------------------
+ *
+ * A view redraws whenever anything in it invalidates -- a video playing in an
+ * AndroidView does so every frame -- and a redraw replays every layer's display
+ * list into the view's bitmap, which is most of a frame's cost.  Measured on a
+ * playing video, nine in ten of those redraws produced exactly the pixels
+ * already there.
+ *
+ * What a replay draws is fixed by: the display lists of the node and of every
+ * node it draws, those nodes' own properties, the Bitmaps (and shaders) they
+ * draw with, and the canvas's matrix and clip.  render_replay_sig() folds all
+ * of that into one number *before* anything is drawn; when it equals the number
+ * the last capture of this view ended on, and the bitmap has not been touched
+ * since, the replay (and the clear before it) is skipped.  Anything the
+ * signature cannot cover -- a mutable CharSequence, an object of a kind not
+ * listed -- makes the list "unsafe", and it is drawn as before. */
+static void sig_mix(uint64_t *h,uint64_t v)
+{
+  *h=(*h^v)*UINT64_C(1099511628211);
+  *h^=*h>>32;
+}
+static void sig_mix_float(uint64_t *h,float f)
+{
+  uint32_t bits;
+  memcpy(&bits,&f,sizeof bits);
+  sig_mix(h,bits);
+}
+/* Reads one parameter descriptor starting at *p, leaving *p after it. */
+static bool render_param(const char **p,char *kind,const char **desc,size_t *length)
+{
+  const char *q=*p;
+  if(!*q || *q==')') return false;
+  *kind=*q;
+  *desc=q;
+  while(*q=='[') ++q;
+  if(*q=='L') {
+    while(*q && *q!=';') ++q;
+    if(*q) ++q;
+  } else if(*q) ++q;
+  *length=(size_t)(q-*desc);
+  *p=q;
+  return true;
+}
+static bool render_desc_is(const char *desc,size_t length,const char *want)
+{
+  return strlen(want)==length && !strncmp(desc,want,length);
+}
+static bool render_add_dep(struct canvas_state *list,dvm_ref ref,enum render_dep_kind kind)
+{
+  struct render_dep *grown=realloc(list->deps,(list->ndeps+1)*sizeof *grown);
+  if(!grown) return false;
+  list->deps=grown;
+  list->deps[list->ndeps].ref=ref;
+  list->deps[list->ndeps].kind=kind;
+  ++list->ndeps;
+  return true;
+}
+/* A paint's live parts.  Gradients, filters and effects are immutable objects,
+ * so their identity says what they are; a shader that reads a Bitmap or other
+ * shaders is not simple enough to vouch for. */
+static bool render_paint_deps(struct dvm *vm,struct canvas_state *list,dvm_ref paint)
+{
+  static const struct { const char *name,*type; } live[]= {
+    {"shader","Landroid/graphics/Shader;"},{"colorFilter","Landroid/graphics/ColorFilter;"},
+    {"maskFilter","Landroid/graphics/MaskFilter;"},{"pathEffect","Landroid/graphics/PathEffect;"},
+  };
+  for(size_t i=0; i<sizeof live/sizeof *live; ++i) {
+    union dvm_value v= {0};
+    if(!dvm_get_field(vm,paint,live[i].name,live[i].type,&v) || !v.l) continue;
+    if(i==0) {
+      const char *name=dvm_object_class(vm,v.l)->name;
+      if(strcmp(name,"android/graphics/LinearGradient") && strcmp(name,"android/graphics/RadialGradient") &&
+          strcmp(name,"android/graphics/SweepGradient")) return false;
+    }
+    if(!render_add_dep(list,v.l,RENDER_DEP_OBJECT)) return false;
+  }
+  return true;
+}
+/* Scans a recorded list once: which child nodes, bitmaps and objects it reads
+ * from, and whether anything in it is beyond what the signature can vouch for. */
+static void render_list_scan(struct dvm *vm,struct canvas_state *list)
+{
+  list->scanned=true;
+  for(size_t i=0; i<list->command_count && !list->unsafe; ++i) {
+    const struct render_command *command=&list->commands[i];
+    if(!command->method) {
+      if(!command->args[0].l || !render_paint_deps(vm,list,command->args[0].l)) list->unsafe=true;
+      continue;
+    }
+    const char *sig=command->method->sig;
+    if(!sig || *sig!='(') {
+      list->unsafe=true;
+      break;
+    }
+    const char *p=sig+1,*desc;
+    char kind;
+    size_t length;
+    for(int a=0; a<command->nargs && render_param(&p,&kind,&desc,&length); ++a) {
+      if(kind!='L' && kind!='[') continue;
+      const dvm_ref ref=command->args[a].l;
+      if(!ref) continue;
+      if(kind=='[' || render_desc_is(desc,length,"Landroid/graphics/Matrix;") ||
+          render_desc_is(desc,length,"Landroid/graphics/Path;") ||
+          render_desc_is(desc,length,"Landroid/graphics/Rect;") ||
+          render_desc_is(desc,length,"Landroid/graphics/RectF;") ||
+          render_desc_is(desc,length,"Landroid/graphics/Region$Op;") ||
+          render_desc_is(desc,length,"Landroid/graphics/PorterDuff$Mode;") ||
+          render_desc_is(desc,length,"Ljava/lang/String;")) continue;   /* copied or immutable */
+      if(render_desc_is(desc,length,"Landroid/graphics/Paint;")) {
+        if(!render_paint_deps(vm,list,ref)) list->unsafe=true;
+        continue;
+      }
+      const bool node=render_desc_is(desc,length,"Landroid/graphics/RenderNode;");
+      if(node || render_desc_is(desc,length,"Landroid/graphics/Bitmap;")) {
+        if(!render_add_dep(list,ref,node ? RENDER_DEP_NODE : RENDER_DEP_BITMAP)) list->unsafe=true;
+        continue;
+      }
+      list->unsafe=true;        /* a kind this does not know how to compare */
+    }
+  }
+}
+static bool render_node_sig(struct dvm *vm,dvm_ref node,int depth,uint64_t *h)
+{
+  if(depth>24 || !dvm__obj(vm,node)) return false;
+  static const char *const ints[]= {"left","top","right","bottom"};
+  static const char *const floats[]= {"translationX","translationY","scaleX","scaleY","rotationZ","pivotX","pivotY","alpha"};
+  for(int i=0; i<4; ++i) sig_mix(h,(uint32_t)rt_get_int(vm,node,ints[i]));
+  for(int i=0; i<8; ++i) sig_mix_float(h,render_node_float(vm,node,floats[i]));
+  static const char *const flags[]= {"pivotExplicit","clipToBounds","clipToOutline"};
+  for(int i=0; i<3; ++i) {
+    union dvm_value flag= {0};
+    (void)dvm_get_field(vm,node,flags[i],"Z",&flag);
+    sig_mix(h,flag.i!=0);
+  }
+  union dvm_value outline= {0},list= {0};
+  (void)dvm_get_field(vm,node,"outline","Landroid/graphics/Outline;",&outline);
+  if(outline.l) {
+    const struct dvm_object *o=dvm__obj(vm,outline.l);
+    if(!o || !o->cls) return false;
+    sig_mix(h,1);
+    for(uint32_t i=0; o->slots && i<o->cls->islots; ++i) sig_mix(h,(uint64_t)o->slots[i].j);
+  } else sig_mix(h,0);
+  (void)dvm_get_field(vm,node,"displayList","Landroid/graphics/RecordingCanvas;",&list);
+  if(!list.l) {
+    sig_mix(h,0);
+    return true;
+  }
+  struct canvas_state *recording=canvas_state(vm,list.l);
+  if(!recording || recording->recording_active) return false;
+  if(!recording->scanned) render_list_scan(vm,recording);
+  if(recording->unsafe || !recording->serial) return false;
+  sig_mix(h,recording->serial);
+  for(size_t i=0; i<recording->ndeps; ++i) {
+    const dvm_ref ref=recording->deps[i].ref;
+    switch(recording->deps[i].kind) {
+    case RENDER_DEP_NODE:
+      if(!render_node_sig(vm,ref,depth+1,h)) return false;
+      break;
+    case RENDER_DEP_BITMAP: {
+      const struct rt_bitmap *bitmap=bitmap_of(vm,ref);
+      if(!bitmap) return false;
+      sig_mix(h,ref);
+      sig_mix(h,bitmap->gen);
+      sig_mix(h,((uint64_t)(uint32_t)bitmap->w<<32)|(uint32_t)bitmap->h);
+      break;
+    }
+    case RENDER_DEP_OBJECT:
+      sig_mix(h,ref);
+      break;
+    }
+  }
+  return true;
+}
+/* The signature of replaying `node` onto `canvas` as it stands now. */
+static bool render_replay_sig(struct dvm *vm,dvm_ref canvas,struct canvas_state *state,dvm_ref node,uint64_t *out)
+{
+  uint64_t h=UINT64_C(14695981039346656037);
+  struct rt_bitmap *dst=canvas_bitmap_peek(vm,canvas);
+  if(!dst) return false;
+  for(size_t i=0; i<state->count; ++i) if(state->saved[i].layer) return false;
+  float matrix[9];
+  canvas_read_matrix(vm,canvas,matrix);
+  for(int i=0; i<9; ++i) sig_mix_float(&h,matrix[i]);
+  sig_mix(&h,state->clips);
+  for(size_t i=0; i<state->clips; ++i) {
+    const struct canvas_clip *clip=&state->clip[i];
+    if(clip->mask) return false;
+    sig_mix(&h,(uint32_t)clip->operation);
+    sig_mix(&h,clip->simple);
+    sig_mix(&h,clip->singular);
+    for(int k=0; k<4; ++k) {
+      sig_mix_float(&h,clip->bounds[k]);
+      sig_mix_float(&h,clip->rect[k]);
+    }
+    for(int k=0; k<9; ++k) sig_mix_float(&h,clip->inverse[k]);
+  }
+  sig_mix(&h,((uint64_t)(uint32_t)dst->w<<32)|(uint32_t)dst->h);
+  if(!render_node_sig(vm,node,0,&h)) return false;
+  *out=h;
+  return true;
+}
+static bool canvas_draw_render_node(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  struct canvas_state *state=canvas_state(vm,self);
+  const dvm_ref node=args[0].l;
+  const bool top=state && node && state->tracking && !state->replay_depth;
+  uint64_t sig=0;
+  bool sig_ok=false;
+  if(top && !state->direct_ops && !state->replays) sig_ok=render_replay_sig(vm,self,state,node,&sig);
+  if(sig_ok && state->defer_clear && state->last_sig_ok && state->last_sig==sig) {
+    struct rt_bitmap *bitmap=canvas_bitmap_peek(vm,self);
+    if(bitmap && bitmap==state->last_dst && bitmap->gen==state->last_gen) {
+      /* The bitmap still holds exactly what this replay would draw. */
+      state->defer_clear=false;
+      state->cur_sig=sig;
+      state->cur_sig_ok=true;
+      ++state->replays;
+      RETV();
+    }
+  }
+  if(state) ++state->replay_depth;
+  const bool good=canvas_replay_render_node(vm,self,args,nargs,out);
+  if(state) {
+    --state->replay_depth;
+    if(top) {
+      ++state->replays;
+      state->cur_sig=sig;
+      state->cur_sig_ok=sig_ok;
+    }
+  }
+  return good;
+}
 static const struct rt_method rt_render_node[]= {
   M("getMatrix","(Landroid/graphics/Matrix;)V",render_node_transform),
   M("hasIdentityMatrix","()Z",render_node_transform),
@@ -4342,6 +4828,8 @@ static const struct rt_method rt_render_node[]= {
   M("<init>","(Ljava/lang/String;)V",render_node_init),
   M("setPosition","(IIII)Z",render_node_position),
   M("setClipToBounds","(Z)Z",render_node_clip),
+  M("setAlpha","(F)Z",render_node_alpha),
+  M("getAlpha","()F",render_node_alpha),
   M("beginRecording","()Landroid/graphics/RecordingCanvas;",render_node_record),
   M("beginRecording","(II)Landroid/graphics/RecordingCanvas;",render_node_record),
   M("endRecording","()V",render_node_record),
@@ -5248,23 +5736,43 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
   (void)dvm_set_field(vm,view,"drawDirty","Z",(union dvm_value) {
     .i=0
   });
-  if (partial) {
-    for(int32_t y=area[1]; y<area[3]; ++y)
-      memset(bm->px+(size_t)y*bm->w+area[0],0,(size_t)(area[2]-area[0])*sizeof *bm->px);
-  } else memset(bm->px,0,(size_t)bm->w*bm->h*sizeof *bm->px);
-  ++bm->gen;
   uint64_t draw_started=ui_render_ns();
   union dvm_value target= {.l=bitmap},argument= {.l=canvas},ignored= {0};
   if (!canvas_set_bitmap(vm,canvas,&target,1,&ignored)) return NULL;
+  /* The clear waits for the first thing that draws (canvas_bitmap): a view whose
+   * only drawing is a replay of RenderNodes identical to the last capture's
+   * keeps the picture it has, without a clear, a replay or an upload. */
+  struct canvas_state *capture=canvas_state(vm,canvas);
+  if (!capture) return NULL;
+  capture->tracking=true;
+  capture->defer_clear=true;
+  capture->clear_partial=partial;
+  memcpy(capture->clear_area,area,sizeof area);
+  capture->direct_ops=capture->replays=0;
+  capture->replay_depth=0;
+  capture->cur_sig_ok=false;
   if (partial) {
     union dvm_value clip[4]= {{.i=area[0]},{.i=area[1]},{.i=area[2]},{.i=area[3]}};
     if (!am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored)) return NULL;
   }
   const bool own_picture_only=ui_is_a(vm,view,"android/view/ViewGroup");
+  capture->accelerated=true;
   if (own_picture_only) g_ui_capture_without_children=true;
   const bool drawn=am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
   if (own_picture_only) g_ui_capture_without_children=false;
-  if (!drawn) return NULL;
+  capture->accelerated=false;
+  capture->tracking=false;
+  if (!drawn) {
+    capture->last_sig_ok=false;
+    canvas_settle(capture,bm);
+    return NULL;
+  }
+  canvas_settle(capture,bm);          /* nothing drew: the picture is blank */
+  /* The next capture may reuse this picture if it was one replay and nothing else. */
+  capture->last_sig_ok=capture->cur_sig_ok && !capture->direct_ops && capture->replays==1;
+  capture->last_sig=capture->cur_sig;
+  capture->last_gen=bm->gen;
+  capture->last_dst=bm;
   (void)dvm_set_field(vm,view,"drawingEpoch","J",(union dvm_value) {
     .j=(int64_t)capture_epoch
   });
@@ -5611,7 +6119,20 @@ static bool bm_compress(struct dvm *vm, dvm_ref self,
   RETI(1);
 }
 
+static bool bm_ninepatch_chunk(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  union dvm_value chunk={0};
+  (void)dvm_get_field(vm,self,"ninePatchChunk","[B",&chunk);
+  RETL(chunk.l);
+}
+static const struct rt_field rt_bitmap_fields[] = {
+  {"ninePatchChunk","[B"}, F_END
+};
 static const struct rt_method rt_bitmap[] = {
+  M("getNinePatchChunk","()[B",bm_ninepatch_chunk),
   M("copyPixelsToBuffer", "(Ljava/nio/Buffer;)V", bm_copyPixelsToBuffer),
   M("getWidth", "()I", bm_getWidth),
   M("getHeight", "()I", bm_getHeight),
@@ -6094,7 +6615,8 @@ static dvm_ref npd_patch(struct dvm *vm, dvm_ref self)
 static bool npd_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                      int nargs, union dvm_value *out)
 {
-  (void)out;
+  union dvm_value initialized={0};
+  if(!drawable_init(vm,self,NULL,0,&initialized)) return false;
   union dvm_value np = { 0 };
   if (nargs >= 3) {
     struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/graphics/NinePatch;");
@@ -6146,11 +6668,98 @@ static bool npd_get_padding(struct dvm *vm, dvm_ref self, const union dvm_value 
   RETI(have && (c.pad[0] | c.pad[1] | c.pad[2] | c.pad[3]) ? 1 : 0);
 }
 
+/* Map each fixed/stretch run independently, including multiple stretch runs.
+ * If fixed runs alone exceed the destination, collapse stretch runs and
+ * proportionally shrink the fixed runs. */
+static bool np_axis(const int32_t *divs,int n,int size,float start,float length,
+                    int source[258],float dest[258])
+{
+  if(n<2 || (n&1) || n>254 || size<=0) return false;
+  source[0]=0;
+  int stretch=0;
+  for(int i=0;i<n;++i) {
+    int v;
+    memcpy(&v,divs+i,sizeof v);
+    if(v<source[i] || v>size) return false;
+    source[i+1]=v;
+    if(i&1) stretch+=v-source[i];
+  }
+  source[n+1]=size;
+  int fixed=size-stretch;
+  float fixed_scale=fixed>0 && length<fixed ? length/fixed : 1;
+  float stretch_scale=stretch>0 ? fmaxf(0,length-fixed)/stretch : 0;
+  dest[0]=start;
+  for(int i=0;i<=n;++i)
+    dest[i+1]=dest[i]+(source[i+1]-source[i])*((i&1)?stretch_scale:fixed_scale);
+  dest[n+1]=start+length;
+  return true;
+}
+
+static bool npd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                     int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","canvas");
+    return false;
+  }
+  dvm_ref np=npd_patch(vm,self),bitmap=np_obj(vm,np,"bitmap","Landroid/graphics/Bitmap;");
+  struct rt_bitmap *bm=bitmap_of(vm,bitmap);
+  if(!bm) RETV();
+  if(!bitmap_live(vm,bm)) return false;
+  struct ninepatch_chunk chunk;
+  if(!ninepatch_parse(vm,np_obj(vm,np,"chunk","[B"),&chunk)) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","invalid nine-patch chunk");
+    return false;
+  }
+  union dvm_value bounds={0},paint={0};
+  if(!drawable_get_bounds(vm,self,NULL,0,&bounds) || !bd_get_paint(vm,self,NULL,0,&paint)) return false;
+  float left=ui_int(vm,bounds.l,"left"),top=ui_int(vm,bounds.l,"top");
+  float width=(float)((int64_t)ui_int(vm,bounds.l,"right")-ui_int(vm,bounds.l,"left"));
+  float height=(float)((int64_t)ui_int(vm,bounds.l,"bottom")-ui_int(vm,bounds.l,"top"));
+  if(width<=0 || height<=0) RETV();
+  int sx[258],sy[258];
+  float dx[258],dy[258];
+  if(!np_axis(chunk.x,chunk.nx,bm->w,left,width,sx,dx) ||
+     !np_axis(chunk.y,chunk.ny,bm->h,top,height,sy,dy)) {
+    dvm__throw(vm,"java/lang/IllegalArgumentException","invalid nine-patch divisions");
+    return false;
+  }
+  const char *fields[]={"sourceRect","destRect"};
+  const char *types[]={"Landroid/graphics/Rect;","Landroid/graphics/RectF;"};
+  dvm_ref rects[2];
+  for(int i=0;i<2;++i) {
+    rects[i]=np_obj(vm,self,fields[i],types[i]);
+    if(!rects[i]) {
+      rects[i]=dvm_new_object(vm,dvm__class_by_desc(vm,types[i]));
+      if(!rects[i]) return false;
+      (void)dvm_set_field(vm,self,fields[i],types[i],(union dvm_value){.l=rects[i]});
+    }
+  }
+  const char *edges[]={"left","top","right","bottom"};
+  for(int y=0;y<=chunk.ny;++y) for(int x=0;x<=chunk.nx;++x) {
+    if(sx[x]==sx[x+1] || sy[y]==sy[y+1] || dx[x]>=dx[x+1] || dy[y]>=dy[y+1]) continue;
+    int src[]={sx[x],sy[y],sx[x+1],sy[y+1]};
+    float dst[]={dx[x],dy[y],dx[x+1],dy[y+1]};
+    for(int i=0;i<4;++i) {
+      rt_set_int(vm,rects[0],edges[i],src[i]);
+      (void)dvm_set_field(vm,rects[1],edges[i],"F",(union dvm_value){.f=dst[i]});
+    }
+    if(!canvas_draw_bitmap_with(vm,ARG(0).l,bitmap,rects[0],rects[1],0,NULL,paint.l,true,out)) return false;
+  }
+  RETV();
+}
+
 static const struct rt_field rt_ninepatch_drawable_fields[] = {
-  { "ninePatch", "Landroid/graphics/NinePatch;" }, F_END
+  { "ninePatch", "Landroid/graphics/NinePatch;" },
+  {"paint","Landroid/graphics/Paint;"},
+  {"sourceRect","Landroid/graphics/Rect;"}, {"destRect","Landroid/graphics/RectF;"}, F_END
 };
 
 static const struct rt_method rt_ninepatch_drawable[] = {
+  M("setDither","(Z)V",bd_property),
+  M("draw","(Landroid/graphics/Canvas;)V",npd_draw),
+  M("setAlpha","(I)V",bd_property), M("getAlpha","()I",bd_property),
   M("<init>", "(Landroid/graphics/NinePatch;)V", npd_init),
   M("<init>", "(Landroid/content/res/Resources;Landroid/graphics/NinePatch;)V",
   npd_init),

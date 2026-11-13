@@ -115,7 +115,6 @@ static const uint32_t cxa_guard_abort_code64[] = {
 #include <cstring>
 #include <ctime>
 #define OPENSSL_SUPPRESS_DEPRECATED
-#include "luna_certs.h"
 #include <openssl/aes.h>
 #include <openssl/des.h>
 #include <openssl/sha.h>
@@ -465,9 +464,7 @@ extern "C" void dynarmic_a64_set_progress_hook(void (*fn)(uint64_t compiles,
 #include "dynarmic/interface/exclusive_monitor.h"
 
 extern "C" {
-#include "luna_media_format.h"
-#include "luna_native_codec.h"
-#include "file_read_cache.h"
+#include "luna_media_codec.h"
 #include "arm_exec.h"
 #include "aaudio_stream.h"
 #include "luna_qfkey.h"
@@ -1608,6 +1605,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"sprintf",                 SVC_SPRINTF},
   {"vsnprintf",               SVC_VSNPRINTF},
   {"vasprintf",               SVC_VASPRINTF},
+  {"asprintf",                SVC_ASPRINTF},
   {"printf",                  SVC_PRINTF},
   {"fprintf",                 SVC_FPRINTF},
   {"vprintf",                 SVC_VPRINTF},
@@ -30579,7 +30577,9 @@ static unsigned jni_method_argument(uint32_t svc)
   return 0;
 }
 
-static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
+/* The whole switch.  Its frame is about 77 KiB, so the calls that need none of it
+ * go through dispatch_svc() below and only the rest pays for it. */
+__attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint32_t svc_no,
                          std::array<uint64_t, 16> &regs) {
   GlDebugDelivery debug_delivery{ctx, regs};
   const unsigned method_argument = jni_method_argument(svc_no);
@@ -31835,7 +31835,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
      * the libc handler runs, and its -1/errno result becomes the kernel's
      * -errno.  One body serves A32 and A64, and libc and raw callers. */
     auto raw_via_libc = [&](uint32_t libc_svc) {
-      dispatch_svc(ctx, libc_svc, regs);
+      dispatch_svc_general(ctx, libc_svc, regs);
       if ((uint32_t)regs[0] == ~0u) {
         uint32_t eva = errno_va(ctx, g_current_tid);
         const int e = eva ? (int)ctx.mem.read32(eva) : EINVAL;
@@ -33568,7 +33568,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
       const GuestVA ts_va = ctx.is_arm64 ? g_svc_args64[4] : (GuestVA)regs[4];
       g_select_budget_ms = ts_va
                            ? (long)(guest_timespec_ns(ctx, ts_va) / 1'000'000ull) : -1L;
-      dispatch_svc(ctx, SVC_NET_SELECT, regs);
+      dispatch_svc_general(ctx, SVC_NET_SELECT, regs);
       g_select_budget_ms = SELECT_BUDGET_FROM_ARGS;
       break;
     }
@@ -36946,7 +36946,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
       message = arm_vformat(ctx, fmt, ap);
     }
     luna_log_assert_write(condition, tag, fmt ? message.c_str() : NULL);
-    dispatch_svc(ctx, SVC_ABORT, regs);
+    dispatch_svc_general(ctx, SVC_ABORT, regs);
     break;
   }
   case SVC_LOG_PRINT:
@@ -37501,7 +37501,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     if (!addr) {
       fprintf(stderr, "[arm_exec] operator new failed to allocate %llu bytes\n",
               (unsigned long long)size);
-      dispatch_svc(ctx, SVC_ABORT, regs);
+      dispatch_svc_general(ctx, SVC_ABORT, regs);
       break;
     }
     alloc_watch(addr, (uint32_t)size, lr, "operator new");
@@ -51548,7 +51548,7 @@ fputws_done:
                                   : nr == (ctx.is_arm64 ? 173u : 64u) ? SVC_GETPPID
                                   : nr == (ctx.is_arm64 ? 178u : 224u) ? SVC_GETTID : 0u;
     if (identity_svc) {
-      dispatch_svc(ctx, identity_svc, regs);
+      dispatch_svc_general(ctx, identity_svc, regs);
       break;
     }
     /* syscall(number, ...) shifts the kernel arguments by one ABI slot.
@@ -51571,7 +51571,7 @@ fputws_done:
       }
       /* The shared raw dispatcher reserves 20 for A32 getpid. */
       kernel_regs[7]=ctx.is_arm64 && nr==20u ? 2020u : nr;
-      dispatch_svc(ctx,0,kernel_regs);
+      dispatch_svc_general(ctx,0,kernel_regs);
       g_svc_args64=saved_args;
       int64_t result=ctx.is_arm64 ? (int64_t)kernel_regs[0]
                      : (int64_t)(int32_t)kernel_regs[0];
@@ -52137,7 +52137,7 @@ fputws_done:
     if (handle && lunaria_app_target_sdk() >= 26) {
       fprintf(stderr, "[pthread_gettid_np] invalid pthread_t 0x%llx\n",
               (unsigned long long)handle);
-      dispatch_svc(ctx, SVC_ABORT, regs);
+      dispatch_svc_general(ctx, SVC_ABORT, regs);
     } else ret32(~0u);
     break;
   }
@@ -52840,14 +52840,23 @@ fputws_done:
     ret32(arm_format_to(ctx, r0, r1, arm_vformat(ctx, ctx.mem.cstr(r2), ap)));
     break;
   }
+  case SVC_ASPRINTF:
   case SVC_VASPRINTF: {
-    // vasprintf(char **strp, fmt, va_list)
-    ArmVarArgs ap{ctx, regs, 0, r2, true, ctx.is_arm64};
+    // Both APIs allocate guest-owned storage; only argument retrieval differs.
+    ArmVarArgs ap{ctx, regs, 2, svc_no == SVC_VASPRINTF ? r2 : regs[13],
+                  svc_no == SVC_VASPRINTF, ctx.is_arm64};
     std::string s = arm_vformat(ctx, ctx.mem.cstr(r1), ap);
+    if (s.size() > INT32_MAX) {
+      store_ptr(argp(0), 0);
+      arm_set_errno(ctx, ENOMEM);
+      ret32(~0u);
+      break;
+    }
     uint32_t p = arm_malloc(ctx, (uint32_t)s.size() + 1);
     if (p) {
       memcpy(ctx.mem.ptr(p), s.c_str(), s.size() + 1);
     }
+    else arm_set_errno(ctx, ENOMEM);
     store_ptr(argp(0), p && ctx.is_arm64 ? a64_guest_va(p) : (GuestVA)p);
     ret32(p ? (uint32_t)s.size() : ~0u);
     break;
@@ -56696,7 +56705,7 @@ pv_done:
       else
         (void)call_guest_cb(ctx, (uint32_t)slot.parent, 0, 0);
     }
-    /* dispatch_svc()'s caller copies regs[0] into the live x0/r0 after
+    /* dispatch_svc_general()'s caller copies regs[0] into the live x0/r0 after
      * this returns (see the a64 default-result branch and the a32
      * post-dispatch loop) — writing g_svc_jit64 here directly would just
      * get overwritten by that copy, so go through the same regs[0] path
@@ -56711,7 +56720,7 @@ pv_done:
     regs[0] = g_svc_args64[0] = (uint64_t)-1;
     regs[1] = g_svc_args64[1] = status;
     regs[2] = g_svc_args64[2] = 0;
-    dispatch_svc(ctx, SVC_WAITPID, regs);
+    dispatch_svc_general(ctx, SVC_WAITPID, regs);
     for (unsigned i = 0; i < 3; ++i) g_svc_args64[i] = saved[i];
     break;
   }
@@ -60581,6 +60590,33 @@ mbsrtowcs_done:
 #undef ARM_STR
 }
 
+/* Every SVC comes through here.  The allocator calls are most of them, and they
+ * need nothing from the switch above: answering them from this small frame
+ * keeps each one from carrying the large one.  With a GL debug callback
+ * registered, the general path runs for everything, as before, because it
+ * delivers the pending messages after each call. */
+static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
+                         std::array<uint64_t, 16> &regs) {
+  if (!g_gl_debug_registered.load(std::memory_order_acquire) &&
+      !jni_method_argument(svc_no)) {
+    const auto &fast = fast_svc_table();
+    const uint32_t fast_index = svc_no - SVC_MALLOC;
+    if (fast_index < fast.size()) {
+      fast[fast_index](ctx, regs);
+      return;
+    }
+    if (svc_no == SVC_MALLOC_USABLE_SIZE) {
+      fast_svc_malloc_usable_size(ctx, regs);
+      return;
+    }
+    if (svc_no == SVC_MEMALIGN) {
+      fast_svc_memalign(ctx, regs);
+      return;
+    }
+  }
+  dispatch_svc_general(ctx, svc_no, regs);
+}
+
 class StubCoprocessor final : public Dynarmic::A32::Coprocessor {
   static std::uint64_t NopCb(void*, std::uint32_t, std::uint32_t) {
     return 0;
@@ -61427,7 +61463,7 @@ public:
       pc_ring[pc_ring_pos++ & 63] = p;
       if ((p & ~1u) < TRAMP_BASE) code_ring[code_ring_pos++ & 63] = p;
       // LUNARIA_CATCH_NULL_BLK: when a block's successor is 0 (branch to null), the block that just ran is the culprit.
-      if (lunaria_env("LUNARIA_CATCH_NULL_BLK") && (p & ~1u) < 0x1000u) {
+      if ((p & ~1u) < 0x1000u && lunaria_env("LUNARIA_CATCH_NULL_BLK")) {
         static int cnb = 0;
         if (cnb++ < 4) {
           fprintf(stderr, "[catchnull] successor=0x%08x  culprit-block-entry=0x%08x\n",
@@ -69575,14 +69611,17 @@ a64_hooks_done:
           tpidrro_el0(g_tpidrro_el0_val), tid(g_current_tid),
           j(jit), ok(jit != nullptr) {
         if (!ok) return;
-        for (size_t i = 0; i < 31; ++i) x[i] = j->GetRegister(i);
+        /* One call for the register file, not 31: each is an out-of-line call
+         * into the JIT, and every SVC makes them. */
+        const std::array<uint64_t, 31> file = j->GetRegisters();
+        for (size_t i = 0; i < 31; ++i) x[i] = file[i];
         sp = j->GetSP();
         pc = j->GetPC();
         if (ArmThread *t = arm_thread_by_tid(g_current_tid)) {
           for (size_t i = 0; i < 31; ++i) t->regs64[i] = x[i];
           t->sp64 = sp;
           t->lr64 = x[30];
-          t->pc64 = j->GetPC();
+          t->pc64 = pc;
         }
       }
       void restore_identity() const {
@@ -69896,8 +69935,10 @@ a64_hooks_done:
           call_trace_left = 64;
         }
       }
-      pc = jit64->GetPC();
-      lr = jit64->GetRegister(30);
+      /* Two calls into the JIT per block exit: only worth making while the
+       * trace has lines left. */
+      pc = call_trace_left ? jit64->GetPC() : 0;
+      lr = call_trace_left ? jit64->GetRegister(30) : 0;
       if (call_trace_left && a64_canon_va(lr) == call_return_canon &&
           a64_canon_va(pc) != call_return_canon) {
         fprintf(stderr,
@@ -69941,7 +69982,7 @@ a64_hooks_done:
           }
         }
       }
-      const uint64_t pc = jit64->GetPC();
+      const uint64_t pc = trace_left ? jit64->GetPC() : 0;
       if (trace_left && pc >= trace_lo && pc < trace_hi) {
         const GuestVA x22 = jit64->GetRegister(22);
         const GuestVA x24 = jit64->GetRegister(24);

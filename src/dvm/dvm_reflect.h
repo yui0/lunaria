@@ -2723,6 +2723,122 @@ static const struct rt_method rt_java_annotation[] = {
   M("annotationType", "()Ljava/lang/Class;", java_annotation_type), M_END
 };
 
+/* Value semantics of materialised annotation instances (java.lang.annotation). */
+static union dvm_value ann_array_value(const struct dvm_object *array,uint32_t i)
+{
+  union dvm_value v={0};
+  size_t width=(size_t)dvm__elem_width(array->elem_kind);
+  memcpy(&v,(const unsigned char *)array->data+(size_t)i*width,width);
+  return v;
+}
+static uint32_t ann_primitive_hash(char kind,union dvm_value v)
+{
+  switch(kind) {
+  case 'Z':return v.i ? 1231u : 1237u;
+  case 'B':return (uint32_t)(int32_t)(int8_t)v.i;
+  case 'S':return (uint32_t)(int32_t)(int16_t)v.i;
+  case 'C':return (uint16_t)v.i;
+  case 'F':return java_f2bits(v.f,false);
+  case 'D':v.ju=java_d2bits(v.d,false); /* fall through */
+  case 'J':return (uint32_t)(v.ju^(v.ju>>32));
+  default:return v.u;
+  }
+}
+static bool ann_ref_hash(struct dvm *vm,dvm_ref value,uint32_t *hash)
+{
+  struct dvm_object *o=dvm__obj(vm,value);
+  if (!o) { *hash=0;return true; }
+  if (o->kind==DVM_OBJ_ARRAY) {
+    uint32_t h=1;
+    for(uint32_t i=0;i<o->length;++i) {
+      union dvm_value v=ann_array_value(o,i);
+      uint32_t item;
+      if(o->elem_kind=='L') { if(!ann_ref_hash(vm,v.l,&item))return false; }
+      else item=ann_primitive_hash(o->elem_kind,v);
+      h=h*31u+item;
+    }
+    *hash=h;return true;
+  }
+  union dvm_value r={0};
+  if(!am_vcall(vm,value,"hashCode","()I",NULL,0,&r))return false;
+  *hash=r.u;return true;
+}
+static bool ann_ref_equal(struct dvm *vm,dvm_ref a,dvm_ref b,bool *same)
+{
+  *same=a==b;
+  if(*same || !a || !b)return true;
+  struct dvm_object *x=dvm__obj(vm,a),*y=dvm__obj(vm,b);
+  if(x && y && x->kind==DVM_OBJ_ARRAY && y->kind==DVM_OBJ_ARRAY) {
+    if(x->elem_kind!=y->elem_kind || x->length!=y->length)return true;
+    for(uint32_t i=0;i<x->length;++i) {
+      union dvm_value xv=ann_array_value(x,i),yv=ann_array_value(y,i);
+      bool equal;
+      if(x->elem_kind=='L') { if(!ann_ref_equal(vm,xv.l,yv.l,&equal))return false; }
+      else if(x->elem_kind=='J') equal=xv.ju==yv.ju;
+      else if(x->elem_kind=='D') equal=java_d2bits(xv.d,false)==java_d2bits(yv.d,false);
+      else equal=ann_primitive_hash(x->elem_kind,xv)==ann_primitive_hash(y->elem_kind,yv);
+      if(!equal)return true;
+    }
+    *same=true;return true;
+  }
+  union dvm_value arg={.l=b},r={0};
+  if(!am_vcall(vm,a,"equals","(Ljava/lang/Object;)Z",&arg,1,&r))return false;
+  *same=r.i!=0;return true;
+}
+static bool ann_element(const struct dvm_method *m)
+{
+  return m->name && m->name[0]!='<' && m->sig && m->sig[0]=='(' && m->sig[1]==')' &&
+         m->sig[2]!='V' && !(m->access & DEX_ACC_STATIC);
+}
+static bool rt_annotation_equals(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                  int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  dvm_ref other=ARG(0).l;
+  if(self==other)RETI(1);
+  struct dvm_class *type=dvm_object_class(vm,self),*have=dvm_object_class(vm,other);
+  if(!have || !dvm__class_assignable(vm,have,type))RETI(0);
+  for(int i=0;i<type->nmethods;++i) {
+    struct dvm_method *m=&type->methods[i];
+    if(!ann_element(m))continue;
+    union dvm_value a={0},b={0};
+    if(!dvm_call(vm,m,self,NULL,0,&a) || !am_vcall(vm,other,m->name,m->sig,NULL,0,&b))return false;
+    char kind=m->sig[2];
+    bool same;
+    if(kind=='L' || kind=='[') { if(!ann_ref_equal(vm,a.l,b.l,&same))return false; }
+    else if(kind=='J')same=a.ju==b.ju;
+    else if(kind=='D')same=java_d2bits(a.d,false)==java_d2bits(b.d,false);
+    else same=ann_primitive_hash(kind,a)==ann_primitive_hash(kind,b);
+    if(!same)RETI(0);
+  }
+  RETI(1);
+}
+static bool rt_annotation_hash(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+  (void)args;(void)nargs;
+  struct dvm_class *type=dvm_object_class(vm,self);
+  uint32_t hash=0;
+  for(int i=0;i<type->nmethods;++i) {
+    struct dvm_method *m=&type->methods[i];
+    if(!ann_element(m))continue;
+    union dvm_value value={0};
+    if(!dvm_call(vm,m,self,NULL,0,&value))return false;
+    uint32_t member;
+    if(m->sig[2]=='L' || m->sig[2]=='[') { if(!ann_ref_hash(vm,value.l,&member))return false; }
+    else member=ann_primitive_hash(m->sig[2],value);
+    uint32_t name=0;
+    size_t length=strlen(m->name),at=0;
+    while(at<length) {
+      uint32_t cp=utf8_next(m->name,length,&at);
+      if(cp>0xffff) { cp-=0x10000;name=name*31u+0xd800+(cp>>10);cp=0xdc00+(cp&1023); }
+      name=name*31u+cp;
+    }
+    hash+=(name*127u)^member;
+  }
+  RETI((int32_t)hash);
+}
+
 /* Java Class.isEnum excludes anonymous constant-specific subclasses. */
 static bool class_is_enum(struct dvm_class *cls)
 {

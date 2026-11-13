@@ -569,7 +569,55 @@ static bool x_db_num_entries(struct dvm *vm, dvm_ref self, const union dvm_value
   if (!x_db_first_cell(vm, in, "getLong", "(I)J", &v)) return false;
   RETJ(v.j);
 }
+/* Android API 31 DatabaseUtils classifies by the first three UTF-16 units,
+ * after String.trim(), rather than parsing SQL or skipping comments. */
+static unsigned x_db_keyword_upper(unsigned c)
+{
+  if(c>='a' && c<='z') return c-'a'+'A';
+  /* The non-ASCII single-unit ROOT uppercase mappings into ASCII. Expanding
+   * mappings cannot turn a three-unit prefix into a three-letter keyword. */
+  if(c==0x131) return 'I';
+  if(c==0x17f) return 'S';
+  return c;
+}
+static bool x_db_statement_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                int nargs,union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","sql");
+    return false;
+  }
+  struct ustr sql;
+  if(ustr_of(vm,ARG(0).l,&sql)<=0) return false;
+  uint32_t begin=0,end=sql.length;
+  while(begin<end && ustr_at(&sql,begin)<=32) ++begin;
+  while(end>begin && ustr_at(&sql,end-1)<=32) --end;
+  if(end-begin<3) RETI(99);
+  char prefix[4]={0};
+  for(unsigned i=0;i<3;++i) {
+    unsigned c=x_db_keyword_upper(ustr_at(&sql,begin+i));
+    if(c>127) RETI(99);
+    prefix[i]=(char)c;
+  }
+  static const struct {const char *prefix; int type;} types[]={
+    {"SEL",1},{"INS",2},{"UPD",2},{"REP",2},{"DEL",2},{"ATT",3},
+    {"BEG",4},{"COM",5},{"END",5},{"PRA",7},{"CRE",8},{"DRO",8},
+    {"ALT",8},{"ANA",9},{"DET",9}
+  };
+  if(!strcmp(prefix,"ROL")) {
+    for(uint32_t i=begin;i+3<end;++i)
+      if(ustr_at(&sql,i)==' ' && x_db_keyword_upper(ustr_at(&sql,i+1))=='T' &&
+         x_db_keyword_upper(ustr_at(&sql,i+2))=='O' && ustr_at(&sql,i+3)==' ') RETI(99);
+    RETI(6);
+  }
+  for(size_t i=0;i<sizeof types/sizeof types[0];++i)
+    if(!strcmp(prefix,types[i].prefix)) RETI(types[i].type);
+  RETI(99);
+}
 static const struct rt_method rt_database_utils[] = {
+  SM("getSqlStatementType", "(Ljava/lang/String;)I", x_db_statement_type),
   SM("stringForQuery", "(Landroid/database/sqlite/SQLiteDatabase;Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;",
   x_db_string_for_query),
   SM("longForQuery", "(Landroid/database/sqlite/SQLiteDatabase;Ljava/lang/String;[Ljava/lang/String;)J",

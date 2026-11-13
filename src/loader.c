@@ -2436,6 +2436,7 @@ main(int argc, const char *argv[])
    * redirected to one startup log.  Fully buffered stdout otherwise leaves
    * "loading module" and dependency messages at the end of the file. */
   setvbuf(stdout, NULL, _IOLBF, 0);
+  luna_os_tune_allocator();
 #ifndef _WIN32
   signal(SIGABRT, host_abort_report);
   /* Register before selecting a launch path, including DEX/NativeActivity. */

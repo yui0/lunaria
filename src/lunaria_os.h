@@ -1779,6 +1779,13 @@ int luna_os_signal_fd(int fd, const void *mask, size_t mask_size, int flags);
  * the guest is told it has is a separate number the emulator decides. */
 int luna_os_cpu_count(void);
 
+/* Keep the allocator from handing large blocks straight back to the kernel.
+ * A rebuilt screen allocates and frees bitmaps and path masks of hundreds of
+ * kilobytes many times a second; each one served by mmap and released by munmap
+ * costs a page fault for every page it touches, and that was a twentieth of the
+ * process's CPU while a video played.  Called once, before any thread starts. */
+void luna_os_tune_allocator(void);
+
 /* Name the calling thread, for the host's own debuggers and profilers. */
 void luna_os_thread_name(const char *name);
 /* Host thread token is valid only while that thread remains alive. Priority

@@ -21,6 +21,7 @@
 #include <sched.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <malloc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -479,6 +480,17 @@ int luna_os_signal_fd(int fd, const void *mask, size_t mask_size, int flags)
 }
 
 /* ---- threads and CPUs --------------------------------------------------- */
+
+void luna_os_tune_allocator(void)
+{
+#ifdef __GLIBC__
+  /* Blocks up to 64 MiB come from the heap and are reused; the heap is trimmed
+   * only when 256 MiB of its top is free.  Both are ceilings, not reservations. */
+  mallopt(M_MMAP_THRESHOLD, 64 << 20);
+  mallopt(M_TRIM_THRESHOLD, 256 << 20);
+  mallopt(M_TOP_PAD, 16 << 20);
+#endif
+}
 
 int luna_os_cpu_count(void)
 {

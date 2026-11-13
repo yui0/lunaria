@@ -1,6 +1,5 @@
 /* Copyright © 2026 Yuichiro Nakada / Project Lunaria
  * SPDX-License-Identifier: MPL-2.0 */
-#include "luna_certs.h"
 #include "lunaria_file.h"
 #include <errno.h>
 #include <limits.h>

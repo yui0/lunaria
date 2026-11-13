@@ -260,6 +260,7 @@ bool luna_overlay_guest_keys_captured(void);
  * event, which is when the guest must not also see it. */
 bool luna_overlay_pointer(double x, double y, int action);
 
+
 /* Replaces the overlay document.  `css` may be NULL to keep the current sheet.
  * Passing NULL html takes the overlay down.  Safe to call from any thread: the
  * strings are copied and the document is parsed on the thread that presents.

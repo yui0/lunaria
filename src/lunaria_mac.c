@@ -1085,6 +1085,11 @@ int luna_os_signal_fd(int fd, const void *mask, size_t mask_size, int flags)
 
 /* ---- threads and CPUs --------------------------------------------------- */
 
+void luna_os_tune_allocator(void)
+{
+  /* The system allocator already keeps freed blocks for reuse. */
+}
+
 int luna_os_cpu_count(void)
 {
   int n = 0;

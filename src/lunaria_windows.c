@@ -960,6 +960,11 @@ int luna_os_signal_fd(int fd, const void *mask, size_t mask_size, int flags)
 
 /* ---- threads and CPUs --------------------------------------------------- */
 
+void luna_os_tune_allocator(void)
+{
+  /* The process heap already keeps freed blocks for reuse. */
+}
+
 int luna_os_cpu_count(void)
 {
   DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);

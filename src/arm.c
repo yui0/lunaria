@@ -13,6 +13,7 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <time.h>
 
 /* The lock is handed out in the order it was asked for.
@@ -127,6 +128,17 @@ static unsigned long long arm_now_ns(void)
          (unsigned long long)ts.tv_nsec;
 }
 
+/* The hold and wait figures above are only ever printed by the slice report
+ * (LUNARIA_SLICE_DETAIL), and gathering them costs two clock reads and several
+ * atomics per acquire/release pair -- on the path every SVC takes.  Decide once
+ * whether anybody will read them. */
+static bool arm_stats(void)
+{
+  static int on = -1;
+  if (on < 0) on = getenv("LUNARIA_SLICE_DETAIL") != NULL;
+  return on;
+}
+
 unsigned long long arm_lock_held_ns(void)
 {
   return atomic_load_explicit(&g_held_ns, memory_order_relaxed);
@@ -156,7 +168,7 @@ void arm_lock_acquire(void)
   pthread_mutex_lock(&g_m);
   if (!g_locked && !g_head) {
     g_locked = true;
-    clock_gettime(CLOCK_MONOTONIC, &g_held_since);
+    if (arm_stats()) clock_gettime(CLOCK_MONOTONIC, &g_held_since);
     pthread_mutex_unlock(&g_m);
   } else {
     /* The releaser only touches the node while holding g_m and only reaches
@@ -196,15 +208,17 @@ void arm_lock_acquire(void)
       w->sleeping = false;
       pthread_mutex_unlock(&g_m);
     }
-    const unsigned long long waited = arm_now_ns() - t0;
-    atomic_fetch_add_explicit(&g_wait_ns, waited, memory_order_relaxed);
-    unsigned long long worst =
-      atomic_load_explicit(&g_max_wait_ns, memory_order_relaxed);
-    while (waited > worst &&
-           !atomic_compare_exchange_weak_explicit(
-             &g_max_wait_ns, &worst, waited,
-             memory_order_relaxed, memory_order_relaxed))
-      ;
+    if (arm_stats()) {
+      const unsigned long long waited = arm_now_ns() - t0;
+      atomic_fetch_add_explicit(&g_wait_ns, waited, memory_order_relaxed);
+      unsigned long long worst =
+        atomic_load_explicit(&g_max_wait_ns, memory_order_relaxed);
+      while (waited > worst &&
+             !atomic_compare_exchange_weak_explicit(
+               &g_max_wait_ns, &worst, waited,
+               memory_order_relaxed, memory_order_relaxed))
+        ;
+    }
     atomic_fetch_sub_explicit(&g_waiters, 1u, memory_order_relaxed);
     /* g_locked stayed true: the releaser handed ownership straight over. */
   }
@@ -223,35 +237,37 @@ void arm_lock_release(void)
   if (!t_depth) return;      /* not ours to release */
   if (--t_depth) return;     /* still held by an outer acquire */
   pthread_mutex_lock(&g_m);
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  /* tv_nsec borrows across the second boundary on roughly half of all
-   * releases (whenever now.tv_nsec < g_held_since.tv_nsec) -- computing
-   * that subtraction in unsigned before adding the whole-seconds term
-   * wrapped it to just under 2^64 ns instead of going negative, so "mine"
-   * came out around 18446744073709.5 ms on those releases. Since that beat
-   * every real hold, g_max_hold_ns latched onto the wrapped value instead
-   * of the actual longest hold almost as often as not -- the
-   * "[slice] longest single hold" line this feeds was reporting garbage,
-   * not a rare fluke. Do the subtraction in signed arithmetic, where a
-   * borrow is just a negative intermediate, and only convert to unsigned
-   * once the true (non-negative, the clock is monotonic) result is known. */
-  const long long mine_s =
-    (long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ll +
-    ((long long)now.tv_nsec - (long long)g_held_since.tv_nsec);
-  const unsigned long long mine = (unsigned long long)mine_s;
-  atomic_fetch_add_explicit(&g_held_ns, mine, memory_order_relaxed);
-  atomic_fetch_add_explicit(&g_tag_ns[t_tag], mine, memory_order_relaxed);
-  {
-    unsigned long long prev =
-      atomic_load_explicit(&g_max_hold_ns, memory_order_relaxed);
-    while (mine > prev &&
-           !atomic_compare_exchange_weak_explicit(
-             &g_max_hold_ns, &prev, mine,
-             memory_order_relaxed, memory_order_relaxed))
-      ;
-    if (mine >= prev)
-      atomic_store_explicit(&g_max_hold_tag, t_tag, memory_order_relaxed);
+  struct timespec now = g_held_since;
+  if (arm_stats()) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    /* tv_nsec borrows across the second boundary on roughly half of all
+     * releases (whenever now.tv_nsec < g_held_since.tv_nsec) -- computing
+     * that subtraction in unsigned before adding the whole-seconds term
+     * wrapped it to just under 2^64 ns instead of going negative, so "mine"
+     * came out around 18446744073709.5 ms on those releases. Since that beat
+     * every real hold, g_max_hold_ns latched onto the wrapped value instead
+     * of the actual longest hold almost as often as not -- the
+     * "[slice] longest single hold" line this feeds was reporting garbage,
+     * not a rare fluke. Do the subtraction in signed arithmetic, where a
+     * borrow is just a negative intermediate, and only convert to unsigned
+     * once the true (non-negative, the clock is monotonic) result is known. */
+    const long long mine_s =
+      (long long)(now.tv_sec - g_held_since.tv_sec) * 1000000000ll +
+      ((long long)now.tv_nsec - (long long)g_held_since.tv_nsec);
+    const unsigned long long mine = (unsigned long long)mine_s;
+    atomic_fetch_add_explicit(&g_held_ns, mine, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_tag_ns[t_tag], mine, memory_order_relaxed);
+    {
+      unsigned long long prev =
+        atomic_load_explicit(&g_max_hold_ns, memory_order_relaxed);
+      while (mine > prev &&
+             !atomic_compare_exchange_weak_explicit(
+               &g_max_hold_ns, &prev, mine,
+               memory_order_relaxed, memory_order_relaxed))
+        ;
+      if (mine >= prev)
+        atomic_store_explicit(&g_max_hold_tag, t_tag, memory_order_relaxed);
+    }
   }
   struct arm_lock_waiter *w = g_head;
   if (w) {

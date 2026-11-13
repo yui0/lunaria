@@ -433,13 +433,13 @@ static bool span_recipients(struct dvm *vm,dvm_ref self,int start,int end,const 
   *recipients=result.l;
   return true;
 }
-static bool span_text_notify(struct dvm *vm,dvm_ref self,dvm_ref watchers,int phase,int start,int count)
+static bool span_text_notify(struct dvm *vm,dvm_ref self,dvm_ref watchers,int phase,int start,int before,int count)
 {
   struct span_builder_buffer *buffer=span_builder_buffer(vm,self);
   if(!buffer) return false;
   const char *names[]= {"beforeTextChanged","onTextChanged","afterTextChanged"};
   const char *sig=phase==2 ? "(Landroid/text/Editable;)V" : "(Ljava/lang/CharSequence;III)V";
-  union dvm_value args[]= {{.l=self},{.i=start},{.i=0},{.i=count}},ignored= {0};
+  union dvm_value args[]= {{.l=self},{.i=start},{.i=before},{.i=count}},ignored= {0};
   ++buffer->watcher_depth;
   bool good=true;
   for(uint32_t i=0; good && i<dvm_array_length(vm,watchers); ++i) {
@@ -515,10 +515,242 @@ static bool span_builder_reserve(struct dvm *vm,struct span_builder_buffer *buff
   buffer->capacity=capacity;
   return true;
 }
-static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+/* Selection uses NoCopySpan markers, so editing moves the cursor with the
+ * same UTF-16 span rules as the platform, rather than parallel integer fields. */
+static bool text_markers_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
-  const char *sig=builtin_sig();
-  bool character=sig[1]=='C',with_span=strstr(sig,";Ljava/lang/Object;")!=NULL;
+  (void)self; (void)args; (void)nargs;
+  struct dvm_class *cls=dvm__builtin_method()->cls;
+  bool selection=!strcmp(cls->name,"android/text/Selection");
+  const char *names[]={selection ? "SELECTION_START" : "COMPOSING","SELECTION_END"};
+  const char *types[]={selection ? "android/text/Selection$START" : "android/view/inputmethod/ComposingText","android/text/Selection$END"};
+  for(int i=0;i<(selection ? 2 : 1);++i) {
+    dvm_ref marker=dvm_new_object(vm,dvm_find_class(vm,types[i]));
+    if(!marker || !dvm_set_static(vm,cls,names[i],"Ljava/lang/Object;",(union dvm_value){.l=marker})) return false;
+  }
+  RETV();
+}
+static dvm_ref text_marker(struct dvm *vm,bool composing,bool end)
+{
+  struct dvm_class *cls=dvm_find_class(vm,composing ? "android/view/inputmethod/BaseInputConnection" : "android/text/Selection");
+  union dvm_value marker={0};
+  if(!cls || !dvm_get_static(vm,cls,composing ? "COMPOSING" : end ? "SELECTION_END" : "SELECTION_START","Ljava/lang/Object;",&marker)) return 0;
+  return marker.l;
+}
+static bool selection_position(struct dvm *vm,dvm_ref text,bool end,int *position)
+{
+  *position=-1;
+  if(!dvm__class_assignable(vm,dvm_object_class(vm,text),dvm_find_class(vm,"android/text/Spanned"))) return true;
+  union dvm_value marker={.l=text_marker(vm,false,end)},value={0};
+  if(!marker.l || !am_vcall(vm,text,"getSpanStart","(Ljava/lang/Object;)I",&marker,1,&value)) return false;
+  *position=value.i;
+  return true;
+}
+static bool selection_assign(struct dvm *vm,dvm_ref text,int start,int end)
+{
+  int oldstart,oldend;
+  if(!selection_position(vm,text,false,&oldstart) || !selection_position(vm,text,true,&oldend)) return false;
+  if(oldstart==start && oldend==end) return true;
+  union dvm_value span[]={{.l=text_marker(vm,false,false)},{.i=start},{.i=start},{.i=0x222}},ignored={0};
+  if(!span[0].l || !am_vcall(vm,text,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+  span[0].l=text_marker(vm,false,true); span[1].i=span[2].i=end; span[3].i=0x22;
+  return span[0].l && am_vcall(vm,text,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored);
+}
+static bool selection_api(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self;
+  const char *name=builtin_name();
+  dvm_ref text=args[0].l;
+  if(!strcmp(name,"getSelectionStart") || !strcmp(name,"getSelectionEnd")) {
+    int position;
+    if(!selection_position(vm,text,!strcmp(name,"getSelectionEnd"),&position)) return false;
+    RETI(position);
+  }
+  if(!text) { dvm__throw(vm,"java/lang/NullPointerException","text"); return false; }
+  if(!strcmp(name,"removeSelection")) {
+    for(int i=0;i<2;++i) {
+      union dvm_value marker={.l=text_marker(vm,false,i!=0)},ignored={0};
+      if(!marker.l || !am_vcall(vm,text,"removeSpan","(Ljava/lang/Object;)V",&marker,1,&ignored)) return false;
+    }
+    RETV();
+  }
+  if(!strcmp(name,"extendSelection")) {
+    union dvm_value span[]={{.l=text_marker(vm,false,true)},args[1],args[1],{.i=0x22}},ignored={0};
+    if(!span[0].l || !am_vcall(vm,text,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+    RETV();
+  }
+  int start=nargs>1 ? args[1].i : 0,end=nargs>2 ? args[2].i : start;
+  if(!strcmp(name,"selectAll")) {
+    union dvm_value length={0};
+    if(!am_vcall(vm,text,"length","()I",NULL,0,&length)) return false;
+    start=0; end=length.i;
+  }
+  if(!selection_assign(vm,text,start,end)) return false;
+  RETV();
+}
+static const struct rt_field rt_selection_sfields[]={
+  {"SELECTION_START","Ljava/lang/Object;"},{"SELECTION_END","Ljava/lang/Object;"},F_END
+};
+static const struct rt_method rt_selection[]={
+  SM("<clinit>","()V",text_markers_init),
+  SM("getSelectionStart","(Ljava/lang/CharSequence;)I",selection_api),
+  SM("getSelectionEnd","(Ljava/lang/CharSequence;)I",selection_api),
+  SM("setSelection","(Landroid/text/Spannable;I)V",selection_api),
+  SM("setSelection","(Landroid/text/Spannable;II)V",selection_api),
+  SM("selectAll","(Landroid/text/Spannable;)V",selection_api),
+  SM("extendSelection","(Landroid/text/Spannable;I)V",selection_api),
+  SM("removeSelection","(Landroid/text/Spannable;)V",selection_api),M_END
+};
+/* BaseInputConnection's common read operations dispatch getEditable virtually:
+ * custom editors own their buffers and must not be replaced by a View.text. */
+static bool bic_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  if(!args[0].l) { dvm__throw(vm,"java/lang/NullPointerException","targetView"); return false; }
+  dvm_set_field(vm,self,"mTargetView","Landroid/view/View;",args[0]);
+  dvm_set_field(vm,self,"mFallbackMode","Z",(union dvm_value){.i=!args[1].i});
+  RETV();
+}
+static bool bic_get_editable(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value buffer={0};
+  dvm_get_field(vm,self,"baseEditable","Landroid/text/Editable;",&buffer);
+  if(!buffer.l) {
+    buffer.l=dvm_new_object(vm,dvm_find_class(vm,"android/text/SpannableStringBuilder"));
+    union dvm_value ignored={0};
+    if(!buffer.l || !am_vcall(vm,buffer.l,"<init>","()V",NULL,0,&ignored)
+        || !selection_assign(vm,buffer.l,0,0)) return false;
+    dvm_set_field(vm,self,"baseEditable","Landroid/text/Editable;",buffer);
+  }
+  RETL(buffer.l);
+}
+static bool bic_query(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  const char *name=builtin_name();
+  bool selected=!strcmp(name,"getSelectedText"),after=!strcmp(name,"getTextAfterCursor");
+  if(!selected && args[0].i<0) { dvm__throw(vm,"java/lang/IllegalArgumentException","negative length"); return false; }
+  union dvm_value editable={0},length={0};
+  if(!am_vcall(vm,self,"getEditable","()Landroid/text/Editable;",NULL,0,&editable)) return false;
+  if(!editable.l) RETL(0);
+  int a,b;
+  if(!selection_position(vm,editable.l,false,&a) || !selection_position(vm,editable.l,true,&b)
+      || !am_vcall(vm,editable.l,"length","()I",NULL,0,&length)) return false;
+  if(a>b) { int temp=a; a=b; b=temp; }
+  if(selected && (a<0 || a==b)) RETL(0);
+  if(!selected) {
+    if(after) {
+      if(b<0) b=0;
+      a=b;
+      b+=args[0].i>length.i-b ? length.i-b : args[0].i;
+    } else {
+      if(a<0) a=0;
+      b=a;
+      a-=args[0].i>a ? a : args[0].i;
+    }
+  }
+  union dvm_value range[]={{.i=a},{.i=b}},part={0};
+  if(!am_vcall(vm,editable.l,"subSequence","(II)Ljava/lang/CharSequence;",range,2,&part)) return false;
+  int flags=args[selected ? 0 : 1].i;
+  if(flags&1) RETL(part.l);
+  return am_vcall(vm,part.l,"toString","()Ljava/lang/String;",NULL,0,out);
+}
+static bool bic_set_selection(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  union dvm_value editable={0},length={0};
+  if(!am_vcall(vm,self,"getEditable","()Landroid/text/Editable;",NULL,0,&editable)) return false;
+  if(!editable.l) RETI(0);
+  if(!am_vcall(vm,editable.l,"length","()I",NULL,0,&length)) return false;
+  if(args[0].i<0 || args[1].i<0 || args[0].i>length.i || args[1].i>length.i) RETI(1);
+  if(!selection_assign(vm,editable.l,args[0].i,args[1].i)) return false;
+  RETI(1);
+}
+static bool bic_composing(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  const char *name=builtin_name();
+  dvm_ref text=args[0].l,marker=text_marker(vm,true,false);
+  if(!marker) return false;
+  if(!strcmp(name,"getComposingSpanStart") || !strcmp(name,"getComposingSpanEnd")) {
+    union dvm_value key={.l=marker};
+    return am_vcall(vm,text,!strcmp(name,"getComposingSpanStart") ? "getSpanStart" : "getSpanEnd","(Ljava/lang/Object;)I",&key,1,out);
+  }
+  dvm_ref spans=0;
+  union dvm_value length={0},ignored={0};
+  if(!am_vcall(vm,text,"length","()I",NULL,0,&length)
+      || !span_recipients(vm,text,0,length.i,"java/lang/Object",&spans)) return false;
+  bool remove=!strcmp(name,"removeComposingSpans");
+  for(uint32_t i=0;i<dvm_array_length(vm,spans);++i) {
+    union dvm_value key={.l=((dvm_ref *)dvm_array_data(vm,spans))[i]},flags={0};
+    if(!am_vcall(vm,text,"getSpanFlags","(Ljava/lang/Object;)I",&key,1,&flags)) return false;
+    if(key.l==marker || (remove && (flags.i&0x100))) {
+      if(!am_vcall(vm,text,"removeSpan","(Ljava/lang/Object;)V",&key,1,&ignored)) return false;
+    } else if(!remove) {
+      union dvm_value start={0},end={0};
+      if(!am_vcall(vm,text,"getSpanStart","(Ljava/lang/Object;)I",&key,1,&start)
+          || !am_vcall(vm,text,"getSpanEnd","(Ljava/lang/Object;)I",&key,1,&end)) return false;
+      union dvm_value span[]={key,start,end,{.i=(flags.i&~0x33)|0x121}};
+      if(!am_vcall(vm,text,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+    }
+  }
+  if(!remove) {
+    union dvm_value span[]={{.l=marker},{.i=0},length,{.i=0x121}};
+    if(!am_vcall(vm,text,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+  }
+  RETV();
+}
+static bool bic_close(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value ignored={0};
+  if(!am_vcall(vm,self,"finishComposingText","()Z",NULL,0,&ignored)) return false;
+  RETV();
+}
+static bool editor_info_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  rt_set_int(vm,self,"initialSelStart",-1); rt_set_int(vm,self,"initialSelEnd",-1);
+  RETV();
+}
+static const char *const rt_iface_input_connection[]={"Landroid/view/inputmethod/InputConnection;",NULL};
+static const struct rt_field rt_bic_fields[]={
+  {"mTargetView","Landroid/view/View;"},{"mFallbackMode","Z"},{"baseEditable","Landroid/text/Editable;"},F_END
+};
+static const struct rt_field rt_bic_sfields[]={{"COMPOSING","Ljava/lang/Object;"},F_END};
+static const struct rt_method rt_base_input_connection[]={
+  SM("<clinit>","()V",text_markers_init),
+  M("<init>","(Landroid/view/View;Z)V",bic_init),
+  M("getEditable","()Landroid/text/Editable;",bic_get_editable),
+  M("getTextBeforeCursor","(II)Ljava/lang/CharSequence;",bic_query),
+  M("getTextAfterCursor","(II)Ljava/lang/CharSequence;",bic_query),
+  M("getSelectedText","(I)Ljava/lang/CharSequence;",bic_query),
+  M("setSelection","(II)Z",bic_set_selection),
+  M("beginBatchEdit","()Z",ret_false),M("endBatchEdit","()Z",ret_false),
+  M("requestCursorUpdates","(I)Z",ret_false),
+  M("closeConnection","()V",bic_close),
+  SM("getComposingSpanStart","(Landroid/text/Spannable;)I",bic_composing),
+  SM("getComposingSpanEnd","(Landroid/text/Spannable;)I",bic_composing),
+  SM("removeComposingSpans","(Landroid/text/Spannable;)V",bic_composing),
+  SM("setComposingSpans","(Landroid/text/Spannable;)V",bic_composing),M_END
+};
+static const struct rt_field rt_editor_info_fields[]={
+  {"inputType","I"},{"imeOptions","I"},{"privateImeOptions","Ljava/lang/String;"},
+  {"actionLabel","Ljava/lang/CharSequence;"},{"actionId","I"},
+  {"initialSelStart","I"},{"initialSelEnd","I"},{"initialCapsMode","I"},
+  {"hintText","Ljava/lang/CharSequence;"},{"label","Ljava/lang/CharSequence;"},
+  {"packageName","Ljava/lang/String;"},{"fieldId","I"},{"fieldName","Ljava/lang/String;"},
+  {"extras","Landroid/os/Bundle;"},{"hintLocales","Landroid/os/LocaleList;"},
+  {"contentMimeTypes","[Ljava/lang/String;"},{"targetInputMethodUser","Landroid/os/UserHandle;"},F_END
+};
+static const struct rt_method rt_editor_info[]={M("<init>","()V",editor_info_init),M_END};
+static bool span_builder_edit(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  const char *sig=builtin_sig(),*method=builtin_name();
+  bool append=!strcmp(method,"append"),clear=!strcmp(method,"clear");
+  bool insert=!strcmp(method,"insert"),replace=!strcmp(method,"replace");
+  bool character=append && sig[1]=='C',with_span=strstr(sig,";Ljava/lang/Object;")!=NULL;
   /* Without spans or filters, this exact framework class has no callbacks to
    * dispatch. Repeated subtitle characters then need no Java allocations. */
   if(character && !strcmp(dvm_object_class(vm,self)->name,"android/text/SpannableStringBuilder")) {
@@ -533,7 +765,7 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
       RETL(self);
     }
   }
-  dvm_ref input=character ? 0 : args[0].l;
+  dvm_ref input=character ? 0 : append ? args[0].l : insert ? args[1].l : replace ? args[2].l : dvm_new_string(vm,"");
   if(character) {
     uint16_t unit=(uint16_t)args[0].i;
     char bytes[3];
@@ -546,19 +778,28 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
   }
   union dvm_value length= {0};
   if(!am_vcall(vm,input,"length","()I",NULL,0,&length)) return false;
-  int first=nargs==3 && !with_span ? args[1].i : 0,last=nargs==3 && !with_span ? args[2].i : length.i;
+  int first=0,last=length.i;
+  if(append && nargs==3 && !with_span) { first=args[1].i; last=args[2].i; }
+  else if(insert && nargs==4) { first=args[2].i; last=args[3].i; }
+  else if(replace && nargs==5) { first=args[3].i; last=args[4].i; }
   if(first<0 || last<first || last>length.i) {
-    dvm__throw(vm,"java/lang/IndexOutOfBoundsException","append range");
+    dvm__throw(vm,"java/lang/IndexOutOfBoundsException","Editable source range");
     return false;
   }
   struct span_builder_buffer *buffer=span_builder_buffer(vm,self);
   if(!buffer) return false;
-  int start=(int)buffer->length;
+  int start=append ? (int)buffer->length : clear ? 0 : args[0].i;
+  int end=append || insert ? start : clear ? (int)buffer->length : args[1].i;
+  if(start<0 || end<start || (size_t)end>buffer->length) {
+    dvm__throw(vm,"java/lang/IndexOutOfBoundsException","Editable range %d..%d length %zu",start,end,buffer->length);
+    return false;
+  }
+  int removed=end-start;
   union dvm_value filters= {0};
   dvm_get_field(vm,self,"filters","[Landroid/text/InputFilter;",&filters);
   for(uint32_t i=0; i<dvm_array_length(vm,filters.l); ++i) {
     dvm_ref filter=((dvm_ref *)dvm_array_data(vm,filters.l))[i];
-    union dvm_value fa[]= {{.l=input},{.i=first},{.i=last},{.l=self},{.i=start},{.i=start}},replacement= {0};
+    union dvm_value fa[]= {{.l=input},{.i=first},{.i=last},{.l=self},{.i=start},{.i=end}},replacement= {0};
     if(!am_vcall(vm,filter,"filter","(Ljava/lang/CharSequence;IILandroid/text/Spanned;II)Ljava/lang/CharSequence;",fa,6,&replacement)) return false;
     if(replacement.l) {
       input=replacement.l;
@@ -584,12 +825,17 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
   struct dvm_object *string=dvm__obj(vm,text);
   if(!string || !string_index(vm,string)) return false;
   size_t count=string->string_length;
+  dvm_ref selection_start=0,selection_end=0;
+  if(removed && count) {
+    selection_start=text_marker(vm,false,false); selection_end=text_marker(vm,false,true);
+    if(!selection_start || !selection_end) return false;
+  }
   dvm_ref *source_spans=NULL;
   int32_t *source_data=NULL,source_count=0;
   if(source) span_arrays(vm,source,&source_spans,&source_data,&source_count);
   bool adds_span=false;
   for(int i=0; i<source_count; ++i) if((source_data[i*3+2]&0x33)!=0x21 || source_data[i*3]!=source_data[i*3+1]) adds_span=true;
-  if(!count && !adds_span) {
+  if(!removed && !count && !adds_span) {
     if(with_span) {
       union dvm_value span[]= {{.l=args[1].l},{.i=start},{.i=start},args[2]},ignored= {0};
       if(!am_vcall(vm,self,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
@@ -597,15 +843,15 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
     RETL(self);
   }
   dvm_ref watchers=0;
-  if(!span_recipients(vm,self,start,start,"android/text/TextWatcher",&watchers)
-      || !span_text_notify(vm,self,watchers,0,start,(int)count)) return false;
+  if(!span_recipients(vm,self,start,end,"android/text/TextWatcher",&watchers)
+      || !span_text_notify(vm,self,watchers,0,start,removed,(int)count)) return false;
   buffer=span_builder_buffer(vm,self);
   if(!buffer) return false;
-  if((size_t)start>buffer->length) {
-    dvm__throw(vm,"java/lang/IndexOutOfBoundsException","append after watcher");
+  if((size_t)end>buffer->length) {
+    dvm__throw(vm,"java/lang/IndexOutOfBoundsException","Editable range after watcher");
     return false;
   }
-  if(count>(size_t)INT32_MAX-buffer->length) {
+  if(count>(size_t)INT32_MAX-(buffer->length-(size_t)removed)) {
     dvm__throw(vm,"java/lang/OutOfMemoryError","Editable length");
     return false;
   }
@@ -622,24 +868,60 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
     objects[i],data[i*3],data[i*3+1]
   };
   int notices_count=n;
-  if(!span_builder_reserve(vm,buffer,count)) {
+  if(!span_builder_reserve(vm,buffer,count>(size_t)removed ? count-(size_t)removed : 0)) {
     free(notices);
     return false;
   }
-  memmove(buffer->chars+start+count,buffer->chars+start,(buffer->length-(size_t)start)*sizeof *buffer->chars);
+  /* Removal notifications see the old text and old span coordinates. */
+  for(int i=0; removed && i<n; ++i) {
+    int oldstart=data[i*3],oldend=data[i*3+1],flags=data[i*3+2];
+    if((flags&0x33)!=0x21 || oldstart<start || oldend>end
+        || (count && oldstart==start && oldend==end)) continue;
+    dvm_ref what=objects[i];
+    memmove(objects+i,objects+i+1,(size_t)(n-i-1)*sizeof *objects);
+    memmove(data+i*3,data+(i+1)*3,(size_t)(n-i-1)*3*sizeof *data);
+    objects[--n]=0;
+    dvm_set_field(vm,self,"spanCount","I",(union dvm_value){.i=n});
+    for(int j=0; j<notices_count; ++j) if(notices[j].what==what) notices[j].what=0;
+    if(!span_notify(vm,self,what,oldstart,oldend,-1,-1)) { free(notices); return false; }
+    span_arrays(vm,self,&objects,&data,&n);
+    --i;
+  }
+  memmove(buffer->chars+start+count,buffer->chars+end,(buffer->length-(size_t)end)*sizeof *buffer->chars);
   if(string->string_units) memcpy(buffer->chars+start,string->string_units,count*sizeof *buffer->chars);
   else {
     const unsigned char *bytes=(const unsigned char *)dvm_string_utf8(vm,text);
     for(size_t i=0; i<count; ++i) buffer->chars[start+i]=bytes[i];
   }
-  bool at_end=(size_t)start==buffer->length;
-  buffer->length+=count;
+  bool at_end=(size_t)end==buffer->length;
+  /* Paragraph boundaries consumed by the replacement advance to the next
+   * old paragraph end. Compute these while the old tail is still available
+   * below through the shifted buffer. */
+  buffer->length=buffer->length-(size_t)removed+count;
   buffer->dirty=true;
-  for(int i=0; i<n; ++i) for(int k=0; k<2; ++k) {
-      int flag=k ? data[i*3+2]&15 : (data[i*3+2]>>4)&15;
-      int *position=&data[i*3+k];
-      if(*position>start || (*position==start && (flag==2 || (flag==3 && at_end)))) *position+=(int)count;
+  int delta=(int)count-removed;
+  for(int i=0; i<n; ++i) {
+    int flags=data[i*3+2];
+    for(int k=0; k<2; ++k) {
+      int flag=k ? flags&15 : (flags>>4)&15;
+      int *position=&data[i*3+k],old=*position;
+      if(removed && count && old>start && old<end
+          && (objects[i]==selection_start || objects[i]==selection_end))
+        *position=start+(int)((int64_t)(old-start)*(int64_t)count/removed);
+      else if(old>end) *position=old+delta;
+      else if(!removed) {
+        if(old==start && (flag==2 || (flag==3 && at_end))) *position=old+(int)count;
+      } else if(old>=start) {
+        if(flag==3 && old>start) {
+          int next=start+(int)count;
+          while((size_t)next<buffer->length && (next==start+(int)count || buffer->chars[next-1]!='\n')) ++next;
+          *position=next;
+        } else if(flag==2) *position=old==start && count ? start : start+(int)count;
+        else *position=old==end && count ? start+(int)count : start;
+      }
     }
+  }
+  dvm_set_field(vm,self,"spanCount","I",(union dvm_value){.i=n});
   bool good=true;
   for(int i=0; good && i<source_count; ++i) {
     span_arrays(vm,self,&objects,&data,&n);
@@ -659,15 +941,16 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
       source_spans[i],-1,-1
     };
   }
-  if(good) good=span_text_notify(vm,self,watchers,1,start,(int)count)
-                  && span_text_notify(vm,self,watchers,2,start,(int)count);
+  if(good) good=span_text_notify(vm,self,watchers,1,start,removed,(int)count)
+                  && span_text_notify(vm,self,watchers,2,start,removed,(int)count);
   for(int i=0; good && i<notices_count; ++i) {
+    if(!notices[i].what) continue;
     span_arrays(vm,self,&objects,&data,&n);
-    for(int j=0; j<n; ++j) if(objects[j]==notices[i].what) {
-        if(data[j*3]!=notices[i].start || data[j*3+1]!=notices[i].end)
-          good=span_notify(vm,self,objects[j],notices[i].start,notices[i].end,data[j*3],data[j*3+1]);
-        break;
-      }
+    int found=-1;
+    for(int j=0; j<n; ++j) if(objects[j]==notices[i].what) { found=j; break; }
+    int nextstart=found<0 ? -1 : data[found*3],nextend=found<0 ? -1 : data[found*3+1];
+    if(nextstart!=notices[i].start || nextend!=notices[i].end)
+      good=span_notify(vm,self,notices[i].what,notices[i].start,notices[i].end,nextstart,nextend);
   }
   free(notices);
   if(!good) return false;
@@ -675,17 +958,27 @@ static bool span_builder_append(struct dvm *vm,dvm_ref self,const union dvm_valu
     union dvm_value span[]= {{.l=args[1].l},{.i=start},{.i=(int)buffer->length},args[2]},ignored= {0};
     if(!am_vcall(vm,self,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
   }
+  if(clear) RETV();
   RETL(self);
 }
+#define SPAN_EDIT_METHODS(result) \
+ M("insert","(ILjava/lang/CharSequence;)" result,span_builder_edit), \
+ M("insert","(ILjava/lang/CharSequence;II)" result,span_builder_edit), \
+ M("delete","(II)" result,span_builder_edit), \
+ M("replace","(IILjava/lang/CharSequence;)" result,span_builder_edit), \
+ M("replace","(IILjava/lang/CharSequence;II)" result,span_builder_edit)
 #define SPAN_APPEND_METHODS(result) \
- M("append","(C)" result,span_builder_append), \
- M("append","(Ljava/lang/CharSequence;)" result,span_builder_append), \
- M("append","(Ljava/lang/CharSequence;II)" result,span_builder_append)
+ M("append","(C)" result,span_builder_edit), \
+ M("append","(Ljava/lang/CharSequence;)" result,span_builder_edit), \
+ M("append","(Ljava/lang/CharSequence;II)" result,span_builder_edit)
 #define SPAN_BUILDER_METHODS \
+ SPAN_EDIT_METHODS("Landroid/text/SpannableStringBuilder;"), \
+ SPAN_EDIT_METHODS("Landroid/text/Editable;"), \
+ M("clear","()V",span_builder_edit), \
  SPAN_APPEND_METHODS("Landroid/text/SpannableStringBuilder;"), \
  SPAN_APPEND_METHODS("Landroid/text/Editable;"), \
  SPAN_APPEND_METHODS("Ljava/lang/Appendable;"), \
- M("append","(Ljava/lang/CharSequence;Ljava/lang/Object;I)Landroid/text/SpannableStringBuilder;",span_builder_append), \
+ M("append","(Ljava/lang/CharSequence;Ljava/lang/Object;I)Landroid/text/SpannableStringBuilder;",span_builder_edit), \
  M("setFilters","([Landroid/text/InputFilter;)V",span_builder_filters), \
  M("getFilters","()[Landroid/text/InputFilter;",span_builder_filters), \
  M("getTextWatcherDepth","()I",span_builder_depth)
@@ -710,6 +1003,7 @@ static const struct rt_method rt_spannable[]= {
   SPANNABLE_METHODS,M_END
 };
 static const struct rt_method rt_spannable_builder[]= {SPANNABLE_METHODS,SPAN_BUILDER_METHODS,M_END};
+#undef SPAN_EDIT_METHODS
 #undef SPAN_BUILDER_METHODS
 #undef SPAN_APPEND_METHODS
 #undef SPANNABLE_METHODS
@@ -3064,6 +3358,7 @@ static bool text_set_input_type(struct dvm *vm, dvm_ref self,
     .i = !multiline
   });
   (void)out;
+  if(!ime_editor_changed(vm,self)) return false;
   RETV();
 }
 TEXT_SET_INT(text_set_ime_options, "imeOptions")
@@ -3239,6 +3534,10 @@ static bool text_set_single_line(struct dvm *vm, dvm_ref self,
   (void)out;
   union dvm_value v = { .i = nargs > 0 ? ARG(0).i : 1 };
   (void)dvm_set_field(vm, self, "singleLine", "Z", v);
+  int type=rt_get_int(vm,self,"inputType");
+  if((type&15)==1) rt_set_int(vm,self,"inputType",v.i ? type&~0x20000 : type|0x20000);
+  rt_set_int(vm,self,"maxLines",v.i ? 1 : INT32_MAX);
+  if(!ime_editor_changed(vm,self)) return false;
   RETV();
 }
 
@@ -4374,6 +4673,50 @@ static const struct rt_method rt_data_set_observable[] = {
   M("notifyInvalidated", "()V", dso_notify),
   M_END,
 };
+/* ContentObservable iterates forwards while holding the list monitor.
+ * dispatchChange filters self notifications; legacy notifyChange does not. */
+static bool content_observable_notify(struct dvm *vm,dvm_ref self,
+                                      const union dvm_value *args,int nargs,
+                                      union dvm_value *out)
+{
+  bool legacy=!strcmp(builtin_name(),"notifyChange");
+  dvm_ref list=observable_list(vm,self);
+  if(!list || !dvm__monitor_enter(vm,list)) return false;
+  struct rt_list *entries=list_of(vm,list);
+  uint32_t expected=entries ? entries->mod_count : 0;
+  bool good=true;
+  for(uint32_t i=0;good;++i) {
+    entries=list_of(vm,list);
+    if(!entries || i==entries->size) break;
+    if(entries->mod_count!=expected) {
+      dvm__throw(vm,"java/util/ConcurrentModificationException","ContentObservable observers");
+      good=false;
+      break;
+    }
+    union dvm_value observer={.l=entries->items[i]},wants={0},ignored={0};
+    bool deliver=true;
+    if(!legacy && ARG(0).i) {
+      good=am_vcall(vm,observer.l,"deliverSelfNotifications","()Z",NULL,0,&wants);
+      deliver=wants.i!=0;
+    }
+    if(good && deliver) {
+      union dvm_value values[]={ARG(0),{.l=nargs>1 ? ARG(1).l : 0}};
+      good=am_vcall(vm,observer.l,legacy ? "onChange" : "dispatchChange",
+                    "(ZLandroid/net/Uri;)V",values,2,&ignored);
+    }
+  }
+  dvm__monitor_exit(vm,list);
+  if(!good) return false;
+  RETV();
+}
+static const struct rt_method rt_content_observable[] = {
+  M("<init>","()V",observable_init),
+  M("registerObserver","(Landroid/database/ContentObserver;)V",observable_mutate),
+  M("dispatchChange","(Z)V",content_observable_notify),
+  M("dispatchChange","(ZLandroid/net/Uri;)V",content_observable_notify),
+  M("notifyChange","(Z)V",content_observable_notify), M_END
+};
+
 static const struct rt_method rt_data_set_observer[] = {
   M("<init>", "()V", empty_void),
   M("onChanged", "()V", empty_void),
@@ -5454,7 +5797,8 @@ static bool res_get_drawable(struct dvm *vm, dvm_ref self,
   }
   struct dvm_class *c = dvm__class_by_desc(vm, cls);
   if (!c) c = dvm__class_by_desc(vm, "Landroid/graphics/drawable/Drawable;");
-  if (!strcmp(cls, "Landroid/graphics/drawable/BitmapDrawable;")) {
+  if (!strcmp(cls, "Landroid/graphics/drawable/BitmapDrawable;") ||
+      !strcmp(cls, "Landroid/graphics/drawable/NinePatchDrawable;")) {
     struct dvm_class *factory = dvm_find_class(vm, "android/graphics/BitmapFactory");
     struct dvm_method *decode = dvm_find_method(vm, factory, "decodeResource",
                                 "(Landroid/content/res/Resources;I)Landroid/graphics/Bitmap;");
@@ -5466,13 +5810,24 @@ static bool res_get_drawable(struct dvm *vm, dvm_ref self,
       return false;
     }
     dvm_pin(vm, bitmap.l);
+    union dvm_value chunk={0};
+    if(!am_vcall(vm,bitmap.l,"getNinePatchChunk","()[B",NULL,0,&chunk)) {
+      dvm_unpin(vm,bitmap.l);
+      return false;
+    }
+    const char *kind=chunk.l ? "android/graphics/drawable/NinePatchDrawable" :
+                               "android/graphics/drawable/BitmapDrawable";
+    c=dvm_find_class(vm,kind);
     dvm_ref drawable = c ? dvm_new_object(vm, c) : 0;
     if (drawable) {
       dvm_pin(vm, drawable);
-      struct dvm_method *init = dvm_find_method(vm, c, "<init>",
-                                "(Landroid/content/res/Resources;Landroid/graphics/Bitmap;)V");
-      union dvm_value constructor[] = {{.l = self}, bitmap}, ignored = {0};
-      bool initialized = init && dvm_call(vm, init, drawable, constructor, 2, &ignored);
+      const char *signature=chunk.l ?
+        "(Landroid/content/res/Resources;Landroid/graphics/Bitmap;[BLandroid/graphics/Rect;Ljava/lang/String;)V" :
+        "(Landroid/content/res/Resources;Landroid/graphics/Bitmap;)V";
+      struct dvm_method *init = dvm_find_method(vm, c, "<init>",signature);
+      union dvm_value constructor[] = {{.l = self}, bitmap,chunk,{0},
+        {.l=path ? dvm_new_string(vm,path) : 0}}, ignored = {0};
+      bool initialized = init && dvm_call(vm, init, drawable, constructor, chunk.l ? 5 : 2, &ignored);
       dvm_unpin(vm, drawable);
       dvm_unpin(vm, bitmap.l);
       if (!initialized) return false;
@@ -12064,7 +12419,8 @@ static dvm_ref dx_build(struct dvm *vm, struct dx *x, const struct dx_tag *t,
     return 0;
   }
   if (!strcmp(t->name,"vector")) return dx_vector(vm,x,t);
-  if (!strcmp(t->name, "bitmap")) {
+  if (!strcmp(t->name, "bitmap") || !strcmp(t->name,"nine-patch")) {
+    const bool patch_xml=!strcmp(t->name,"nine-patch");
     /* The XML is a BitmapDrawable specification, not image bytes. Decode
      * its src with the resource decoder so source density is preserved. */
     uint8_t type = 0;
@@ -12086,14 +12442,29 @@ static dvm_ref dx_build(struct dvm *vm, struct dx *x, const struct dx_tag *t,
     dvm_ref drawable = 0;
     if (good && bitmap.l) {
       dvm_pin(vm, bitmap.l);
-      drawable = dx_new(vm, "Landroid/graphics/drawable/BitmapDrawable;");
+      union dvm_value chunk={0};
+      if(patch_xml) {
+        good=am_vcall(vm,bitmap.l,"getNinePatchChunk","()[B",NULL,0,&chunk);
+        if(good && !chunk.l) {
+          dvm__throw(vm,"org/xmlpull/v1/XmlPullParserException",
+                     "<nine-patch> requires a valid nine-patch source");
+          good=false;
+        }
+      }
+      drawable = good ? dx_new(vm,patch_xml ? "Landroid/graphics/drawable/NinePatchDrawable;" :
+                                        "Landroid/graphics/drawable/BitmapDrawable;") : 0;
       if (drawable) {
         dvm_pin(vm, drawable);
-        union dvm_value ctor[] = {{.l = resources}, bitmap}, ignored = {0};
-        good = am_vcall(vm, drawable, "<init>",
+        union dvm_value ctor[] = {{.l = resources}, bitmap,chunk,{0},{0}}, ignored = {0};
+        good = am_vcall(vm, drawable, "<init>",patch_xml ?
+                        "(Landroid/content/res/Resources;Landroid/graphics/Bitmap;[BLandroid/graphics/Rect;Ljava/lang/String;)V" :
                         "(Landroid/content/res/Resources;Landroid/graphics/Bitmap;)V",
-                        ctor, 2, &ignored);
-        if (good) {
+                        ctor, patch_xml ? 5 : 2, &ignored);
+        if(good && patch_xml) {
+          union dvm_value dither={.i=dx_int(x,t,"dither",0)};
+          good=am_vcall(vm,drawable,"setDither","(Z)V",&dither,1,&ignored);
+        }
+        if (good && !patch_xml) {
           union dvm_value gravity= {.i=dx_int(x,t,"gravity",0x77)};
           good=am_vcall(vm,drawable,"setGravity","(I)V",&gravity,1,&ignored);
           const char *names[]= {"antialias","filter","dither"};
@@ -14600,11 +14971,38 @@ static void ui_emit_drawables(struct dvm *vm, struct ui_buf *css, dvm_ref view,
     const int32_t st = ui_int(vm, view, "scaleType");
     const char *pos = st == 3 || st == 1 ? "left top"
                       : st == 5 ? "right bottom" : "center";
-    ui_printf(css, "background-image:url('%s');background-size:%s;"
-                   "background-repeat:no-repeat;background-position:%s;",
-              src, fills[(unsigned)st < 9 ? st : 0], pos);
     int32_t iw = 0, ih = 0;
-    if (ui_png_size(src, &iw, &ih)) {
+    const bool sized = ui_png_size(src, &iw, &ih);
+    if (sized && st == 1) {
+      /* MATRIX draws the image at its own size through the view's imageMatrix,
+       * which the renderer cannot know: an app that centres a logo with
+       * Matrix.setRectToRect, or scales it, would see it at the top left at
+       * natural size.  When the matrix is a scale and a translation (a
+       * rotation or skew has no background-size form), say where the image
+       * lands. */
+      float sx = 1, sy = 1, tx = 0, ty = 0;
+      dvm_ref matrix = ui_obj(vm, view, "imageMatrix", "Landroid/graphics/Matrix;");
+      union dvm_value values = { 0 };
+      if (matrix && dvm_get_field(vm, matrix, "values", "[F", &values) && values.l &&
+          dvm_array_length(vm, values.l) >= 9) {
+        const float *f = dvm_array_data(vm, values.l);
+        if (f[1] == 0 && f[3] == 0 && f[6] == 0 && f[7] == 0 && f[8] == 1 &&
+            f[0] > 0 && f[4] > 0 && isfinite(f[0]) && isfinite(f[4]) &&
+            isfinite(f[2]) && isfinite(f[5])) {
+          sx = f[0];
+          sy = f[4];
+          tx = f[2];
+          ty = f[5];
+        }
+      }
+      ui_printf(css, "background-image:url('%s');background-size:%.2fpx %.2fpx;"
+                     "background-repeat:no-repeat;background-position:%.2fpx %.2fpx;",
+                src, (double)(iw * sx), (double)(ih * sy), (double)tx, (double)ty);
+    } else
+      ui_printf(css, "background-image:url('%s');background-size:%s;"
+                     "background-repeat:no-repeat;background-position:%s;",
+                src, fills[(unsigned)st < 9 ? st : 0], pos);
+    if (sized) {
       if (lw != -1 && lw <= 0) ui_printf(css, "width:%dpx;", iw);
       if (lh != -1 && lh <= 0) ui_printf(css, "height:%dpx;", ih);
       return;
