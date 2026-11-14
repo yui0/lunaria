@@ -1890,20 +1890,109 @@ static bool date_default_instance(struct dvm *vm,dvm_ref self,const union dvm_va
 }
 static bool am_vcall(struct dvm *, dvm_ref, const char *, const char *,
                      const union dvm_value *, int, union dvm_value *);
+static const char *rt_charseq_utf8(struct dvm *vm, dvm_ref cs);
+/* The locale of a Context's Configuration, else the default one. */
+static bool android_context_locale(struct dvm *vm,dvm_ref context,union dvm_value *locale)
+{
+  if (!context) {
+    dvm__throw(vm,"java/lang/NullPointerException","context");
+    return false;
+  }
+  union dvm_value resources= {0},configuration= {0};
+  *locale=(union dvm_value) {0};
+  if (!am_vcall(vm,context,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources) ||
+      !am_vcall(vm,resources.l,"getConfiguration","()Landroid/content/res/Configuration;",NULL,0,&configuration)) return false;
+  dvm_get_field(vm,configuration.l,"locale","Ljava/util/Locale;",locale);
+  return locale->l || loc_getDefault(vm,0,NULL,0,locale);
+}
+/* DateFormat.format(pattern, time): android.text.format.DateFormat's pattern
+ * letters are SimpleDateFormat's (a h H k K m s y M L d E c z Z, 'quotes'), so the
+ * pattern is run through one, in the default locale as the platform does. */
+/* Formats `millis` with a SimpleDateFormat pattern in the default locale. */
+static bool android_format_millis(struct dvm *vm,const char *pattern,int64_t millis,union dvm_value *out)
+{
+  union dvm_value date= {0},locale= {0};
+  dvm_ref d=dvm_new_object(vm,dvm_find_class(vm,"java/util/Date"));
+  if (!d) return false;
+  dvm_pin(vm,d);
+  union dvm_value ms= {.j=millis},ignored= {0};
+  const bool made=am_vcall(vm,d,"<init>","(J)V",&ms,1,&ignored);
+  dvm_unpin(vm,d);
+  if (!made) return false;
+  date.l=d;
+  dvm_pin(vm,d);
+  bool ok=loc_getDefault(vm,0,NULL,0,&locale);
+  dvm_ref format=ok ? dvm_new_object(vm,dvm_find_class(vm,"java/text/SimpleDateFormat")) : 0;
+  if (format) dvm_pin(vm,format);
+  union dvm_value init[]= {{.l=format ? dvm_new_string(vm,pattern) : 0},locale};
+  ok=format && init[0].l && sdf_init(vm,format,init,2,&ignored);
+  union dvm_value text= {0};
+  if (ok) ok=am_vcall(vm,format,"format","(Ljava/util/Date;)Ljava/lang/String;",&date,1,&text);
+  if (format) dvm_unpin(vm,format);
+  dvm_unpin(vm,d);
+  if (!ok) return false;
+  out->l=text.l;
+  return true;
+}
+/* DateFormat.format(pattern, time): android.text.format.DateFormat's pattern
+ * letters are SimpleDateFormat's (a h H k K m s y M L d E c z Z, 'quotes'), so the
+ * pattern is run through one, in the default locale as the platform does. */
+static bool android_date_format_text(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                     int nargs,union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  const char *pattern=ARG(0).l ? rt_charseq_utf8(vm,ARG(0).l) : NULL;
+  const char *sig=builtin_sig();
+  const bool millis=strstr(sig,";J)")!=NULL;
+  if (!pattern || (!millis && !ARG(1).l)) {
+    dvm__throw(vm,"java/lang/NullPointerException",pattern ? "inDate" : "inFormat");
+    return false;
+  }
+  if (millis) return android_format_millis(vm,pattern,ARG(1).j,out);
+  union dvm_value date=ARG(1),ms= {0};
+  if (strstr(sig,"Calendar;)") && !am_vcall(vm,ARG(1).l,"getTime","()Ljava/util/Date;",NULL,0,&date)) return false;
+  if (!am_vcall(vm,date.l,"getTime","()J",NULL,0,&ms)) return false;
+  return android_format_millis(vm,pattern,ms.j,out);
+}
+/* is24HourFormat(): the "time_12_24" setting, else what the locale's own short
+ * time pattern uses (H or k for a 24-hour clock). */
+static bool android_is_24_hour(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                               int nargs,union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  union dvm_value locale= {0},time_format= {0};
+  if (!android_context_locale(vm,ARG(0).l,&locale)) return false;
+  const int style=3;
+  if (!date_time_instance_impl(vm,-1,style,locale.l,&time_format)) return false;
+  union dvm_value pattern= {0};
+  if (!am_vcall(vm,time_format.l,"toPattern","()Ljava/lang/String;",NULL,0,&pattern)) return false;
+  const char *p=pattern.l ? dvm_string_utf8(vm,pattern.l) : NULL;
+  bool in_quote=false,h24=false;
+  for (; p && *p; ++p) {
+    if (*p=='\'') in_quote=!in_quote;
+    else if (!in_quote && (*p=='H' || *p=='k')) h24=true;
+  }
+  RETI(h24);
+}
+/* getTimeFormat(Context): the locale's short time pattern. */
+static bool android_clock_format(struct dvm *vm,dvm_ref self,const union dvm_value *args,
+                                 int nargs,union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  union dvm_value locale= {0};
+  if (!android_context_locale(vm,ARG(0).l,&locale)) return false;
+  return date_time_instance_impl(vm,-1,3,locale.l,out);
+}
 static bool android_date_instance(struct dvm *vm,dvm_ref self,const union dvm_value *args,
                                   int nargs,union dvm_value *out)
 {
   (void)self;
   (void)nargs;
-  if (!ARG(0).l) {
-    dvm__throw(vm,"java/lang/NullPointerException","context");
-    return false;
-  }
-  union dvm_value resources= {0},configuration= {0},locale= {0};
-  if (!am_vcall(vm,ARG(0).l,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources) ||
-      !am_vcall(vm,resources.l,"getConfiguration","()Landroid/content/res/Configuration;",NULL,0,&configuration)) return false;
-  dvm_get_field(vm,configuration.l,"locale","Ljava/util/Locale;",&locale);
-  if (!locale.l && !loc_getDefault(vm,0,NULL,0,&locale)) return false;
+  union dvm_value locale= {0};
+  if (!android_context_locale(vm,ARG(0).l,&locale)) return false;
   const char *name=builtin_name();
   union dvm_value factory[]= {{.i=strstr(name,"Medium") ? 2 : strstr(name,"Long") ? 1 : 3},locale};
   return date_instance(vm,0,factory,2,out);
@@ -1918,7 +2007,13 @@ static bool sdf_toPattern(struct dvm *vm,dvm_ref self,const union dvm_value *arg
 static const struct rt_method rt_android_date_format[]= {
   SM("getDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),
   SM("getMediumDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),
-  SM("getLongDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),M_END,
+  SM("getLongDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),
+  SM("getTimeFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_clock_format),
+  SM("is24HourFormat","(Landroid/content/Context;)Z",android_is_24_hour),
+  SM("format","(Ljava/lang/CharSequence;J)Ljava/lang/CharSequence;",android_date_format_text),
+  SM("format","(Ljava/lang/CharSequence;Ljava/util/Date;)Ljava/lang/CharSequence;",android_date_format_text),
+  SM("format","(Ljava/lang/CharSequence;Ljava/util/Calendar;)Ljava/lang/CharSequence;",android_date_format_text),
+  M_END,
 };
 
 static const struct rt_field rt_time_fields[] = {

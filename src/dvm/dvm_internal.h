@@ -801,6 +801,7 @@ extern const struct dvm_sqlite_method dvm_sqlite_open_params_builder_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_open_params_fields[];
 extern const struct dvm_sqlite_method dvm_sqlite_program_methods[];
 extern const struct dvm_sqlite_method dvm_sqlite_statement_methods[];
+extern const struct dvm_sqlite_method dvm_sqlite_query_cursor_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_program_fields[];
 extern const struct dvm_sqlite_method dvm_sqlite_helper_methods[];
 extern const struct dvm_sqlite_field  dvm_sqlite_helper_fields[];

@@ -467,7 +467,8 @@ enum {
 /* Raises the input method over `initial`, with the Android input type the
  * field asked for (TYPE_* bits — the password variation is honoured) and the
  * field's own single/multi-line setting. */
-void luna_ime_show(const char *initial, int input_type, bool multiline);
+/* `direct`: the field is visible Android UI that takes the typing itself; no panel is drawn. */
+void luna_ime_show(const char *initial, int input_type, bool multiline, bool direct);
 void luna_ime_hide(void);
 bool luna_ime_active(void);
 

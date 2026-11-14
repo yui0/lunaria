@@ -20299,6 +20299,8 @@ static void arsc_index_names(const uint8_t *b, size_t n, ArscNames &index) {
           const auto &type = types[type_id - 1];
           const auto &name = keys[key_index];
           index.ids.emplace(type + "/" + name, id);
+          /* The framework's own names are also kept apart: "android:type/name". */
+          if ((pkg_id & 0xffu) == 1) index.ids.emplace("android:" + type + "/" + name, id);
           index.names.emplace(id, std::make_pair(type, name));
         }
       }
@@ -20329,6 +20331,14 @@ static uint32_t arsc_identifier(const char *type, const char *name) {
 
 extern "C" uint32_t arm_exec_apk_resource_id(const char *type, const char *name) {
   return arsc_identifier(type, name);
+}
+
+/* A resource of the "android" package (framework-res), by type and entry name. */
+extern "C" uint32_t arm_exec_framework_resource_id(const char *type, const char *name) {
+  if (!type || !name) return 0;
+  const auto &ids = arsc_names().ids;
+  auto it = ids.find(std::string("android:") + type + "/" + name);
+  return it == ids.end() ? 0 : it->second;
 }
 
 extern "C" int arm_exec_apk_resource_name(uint32_t id, char *type, size_t type_cap,
@@ -24068,6 +24078,21 @@ extern "C" void arm_exec_audio_service(void);
 extern "C" void arm_exec_audio_service(void) {
   if (!g_ctx || !luna_at_active()) return;
   drive_opensles_callbacks(*g_ctx);
+}
+
+extern "C" int arm_exec_asset_open_fd(const char *name,int64_t *start,int64_t *length) {
+  if (!name || !*name) {errno=ENOENT;return -1;}
+  GuestAsset asset;
+  if (aasset_resolve_host(name,asset.host_path,asset.length,nullptr))
+    return aasset_open_file_descriptor(asset,start,length);
+  int64_t span_length=0;
+  if (!asset_bridge::apk_entry_stored_span(name,asset.fd_path,asset.fd_offset,span_length) &&
+      !aasset_stored_span(name,asset.fd_path,asset.fd_offset,span_length)) {
+    errno=ENOENT;
+    return -1;
+  }
+  asset.length=(uint64_t)span_length;
+  return aasset_open_file_descriptor(asset,start,length);
 }
 
 extern "C" unsigned char *arm_exec_asset_read(const char *name, size_t *len) {

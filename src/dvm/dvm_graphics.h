@@ -100,6 +100,16 @@ static struct rt_bitmap *bitmap_of(struct dvm *vm, dvm_ref b)
   return bm;
 }
 
+static bool surface_capture_refresh(struct dvm *vm,dvm_ref ref)
+{
+  struct dvm_object *obj=ref ? dvm__obj(vm,ref) : NULL;
+  struct rt_bitmap *bm=obj ? obj->data : NULL;
+  if (!bm || !bm->native_sink) return false;
+  unsigned previous=bm->gen;
+  (void)bitmap_of(vm,ref);
+  return bm->gen!=previous;
+}
+
 /* The density of the screen the emulator presents: the same number
  * AConfiguration, DisplayMetrics and the property table report, so dp and px
  * mean one thing wherever an app asks. */
@@ -156,13 +166,13 @@ static void surface_image_pull(void *sink,const char *key,int64_t present_ns)
   int w=0,h=0;
   if(lm_sink_take_at(sink,present_ns,&rgba,&w,&h)) (void)luna_overlay_image_rgba(key,w,h,rgba);
 }
-static bool surface_refresh_bitmap(struct dvm *vm, dvm_ref surface)
+static bool surface_refresh_bitmap_mode(struct dvm *vm, dvm_ref surface,bool direct)
 {
   struct lm_sink *sink = surface_sink(vm, surface);
   dvm_ref existing=ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;");
   struct dvm_object *existing_object=existing ? dvm__obj(vm,existing) : NULL;
   struct rt_bitmap *existing_bitmap=existing_object ? existing_object->data : NULL;
-  if(sink && existing_bitmap && existing_bitmap->native_sink==sink) return false;
+  if(direct && sink && existing_bitmap && existing_bitmap->native_sink==sink) return false;
   const uint8_t *rgba = NULL;
   int w = 0, h = 0;
   struct timespec now;
@@ -213,15 +223,21 @@ static bool surface_refresh_bitmap(struct dvm *vm, dvm_ref surface)
     bm->surface_frame = true;
     /* Ownership of subsequent acquisitions moves to the compositor. CPU
      * readers mirror its front lazily; a new video frame needs no traversal. */
-    lm_sink_ref(sink);
-    if(luna_overlay_image_source(bm->overlay_key,sink,surface_image_pull,surface_image_release)) {
-      lm_sink_free(bm->native_sink);
+    if (direct) {
       lm_sink_ref(sink);
-      bm->native_sink=sink;
-      (void)lm_sink_snapshot_argb(sink,&bm->native_serial,&bm->px,&bm->w,&bm->h);
-    } else lm_sink_free(sink);
+      if(luna_overlay_image_source(bm->overlay_key,sink,surface_image_pull,surface_image_release)) {
+        lm_sink_free(bm->native_sink);
+        lm_sink_ref(sink);
+        bm->native_sink=sink;
+        (void)lm_sink_snapshot_argb(sink,&bm->native_serial,&bm->px,&bm->w,&bm->h);
+      } else lm_sink_free(sink);
+    }
   }
   return true;
+}
+static bool surface_refresh_bitmap(struct dvm *vm,dvm_ref surface)
+{
+  return surface_refresh_bitmap_mode(vm,surface,true);
 }
 
 static bool bitmap_live(struct dvm *vm, struct rt_bitmap *bm)
@@ -299,6 +315,61 @@ static dvm_ref bitmap_scaled(struct dvm *vm, struct rt_bitmap *src,
     }
   dst->density = src->density;
   return r;
+}
+
+static bool texture_view_get_bitmap(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  dvm_ref target=nargs==1 ? ARG(0).l : 0;
+  if (nargs==1 && !target) RETL(0);
+  dvm_ref texture=ui_obj(vm,self,"surfaceTexture","Landroid/graphics/SurfaceTexture;");
+  int width=nargs==2 ? ARG(0).i : view_span(vm,self,false);
+  int height=nargs==2 ? ARG(1).i : view_span(vm,self,true);
+  if (!texture || width<=0 || height<=0) RETL(target);
+  if (target) {
+    struct rt_bitmap *bm=bitmap_of(vm,target);
+    if (!bm || bm->recycled || !bm->is_mutable) {
+      dvm__throw(vm,"java/lang/IllegalArgumentException","TextureView bitmap must be mutable and not recycled");
+      return false;
+    }
+    width=bm->w;
+    height=bm->h;
+  } else {
+    target=bitmap_new(vm,width,height);
+    if (!target) return false;
+    bitmap_of(vm,target)->is_mutable=true;
+  }
+  dvm_pin(vm,target);
+  if (!texture_view_prepare(vm,self,true)) {
+    dvm_unpin(vm,target);
+    return false;
+  }
+  dvm_ref surface=ui_obj(vm,self,"textureSurface","Landroid/view/Surface;");
+  dvm_ref source=ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;");
+  (void)surface_capture_refresh(vm,source);
+  bool good=true;
+  if (source) {
+    dvm_ref canvas=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Canvas"));
+    dvm_pin(vm,canvas);
+    union dvm_value arg={.l=target},ignored={0};
+    good=canvas && am_vcall(vm,canvas,"<init>","(Landroid/graphics/Bitmap;)V",&arg,1,&ignored);
+    int vw=view_span(vm,self,false),vh=view_span(vm,self,true);
+    union dvm_value scale[]={{.f=(float)width/vw},{.f=(float)height/vh}};
+    if (good) good=am_vcall(vm,canvas,"scale","(FF)V",scale,2,&ignored);
+    dvm_ref matrix=ui_obj(vm,self,"textureTransform","Landroid/graphics/Matrix;");
+    arg.l=matrix;
+    if (good && matrix) good=am_vcall(vm,canvas,"concat","(Landroid/graphics/Matrix;)V",&arg,1,&ignored);
+    dvm_ref rect=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Rect"));
+    rt_set_int(vm,rect,"right",vw);
+    rt_set_int(vm,rect,"bottom",vh);
+    union dvm_value draw[]={{.l=source},{0},{.l=rect},{0}};
+    if (good) good=am_vcall(vm,canvas,"drawBitmap",
+        "(Landroid/graphics/Bitmap;Landroid/graphics/Rect;Landroid/graphics/Rect;Landroid/graphics/Paint;)V",draw,4,&ignored);
+    dvm_unpin(vm,canvas);
+  }
+  dvm_unpin(vm,target);
+  if (!good) return false;
+  RETL(target);
 }
 
 /* Dependency-free WebP support belongs to the BitmapFactory decoder. */
@@ -1542,6 +1613,7 @@ static const struct rt_method rt_matrix[] = {
 struct canvas_clip {
   float inverse[9], rect[4];
   unsigned char *mask;
+  uint64_t mask_key[2];
   int mask_width,mask_height,mask_x,mask_y; /* mask covers [mask_x,+mask_width) x [mask_y,+mask_height) */
   float bounds[4]; /* conservative device bounds for finite affine maps */
   int operation; /* Region.Op: difference, intersect, union, xor, reverse difference, replace */
@@ -2498,6 +2570,8 @@ struct mask_cache_entry {
   unsigned char *pixels;
   size_t bytes;
   uint64_t used;
+  int extent[4];
+  bool extent_valid;
 };
 #define MASK_CACHE_ENTRIES 96
 #define MASK_CACHE_BYTES (32u<<20)
@@ -2516,10 +2590,22 @@ static void mask_hash(uint64_t h[2],const void *data,size_t n)
   }
 }
 
+static void canvas_mask_extent(const unsigned char *pixels,int w,int h,int extent[4])
+{
+  extent[0]=w;extent[1]=h;extent[2]=extent[3]=0;
+  for (int y=0;y<h;++y) for (int x=0;x<w;++x) {
+    if (!pixels[4*((size_t)y*w+x)+3]) continue;
+    if (x<extent[0]) extent[0]=x;
+    if (y<extent[1]) extent[1]=y;
+    if (x+1>extent[2]) extent[2]=x+1;
+    if (y+1>extent[3]) extent[3]=y+1;
+  }
+}
+
 /* Like luna_path_mask(); *cached tells the caller whether the result is the
  * cache's (do not free) or its own. */
 static unsigned char *canvas_mask_cached(const luna_path *path,int w,int h,const float matrix[9],
-    int style,float stroke,int cap,int join,float miter,bool aa,bool *cached)
+    int style,float stroke,int cap,int join,float miter,bool aa,bool *cached,uint64_t out_key[2],int extent[4])
 {
   uint64_t key[2]= {UINT64_C(14695981039346656037),UINT64_C(0x1234567)};
   const int params[]= {w,h,style,cap,join,aa,path->fill};
@@ -2532,6 +2618,7 @@ static unsigned char *canvas_mask_cached(const luna_path *path,int w,int h,const
     mask_hash(key,&n->closed,sizeof n->closed);
     if(n->pts) mask_hash(key,n->pts,(size_t)n->npts*2*sizeof(float));
   }
+  if (out_key) memcpy(out_key,key,sizeof key);
   const size_t bytes=(size_t)w*(size_t)h*4u;
   *cached=false;
   for(int i=0; i<MASK_CACHE_ENTRIES; ++i) {
@@ -2539,10 +2626,18 @@ static unsigned char *canvas_mask_cached(const luna_path *path,int w,int h,const
     if(e->pixels && e->key[0]==key[0] && e->key[1]==key[1] && e->bytes==bytes) {
       e->used=++g_mask_cache_tick;
       *cached=true;
+      if (extent) {
+        if (!e->extent_valid) {
+          canvas_mask_extent(e->pixels,w,h,e->extent);
+          e->extent_valid=true;
+        }
+        memcpy(extent,e->extent,sizeof e->extent);
+      }
       return e->pixels;
     }
   }
   unsigned char *pixels=luna_path_mask(path,w,h,matrix,style,stroke,cap,join,miter,aa);
+  if (pixels && extent) canvas_mask_extent(pixels,w,h,extent);
   if(!pixels || bytes>MASK_CACHE_MAX_ENTRY) return pixels;
   /* Make room: least recently used first, until the entry and the byte budget fit. */
   for(;;) {
@@ -2570,6 +2665,8 @@ static unsigned char *canvas_mask_cached(const luna_path *path,int w,int h,const
     victim->key[0]=key[0];
     victim->key[1]=key[1];
     victim->pixels=pixels;
+    victim->extent_valid=extent!=NULL;
+    if (extent) memcpy(victim->extent,extent,sizeof victim->extent);
     victim->bytes=bytes;
     victim->used=++g_mask_cache_tick;
     g_mask_cache_bytes+=bytes;
@@ -2611,6 +2708,22 @@ static inline uint32_t gradient_lut_sample(const struct canvas_shader *s,const u
   return lut[(int)(t*(GRADIENT_LUT-1)+.5f)];
 }
 
+/* Coverage texels describe pixel areas, whose centres are at n + .5.
+ * Fractional transforms need interpolation rather than snapping the mask. */
+static inline unsigned canvas_mask_sample(const unsigned char *mask,int width,int height,float u,float v)
+{
+  float x=u-.5f,y=v-.5f;
+  int ix=(int)floorf(x),iy=(int)floorf(y);
+  float fx=x-ix,fy=y-iy;
+  unsigned a=0,b=0,c=0,d=0;
+  if (ix>=0 && ix<width && iy>=0 && iy<height) a=mask[4*((size_t)iy*width+ix)+3];
+  if (ix+1>=0 && ix+1<width && iy>=0 && iy<height) b=mask[4*((size_t)iy*width+ix+1)+3];
+  if (ix>=0 && ix<width && iy+1>=0 && iy+1<height) c=mask[4*((size_t)(iy+1)*width+ix)+3];
+  if (ix+1>=0 && ix+1<width && iy+1>=0 && iy+1<height) d=mask[4*((size_t)(iy+1)*width+ix+1)+3];
+  if (a==b && a==c && a==d) return a;
+  return (unsigned)lroundf((a+(b-(float)a)*fx)*(1-fy)+(c+(d-(float)c)*fx)*fy);
+}
+
 struct canvas_path_rows {
   struct canvas_state *state;
   struct rt_bitmap *dst;
@@ -2621,7 +2734,7 @@ struct canvas_path_rows {
   int limits[4], width, height, mode;
   float scale;
   uint32_t color;
-  bool device_coverage, solid, use_lut;
+  bool device_coverage, solid, use_lut, antialias;
 };
 static void canvas_path_rows_draw(void *context, int begin, int end)
 {
@@ -2647,12 +2760,12 @@ static void canvas_path_rows_draw(void *context, int begin, int end)
                     inverse[7]==0.0f && inverse[8]==1.0f;
   for(int y=begin; y<end; ++y) {
     if(simple_clip && !(y+.5f>=cb[1] && y+.5f<cb[3])) continue;
-    float row_ly=0;
+    float row_ly=0,row_v=0;
     const unsigned char *row_mask=NULL;
     if(axis) {
       const float row_y=y+.5f;
       row_ly=inverse[3]*0.0f+inverse[4]*row_y+inverse[5];
-      const float row_v=device_coverage ? row_y : row_ly*scale-bounds[1];
+      row_v=device_coverage ? row_y : row_ly*scale-bounds[1];
       if(!isfinite(row_v) || row_v<0 || row_v>=height) continue;
       row_mask=mask+4*(size_t)(int)row_v*width;
     }
@@ -2666,7 +2779,7 @@ static void canvas_path_rows_draw(void *context, int begin, int end)
         ly=row_ly;
         const float u=device_coverage ? column_x : lx*scale-bounds[0];
         if(!isfinite(u) || u<0 || u>=width) continue;
-        coverage=row_mask[4*(size_t)(int)u+3];
+        coverage=job->antialias && !device_coverage ? canvas_mask_sample(mask,width,height,u,row_v) : row_mask[4*(size_t)(int)u+3];
       } else {
         mat_map(inverse,x+.5f,y+.5f,&lx,&ly);
         float u=x+.5f,v=y+.5f;
@@ -2675,7 +2788,7 @@ static void canvas_path_rows_draw(void *context, int begin, int end)
           v=ly*scale-bounds[1];
         }
         if(!isfinite(u) || !isfinite(v) || u<0 || v<0 || u>=width || v>=height) continue;
-        coverage=mask[4*((size_t)(int)v*width+(int)u)+3];
+        coverage=job->antialias && !device_coverage ? canvas_mask_sample(mask,width,height,u,v) : mask[4*((size_t)(int)v*width+(int)u)+3];
       }
       if(!coverage) continue;
       size_t index=(size_t)y*dst->w+x;
@@ -2777,7 +2890,7 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
   if(limits[2]<=limits[0] || limits[3]<=limits[1]) RETV();
   bool mask_cached=false;
   unsigned char *mask=canvas_mask_cached(path,width,height,local,style,
-                                         hairline ? 1 : stroke*scale,cap,join,miter,aa,&mask_cached);
+                                         hairline ? 1 : stroke*scale,cap,join,miter,aa,&mask_cached,NULL,NULL);
   if(!mask) {
     dvm__throw(vm,"java/lang/OutOfMemoryError","Path mask");
     return false;
@@ -2793,7 +2906,7 @@ static bool canvas_path_color(struct dvm *vm,dvm_ref self,const luna_path *path,
   struct canvas_path_rows job = {
     .state=state, .dst=dst, .shader=shader, .inverse=inverse, .bounds=bounds,
     .mask=mask, .lut=lut, .width=width, .height=height, .mode=mode, .scale=scale,
-    .color=color, .device_coverage=device_coverage, .solid=solid, .use_lut=use_lut
+    .color=color, .antialias=aa, .device_coverage=device_coverage, .solid=solid, .use_lut=use_lut
   };
   memcpy(job.limits, limits, sizeof limits);
   canvas_run_rows(vm, canvas_path_rows_draw, &job, limits, shader.bitmap != dst);
@@ -2866,6 +2979,15 @@ static bool canvas_round_rect(struct dvm *vm,dvm_ref self,const union dvm_value 
   luna_path_clear(&path,true);
   return good;
 }
+static bool canvas_clip_has_pixels(struct canvas_state *state,struct rt_bitmap *bitmap)
+{
+  int limits[4];
+  canvas_clip_limits(state,bitmap,limits);
+  for (int y=limits[1];y<limits[3];++y) for (int x=limits[0];x<limits[2];++x)
+    if (canvas_clip_contains(state,x+.5f,y+.5f)) return true;
+  return false;
+}
+
 static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   int operation;
@@ -2927,7 +3049,20 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
    * and the clip takes a copy: the cache may evict its own while this one lives
    * on in the canvas state. */
   bool mask_shared=false;
-  unsigned char *built=canvas_mask_cached(path,clip.mask_width,clip.mask_height,shifted,0,0,0,0,4,false,&mask_shared);
+  int extent[4];
+  unsigned char *built=canvas_mask_cached(path,clip.mask_width,clip.mask_height,shifted,0,0,0,0,4,false,&mask_shared,clip.mask_key,extent);
+  /* Repeating an intersection adds no restriction. Stop at operations that
+   * can expose pixels outside the earlier mask, such as UNION or XOR. */
+  if (built && operation==1) for (size_t i=state->clips;i>0;--i) {
+    const struct canvas_clip *previous=&state->clip[i-1];
+    if (previous->operation!=1) break;
+    if (previous->mask && previous->mask_x==clip.mask_x && previous->mask_y==clip.mask_y &&
+        previous->mask_width==clip.mask_width && previous->mask_height==clip.mask_height &&
+        !memcmp(previous->mask_key,clip.mask_key,sizeof clip.mask_key)) {
+      if (!mask_shared) free(built);
+      RETI(canvas_clip_has_pixels(state,bitmap));
+    }
+  }
   if(built && mask_shared) {
     const size_t bytes=(size_t)clip.mask_width*(size_t)clip.mask_height*4u;
     clip.mask=malloc(bytes);
@@ -2952,14 +3087,10 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
   /* Bounds describe this path's device mask independently of the previous
    * clip: legacy UNION/REPLACE may expose pixels outside the previous clip. */
   int minx=bitmap->w,miny=bitmap->h,maxx=0,maxy=0;
-  for(int y=0; y<clip.mask_height; ++y) for(int x=0; x<clip.mask_width; ++x) {
-      if(!clip.mask[4*((size_t)y*clip.mask_width+x)+3]) continue;
-      int dx=x+clip.mask_x,dy=y+clip.mask_y;
-      minx=dx<minx ? dx : minx;
-      miny=dy<miny ? dy : miny;
-      maxx=dx+1>maxx ? dx+1 : maxx;
-      maxy=dy+1>maxy ? dy+1 : maxy;
-    }
+  if (extent[0]<extent[2] && extent[1]<extent[3]) {
+    minx=extent[0]+clip.mask_x;miny=extent[1]+clip.mask_y;
+    maxx=extent[2]+clip.mask_x;maxy=extent[3]+clip.mask_y;
+  }
   clip.bounded=true;
   clip.bounds[0]=minx;
   clip.bounds[1]=miny;
@@ -2968,15 +3099,7 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
   state->clip[state->clips++]=clip;
   state->clip_cache_valid=false;
   state->query_clip_valid=false;
-  int limits[4];
-  canvas_clip_limits(state,bitmap,limits);
-  bool any=false;
-  for(int y=limits[1]; !any && y<limits[3]; ++y) for(int x=limits[0]; x<limits[2]; ++x)
-      if(canvas_clip_contains(state,x+.5f,y+.5f)) {
-        any=true;
-        break;
-      }
-  RETI(any);
+  RETI(canvas_clip_has_pixels(state,bitmap));
 }
 
 static bool canvas_fill_color(struct dvm *vm,dvm_ref self,const float *rect,
@@ -4225,6 +4348,15 @@ static bool recording_canvas_call(struct dvm *vm,dvm_ref self,
   return true;
 }
 static const struct rt_method rt_recording_canvas[] = {
+  M("drawCircle", "(FFFLandroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawOval", "(Landroid/graphics/RectF;Landroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawOval", "(FFFFLandroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawArc", "(Landroid/graphics/RectF;FFZLandroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawArc", "(FFFFFFZLandroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawLine", "(FFFFLandroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawPoint", "(FFLandroid/graphics/Paint;)V", recording_canvas_call),
+  M("drawPaint", "(Landroid/graphics/Paint;)V", recording_canvas_call),
+
   M("saveLayer", "(Landroid/graphics/RectF;Landroid/graphics/Paint;)I", recording_canvas_call),
   M("saveLayer", "(Landroid/graphics/RectF;Landroid/graphics/Paint;I)I", recording_canvas_call),
   M("saveLayer", "(FFFFLandroid/graphics/Paint;)I", recording_canvas_call),
@@ -4852,9 +4984,17 @@ static bool view_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   const struct ui_node *node=ui_node(vm,self);
   int32_t width=node ? node->w : ui_int(vm,self,"right")-ui_int(vm,self,"left");
   int32_t height=node ? node->h : ui_int(vm,self,"bottom")-ui_int(vm,self,"top");
-  if (ui_is_a(vm,self,"android/view/SurfaceView")) {
-    dvm_ref holder=ui_obj(vm,self,"holder","Landroid/view/SurfaceHolder;");
-    dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
+  if (ui_is_a(vm,self,"android/view/SurfaceView") || ui_is_a(vm,self,"android/view/TextureView")) {
+    const bool texture=ui_is_a(vm,self,"android/view/TextureView");
+    if (texture) {
+      union dvm_value hardware={0};
+      if (!am_vcall(vm,canvas,"isHardwareAccelerated","()Z",NULL,0,&hardware)) return false;
+      if (!hardware.i) RETV();
+    }
+    if (texture && !texture_view_prepare(vm,self,true)) return false;
+    dvm_ref holder=texture ? 0 : ui_obj(vm,self,"holder","Landroid/view/SurfaceHolder;");
+    dvm_ref surface=texture ? ui_obj(vm,self,"textureSurface","Landroid/view/Surface;") :
+        ui_obj(vm,holder,"surface","Landroid/view/Surface;");
     dvm_ref bitmap=ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;");
     if (bitmap) {
       dvm_ref rect=ui_obj(vm,surface,"bufferRect","Landroid/graphics/Rect;");
@@ -4869,11 +5009,22 @@ static bool view_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
       rt_set_int(vm,rect,"top",0);
       rt_set_int(vm,rect,"right",width);
       rt_set_int(vm,rect,"bottom",height);
-      float bounds[]= {0,0,(float)width,(float)height};
-      if (!canvas_fill_color(vm,canvas,bounds,0,0,0,false,0,out)) return false;
+      /* Dispatch through Canvas: a RecordingCanvas must retain the video
+       * Bitmap command, not attempt to rasterise into a nonexistent target. */
+      union dvm_value saved={0},clip={.l=rect},clear[2]={{0},{0}},ignored={0};
+      if (!dvm_get_static(vm,dvm_find_class(vm,"android/graphics/PorterDuff$Mode"),"CLEAR",
+                          "Landroid/graphics/PorterDuff$Mode;",&clear[1]) ||
+          !am_vcall(vm,canvas,"save","()I",NULL,0,&saved) ||
+          !am_vcall(vm,canvas,"clipRect","(Landroid/graphics/Rect;)Z",&clip,1,&ignored) ||
+          (!texture && !am_vcall(vm,canvas,"drawColor","(ILandroid/graphics/PorterDuff$Mode;)V",clear,2,&ignored))) return false;
       union dvm_value draw[]= {{.l=bitmap},{0},{.l=rect},{0}};
-      if (!canvas_draw_bitmap(vm,canvas,draw,4,out)) return false;
+      dvm_ref transform=texture ? ui_obj(vm,self,"textureTransform","Landroid/graphics/Matrix;") : 0;
+      union dvm_value transform_arg={.l=transform};
+      if (transform && !am_vcall(vm,canvas,"concat","(Landroid/graphics/Matrix;)V",&transform_arg,1,&ignored)) return false;
+      if (!am_vcall(vm,canvas,"drawBitmap","(Landroid/graphics/Bitmap;Landroid/graphics/Rect;Landroid/graphics/Rect;Landroid/graphics/Paint;)V",draw,4,out) ||
+          !am_vcall(vm,canvas,"restoreToCount","(I)V",&saved,1,&ignored)) return false;
     }
+    if (texture) RETV();
   }
   dvm_ref bg=ui_obj(vm,self,"background","Landroid/graphics/drawable/Drawable;");
   if (bg) {
@@ -4973,7 +5124,23 @@ static bool vg_draw_child(struct dvm *vm,dvm_ref self,const union dvm_value *arg
             matrix[0],matrix[1],matrix[2],matrix[3],matrix[4],matrix[5],matrix[6],matrix[7],matrix[8],before);
   }
   union dvm_value argument= {.l=canvas};
-  if (good && (visible || more)) good=am_vcall(vm,child,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
+  if (good && (visible || more)) {
+    /* A retained child remains a texture even when its parent interleaves it
+     * with Canvas drawing. Reuse the same invalidation-based capture rather
+     * than walking and drawing that child's whole app subtree again. */
+    bool captured=false;
+    if (g_ui_building && !more && !canvas_state(vm,canvas)->recording && ui_capture_draws_children(vm,child)) {
+      const char *picture=ui_capture_custom_view(vm,child);
+      if (dvm_exception(vm)) good=false;
+      dvm_ref pixels=ui_obj(vm,child,"drawingBitmap","Landroid/graphics/Bitmap;");
+      if (good && picture && pixels) {
+        const float identity[9]={1,0,0,0,1,0,0,0,1};
+        good=canvas_draw_bitmap_with(vm,canvas,pixels,0,0,0,identity,0,false,&ignored);
+        captured=true;
+      }
+    }
+    if (good && !captured) good=am_vcall(vm,child,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
+  }
   if(trace) {
     uint32_t after=0;
     if(trace_bitmap && trace_bitmap->px && trace_bitmap->w>0 && trace_bitmap->h>0)
@@ -5630,7 +5797,7 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
     if (m && m->has_code) custom=true;
   }
   /* ProgressBar renders its Drawable through the same View/Canvas pipeline. */
-  if(ui_is_a(vm,view,"android/widget/ProgressBar")) custom=true;
+  if(ui_is_a(vm,view,"android/widget/ProgressBar") || ui_is_a(vm,view,"android/view/TextureView")) custom=true;
   if (ui_is_a(vm,view,"android/view/SurfaceView")) {
     dvm_ref holder=ui_obj(vm,view,"holder","Landroid/view/SurfaceHolder;");
     dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
@@ -5670,7 +5837,8 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
   const uint64_t capture_epoch=g_ui_draw_epoch;
   const bool epoch_matches=(uint64_t)recorded_epoch.j==capture_epoch;
   if (app_draw && epoch_matches && bm && bm->w==node->w && bm->h==node->h && bm->overlay_key[0] && bm->overlay_gen==bm->gen &&
-      (uint32_t)ui_int(vm,view,"drawingSeq")+1==g_ui_build_seq && !ui_int(vm,view,"drawDirty")) {
+      ((uint32_t)ui_int(vm,view,"drawingSeq")==g_ui_build_seq ||
+       (uint32_t)ui_int(vm,view,"drawingSeq")+1==g_ui_build_seq) && !ui_int(vm,view,"drawDirty")) {
     (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
       .i=(int32_t)g_ui_build_seq
     });
@@ -5755,11 +5923,12 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
     union dvm_value clip[4]= {{.i=area[0]},{.i=area[1]},{.i=area[2]},{.i=area[3]}};
     if (!am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored)) return NULL;
   }
-  const bool own_picture_only=ui_is_a(vm,view,"android/view/ViewGroup");
+  const bool own_picture_only=ui_is_a(vm,view,"android/view/ViewGroup") && !ui_capture_draws_children(vm,view);
   capture->accelerated=true;
-  if (own_picture_only) g_ui_capture_without_children=true;
+  const bool saved_capture_mode=g_ui_capture_without_children;
+  g_ui_capture_without_children=own_picture_only;
   const bool drawn=am_vcall(vm,view,"draw","(Landroid/graphics/Canvas;)V",&argument,1,&ignored);
-  if (own_picture_only) g_ui_capture_without_children=false;
+  g_ui_capture_without_children=saved_capture_mode;
   capture->accelerated=false;
   capture->tracking=false;
   if (!drawn) {

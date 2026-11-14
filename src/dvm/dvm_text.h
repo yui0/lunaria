@@ -1871,6 +1871,8 @@ static bool static_layout_ellipsize(struct dvm *vm,struct textview_layout *layou
   if(!good) return false;
   free(line->run.glyphs);
   line->run=run;
+  line->ellipsis_start=left;
+  line->ellipsis_count=n-left-right;
   layout->widest=0;
   for(size_t i=0; i<layout->count; ++i) layout->widest=fmaxf(layout->widest,layout->lines[i].run.width*layout->scale);
   return true;
@@ -1942,6 +1944,7 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
                                                              .direction=direction.l,.source_start=start,.source_end=end,
                                                                                                         .spacing_add=add.f,.spacing_mult=mult.f,.fallback_spacing=rt_get_int(vm,self,"fallbackSpacing")!=0,
                                                                                                                                                 .px=px.f,.scale=scale.f,.width=width,.max_lines=max,.padding=rt_get_int(vm,self,"includePad")!=0,
+    .single=result && ui_is_a(vm,result,"android/text/BoringLayout"),.ellipsized_width=width,
                                                                                                                                                                                                     .bold=(flags.i&32) || (face.l && (rt_get_int(vm,face.l,"style")&1))
   };
   if(max && !textview_layout_build(vm,layout)) {
@@ -1952,7 +1955,8 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
     union dvm_value ename= {0};
     const char *where=dvm_get_field(vm,ellipsis.l,"name","Ljava/lang/String;",&ename) && ename.l ? dvm_string_utf8(vm,ename.l) : "END";
     int eavail=rt_get_int(vm,self,"ellipsizedWidth");
-    if(!where || !static_layout_ellipsize(vm,layout,where,(float)(eavail ? eavail : width))) {
+    layout->ellipsized_width=eavail;
+    if(!where || !static_layout_ellipsize(vm,layout,where,(float)eavail)) {
       textview_layout_destroy(layout);
       return false;
     }
@@ -1970,6 +1974,7 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
     textview_layout_destroy(layout);
     return false;
   }
+  if (o->data_destroy) o->data_destroy(o->data);
   o->data=layout;
   o->data_destroy=textview_layout_destroy;
   dvm_set_field(vm,result,"source","Ljava/lang/CharSequence;",source);
@@ -2005,6 +2010,107 @@ static bool static_layout_init(struct dvm *vm,dvm_ref self,
   dvm_unpin(vm,builder.l);
   if(!good) return false;
   RETV();
+}
+
+/* A BoringLayout always owns one complete LTR line. The supplied Metrics
+ * determine its vertical extents; unlike StaticLayout, it never wraps. */
+static bool boring_layout_init(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  const bool make=!strcmp(builtin_name(),"make"),ctor=!strcmp(builtin_name(),"<init>");
+  const bool modern=nargs==9;
+  const int mi=modern ? 4 : 6,pi=mi+1,ei=mi+2;
+  if (!ARG(mi).l) {dvm__throw(vm,"java/lang/NullPointerException","metrics");return false;}
+  struct rt_text_units text={0};
+  if (!text_read_units(vm,ARG(0).l,false,"java/lang/NullPointerException",&text)) return false;
+  union dvm_value obtain[] = {ARG(0),{0},{.i=(int32_t)text.length},ARG(1),ARG(2)},builder={0};
+  free(text.owned);
+  if (!static_builder_obtain(vm,0,obtain,5,&builder)) return false;
+  dvm_pin(vm,builder.l);
+  dvm_ref result=make ? dvm_new_object(vm,dvm_find_class(vm,"android/text/BoringLayout")) : self;
+  dvm_pin(vm,result);
+  union dvm_value direction={0};
+  dvm_get_static(vm,dvm_find_class(vm,"android/text/TextDirectionHeuristics"),"LTR","Landroid/text/TextDirectionHeuristic;",&direction);
+  bool good=result && dvm_set_field(vm,builder.l,"alignment","Landroid/text/Layout$Alignment;",ARG(3)) &&
+      dvm_set_field(vm,builder.l,"includePad","Z",ARG(pi)) &&
+      dvm_set_field(vm,builder.l,"maxLines","I",(union dvm_value){.i=1});
+  if (good && direction.l) dvm_set_field(vm,builder.l,"direction","Landroid/text/TextDirectionHeuristic;",direction);
+  if (good && nargs>ei) {
+    good=dvm_set_field(vm,builder.l,"ellipsize","Landroid/text/TextUtils$TruncateAt;",ARG(ei)) &&
+        dvm_set_field(vm,builder.l,"ellipsizedWidth","I",ARG(ei+1));
+  }
+  if (good) good=static_layout_build(vm,builder.l,result,out);
+  if (good) {
+    struct textview_layout *layout=layout_data(vm,result);
+    int top=rt_get_int(vm,ARG(mi).l,"top"),bottom=rt_get_int(vm,ARG(mi).l,"bottom");
+    int ascent=rt_get_int(vm,ARG(mi).l,"ascent"),descent=rt_get_int(vm,ARG(mi).l,"descent");
+    if (nargs==11 ? ARG(10).i : modern && ARG(8).i) {
+      ascent=(int)fminf(ascent,floorf(layout->lines[0].run.ascent+.5f));
+      descent=(int)fmaxf(descent,floorf(layout->lines[0].run.descent+.5f));
+      top=top<ascent ? top : ascent;
+      bottom=bottom>descent ? bottom : descent;
+    }
+    layout->height=(float)((int64_t)(ARG(pi).i ? bottom : descent)-(ARG(pi).i ? top : ascent));
+    layout->top_padding=ARG(pi).i ? top-ascent : 0;
+    layout->bottom_padding=ARG(pi).i ? bottom-descent : 0;
+    layout->lines[0].top=0;
+    layout->lines[0].bottom=layout->height;
+    layout->lines[0].descent=(float)(ARG(pi).i ? bottom : descent);
+    layout->lines[0].baseline=-(float)(ARG(pi).i ? top : ascent);
+    layout->fallback_spacing=nargs==11 ? ARG(10).i : modern && ARG(8).i;
+    if (!layout->lines[0].ellipsis_count) {
+      layout->widest=(float)rt_get_int(vm,ARG(mi).l,"width");
+      if (layout->scale!=0) layout->lines[0].run.width=layout->widest/layout->scale;
+    }
+    float remaining=layout->width-layout->widest;
+    int alignment=rt_get_int(vm,ARG(3).l,"ordinal");
+    layout->lines[0].left=alignment==2 ? remaining*.5f : alignment==1 || alignment==4 ? remaining : 0;
+    if (layout->lines[0].ellipsis_count) {
+      size_t start=layout->lines[0].ellipsis_start,count=layout->lines[0].ellipsis_count;
+      uint16_t *shown=malloc(layout->text.length*sizeof *shown);
+      if (!shown) {dvm__throw(vm,"java/lang/OutOfMemoryError","BoringLayout ellipsis");good=false;}
+      else {
+        memcpy(shown,layout->text.data,layout->text.length*sizeof *shown);
+        shown[start]=0x2026;
+        for (size_t i=1;i<count;++i) shown[start+i]=0xfeff;
+        dvm_ref text=text_from_utf16(vm,shown,layout->text.length);
+        free(shown);
+        good=text!=0;
+        if (good) {
+          layout->source=text;
+          dvm_set_field(vm,result,"source","Ljava/lang/CharSequence;",(union dvm_value){.l=text});
+        }
+      }
+    }
+  }
+  dvm_unpin(vm,result);
+  dvm_unpin(vm,builder.l);
+  if (!good) return false;
+  if (ctor) RETV();
+  RETL(result);
+}
+
+/* BoringLayout accepts the sentinel line used by Layout's range helpers. */
+static bool boring_layout_property(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  struct textview_layout *layout=layout_data(vm,self);
+  if (!layout) return false;
+  const char *name=builtin_name();
+  if (!strcmp(name,"getLineStart")) RETI(ARG(0).i ? layout->source_end : 0);
+  if (!strcmp(name,"getLineTop")) RETI(ARG(0).i ? (int)layout->height : 0);
+  if (!strcmp(name,"getLineDescent")) RETI((int)layout->lines[0].descent);
+  if (!strcmp(name,"getParagraphDirection")) RETI(1);
+  if (!strcmp(name,"getLineWidth")) RETF(ARG(0).i ? 0 : layout->widest);
+  if (!strcmp(name,"getLineMax")) RETF(layout->widest);
+  if (!strcmp(name,"getEllipsizedWidth")) RETI(layout->ellipsized_width);
+  if (!strcmp(name,"getEllipsisCount")) RETI(layout->lines[0].ellipsis_count);
+  if (!strcmp(name,"getEllipsisStart")) RETI(layout->lines[0].ellipsis_start);
+  if (!strcmp(name,"isFallbackLineSpacingEnabled")) RETI(layout->fallback_spacing);
+  if (!strcmp(name,"getSpacingMultiplier")) RETF(1);
+  if (!strcmp(name,"getSpacingAdd")) RETF(0);
+  RETI(0);
 }
 
 static const struct rt_method rt_static_layout[]= {

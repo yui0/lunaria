@@ -106,6 +106,7 @@ bool lm_sink_commit(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
 bool lm_sink_commit_at(struct lm_sink *s, int w, int h, int64_t timestamp_ns);
 void lm_sink_abandon(struct lm_sink *s);
 uint64_t lm_sink_commit_id(struct lm_sink *s);
+bool lm_sink_frame_ready(struct lm_sink *s,int64_t present_ns);
 int64_t lm_sink_acquired_timestamp(struct lm_sink *s);
 
 /* Consumer side.  False when no frame has arrived since the last take; the

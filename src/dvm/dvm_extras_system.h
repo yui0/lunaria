@@ -826,6 +826,660 @@ static bool ssl_engine_null(struct dvm *vm, dvm_ref self, const union dvm_value 
   RETL(0);
 }
 
+
+/* --- lunaria.HostSSLEngine: the built-in SSLContext's engine ---------------
+ * A real TLS session over memory BIOs in the host's TLS library.  The
+ * caller moves the bytes (wrap() produces what goes to the peer, unwrap() takes
+ * what came from it), exactly as with Conscrypt's engine.  Verification is the
+ * platform's: the chain against the host trust store, and the name when the
+ * endpoint identification algorithm is set. */
+struct host_engine {
+  struct dvm_tls_engine *tls;
+  bool client, began, reported, in_done, out_done, verify_host, session_creation;
+  bool need_client_auth, want_client_auth;
+  char **protocols, **ciphers, **alpn;
+  int nprotocols, nciphers, nalpn;
+  char peer_host[256];
+  int peer_port;
+  char error[256];
+};
+
+static struct host_engine *host_engine_of(struct dvm *vm, dvm_ref self)
+{
+  struct dvm_object *o = dvm__obj(vm, self);
+  if (!o) return NULL;
+  if (!o->data) {
+    struct host_engine *h = calloc(1, sizeof *h);
+    if (!h) return NULL;
+    h->client = true;
+    h->session_creation = true;
+    h->peer_port = -1;
+    o->data = h;
+  }
+  return o->data;
+}
+
+static void host_engine_set_list(char ***dst, int *n, char **v, int nv)
+{
+  string_list_free(*dst, *n);
+  *dst = v;
+  *n = nv;
+}
+
+/* The TLS session, made on first use from what the engine was configured with
+ * (setEnabledProtocols() and friends are legal until the handshake begins). */
+static bool host_engine_tls(struct dvm *vm, struct host_engine *h)
+{
+  (void)vm;
+  if (h->tls) return true;
+  int minv = 0, maxv = 0;
+  for (int i = 0; i < h->nprotocols; ++i) {
+    const int v = tls_version_of(h->protocols[i]);
+    if (!v) continue;
+    if (!minv || v < minv) minv = v;
+    if (!maxv || v > maxv) maxv = v;
+  }
+  if (!h->nprotocols) {
+    minv = TLS1_2_VERSION;
+    maxv = TLS1_3_VERSION;
+  }
+  uint8_t wire[512];
+  size_t wlen = 0;
+  for (int i = 0; i < h->nalpn; ++i) {
+    const size_t l = strlen(h->alpn[i]);
+    if (!l || l > 255 || wlen + 1 + l > sizeof wire) continue;
+    wire[wlen++] = (uint8_t)l;
+    memcpy(wire + wlen, h->alpn[i], l);
+    wlen += l;
+  }
+  h->tls = dvm_tls_engine_new(h->client, h->peer_host,
+                              DVM_TLS_VERIFY_CHAIN | (h->verify_host ? DVM_TLS_VERIFY_HOST : 0),
+                              wlen ? wire : NULL, wlen, minv, maxv,
+                              (const char *const *)h->ciphers, h->nciphers);
+  return h->tls != NULL;
+}
+
+static bool host_engine_fail(struct dvm *vm, struct host_engine *h, const char *why)
+{
+  snprintf(h->error, sizeof h->error, "%s", why);
+  dvm__throw(vm, "javax/net/ssl/SSLHandshakeException", "%s", why);
+  return false;
+}
+
+/* A one-shot SSLEngineResult. */
+static bool host_engine_result(struct dvm *vm, const char *status, const char *hs,
+                               int consumed, int produced, union dvm_value *out)
+{
+  struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/net/ssl/SSLEngineResult;");
+  dvm_ref r = c ? dvm_new_object(vm, c) : 0;
+  if (!r) return false;
+  dvm_pin(vm, r);
+  union dvm_value a[4] = { 0 }, ign;
+  struct dvm_class *sc = dvm__class_by_desc(vm, "Ljavax/net/ssl/SSLEngineResult$Status;");
+  struct dvm_class *hc = dvm__class_by_desc(vm, "Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;");
+  if (!sc || !hc || !dvm_get_static(vm, sc, status, "Ljavax/net/ssl/SSLEngineResult$Status;", &a[0]) ||
+      !dvm_get_static(vm, hc, hs, "Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;", &a[1])) {
+    dvm_unpin(vm, r);
+    return false;
+  }
+  a[2].i = consumed;
+  a[3].i = produced;
+  const bool ok = am_vcall(vm, r, "<init>",
+                           "(Ljavax/net/ssl/SSLEngineResult$Status;Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;II)V",
+                           a, 4, &ign);
+  dvm_unpin(vm, r);
+  if (ok) out->l = r;
+  return ok;
+}
+
+/* The handshake status the engine is in now; FINISHED is reported once, by the
+ * call that completed the handshake and left nothing of it unsent. */
+static const char *host_engine_hs(struct host_engine *h, bool consume_finished)
+{
+  if (!h->tls || !h->began) return "NOT_HANDSHAKING";
+  const bool established = dvm_tls_engine_established(h->tls);
+  const bool pending = dvm_tls_engine_pending_out(h->tls) > 0;
+  if (established && !h->reported) {
+    if (pending) return "NEED_WRAP";
+    if (consume_finished) h->reported = true;
+    return "FINISHED";
+  }
+  if (established) return "NOT_HANDSHAKING";
+  if (pending) return "NEED_WRAP";
+  return "NEED_UNWRAP";
+}
+
+static bool host_engine_begin(struct dvm *vm, struct host_engine *h)
+{
+  if (!host_engine_tls(vm, h)) return host_engine_fail(vm, h, "SSL_new failed");
+  if (h->began) return true;
+  h->began = true;
+  char err[256] = "";
+  if (dvm_tls_engine_handshake(h->tls, err, sizeof err) < 0) return host_engine_fail(vm, h, err);
+  return true;
+}
+
+static bool x_hse_begin(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  (void)out;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  if (!host_engine_begin(vm, h)) return false;
+  RETV();
+}
+
+static bool x_hse_hs_status(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  struct dvm_class *hc = dvm__class_by_desc(vm, "Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;");
+  if (!h || !hc) return false;
+  /* A finished handshake reads as NOT_HANDSHAKING here, as in the JDK. */
+  const char *st = host_engine_hs(h, false);
+  if (!strcmp(st, "FINISHED")) st = "NOT_HANDSHAKING";
+  return dvm_get_static(vm, hc, st, "Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;", out);
+}
+
+/* Remaining bytes of a ByteBuffer, and moving bytes in and out of one. */
+static int hse_remaining(struct dvm *vm, dvm_ref bb)
+{
+  union dvm_value v = { 0 };
+  return am_vcall(vm, bb, "remaining", "()I", NULL, 0, &v) ? v.i : 0;
+}
+
+static bool hse_get(struct dvm *vm, dvm_ref bb, uint8_t *dst, int n)
+{
+  dvm_ref arr = dvm_new_array(vm, 'B', "B", (uint32_t)n);
+  if (!arr) return false;
+  dvm_pin(vm, arr);
+  union dvm_value a[3] = { { .l = arr }, { .i = 0 }, { .i = n } }, ign;
+  const bool ok = am_vcall(vm, bb, "get", "([BII)Ljava/nio/ByteBuffer;", a, 3, &ign);
+  if (ok) memcpy(dst, dvm_array_data(vm, arr), (size_t)n);
+  dvm_unpin(vm, arr);
+  return ok;
+}
+
+static bool hse_put(struct dvm *vm, dvm_ref bb, const uint8_t *src, int n)
+{
+  dvm_ref arr = dvm_new_array(vm, 'B', "B", (uint32_t)n);
+  if (!arr) return false;
+  dvm_pin(vm, arr);
+  memcpy(dvm_array_data(vm, arr), src, (size_t)n);
+  union dvm_value a[3] = { { .l = arr }, { .i = 0 }, { .i = n } }, ign;
+  const bool ok = am_vcall(vm, bb, "put", "([BII)Ljava/nio/ByteBuffer;", a, 3, &ign);
+  dvm_unpin(vm, arr);
+  return ok;
+}
+
+#define HSE_RECORD 16709   /* the largest TLS record: payload + header + overhead */
+
+/* wrap(ByteBuffer[] srcs, int off, int len, ByteBuffer dst) */
+static bool x_hse_wrap(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  if (!host_engine_begin(vm, h)) return false;
+  dvm_ref dst = ARG(3).l;
+  struct dvm_object *srcs = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
+  const int off = ARG(1).i, cnt = ARG(2).i;
+  struct dvm_tls_engine *t = h->tls;
+  uint8_t *buf = malloc(HSE_RECORD);
+  if (!buf) return false;
+  const int room = hse_remaining(vm, dst);
+  int consumed = 0, produced = 0;
+  char err[256] = "";
+  bool ok = true;
+
+  if (h->out_done && !dvm_tls_engine_pending_out(t)) {
+    free(buf);
+    return host_engine_result(vm, "CLOSED", "NOT_HANDSHAKING", 0, 0, out);
+  }
+  if (!dvm_tls_engine_established(t)) {
+    int r = dvm_tls_engine_handshake(t, err, sizeof err);
+    if (r < 0) {
+      free(buf);
+      return host_engine_fail(vm, h, err);
+    }
+  } else if (!h->out_done && srcs && srcs->data) {
+    /* Application data: one record's worth of the sources, if there is room for
+     * the record (the caller sizes dst by getSession().getPacketBufferSize()). */
+    const dvm_ref *items = srcs->data;
+    for (int i = off; i < off + cnt && ok && room >= HSE_RECORD; ++i) {
+      const int rem = items[i] ? hse_remaining(vm, items[i]) : 0;
+      if (rem <= 0) continue;
+      const int n = rem > 16384 ? 16384 : rem;
+      uint8_t *plain = malloc((size_t)n);
+      if (!plain) {
+        ok = false;
+        break;
+      }
+      ok = hse_get(vm, items[i], plain, n);
+      if (ok) {
+        long w = dvm_tls_engine_write(t, plain, (size_t)n, err, sizeof err);
+        if (w < 0) ok = false;
+        else consumed += (int)w;
+      }
+      free(plain);
+      break;
+    }
+    if (!ok) {
+      free(buf);
+      if (!dvm_exception(vm)) host_engine_fail(vm, h, err[0] ? err : "SSL write failed");
+      return false;
+    }
+  }
+  if (h->out_done) dvm_tls_engine_shutdown(t);
+  if (room > 0) {
+    const size_t cap = (size_t)room < HSE_RECORD ? (size_t)room : HSE_RECORD;
+    produced = (int)dvm_tls_engine_drain(t, buf, cap);
+    if (produced && !hse_put(vm, dst, buf, produced)) ok = false;
+  }
+  const bool overflow = room <= 0 && dvm_tls_engine_pending_out(t) > 0;
+  free(buf);
+  if (!ok) return false;
+  const char *status = overflow ? "BUFFER_OVERFLOW"
+                       : (h->out_done && !dvm_tls_engine_pending_out(t)) ? "CLOSED" : "OK";
+  return host_engine_result(vm, status, host_engine_hs(h, true), consumed, produced, out);
+}
+
+/* unwrap(ByteBuffer src, ByteBuffer[] dsts, int off, int len) */
+static bool x_hse_unwrap(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                         union dvm_value *out)
+{
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  if (!host_engine_begin(vm, h)) return false;
+  struct dvm_tls_engine *t = h->tls;
+  dvm_ref src = ARG(0).l;
+  struct dvm_object *dsts = ARG(1).l ? dvm__obj(vm, ARG(1).l) : NULL;
+  const int off = ARG(2).i, cnt = ARG(3).i;
+  char err[256] = "";
+  if (h->in_done) return host_engine_result(vm, "CLOSED", host_engine_hs(h, false), 0, 0, out);
+
+  int room = 0;
+  const dvm_ref *items = dsts ? dsts->data : NULL;
+  for (int i = off; items && i < off + cnt; ++i)
+    if (items[i]) room += hse_remaining(vm, items[i]);
+  const int avail = src ? hse_remaining(vm, src) : 0;
+  const bool buffered = dvm_tls_engine_pending_in(t) > 0;
+  if (!avail && !buffered)
+    return host_engine_result(vm, "BUFFER_UNDERFLOW", host_engine_hs(h, false), 0, 0, out);
+  /* Decrypted bytes the session already holds must find room before more is fed. */
+  if (buffered && room <= 0)
+    return host_engine_result(vm, "BUFFER_OVERFLOW", host_engine_hs(h, false), 0, 0, out);
+
+  int consumed = 0, produced = 0;
+  if (avail) {
+    uint8_t *net = malloc((size_t)avail);
+    if (!net || !hse_get(vm, src, net, avail)) {
+      free(net);
+      return false;
+    }
+    consumed = (int)dvm_tls_engine_feed(t, net, (size_t)avail);
+    free(net);
+  }
+  if (!dvm_tls_engine_established(t)) {
+    if (dvm_tls_engine_handshake(t, err, sizeof err) < 0) return host_engine_fail(vm, h, err);
+  }
+  bool closed = false;
+  if (dvm_tls_engine_established(t) && room > 0) {
+    uint8_t *plain = malloc(16384);
+    if (!plain) return false;
+    for (int i = off; items && i < off + cnt && !closed; ++i) {
+      int space = items[i] ? hse_remaining(vm, items[i]) : 0;
+      while (space > 0) {
+        const long r = dvm_tls_engine_read(t, plain, (size_t)(space < 16384 ? space : 16384), err, sizeof err);
+        if (r == -1) {
+          closed = true;
+          break;
+        }
+        if (r == -2) {
+          free(plain);
+          return host_engine_fail(vm, h, err);
+        }
+        if (r == 0) break;
+        if (!hse_put(vm, items[i], plain, (int)r)) {
+          free(plain);
+          return false;
+        }
+        produced += (int)r;
+        space -= (int)r;
+      }
+      if (space > 0) break;   /* the session has no more for now */
+    }
+    free(plain);
+  }
+  if (closed || dvm_tls_engine_peer_closed(t)) {
+    h->in_done = true;
+    /* close_notify is answered by closing our side too. */
+    if (!h->out_done) {
+      h->out_done = true;
+      dvm_tls_engine_shutdown(t);
+    }
+  }
+  return host_engine_result(vm, h->in_done ? "CLOSED" : "OK", host_engine_hs(h, true), consumed, produced, out);
+}
+
+static bool x_hse_close(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  (void)out;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  if (!strcmp(builtin_name(), "closeInbound")) {
+    /* Without the peer's close_notify the data may have been truncated. */
+    if (!h->in_done && h->tls && dvm_tls_engine_established(h->tls) && !dvm_tls_engine_peer_closed(h->tls)) {
+      h->in_done = true;
+      dvm__throw(vm, "javax/net/ssl/SSLException",
+                 "Inbound closed before receiving peer's close_notify: possible truncation attack?");
+      return false;
+    }
+    h->in_done = true;
+  } else {
+    h->out_done = true;
+    if (h->tls) dvm_tls_engine_shutdown(h->tls);
+  }
+  RETV();
+}
+
+static bool x_hse_done(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  if (!strcmp(builtin_name(), "isInboundDone")) RETI(h->in_done);
+  RETI(h->out_done && (!h->tls || !dvm_tls_engine_pending_out(h->tls)));
+}
+
+static bool x_hse_task(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+  (void)vm;
+  (void)self;
+  (void)args;
+  (void)nargs;
+  /* The host library finishes every step inside wrap()/unwrap(): no delegated tasks. */
+  RETL(0);
+}
+
+static bool x_hse_supported(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                            union dvm_value *out)
+{
+  (void)self;
+  (void)args;
+  (void)nargs;
+  if (!strcmp(builtin_name(), "getSupportedProtocols")) RETL(string_array_of(vm, g_ssl_protocols, 4));
+  const char *const *all = dvm_tls_supported_ciphers();
+  RETL(string_array_of(vm, all, cipher_count(all)));
+}
+
+static bool x_hse_enabled(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  if (!strcmp(builtin_name(), "getEnabledProtocols")) {
+    if (h->nprotocols) RETL(string_array_of(vm, (const char *const *)h->protocols, h->nprotocols));
+    RETL(string_array_of(vm, g_ssl_default_protocols, 2));
+  }
+  if (h->nciphers) RETL(string_array_of(vm, (const char *const *)h->ciphers, h->nciphers));
+  const char *const *all = dvm_tls_supported_ciphers();
+  RETL(string_array_of(vm, all, cipher_count(all)));
+}
+
+static bool x_hse_set_enabled(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                              union dvm_value *out)
+{
+  (void)nargs;
+  (void)out;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  const bool protocols = !strcmp(builtin_name(), "setEnabledProtocols");
+  if (!ARG(0).l) {
+    dvm__throw(vm, "java/lang/IllegalArgumentException", protocols ? "protocols == null" : "suites == null");
+    return false;
+  }
+  char **v = NULL;
+  const int n = string_array_take(vm, ARG(0).l, &v);
+  for (int i = 0; i < n; ++i) {
+    bool ok = false;
+    if (protocols) {
+      for (int k = 0; k < 4 && !ok; ++k) ok = !strcmp(v[i], g_ssl_protocols[k]);
+    } else {
+      const char *const *all = dvm_tls_supported_ciphers();
+      for (int k = 0; all[k] && !ok; ++k) ok = !strcmp(v[i], all[k]);
+      ok |= !strcmp(v[i], "TLS_EMPTY_RENEGOTIATION_INFO_SCSV") || !strcmp(v[i], "TLS_FALLBACK_SCSV");
+    }
+    if (!ok) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 protocols ? "Protocol %s is not supported" : "Unsupported cipher suite: %s", v[i]);
+      string_list_free(v, n);
+      return false;
+    }
+  }
+  if (protocols) host_engine_set_list(&h->protocols, &h->nprotocols, v, n);
+  else host_engine_set_list(&h->ciphers, &h->nciphers, v, n);
+  RETV();
+}
+
+static bool x_hse_mode(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  const char *name = builtin_name();
+  if (!strcmp(name, "setUseClientMode")) {
+    if (h->tls) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "Cannot change mode after handshake has started");
+      return false;
+    }
+    h->client = ARG(0).i != 0;
+    RETV();
+  }
+  if (!strcmp(name, "getUseClientMode")) RETI(h->client);
+  if (!strcmp(name, "setNeedClientAuth")) {
+    h->need_client_auth = ARG(0).i != 0;
+    if (h->need_client_auth) h->want_client_auth = false;
+    RETV();
+  }
+  if (!strcmp(name, "getNeedClientAuth")) RETI(h->need_client_auth);
+  if (!strcmp(name, "setWantClientAuth")) {
+    h->want_client_auth = ARG(0).i != 0;
+    if (h->want_client_auth) h->need_client_auth = false;
+    RETV();
+  }
+  if (!strcmp(name, "getWantClientAuth")) RETI(h->want_client_auth);
+  if (!strcmp(name, "setEnableSessionCreation")) {
+    h->session_creation = ARG(0).i != 0;
+    RETV();
+  }
+  RETI(h->session_creation);
+}
+
+static bool x_hse_alpn(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                       union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  /* null until the handshake is done, "" when no protocol was agreed. */
+  if (!h->tls || !dvm_tls_engine_established(h->tls)) RETL(0);
+  char sel[64];
+  dvm_tls_engine_alpn(h->tls, sel, sizeof sel);
+  RETL(dvm_new_string(vm, sel));
+}
+
+static bool x_hse_session(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                          union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  struct dvm_class *c = dvm__class_by_desc(vm, "Lcom/android/org/conscrypt/ActiveSession;");
+  dvm_ref sess = c ? dvm_new_object(vm, c) : 0;
+  if (!h || !sess) RETL(sess);
+  dvm_pin(vm, sess);
+  const bool up = h->tls && dvm_tls_engine_established(h->tls);
+  union dvm_value v = { 0 };
+  /* Before the handshake: the null session (SSL_NULL_WITH_NULL_NULL / NONE). */
+  v.l = dvm_new_string(vm, up ? dvm_tls_engine_cipher(h->tls) : "SSL_NULL_WITH_NULL_NULL");
+  (void)dvm_set_field(vm, sess, "cipherSuite", "Ljava/lang/String;", v);
+  v.l = dvm_new_string(vm, up ? dvm_tls_engine_protocol(h->tls) : "NONE");
+  (void)dvm_set_field(vm, sess, "protocol", "Ljava/lang/String;", v);
+  v.l = dvm_new_string(vm, h->peer_host);
+  (void)dvm_set_field(vm, sess, "peerHost", "Ljava/lang/String;", v);
+  v.i = h->peer_port;
+  (void)dvm_set_field(vm, sess, "peerPort", "I", v);
+  v.j = (int64_t)time(NULL) * 1000;
+  (void)dvm_set_field(vm, sess, "creationTime", "J", v);
+  v.i = up;
+  (void)dvm_set_field(vm, sess, "valid", "Z", v);
+  if (up) {
+    uint8_t **der = NULL;
+    int *len = NULL;
+    const int n = dvm_tls_engine_peer_chain(h->tls, &der, &len);
+    dvm_ref arr = dvm_new_array(vm, 'L', "Ljava/security/cert/Certificate;", (uint32_t)n);
+    if (arr) dvm_pin(vm, arr);
+    for (int i = 0; i < n; ++i) {
+      dvm_ref cert = arr ? x509_from_der(vm, der[i], len[i]) : 0;
+      dvm_ref *items = arr ? dvm_array_data(vm, arr) : NULL;
+      if (items) items[i] = cert;
+      free(der[i]);
+    }
+    free(der);
+    free(len);
+    v.l = arr;
+    (void)dvm_set_field(vm, sess, "peerCertificates", "[Ljava/security/cert/Certificate;", v);
+    if (arr) dvm_unpin(vm, arr);
+  }
+  dvm_unpin(vm, sess);
+  RETL(sess);
+}
+
+static bool x_hse_get_params(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct host_engine *h = host_engine_of(vm, self);
+  struct dvm_class *c = dvm__class_by_desc(vm, "Ljavax/net/ssl/SSLParameters;");
+  dvm_ref p = c ? dvm_new_object(vm, c) : 0;
+  if (!p || !h) RETL(p);
+  dvm_pin(vm, p);
+  union dvm_value en = { 0 }, v = { 0 };
+  const char *const *all = dvm_tls_supported_ciphers();
+  v.l = h->nciphers ? string_array_of(vm, (const char *const *)h->ciphers, h->nciphers)
+        : string_array_of(vm, all, cipher_count(all));
+  (void)dvm_set_field(vm, p, "cipherSuites", "[Ljava/lang/String;", v);
+  v.l = h->nprotocols ? string_array_of(vm, (const char *const *)h->protocols, h->nprotocols)
+        : string_array_of(vm, g_ssl_default_protocols, 2);
+  (void)dvm_set_field(vm, p, "protocols", "[Ljava/lang/String;", v);
+  v.l = string_array_of(vm, (const char *const *)h->alpn, h->nalpn);
+  (void)dvm_set_field(vm, p, "applicationProtocols", "[Ljava/lang/String;", v);
+  v.l = h->verify_host ? dvm_new_string(vm, "HTTPS") : 0;
+  (void)dvm_set_field(vm, p, "endpointIdentificationAlgorithm", "Ljava/lang/String;", v);
+  v.i = h->need_client_auth;
+  (void)dvm_set_field(vm, p, "needClientAuth", "Z", v);
+  v.i = h->want_client_auth;
+  (void)dvm_set_field(vm, p, "wantClientAuth", "Z", v);
+  (void)en;
+  dvm_unpin(vm, p);
+  RETL(p);
+}
+
+static bool x_hse_set_params(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+  (void)nargs;
+  (void)out;
+  struct host_engine *h = host_engine_of(vm, self);
+  if (!h) return false;
+  dvm_ref p = ARG(0).l;
+  if (!p) RETV();
+  union dvm_value v = { 0 };
+  char **l = NULL;
+  int n;
+  if (dvm_get_field(vm, p, "cipherSuites", "[Ljava/lang/String;", &v) && v.l) {
+    n = string_array_take(vm, v.l, &l);
+    host_engine_set_list(&h->ciphers, &h->nciphers, l, n);
+  }
+  if (dvm_get_field(vm, p, "protocols", "[Ljava/lang/String;", &v) && v.l) {
+    n = string_array_take(vm, v.l, &l);
+    host_engine_set_list(&h->protocols, &h->nprotocols, l, n);
+  }
+  if (dvm_get_field(vm, p, "applicationProtocols", "[Ljava/lang/String;", &v) && v.l) {
+    n = string_array_take(vm, v.l, &l);
+    host_engine_set_list(&h->alpn, &h->nalpn, l, n);
+  }
+  if (dvm_get_field(vm, p, "endpointIdentificationAlgorithm", "Ljava/lang/String;", &v))
+    h->verify_host = v.l && !strcasecmp(dvm_string_utf8(vm, v.l), "HTTPS");
+  if (dvm_get_field(vm, p, "needClientAuth", "Z", &v)) h->need_client_auth = v.i != 0;
+  if (dvm_get_field(vm, p, "wantClientAuth", "Z", &v)) h->want_client_auth = v.i != 0;
+  RETV();
+}
+
+static const struct rt_method rt_host_ssl_engine[] = {
+  M("<init>", "()V", ssl_engine_init),
+  M("<init>", "(Ljava/lang/String;I)V", ssl_engine_init),
+  M("beginHandshake", "()V", x_hse_begin),
+  M("getHandshakeStatus", "()Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;", x_hse_hs_status),
+  M("wrap", "([Ljava/nio/ByteBuffer;IILjava/nio/ByteBuffer;)Ljavax/net/ssl/SSLEngineResult;", x_hse_wrap),
+  M("unwrap", "(Ljava/nio/ByteBuffer;[Ljava/nio/ByteBuffer;II)Ljavax/net/ssl/SSLEngineResult;", x_hse_unwrap),
+  M("closeInbound", "()V", x_hse_close),
+  M("closeOutbound", "()V", x_hse_close),
+  M("isInboundDone", "()Z", x_hse_done),
+  M("isOutboundDone", "()Z", x_hse_done),
+  M("getDelegatedTask", "()Ljava/lang/Runnable;", x_hse_task),
+  M("getSupportedProtocols", "()[Ljava/lang/String;", x_hse_supported),
+  M("getSupportedCipherSuites", "()[Ljava/lang/String;", x_hse_supported),
+  M("getEnabledProtocols", "()[Ljava/lang/String;", x_hse_enabled),
+  M("getEnabledCipherSuites", "()[Ljava/lang/String;", x_hse_enabled),
+  M("setEnabledProtocols", "([Ljava/lang/String;)V", x_hse_set_enabled),
+  M("setEnabledCipherSuites", "([Ljava/lang/String;)V", x_hse_set_enabled),
+  M("setUseClientMode", "(Z)V", x_hse_mode),
+  M("getUseClientMode", "()Z", x_hse_mode),
+  M("setNeedClientAuth", "(Z)V", x_hse_mode),
+  M("getNeedClientAuth", "()Z", x_hse_mode),
+  M("setWantClientAuth", "(Z)V", x_hse_mode),
+  M("getWantClientAuth", "()Z", x_hse_mode),
+  M("setEnableSessionCreation", "(Z)V", x_hse_mode),
+  M("getEnableSessionCreation", "()Z", x_hse_mode),
+  M("getApplicationProtocol", "()Ljava/lang/String;", x_hse_alpn),
+  M("getHandshakeApplicationProtocol", "()Ljava/lang/String;", x_hse_alpn),
+  M("getSession", "()Ljavax/net/ssl/SSLSession;", x_hse_session),
+  M("getSSLParameters", "()Ljavax/net/ssl/SSLParameters;", x_hse_get_params),
+  M("setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V", x_hse_set_params),
+  M_END,
+};
+
+/* SSLContext.createSSLEngine([host, port]) of the built-in context. */
+static dvm_ref host_engine_new(struct dvm *vm, const char *host, int port)
+{
+  struct dvm_class *c = dvm__class_by_desc(vm, "Llunaria/HostSSLEngine;");
+  dvm_ref e = c ? dvm_new_object(vm, c) : 0;
+  struct host_engine *h = e ? host_engine_of(vm, e) : NULL;
+  if (!h) return 0;
+  if (host) snprintf(h->peer_host, sizeof h->peer_host, "%s", host);
+  h->peer_port = host ? port : -1;
+  return e;
+}
+
 static const struct rt_field rt_ssl_engine_fields[] = {
   { "peerHost", "Ljava/lang/String;" }, { "peerPort", "I" }, F_END,
 };

@@ -72,9 +72,21 @@ static int g_field_idx = -1;
  * up. */
 #define IME_BAND_H 240
 
+/* Direct entry: the field being edited is an Android view that is on screen, so the host
+ * keyboard types straight into it, as a hardware keyboard does on a device: no panel is
+ * drawn and no band is reserved.  The text reaches the EditText as it is typed (Enter is the
+ * editor action, Shift+Enter a new line).  A field with nothing to see on screen -- a game
+ * that draws its own text box and keeps a hidden EditText for the keyboard -- has no place
+ * to type into, so the panel is the keyboard.  The caller decides per field. */
+static bool g_direct;
+static bool ime_direct(void)
+{
+  return g_direct;
+}
+
 int luna_ime_band_height(int surface_h)
 {
-  if (!g_active) return 0;
+  if (!g_active || ime_direct()) return 0;
   return (surface_h > 0 && surface_h < IME_BAND_H) ? surface_h : IME_BAND_H;
 }
 
@@ -174,6 +186,12 @@ static void ime_publish(bool up, int input_type, bool multiline,
    * full-surface backdrop element, and an opaque one there covers the frame
    * the guest has just drawn — the whole game, behind a keyboard that is only
    * supposed to take a third of the screen. */
+  static const char css_direct[] =
+    /* The field still exists, off-screen, because it is what edits the text. */
+    "body{margin:0;background:transparent;}"
+    "#luna-ime{position:absolute;left:-4000px;top:0;width:600px;height:80px;opacity:0;}"
+    ".luna-ime-field{display:block;width:100%;height:52px;font-size:26px;}"
+    ".luna-ime-head,.luna-ime-row{display:none;}";
   static const char css[] =
     "body{margin:0;background:transparent;}"
     /* Exactly the band, with nothing on the box itself that could change
@@ -192,15 +210,16 @@ static void ime_publish(bool up, int input_type, bool multiline,
     ".luna-ime-ok{background:#2d5c96;color:#ffffff;}"
     ".luna-ime-hint{color:#6b7fa6;font-size:14px;}";
 
-  luna_overlay_set_ime(html, css);
+  luna_overlay_set_ime(html, ime_direct() ? css_direct : css);
 }
 
 /* ------------------------------------------------------------------------ *
  * dvm main-looper side
  * ------------------------------------------------------------------------ */
 
-void luna_ime_show(const char *initial, int input_type, bool multiline)
+void luna_ime_show(const char *initial, int input_type, bool multiline, bool direct)
 {
+  g_direct = direct;
   pthread_mutex_lock(&g_lock);
   g_input_type = input_type;
   g_multiline = multiline;
@@ -214,8 +233,8 @@ void luna_ime_show(const char *initial, int input_type, bool multiline)
   g_queue_count = 0;
   pthread_mutex_unlock(&g_queue_lock);
 
-  fprintf(stderr, "[ime] up: inputType=0x%x%s, seeded \"%s\"\n",
-          input_type, multiline ? ", multi-line" : "", g_text);
+  fprintf(stderr, "[ime] up: inputType=0x%x%s%s, seeded \"%s\"\n",
+          input_type, multiline ? ", multi-line" : "", direct ? ", direct" : "", g_text);
   ime_publish(true, input_type, multiline, g_text);
 }
 
@@ -374,7 +393,7 @@ void luna_ime_frame(bool document_reparsed)
      * the field is clicked — and clicking a text box to put the caret in it
      * must not submit it. */
     if ((batch[i].key == LUNA_KEY_ENTER || batch[i].key == LUNA_KEY_KP_ENTER) &&
-        !ml) {
+        (!ml || (ime_direct() && !(batch[i].mods & 1 /* GLFW_MOD_SHIFT */)))) {
       if (batch[i].action == LUNA_PRESS) accepted = true;
       continue;
     }

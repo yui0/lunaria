@@ -585,7 +585,7 @@ Everyday and diagnostic options; development-only switches are in the source and
 | `LUNARIA_DVM` | `1` | Dalvik emulator: `0` off, `1` only where no host stub exists, `2` prefer dex over stubs |
 | `LUNARIA_DEX_START` | on | Start the Activity lifecycle from dex; `0` only to compare the legacy launch |
 | `LUNARIA_TOUCH_TEST` | off | Inject taps `x,y[;x,y…]` (max 8); `_FRAME` / `_HOLD` / `_GAP` default `60` / `10` / `60` |
-| `LUNARIA_TOUCH_FIFO` | off | Taps `x,y[,hold]`, `key N` (4 = Back), drags `down`/`move`/`up x,y`; Windows: `\\.\pipe\lunaria-touch` |
+| `LUNARIA_TOUCH_FIFO` | off | Taps `x,y[,hold]`, `key N` (4 = Back), `text <chars>` / `enter` (the on-screen field's keyboard), drags `down`/`move`/`up x,y`; Windows: `\\.\pipe\lunaria-touch` |
 | `LUNARIA_DUMP_FRAME` / `_SCREENSHOT_EVERY` / `_DUMP_DIR` | off / off / `/tmp` | Frame capture |
 | `LUNARIA_TRACE_SVC` / `_TRACE_MEDIA` / `_TRACE_HEAP` | off | Trace SVC calls / MediaCodec states / corrupt free-list entries |
 | `LUNARIA_DVM_TRACE` | off | Log methods the Dalvik emulator declined |

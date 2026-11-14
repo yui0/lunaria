@@ -46,6 +46,13 @@ bool luna_uc_punct(int32_t cp);
 bool luna_uc_xdigit(int32_t cp);
 /* UTF-16 boundaries: 1=line opportunity, 2=grapheme, 4=mandatory line break. */
 bool luna_uc_breaks_utf16(const uint16_t *text, size_t length, unsigned char *breaks);
+/* Grapheme_Cluster_Break property value of a code point, as the names
+ * UnicodeSet spells it ("Other", "CR", "LF", "Control", "Extend", "ZWJ",
+ * "Regional_Indicator", "Prepend", "SpacingMark", "L", "V", "T", "LV", "LVT"). */
+const char *luna_uc_grapheme_break(int32_t cp);
+/* The code point range of a Unicode block, name matched without case, spaces,
+ * '_' and '-'.  False when there is no such block. */
+bool luna_uc_block(const char *name, int32_t *first, int32_t *last);
 #ifdef __cplusplus
 }
 #endif

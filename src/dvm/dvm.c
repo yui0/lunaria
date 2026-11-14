@@ -1806,6 +1806,11 @@ bool dvm_init_class(struct dvm *vm, struct dvm_class *cls)
         dvm_describe_exception(vm, vm->exception, why, sizeof why);
       fprintf(stderr, "[dvm] <clinit> %s failed: %s\n", cls->name,
               why[0] ? why : "no exception");
+      for (int i = 0; vm->exception && i < vm->nexc_trace; ++i) {
+        struct dvm_method *f = vm->exc_trace[i];
+        fprintf(stderr, "[dvm]   at %s.%s%s\n", f->cls ? f->cls->name : "?",
+                f->name, f->sig ? f->sig : "");
+      }
       goto failed;
     }
   }

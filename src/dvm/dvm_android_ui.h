@@ -614,7 +614,11 @@ static bool bic_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int
 static bool bic_get_editable(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)args; (void)nargs;
-  union dvm_value buffer={0};
+  union dvm_value buffer={0},target={0};
+  /* A connection made for a TextView edits that view's own Editable. */
+  dvm_get_field(vm,self,"mTargetView","Landroid/view/View;",&target);
+  if(target.l && ui_is_a(vm,target.l,"android/widget/TextView"))
+    return am_vcall(vm,target.l,"getEditableText","()Landroid/text/Editable;",NULL,0,out);
   dvm_get_field(vm,self,"baseEditable","Landroid/text/Editable;",&buffer);
   if(!buffer.l) {
     buffer.l=dvm_new_object(vm,dvm_find_class(vm,"android/text/SpannableStringBuilder"));
@@ -708,6 +712,150 @@ static bool bic_close(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
   if(!am_vcall(vm,self,"finishComposingText","()Z",NULL,0,&ignored)) return false;
   RETV();
 }
+/* ---- BaseInputConnection's editing operations (AOSP) -------------------------------------- */
+static bool bic_editable_of(struct dvm *vm,dvm_ref self,dvm_ref *editable)
+{
+  union dvm_value e={0};
+  if(!am_vcall(vm,self,"getEditable","()Landroid/text/Editable;",NULL,0,&e)) return false;
+  *editable=e.l;
+  return true;
+}
+static bool bic_remove_composing(struct dvm *vm,dvm_ref editable)
+{
+  struct dvm_class *c=dvm_find_class(vm,"android/view/inputmethod/BaseInputConnection");
+  struct dvm_method *m=c ? dvm_find_method(vm,c,"removeComposingSpans","(Landroid/text/Spannable;)V") : NULL;
+  union dvm_value a={.l=editable},ignored={0};
+  return m && dvm_call(vm,m,0,&a,1,&ignored);
+}
+/* The composing region, or -1/-1. */
+static bool bic_composing_region(struct dvm *vm,dvm_ref editable,int *a,int *b)
+{
+  dvm_ref marker=text_marker(vm,true,false);
+  union dvm_value key={.l=marker},s={0},e={0};
+  if(!marker || !am_vcall(vm,editable,"getSpanStart","(Ljava/lang/Object;)I",&key,1,&s) ||
+      !am_vcall(vm,editable,"getSpanEnd","(Ljava/lang/Object;)I",&key,1,&e)) return false;
+  *a=s.i;
+  *b=e.i;
+  return true;
+}
+/* BaseInputConnection.replaceText(): replaces the composing region, or the selection, and puts
+ * the cursor `newCursor` units from the new text (positive: after it). */
+static bool bic_replace_text(struct dvm *vm,dvm_ref self,dvm_ref text,int new_cursor,bool composing)
+{
+  dvm_ref editable=0;
+  if(!bic_editable_of(vm,self,&editable)) return false;
+  if(!editable) return true;
+  int a=-1,b=-1;
+  if(!bic_composing_region(vm,editable,&a,&b)) return false;
+  if(b<a) { int t=a; a=b; b=t; }
+  if(a!=-1 && b!=-1) {
+    if(!bic_remove_composing(vm,editable)) return false;
+  } else {
+    if(!selection_position(vm,editable,false,&a) || !selection_position(vm,editable,true,&b)) return false;
+    if(a<0) a=0;
+    if(b<0) b=0;
+    if(b<a) { int t=a; a=b; b=t; }
+  }
+  union dvm_value length={0},ignored={0},tlen={0};
+  if(!am_vcall(vm,editable,"length","()I",NULL,0,&length)) return false;
+  if(!text) {
+    dvm__throw(vm,"java/lang/NullPointerException","text");
+    return false;
+  }
+  if(!am_vcall(vm,text,"length","()I",NULL,0,&tlen)) return false;
+  new_cursor += new_cursor>0 ? b-1 : a;
+  if(new_cursor<0) new_cursor=0;
+  if(new_cursor>length.i) new_cursor=length.i;
+  if(!selection_assign(vm,editable,new_cursor,new_cursor)) return false;
+  union dvm_value r[3]={{.i=a},{.i=b},{.l=text}};
+  if(!am_vcall(vm,editable,"replace","(IILjava/lang/CharSequence;)Landroid/text/Editable;",r,3,&ignored)) return false;
+  if(composing) {
+    dvm_ref marker=text_marker(vm,true,false);
+    union dvm_value span[]={{.l=marker},{.i=a},{.i=a+tlen.i},{.i=0x121}};
+    if(!marker || !am_vcall(vm,editable,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+  }
+  return true;
+}
+static bool bic_text_op(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  const char *name=builtin_name();
+  if(!strcmp(name,"commitText") || !strcmp(name,"setComposingText")) {
+    if(!bic_replace_text(vm,self,args[0].l,args[1].i,name[0]=='s')) return false;
+    RETI(1);
+  }
+  dvm_ref editable=0;
+  if(!bic_editable_of(vm,self,&editable)) return false;
+  if(!strcmp(name,"finishComposingText")) {
+    if(editable && !bic_remove_composing(vm,editable)) return false;
+    RETI(1);
+  }
+  if(!editable) RETI(0);
+  union dvm_value length={0},ignored={0};
+  if(!am_vcall(vm,editable,"length","()I",NULL,0,&length)) return false;
+  if(!strcmp(name,"setComposingRegion")) {
+    int a=args[0].i,b=args[1].i;
+    if(a<0) a=0;
+    if(b<0) b=0;
+    if(a>length.i) a=length.i;
+    if(b>length.i) b=length.i;
+    if(b<a) { int t=a; a=b; b=t; }
+    if(!bic_remove_composing(vm,editable)) return false;
+    dvm_ref marker=text_marker(vm,true,false);
+    union dvm_value span[]={{.l=marker},{.i=a},{.i=b},{.i=0x121}};
+    if(!marker || !am_vcall(vm,editable,"setSpan","(Ljava/lang/Object;III)V",span,4,&ignored)) return false;
+    RETI(1);
+  }
+  /* deleteSurroundingText(before, after): what follows the selection first, then what precedes it. */
+  int a=0,b=0;
+  if(!selection_position(vm,editable,false,&a) || !selection_position(vm,editable,true,&b)) return false;
+  if(a<0 || b<0) { a=b=length.i; }
+  if(b<a) { int t=a; a=b; b=t; }
+  int before=args[0].i<0 ? 0 : args[0].i,after=args[1].i<0 ? 0 : args[1].i;
+  if(after>0) {
+    int end=b+after>length.i ? length.i : b+after;
+    union dvm_value d[2]={{.i=b},{.i=end}};
+    if(end>b && !am_vcall(vm,editable,"delete","(II)Landroid/text/Editable;",d,2,&ignored)) return false;
+  }
+  if(before>0) {
+    int start=a-before<0 ? 0 : a-before;
+    union dvm_value d[2]={{.i=start},{.i=a}};
+    if(a>start && !am_vcall(vm,editable,"delete","(II)Landroid/text/Editable;",d,2,&ignored)) return false;
+  }
+  RETI(1);
+}
+/* sendKeyEvent / performEditorAction act on the view the connection serves. */
+static bool bic_view_op(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  union dvm_value target={0},ignored={0};
+  (void)dvm_get_field(vm,self,"mTargetView","Landroid/view/View;",&target);
+  if(!target.l) RETI(0);
+  if(!strcmp(builtin_name(),"sendKeyEvent")) {
+    union dvm_value a={.l=args[0].l},r={0};
+    if(!am_vcall(vm,target.l,"dispatchKeyEvent","(Landroid/view/KeyEvent;)Z",&a,1,&r)) return false;
+    RETI(r.i);
+  }
+  /* performEditorAction(code): the TextView's own onEditorAction handling. */
+  struct dvm_class *cls=dvm_object_class(vm,target.l);
+  struct dvm_method *m=cls ? dvm_find_method(vm,cls,"onEditorAction","(I)V") : NULL;
+  if(m && !dvm_call(vm,m,target.l,(union dvm_value *)args,1,&ignored)) return false;
+  RETI(1);
+}
+static bool bic_answer(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)vm; (void)self; (void)args; (void)nargs;
+  const char *name=builtin_name();
+  /* The base connection accepts batching and fullscreen reports, and declines everything it
+   * has no editor-side meaning for. */
+  RETI(!strcmp(name,"beginBatchEdit") || !strcmp(name,"endBatchEdit") || !strcmp(name,"reportFullscreenMode"));
+}
+static bool bic_zero(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)vm; (void)self; (void)args; (void)nargs;
+  if(builtin_sig()[strlen(builtin_sig())-1]=='I') RETI(0);
+  RETL(0);
+}
 static bool editor_info_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)args; (void)nargs;
@@ -727,8 +875,24 @@ static const struct rt_method rt_base_input_connection[]={
   M("getTextAfterCursor","(II)Ljava/lang/CharSequence;",bic_query),
   M("getSelectedText","(I)Ljava/lang/CharSequence;",bic_query),
   M("setSelection","(II)Z",bic_set_selection),
-  M("beginBatchEdit","()Z",ret_false),M("endBatchEdit","()Z",ret_false),
+  M("beginBatchEdit","()Z",bic_answer),M("endBatchEdit","()Z",bic_answer),M("reportFullscreenMode","(Z)Z",bic_answer),
   M("requestCursorUpdates","(I)Z",ret_false),
+  M("commitText","(Ljava/lang/CharSequence;I)Z",bic_text_op),
+  M("setComposingText","(Ljava/lang/CharSequence;I)Z",bic_text_op),
+  M("finishComposingText","()Z",bic_text_op),
+  M("setComposingRegion","(II)Z",bic_text_op),
+  M("deleteSurroundingText","(II)Z",bic_text_op),
+  M("deleteSurroundingTextInCodePoints","(II)Z",bic_text_op),
+  M("sendKeyEvent","(Landroid/view/KeyEvent;)Z",bic_view_op),
+  M("performEditorAction","(I)Z",bic_view_op),
+  M("getCursorCapsMode","(I)I",bic_zero),
+  M("getExtractedText","(Landroid/view/inputmethod/ExtractedTextRequest;I)Landroid/view/inputmethod/ExtractedText;",bic_zero),
+  M("getHandler","()Landroid/os/Handler;",bic_zero),
+  M("commitCompletion","(Landroid/view/inputmethod/CompletionInfo;)Z",ret_false),
+  M("commitCorrection","(Landroid/view/inputmethod/CorrectionInfo;)Z",ret_false),
+  M("clearMetaKeyStates","(I)Z",ret_false),
+  M("performContextMenuAction","(I)Z",ret_false),
+  M("performPrivateCommand","(Ljava/lang/String;Landroid/os/Bundle;)Z",ret_false),
   M("closeConnection","()V",bic_close),
   SM("getComposingSpanStart","(Landroid/text/Spannable;)I",bic_composing),
   SM("getComposingSpanEnd","(Landroid/text/Spannable;)I",bic_composing),
@@ -2947,6 +3111,123 @@ static const char *const rt_iface_input_filter[] = {
   "Landroid/text/InputFilter;", NULL
 };
 
+/* ---- the Editable behind an EditText -------------------------------------------------
+ * An EditText's text is an Editable, and a TextView that has TextWatchers is given one too
+ * (TextView.setText: needEditableForNotification).  The listeners are not called by the
+ * Editable itself: a single ChangeWatcher span is attached to it, and that forwards every
+ * change to the view's listener list, exactly as android.widget.TextView.ChangeWatcher. */
+static const struct rt_field rt_text_change_watcher_fields[] = {
+  { "view", "Landroid/widget/TextView;" }, F_END,
+};
+static const char *const rt_iface_text_watcher[] = { "Landroid/text/TextWatcher;", NULL };
+
+static bool text_change_watcher(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+  (void)out;
+  union dvm_value view = { 0 }, list = { 0 };
+  (void)dvm_get_field(vm, self, "view", "Landroid/widget/TextView;", &view);
+  if (dvm__env("LUNARIA_IME_TRACE")) fprintf(stderr, "[text] ChangeWatcher.%s view=%u\n", builtin_name(), (unsigned)view.l);
+  if (!view.l) RETV();
+  /* TextView.handleTextChanged(): the view's own onTextChanged() hook runs first, then the listeners. */
+  if (!strcmp(builtin_name(), "onTextChanged")) {
+    union dvm_value ignored = { 0 };
+    if (!am_vcall(vm, view.l, "onTextChanged", "(Ljava/lang/CharSequence;III)V", args, nargs, &ignored)) return false;
+  }
+  (void)dvm_get_field(vm, view.l, "textWatchers", "Ljava/util/List;", &list);
+  struct rt_list *l = list.l ? list_of(vm, list.l) : NULL;
+  if (!l || !l->size) RETV();
+  /* A listener may add or remove listeners: walk a snapshot. */
+  dvm_ref snapshot[64];
+  uint32_t n = l->size < 64 ? l->size : 64;
+  for (uint32_t i = 0; i < n; ++i) {
+    snapshot[i] = l->items[i];
+    dvm_pin(vm, snapshot[i]);
+  }
+  const char *name = builtin_name(), *sig = builtin_sig();
+  if (dvm__env("LUNARIA_IME_TRACE")) fprintf(stderr, "[text] %s -> %u listener(s)\n", name, (unsigned)n);
+  bool ok = true;
+  for (uint32_t i = 0; ok && i < n; ++i) {
+    union dvm_value ignored = { 0 };
+    ok = am_vcall(vm, snapshot[i], name, sig, args, nargs, &ignored);
+  }
+  for (uint32_t i = 0; i < n; ++i) dvm_unpin(vm, snapshot[i]);
+  return ok;
+}
+static const struct rt_method rt_text_change_watcher[] = {
+  M("beforeTextChanged", "(Ljava/lang/CharSequence;III)V", text_change_watcher),
+  M("onTextChanged", "(Ljava/lang/CharSequence;III)V", text_change_watcher),
+  M("afterTextChanged", "(Landroid/text/Editable;)V", text_change_watcher),
+  M_END,
+};
+
+static bool text_is_editable(struct dvm *vm, dvm_ref cs)
+{
+  struct dvm_class *editable = dvm_find_class(vm, "android/text/Editable");
+  return cs && editable && dvm__class_assignable(vm, dvm_object_class(vm, cs), editable);
+}
+
+/* A new Editable holding `source` (null: empty), with the view's ChangeWatcher attached. */
+static dvm_ref text_make_editable(struct dvm *vm, dvm_ref view, dvm_ref source)
+{
+  dvm_ref editable = dvm_new_object(vm, dvm__class_by_desc(vm, "Landroid/text/SpannableStringBuilder;"));
+  dvm_ref watcher = dvm_new_object(vm, dvm__class_by_desc(vm, "Llunaria/TextChangeWatcher;"));
+  if (!editable || !watcher) return 0;
+  dvm_pin(vm, editable);
+  dvm_pin(vm, watcher);
+  union dvm_value ignored = { 0 }, src = { .l = source }, length = { 0 };
+  bool ok = source ? am_vcall(vm, editable, "<init>", "(Ljava/lang/CharSequence;)V", &src, 1, &ignored)
+            : am_vcall(vm, editable, "<init>", "()V", NULL, 0, &ignored);
+  ok = ok && am_vcall(vm, editable, "length", "()I", NULL, 0, &length);
+  (void)dvm_set_field(vm, watcher, "view", "Landroid/widget/TextView;", (union dvm_value) {
+    .l = view
+  });
+  if (ok) {
+    union dvm_value a[4] = { { .l = watcher }, { .i = 0 }, { .i = length.i }, { .i = 0x12 /* SPAN_INCLUSIVE_INCLUSIVE */ } };
+    ok = am_vcall(vm, editable, "setSpan", "(Ljava/lang/Object;III)V", a, 4, &ignored);
+  }
+  dvm_unpin(vm, watcher);
+  dvm_unpin(vm, editable);
+  return ok ? editable : 0;
+}
+
+/* An Editable the app built itself gets the view's ChangeWatcher too (TextView.setText does this
+ * for any Spannable it adopts), unless it already carries one for this view. */
+static bool text_attach_watcher(struct dvm *vm, dvm_ref view, dvm_ref editable)
+{
+  struct dvm_class *wc = dvm__class_by_desc(vm, "Llunaria/TextChangeWatcher;");
+  dvm_ref klass = wc ? class_object_for(vm, wc) : 0;
+  union dvm_value length = { 0 }, spans = { 0 }, ignored = { 0 };
+  if (!klass || !am_vcall(vm, editable, "length", "()I", NULL, 0, &length)) return false;
+  union dvm_value q[3] = { { .i = 0 }, { .i = length.i }, { .l = klass } };
+  if (!am_vcall(vm, editable, "getSpans", "(IILjava/lang/Class;)[Ljava/lang/Object;", q, 3, &spans)) return false;
+  struct dvm_object *arr = spans.l ? dvm__obj(vm, spans.l) : NULL;
+  for (uint32_t i = 0; arr && i < arr->length; ++i) {
+    union dvm_value v = { 0 };
+    dvm_ref w = ((dvm_ref *)arr->data)[i];
+    (void)dvm_get_field(vm, w, "view", "Landroid/widget/TextView;", &v);
+    if (v.l == view) return true;
+  }
+  dvm_ref watcher = dvm_new_object(vm, wc);
+  if (!watcher) return false;
+  dvm_pin(vm, watcher);
+  (void)dvm_set_field(vm, watcher, "view", "Landroid/widget/TextView;", (union dvm_value) {
+    .l = view
+  });
+  union dvm_value a[4] = { { .l = watcher }, { .i = 0 }, { .i = length.i }, { .i = 0x12 } };
+  const bool ok = am_vcall(vm, editable, "setSpan", "(Ljava/lang/Object;III)V", a, 4, &ignored);
+  dvm_unpin(vm, watcher);
+  return ok;
+}
+
+static bool text_has_watchers(struct dvm *vm, dvm_ref view)
+{
+  union dvm_value list = { 0 };
+  (void)dvm_get_field(vm, view, "textWatchers", "Ljava/util/List;", &list);
+  struct rt_list *l = list.l ? list_of(vm, list.l) : NULL;
+  return l && l->size;
+}
+
 static bool text_get_text(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
                           union dvm_value *out)
@@ -2955,6 +3236,17 @@ static bool text_get_text(struct dvm *vm, dvm_ref self,
   (void)nargs;
   union dvm_value text = { 0 };
   (void)dvm_get_field(vm, self, "text", "Ljava/lang/CharSequence;", &text);
+  if (text.l && ui_is_a(vm, self, "android/widget/EditText") && text_is_editable(vm, text.l) &&
+      !text_attach_watcher(vm, self, text.l)) return false;
+  if (ui_is_a(vm, self, "android/widget/EditText") && !text_is_editable(vm, text.l)) {
+    /* An EditText's getText() is always an Editable, even before anything was set. */
+    dvm_ref editable = text_make_editable(vm, self, text.l);
+    if (!editable) return false;
+    (void)dvm_set_field(vm, self, "text", "Ljava/lang/CharSequence;", (union dvm_value) {
+      .l = editable
+    });
+    RETL(editable);
+  }
   RETL(text.l ? text.l : dvm_new_string(vm, ""));
 }
 
@@ -2975,6 +3267,48 @@ static bool text_set_text(struct dvm *vm, dvm_ref self,
       const char *x = dvm_string_utf8(vm, old.l), *y = dvm_string_utf8(vm, text.l);
       if (x && y && !strcmp(x, y)) RETV();
     }
+  }
+  const bool want_editable = ui_is_a(vm, self, "android/widget/EditText") || text_has_watchers(vm, self);
+  if (want_editable && text.l && text_is_editable(vm, text.l) && !text_attach_watcher(vm, self, text.l)) return false;
+  if (want_editable && text.l && !text_is_editable(vm, text.l)) {
+    /* TextView.setText(): the new text is an Editable; listeners hear before / on / after. */
+    dvm_ref editable = text_make_editable(vm, self, text.l);
+    if (!editable) return false;
+    dvm_pin(vm, editable);
+    union dvm_value oldlen = { 0 }, newlen = { 0 }, ignored = { 0 };
+    if (old.l) (void)am_vcall(vm, old.l, "length", "()I", NULL, 0, &oldlen);
+    (void)am_vcall(vm, editable, "length", "()I", NULL, 0, &newlen);
+    union dvm_value before[4] = { { .l = old.l }, { .i = 0 }, { .i = oldlen.i }, { .i = newlen.i } };
+    union dvm_value changed[4] = { { .l = editable }, { .i = 0 }, { .i = oldlen.i }, { .i = newlen.i } };
+    union dvm_value after = { .l = editable };
+    union dvm_value watchers = { 0 };
+    (void)dvm_get_field(vm, self, "textWatchers", "Ljava/util/List;", &watchers);
+    struct rt_list *wl = watchers.l ? list_of(vm, watchers.l) : NULL;
+    dvm_ref snap[64];
+    uint32_t nw = wl ? (wl->size < 64 ? wl->size : 64) : 0;
+    for (uint32_t i = 0; i < nw; ++i) {
+      snap[i] = wl->items[i];
+      dvm_pin(vm, snap[i]);
+    }
+    bool ok = true;
+    for (uint32_t i = 0; ok && i < nw; ++i)
+      if (old.l) ok = am_vcall(vm, snap[i], "beforeTextChanged", "(Ljava/lang/CharSequence;III)V", before, 4, &ignored);
+    if (ok) {
+      (void)dvm_set_field(vm, self, "text", "Ljava/lang/CharSequence;", (union dvm_value) {
+        .l = editable
+      });
+      ok = am_vcall(vm, self, "onTextChanged", "(Ljava/lang/CharSequence;III)V", changed, 4, &ignored);
+      for (uint32_t i = 0; ok && i < nw; ++i)
+        ok = am_vcall(vm, snap[i], "onTextChanged", "(Ljava/lang/CharSequence;III)V", changed, 4, &ignored);
+      for (uint32_t i = 0; ok && i < nw; ++i)
+        ok = am_vcall(vm, snap[i], "afterTextChanged", "(Landroid/text/Editable;)V", &after, 1, &ignored);
+    }
+    for (uint32_t i = 0; i < nw; ++i) dvm_unpin(vm, snap[i]);
+    dvm_unpin(vm, editable);
+    if (!ok) return false;
+    ui_view_layout_changed(vm, self);
+    ui_invalidate_view(vm, self, NULL, 0);
+    RETV();
   }
   (void)dvm_set_field(vm, self, "text", "Ljava/lang/CharSequence;", text);
   /* TextView.checkForRelayout(): a label whose box cannot change size with its
@@ -3269,6 +3603,10 @@ static bool text_set_compound_drawables(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_field rt_text_view_fields[] = {
+  { "lineSpacingExtra", "F" }, { "lineSpacingMult", "F" }, { "lineSpacingMultSet", "Z" },
+  { "imeActionLabel", "Ljava/lang/CharSequence;" }, { "imeActionId", "I" },
+  { "noSoftInputOnFocus", "Z" },
+  { "horizontallyScrolling", "Z" }, { "shadowColor", "I" },
   { "paintFlags", "I" },
   { "textPaint", "Landroid/text/TextPaint;" },
   { "drawablePadding", "I" },
@@ -3552,6 +3890,20 @@ static bool text_add_watcher(struct dvm *vm, dvm_ref self,
   }
   if (!v.l) RETV();
   return list_add(vm, v.l, args, nargs, out);
+}
+
+static bool text_remove_watcher(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                                union dvm_value *out)
+{
+  (void)nargs;
+  (void)out;
+  union dvm_value list = { 0 }, ignored = { 0 };
+  (void)dvm_get_field(vm, self, "textWatchers", "Ljava/util/List;", &list);
+  if (!list.l) RETV();
+  union dvm_value a = { .l = ARG(0).l };
+  /* List.remove(Object): drops the first occurrence only, as the platform does. */
+  if (!am_vcall(vm, list.l, "remove", "(Ljava/lang/Object;)Z", &a, 1, &ignored)) return false;
+  RETV();
 }
 
 #define TEXT_SET_REF(fn, field, desc)                                        \
@@ -3979,7 +4331,7 @@ static const struct rt_method rt_text_view[] = {
   M("setSelection", "(II)V", text_set_selection),
   M("addTextChangedListener", "(Landroid/text/TextWatcher;)V",
   text_add_watcher),
-  M("removeTextChangedListener", "(Landroid/text/TextWatcher;)V", nop_void),
+  M("removeTextChangedListener", "(Landroid/text/TextWatcher;)V", text_remove_watcher),
   M("setOnEditorActionListener",
   "(Landroid/widget/TextView$OnEditorActionListener;)V",
   text_set_editor_action),
@@ -4001,6 +4353,7 @@ static const struct rt_field rt_image_view_fields[] = {
   { "cropToPadding", "Z" },
   { "imageAlpha", "I" }, { "imageAlphaSet", "Z" },
   { "imageTintList", "Landroid/content/res/ColorStateList;" }, { "imageTintMode", "Landroid/graphics/PorterDuff$Mode;" },
+  { "colorFilter", "Landroid/graphics/ColorFilter;" },
   { "maxWidth", "I" }, { "maxHeight", "I" }, { "maxSizeSet", "Z" },
   F_END
 };
@@ -5402,8 +5755,12 @@ static bool res_getIdentifier(struct dvm *vm, dvm_ref self,
   if (pkg && !strcmp(pkg,"android")) {
     if (type && !strcmp(type,"string")) id=luna_framework_string_id(entry);
     else if(type && !strcmp(type,"color")) id=luna_framework_color_id(entry);
+    /* Everything else (attr, integer, dimen, style, ...) is in framework-res itself. */
+    if (!id) id=arm_exec_framework_resource_id(type,entry);
   } else if (!pkg || !*pkg || (app && !strcmp(pkg,app)))
     id=arm_exec_apk_resource_id(type,entry);
+  if (!id && dvm__env("LUNARIA_TRACE_RES"))
+    fprintf(stderr, "[res] getIdentifier(%s, %s, %s) -> 0 (app=%s)\n", entry, type ? type : "-", pkg ? pkg : "-", app ? app : "-");
   free(qualified);
   RETI((int32_t)id);
 }
@@ -5594,6 +5951,28 @@ static bool res_get_value(struct dvm *vm, dvm_ref self,
   int kind = arm_exec_apk_resource_value((uint32_t)ARG(0).i, &value, &string);
   if (nargs > 1) typed_value_assign(vm, ARG(1).l, kind, value, string);
   RETV();
+}
+
+static bool res_open_raw_resource_fd(struct dvm *vm,dvm_ref self,
+    const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  int32_t value=0;
+  const char *path=NULL;
+  int kind=res_value_resolved(ARG(0).u,&value,&path);
+  dvm_ref result=kind=='L' && path ? asset_descriptor_open(vm,path) : 0;
+  if (!result) {
+    dvm_ref exception=dvm_exception(vm);
+    if (exception) {
+      const char *name=dvm_class_name(dvm_object_class(vm,exception));
+      if (strcmp(name,"java/io/FileNotFoundException")) return false;
+      dvm_clear_exception(vm);
+    }
+    dvm__throw(vm,"android/content/res/Resources$NotFoundException","Raw resource 0x%08x has no file descriptor",ARG(0).u);
+    return false;
+  }
+  RETL(result);
 }
 
 static bool res_open_raw_resource(struct dvm *vm, dvm_ref self,
@@ -5947,6 +6326,7 @@ static bool res_getSystem(struct dvm *vm, dvm_ref self,
 
 static const struct rt_method rt_resources[] = {
   M("openRawResource", "(I)Ljava/io/InputStream;", res_open_raw_resource),
+  M("openRawResourceFd", "(I)Landroid/content/res/AssetFileDescriptor;", res_open_raw_resource_fd),
   M("openRawResource", "(ILandroid/util/TypedValue;)Ljava/io/InputStream;", res_open_raw_resource),
   M("getString", "(I)Ljava/lang/String;", res_getString),
   M("getString", "(I[Ljava/lang/Object;)Ljava/lang/String;", context_get_string),
@@ -6000,6 +6380,7 @@ static const struct rt_method rt_resources[] = {
 };
 
 static const struct rt_field rt_resources_fields[] = {
+  { "loaders", "Ljava/util/List;" },
   { "configuration", "Landroid/content/res/Configuration;" },
   { "displayMetrics", "Landroid/util/DisplayMetrics;" },
   F_END
@@ -15449,6 +15830,7 @@ struct rt_text_units {
 };
 struct textview_line {
   size_t start,end;
+  size_t ellipsis_start,ellipsis_count;
   struct luna_text_run run;
   float left,top,bottom,baseline,descent,extra;
   int direction;
@@ -15460,7 +15842,7 @@ struct textview_layout {
   dvm_ref source,paint,face,direction,draw_units;
   int source_start,source_end,paragraph_direction;
   float px,scale,height,widest,top_padding,bottom_padding,spacing_mult,spacing_add;
-  int width,max_lines;
+  int width,max_lines,ellipsized_width;
   bool bold,single,padding,fallback_spacing;
 };
 static bool text_layout_direction(struct dvm *,struct textview_layout *,size_t,size_t);
@@ -15612,11 +15994,13 @@ static bool layout_padding(struct dvm *vm,dvm_ref self,const union dvm_value *ar
 static bool layout_ellipsis_count(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                                   int nargs, union dvm_value *out)
 {
-  (void)vm;
-  (void)self;
-  (void)args;
   (void)nargs;
-  RETI(0);
+  struct textview_layout *layout=layout_data(vm,self);
+  int line=ARG(0).i;
+  if (!layout || line<0 || (size_t)line>=layout->count) {
+    dvm__throw(vm,"java/lang/IndexOutOfBoundsException","line");return false;
+  }
+  RETI(!strcmp(builtin_name(),"getEllipsisStart") ? layout->lines[line].ellipsis_start : layout->lines[line].ellipsis_count);
 }
 
 static bool layout_line_width(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -15701,6 +16085,7 @@ static const struct rt_method rt_text_layout[] = {
   M("getLineDescent", "(I)I", layout_line_edge),M("getLineExtra", "(I)I", layout_line_edge),
   M("getTopPadding", "()I", layout_padding),M("getBottomPadding", "()I", layout_padding),
   M("getEllipsisCount", "(I)I", layout_ellipsis_count),
+  M("getEllipsisStart", "(I)I", layout_ellipsis_count),
   M("getLineWidth", "(I)F", layout_line_width),
   M("getText", "()Ljava/lang/CharSequence;", layout_get_text),
   M_END,
@@ -16687,6 +17072,25 @@ static bool widget_on_measure(struct dvm *vm, dvm_ref self,
   return view_set_measured(vm, self, sizes, nargs, out);
 }
 
+/* Space.onMeasure(): its own getDefaultSize2(), which under AT_MOST wants no more than the
+ * suggested minimum where View.getDefaultSize() would fill what is offered. */
+static bool space_on_measure(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+  union dvm_value sizes[2] = {{0}, {0}};
+  for (int i = 0; i < 2; ++i) {
+    const int32_t want = view_suggested_minimum(vm, self, i != 0);
+    const uint32_t spec = (uint32_t)args[i].i;
+    const int32_t size = (int32_t)(spec & 0x3fffffffu);
+    const uint32_t mode = spec >> 30;
+    sizes[i].i = mode == 0 ? want : mode == 1 ? size : (want < size ? want : size);
+  }
+  return view_set_measured(vm, self, sizes, nargs, out);
+}
+static const struct rt_method rt_gap_space[] = {
+  M("onMeasure", "(II)V", space_on_measure), M_END,
+};
+
 #define VIEW_MEASURE_GETTER(fn, field, mask) \
 static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
                int nargs, union dvm_value *out) \
@@ -17009,7 +17413,10 @@ static void ui_emit_view_inner(struct dvm *vm, struct ui_buf *b, struct ui_buf *
   }
 
   if (visibility == 4) ui_puts(b2, "visibility:hidden;");
-  const bool disabled = ui_int(vm, view, "disabled") != 0;
+  /* A disabled widget draws its disabled state (a Button's dimmed label and fill).  A disabled
+   * container draws nothing of its own, and its children keep their own look: dimming the
+   * group would dim everything inside it. */
+  const bool disabled = ui_int(vm, view, "disabled") != 0 && !ui_is_a(vm, view, "android/view/ViewGroup");
   union dvm_value alpha_set = { 0 };
   (void)dvm_get_field(vm, view, "alphaSet", "Z", &alpha_set);
   union dvm_value transition_set = {0};
@@ -17031,10 +17438,11 @@ static void ui_emit_view_inner(struct dvm *vm, struct ui_buf *b, struct ui_buf *
             ui_is_a(vm, view, "android/view/SurfaceView") ? " lunaria-surface-hole" : "",
             simple, is_webview ? " lunaria-webview lunaria-touchview" : " lunaria-touchview",
             ui_is_a(vm, view, "android/widget/NumberPicker") ? " lunaria-gestureview" : "");
-  /* A custom View is its picture, but a ViewGroup that paints something of its
-   * own (a status-bar scrim, a divider) still has children of the app's own
-   * to show: they stay in the document on top of that picture. */
-  if (raster && !ui_is_a(vm, view, "android/view/ViewGroup")) {
+  /* A custom child/foreground dispatcher owns painter order within the
+   * subtree. Its capture already contains the children; emitting them again
+   * would put them over Canvas content the app painted after drawChild().
+   * Groups with ordinary dispatch retain independent child elements. */
+  if (raster && (!ui_is_a(vm, view, "android/view/ViewGroup") || ui_capture_draws_children(vm,view))) {
     ui_puts(b,"</div>");
     return;
   }
@@ -17467,6 +17875,9 @@ static void ui_dump_tree(struct dvm *vm, dvm_ref view, unsigned depth)
           ui_int(vm, view, "visibility"), n ? n->w : -1, n ? n->h : -1,
           n ? n->x : 0, n ? n->y : 0,(unsigned)view, (int)ui_is_clickable(vm, view),
           ui_obj(vm,view,"touchListener","Landroid/view/View$OnTouchListener;")!=0);
+  if (ui_int(vm, view, "disabled")) fprintf(stderr, "[tree-disabled] ref=%u\n", (unsigned)view);
+  if (ui_int(vm, view, "alphaSet"))
+    fprintf(stderr, "[tree-alpha] ref=%u alpha=%g\n", (unsigned)view, (double)ui_float(vm, view, "alpha"));
   if (ui_is_a(vm, view, "android/widget/ImageView")) {
     dvm_ref dr = ui_obj(vm, view, "drawable", "Landroid/graphics/drawable/Drawable;");
     fprintf(stderr, "[tree-image] ref=%u res=0x%x drawable=%s\n", (unsigned)view,
@@ -17762,7 +18173,8 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
     union dvm_value r = { 0 };
     (void)view_request_focus(vm, clicked, NULL, 0, &r);
     union dvm_value a[2] = { { .l = clicked }, { .i = 0 } };
-    (void)imm_show_soft_input(vm, 0, a, 2, &r);
+    /* A field that turned showSoftInputOnFocus off raises the keyboard itself, when it chooses to. */
+    if (!ui_int(vm, clicked, "noSoftInputOnFocus")) (void)imm_show_soft_input(vm, 0, a, 2, &r);
     if (!ui_obj(vm, clicked, "clickListener", "Landroid/view/View$OnClickListener;"))
       return;
   }

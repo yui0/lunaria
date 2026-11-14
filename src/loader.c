@@ -490,6 +490,28 @@ static void touch_fifo_line(const char *line, int frame_count)
     }
     return;
   }
+  /* "text <chars>" types into the on-screen field the way the host keyboard does
+   * (GLFW's char callback -> luna_ime_char); "enter" is the Return key.  Both
+   * are ignored while no field has the keyboard, as a physical key would be. */
+  if (!strncmp(line, "text ", 5)) {
+    const unsigned char *u = (const unsigned char *)line + 5;
+    while (*u && *u != '\n') {
+      uint32_t cp = *u;
+      int extra = cp >= 0xf0 ? 3 : cp >= 0xe0 ? 2 : cp >= 0xc0 ? 1 : 0;
+      if (extra) cp &= 0x3f >> extra;
+      ++u;
+      for (; extra && (*u & 0xc0) == 0x80; --extra, ++u) cp = (cp << 6) | (*u & 0x3f);
+      luna_ime_char(cp);
+    }
+    fprintf(stderr, "[loader] TOUCH_FIFO text frame %d\n", frame_count);
+    return;
+  }
+  if (!strncmp(line, "enter", 5)) {
+    luna_ime_key(257 /* GLFW_KEY_ENTER */, 0, 1, 0);
+    luna_ime_key(257, 0, 0, 0);
+    fprintf(stderr, "[loader] TOUCH_FIFO enter frame %d\n", frame_count);
+    return;
+  }
   /* Explicit samples use the same host input route as a physical drag. */
   static const char *const commands[] = { "down ", "up ", "move " };
   for (int action = 0; action < 3; ++action) {

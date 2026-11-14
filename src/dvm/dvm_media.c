@@ -726,6 +726,14 @@ uint64_t lm_sink_commit_id(struct lm_sink *s)
   pthread_mutex_unlock(&s->mu);
   return serial;
 }
+bool lm_sink_frame_ready(struct lm_sink *s,int64_t present_ns)
+{
+  if (!s) return false;
+  pthread_mutex_lock(&s->mu);
+  bool ready=s->count && (!s->queued[s->head].timed || s->queued[s->head].due_ns<=present_ns);
+  pthread_mutex_unlock(&s->mu);
+  return ready;
+}
 int64_t lm_sink_acquired_timestamp(struct lm_sink *s)
 {
   if(!s) return 0;

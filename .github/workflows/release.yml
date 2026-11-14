@@ -40,7 +40,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential nasm cmake clang libclang-dev lld \
             pkg-config libssl-dev libglfw3-dev libgles2-mesa-dev libegl1-mesa-dev \
-            libasound2-dev libbsd-dev libunwind-dev zlib1g-dev \
+            libasound2-dev libbsd-dev libunwind-dev zlib1g-dev libboost-dev \
             libxcb1-dev libxcb-shm0-dev libxcb-randr0-dev
 
       - name: Build dynarmic

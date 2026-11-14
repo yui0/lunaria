@@ -189,6 +189,39 @@ size_t dvm_tls_session_id(const struct dvm_tls *t, uint8_t *out, size_t outsz);
  * and owned by the library. */
 const char *const *dvm_tls_supported_ciphers(void);
 
+/* A TLS session that owns no socket: the caller moves the bytes (what
+ * javax.net.ssl.SSLEngine needs).  Encrypted bytes from the peer go in through
+ * dvm_tls_engine_feed(), encrypted bytes for the peer come out of
+ * dvm_tls_engine_drain(), and application data passes through _read/_write.
+ * Not thread-safe; the engine's caller serializes. */
+struct dvm_tls_engine;
+struct dvm_tls_engine *dvm_tls_engine_new(bool client, const char *host, int verify,
+    const uint8_t *alpn, size_t alpn_len,
+    int min_version, int max_version,
+    const char *const *ciphers, int nciphers);
+void dvm_tls_engine_free(struct dvm_tls_engine *e);
+/* Starts (or continues) the handshake.  1 = complete, 0 = needs more I/O,
+ * -1 = failed (err filled). */
+int dvm_tls_engine_handshake(struct dvm_tls_engine *e, char *err, size_t errsz);
+size_t dvm_tls_engine_feed(struct dvm_tls_engine *e, const void *buf, size_t n);
+size_t dvm_tls_engine_drain(struct dvm_tls_engine *e, void *buf, size_t n);
+size_t dvm_tls_engine_pending_out(const struct dvm_tls_engine *e);
+/* Decrypted bytes buffered inside the session. */
+size_t dvm_tls_engine_pending_in(const struct dvm_tls_engine *e);
+/* >0 bytes, 0 = nothing yet (need more input), -1 = peer closed (close_notify),
+ * -2 = error (err filled). */
+long dvm_tls_engine_read(struct dvm_tls_engine *e, void *buf, size_t n, char *err, size_t errsz);
+/* >0 bytes consumed, 0 = handshake not finished, -2 = error. */
+long dvm_tls_engine_write(struct dvm_tls_engine *e, const void *buf, size_t n, char *err, size_t errsz);
+bool dvm_tls_engine_established(const struct dvm_tls_engine *e);
+/* Queues close_notify; drain it afterwards. */
+void dvm_tls_engine_shutdown(struct dvm_tls_engine *e);
+bool dvm_tls_engine_peer_closed(const struct dvm_tls_engine *e);
+const char *dvm_tls_engine_protocol(const struct dvm_tls_engine *e);
+const char *dvm_tls_engine_cipher(const struct dvm_tls_engine *e);
+int dvm_tls_engine_peer_chain(const struct dvm_tls_engine *e, uint8_t ***der, int **len);
+void dvm_tls_engine_alpn(const struct dvm_tls_engine *e, char *out, size_t outsz);
+
 /* DNS-SD host adapter. */
 /* Caller serializes operations. Events own TXT data until event_clear().
  * Callbacks are collected during poll; guest code never runs inside Avahi. */

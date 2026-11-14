@@ -957,11 +957,11 @@ $(BUILD_DIR)/test_dex_reader: test/dex_reader_test.c src/dvm/dex.c src/dvm/dvm.h
 	$(CC) -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra -Isrc $(DVM_TEST_SAN) \
 	    test/dex_reader_test.c src/dvm/dex.c -o $@
 
-test/test_dvm: test/declared_click_tests.h test/locale_iso_tests.h test/sonic_apk_probe.h test/short_buffer_tests.h test/int_animator_tests.h test/class_initialization_tests.h test/runtime_shutdown_tests.h test/vector_fixture.h test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
+test/test_dvm: test/declared_click_tests.h test/locale_iso_tests.h test/sonic_apk_probe.h test/short_buffer_tests.h test/int_animator_tests.h test/class_initialization_tests.h test/runtime_shutdown_tests.h test/vector_fixture.h test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC) $(DVM_HDR) $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o
 	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -D_GNU_SOURCE -Isrc \
 	    $(CPPFLAGS) $(HOST_TEST_RPATH) \
 	    $(DVM_TEST_SAN) \
-	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
+	    test/dvm_test.c test/dvm_host_fixture.c src/jvm/packages.c $(DVM_SRC:src/dvm/dvm_jni.c=) $(LUNA_OS_OBJ) $(LUNA_FNM_OBJ) $(BUILD_DIR)/luna_input.o $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o \
 	    -lm $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_CRYPTO_LIBS) $(HOST_CHARSET_LIBS) $(HOST_Z_LIBS) $(HOST_SYSTEM_DL_LIBS) $(HOST_GL_LIBS) -o $@
 
 .PHONY: runtime-shutdown-test

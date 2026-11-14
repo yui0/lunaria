@@ -393,6 +393,8 @@ void     arm_exec_upload_texture_rgba(int tex, const uint8_t *rgba, int w, int h
  * APKs, OBB and the staged files tree. */
 void arm_exec_audio_service(void);
 unsigned char *arm_exec_asset_read(const char *name, size_t *len);
+/* Caller owns the descriptor. Compressed package members have no FD span. */
+int arm_exec_asset_open_fd(const char *name,int64_t *start,int64_t *length);
 /* Decode a whole Ogg Vorbis stream to interleaved 16-bit PCM.  On success
  * returns 1 and a malloc'd buffer of `*frames` frames (free() it); 0 when the
  * bytes are not decodable Vorbis. */
@@ -732,6 +734,7 @@ static inline int arsc_find_bag(const uint8_t *b, size_t n, uint32_t id,
 
 /* resources.arsc name/value lookup used by android.content.res.Resources. */
 uint32_t arm_exec_apk_resource_id(const char *type, const char *name);
+uint32_t arm_exec_framework_resource_id(const char *type, const char *name);
 /* The type and entry name of a resource id (1), or 0 when it has none here. */
 int arm_exec_apk_resource_name(uint32_t id, char *type, size_t type_cap,
                                char *entry, size_t entry_cap);

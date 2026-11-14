@@ -1563,6 +1563,190 @@ struct dvm_tls *dvm_tls_connect(int fd, const char *host, int verify,
                                 0, -1);
 }
 
+/* ---- TLS session over memory BIOs (SSLEngine) ---------------------------- */
+struct dvm_tls_engine {
+  SSL_CTX *ctx;
+  SSL *ssl;
+  BIO *in, *out;        /* owned by `ssl` once set */
+  bool client, peer_closed, shut;
+};
+
+struct dvm_tls_engine *dvm_tls_engine_new(bool client, const char *host, int verify,
+    const uint8_t *alpn, size_t alpn_len,
+    int min_version, int max_version,
+    const char *const *ciphers, int nciphers)
+{
+  struct dvm_tls_engine *e = calloc(1, sizeof *e);
+  if (!e) return NULL;
+  e->client = client;
+  e->ctx = SSL_CTX_new(client ? TLS_client_method() : TLS_server_method());
+  if (!e->ctx) goto fail;
+  SSL_CTX_set_options(e->ctx, SSL_OP_NO_SSLv3);
+  if (verify & DVM_TLS_VERIFY_CHAIN) {
+    SSL_CTX_set_default_verify_paths(e->ctx);
+    SSL_CTX_set_verify(e->ctx, SSL_VERIFY_PEER, NULL);
+  } else {
+    SSL_CTX_set_verify(e->ctx, SSL_VERIFY_NONE, NULL);
+  }
+  if (min_version) SSL_CTX_set_min_proto_version(e->ctx, min_version);
+  if (max_version) SSL_CTX_set_max_proto_version(e->ctx, max_version);
+  e->ssl = SSL_new(e->ctx);
+  if (!e->ssl) goto fail;
+  e->in = BIO_new(BIO_s_mem());
+  e->out = BIO_new(BIO_s_mem());
+  if (!e->in || !e->out) goto fail;
+  BIO_set_mem_eof_return(e->in, -1);       /* an empty input is "retry", not EOF */
+  SSL_set_bio(e->ssl, e->in, e->out);       /* ssl owns both from here */
+  tls_apply_ciphers(e->ssl, ciphers, nciphers);
+  if (alpn && alpn_len) SSL_set_alpn_protos(e->ssl, alpn, (unsigned)alpn_len);
+  if (client) {
+    SSL_set_connect_state(e->ssl);
+    if (host && *host) {
+      unsigned char probe[16];
+      const bool is_ip = inet_pton(AF_INET, host, probe) == 1 ||
+                         inet_pton(AF_INET6, host, probe) == 1;
+      if (!is_ip) SSL_set_tlsext_host_name(e->ssl, host);
+      if (verify & DVM_TLS_VERIFY_HOST) {
+        if (!is_ip) SSL_set1_host(e->ssl, host);
+        else X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(e->ssl), host);
+      }
+    }
+  } else {
+    SSL_set_accept_state(e->ssl);
+  }
+  SSL_set_mode(e->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+  return e;
+fail:
+  if (e->ssl) SSL_free(e->ssl);
+  else {
+    BIO_free(e->in);
+    BIO_free(e->out);
+  }
+  if (e->ctx) SSL_CTX_free(e->ctx);
+  free(e);
+  return NULL;
+}
+
+void dvm_tls_engine_free(struct dvm_tls_engine *e)
+{
+  if (!e) return;
+  SSL_free(e->ssl);
+  SSL_CTX_free(e->ctx);
+  free(e);
+}
+
+static void tls_engine_error(char *err, size_t errsz)
+{
+  if (!errsz) return;
+  unsigned long c = ERR_get_error();
+  if (c) ERR_error_string_n(c, err, errsz);
+  else snprintf(err, errsz, "TLS failure");
+}
+
+int dvm_tls_engine_handshake(struct dvm_tls_engine *e, char *err, size_t errsz)
+{
+  if (SSL_is_init_finished(e->ssl)) return 1;
+  ERR_clear_error();
+  int r = SSL_do_handshake(e->ssl);
+  if (r == 1) return 1;
+  int w = SSL_get_error(e->ssl, r);
+  if (w == SSL_ERROR_WANT_READ || w == SSL_ERROR_WANT_WRITE) return 0;
+  if (w == SSL_ERROR_ZERO_RETURN) {
+    e->peer_closed = true;
+    return 0;
+  }
+  tls_engine_error(err, errsz);
+  return -1;
+}
+
+size_t dvm_tls_engine_feed(struct dvm_tls_engine *e, const void *buf, size_t n)
+{
+  if (!n) return 0;
+  int w = BIO_write(e->in, buf, (int)(n > 0x7fffffff ? 0x7fffffff : n));
+  return w > 0 ? (size_t)w : 0;
+}
+
+size_t dvm_tls_engine_drain(struct dvm_tls_engine *e, void *buf, size_t n)
+{
+  if (!n) return 0;
+  int r = BIO_read(e->out, buf, (int)(n > 0x7fffffff ? 0x7fffffff : n));
+  return r > 0 ? (size_t)r : 0;
+}
+
+size_t dvm_tls_engine_pending_out(const struct dvm_tls_engine *e)
+{
+  return (size_t)BIO_ctrl_pending(e->out);
+}
+
+size_t dvm_tls_engine_pending_in(const struct dvm_tls_engine *e)
+{
+  return (size_t)SSL_pending(e->ssl);
+}
+
+long dvm_tls_engine_read(struct dvm_tls_engine *e, void *buf, size_t n, char *err, size_t errsz)
+{
+  ERR_clear_error();
+  int r = SSL_read(e->ssl, buf, (int)(n > 0x7fffffff ? 0x7fffffff : n));
+  if (r > 0) return r;
+  int w = SSL_get_error(e->ssl, r);
+  if (w == SSL_ERROR_WANT_READ || w == SSL_ERROR_WANT_WRITE) return 0;
+  if (w == SSL_ERROR_ZERO_RETURN) {
+    e->peer_closed = true;
+    return -1;
+  }
+  tls_engine_error(err, errsz);
+  return -2;
+}
+
+long dvm_tls_engine_write(struct dvm_tls_engine *e, const void *buf, size_t n, char *err, size_t errsz)
+{
+  if (!SSL_is_init_finished(e->ssl)) return 0;
+  ERR_clear_error();
+  int r = SSL_write(e->ssl, buf, (int)(n > 0x7fffffff ? 0x7fffffff : n));
+  if (r > 0) return r;
+  tls_engine_error(err, errsz);
+  return -2;
+}
+
+bool dvm_tls_engine_established(const struct dvm_tls_engine *e)
+{
+  return SSL_is_init_finished(e->ssl) != 0;
+}
+
+void dvm_tls_engine_shutdown(struct dvm_tls_engine *e)
+{
+  if (e->shut) return;
+  e->shut = true;
+  if (SSL_is_init_finished(e->ssl)) SSL_shutdown(e->ssl);
+}
+
+bool dvm_tls_engine_peer_closed(const struct dvm_tls_engine *e)
+{
+  return e->peer_closed || (SSL_get_shutdown(e->ssl) & SSL_RECEIVED_SHUTDOWN);
+}
+
+const char *dvm_tls_engine_protocol(const struct dvm_tls_engine *e)
+{
+  return SSL_is_init_finished(e->ssl) ? SSL_get_version(e->ssl) : "NONE";
+}
+
+const char *dvm_tls_engine_cipher(const struct dvm_tls_engine *e)
+{
+  const char *c = SSL_is_init_finished(e->ssl) ? SSL_CIPHER_standard_name(SSL_get_current_cipher(e->ssl)) : NULL;
+  return c ? c : "SSL_NULL_WITH_NULL_NULL";
+}
+
+void dvm_tls_engine_alpn(const struct dvm_tls_engine *e, char *out, size_t outsz)
+{
+  const unsigned char *p = NULL;
+  unsigned n = 0;
+  SSL_get0_alpn_selected(e->ssl, &p, &n);
+  if (!outsz) return;
+  if (n >= outsz) n = (unsigned)outsz - 1;
+  if (n) memcpy(out, p, n);
+  out[n] = 0;
+}
+
 /* Sleeps until the fd can do what the session asked for.  0 = ready,
  * -2 = timed out, -1 = error. */
 int dvm_socket_wait(int fd, short events, int timeout_ms, int cancel_fd)
@@ -1784,11 +1968,11 @@ void dvm_tls_alpn(const struct dvm_tls *t, char *out, size_t outsz)
   out[len] = '\0';
 }
 
-int dvm_tls_peer_chain(const struct dvm_tls *t, uint8_t ***der, int **len)
+static int tls_chain_der(SSL *ssl, uint8_t ***der, int **len)
 {
   *der = NULL;
   *len = NULL;
-  STACK_OF(X509) *sk = t && t->ssl ? SSL_get_peer_cert_chain(t->ssl) : NULL;
+  STACK_OF(X509) *sk = ssl ? SSL_get_peer_cert_chain(ssl) : NULL;
   int n = sk ? sk_X509_num(sk) : 0;
   if (n <= 0) return 0;
   *der = calloc((size_t)n, sizeof **der);
@@ -1816,6 +2000,16 @@ int dvm_tls_peer_chain(const struct dvm_tls *t, uint8_t ***der, int **len)
     ++k;
   }
   return k;
+}
+
+int dvm_tls_peer_chain(const struct dvm_tls *t, uint8_t ***der, int **len)
+{
+  return tls_chain_der(t ? t->ssl : NULL, der, len);
+}
+
+int dvm_tls_engine_peer_chain(const struct dvm_tls_engine *e, uint8_t ***der, int **len)
+{
+  return tls_chain_der(e ? e->ssl : NULL, der, len);
 }
 
 const char *dvm_tls_auth_type(const struct dvm_tls *t)

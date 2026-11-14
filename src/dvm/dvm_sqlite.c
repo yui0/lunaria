@@ -55,6 +55,7 @@
 #define DB_DESC     "Landroid/database/sqlite/SQLiteDatabase;"
 #define CURSOR_DESC "Landroid/database/Cursor;"
 #define STMT_DESC   "Landroid/database/sqlite/SQLiteStatement;"
+#define QUERY_DESC  "Landroid/database/sqlite/SQLiteQuery;"
 
 /* --- the host library ---------------------------------------------------- */
 
@@ -601,8 +602,8 @@ static dvm_ref cursor_wrap(struct dvm *vm, struct sq_cursor *data)
 }
 
 /* Runs `sql` with `binds` to completion and keeps every row. */
-static dvm_ref sq_run_query(struct dvm *vm, struct sq_db *d, const char *sql,
-                            const struct sq_binds *binds)
+static struct sq_cursor *sq_query_data(struct dvm *vm, struct sq_db *d, const char *sql,
+                                       const struct sq_binds *binds)
 {
   sqlite3_stmt *st = NULL;
   int rc = sq.prepare_v2(d->db, sql, -1, &st, NULL);
@@ -616,7 +617,7 @@ static dvm_ref sq_run_query(struct dvm *vm, struct sq_db *d, const char *sql,
     dvm__throw(vm, "java/lang/OutOfMemoryError", "Cursor");
     return 0;
   }
-  if (!st) return cursor_wrap(vm, c);
+  if (!st) return c;
   if (!binds_bind(vm, d, st, binds, sql)) {
     sq.finalize(st);
     cursor_data_free(c);
@@ -670,11 +671,18 @@ static dvm_ref sq_run_query(struct dvm *vm, struct sq_db *d, const char *sql,
     goto fail;
   }
   sq.finalize(st);
-  return cursor_wrap(vm, c);
+  return c;
 fail:
   sq.finalize(st);
   cursor_data_free(c);
   return 0;
+}
+
+static dvm_ref sq_run_query(struct dvm *vm, struct sq_db *d, const char *sql,
+                            const struct sq_binds *binds)
+{
+  struct sq_cursor *c = sq_query_data(vm, d, sql, binds);
+  return c ? cursor_wrap(vm, c) : 0;
 }
 
 /* --- Cursor methods ------------------------------------------------------ */
@@ -1966,6 +1974,7 @@ static bool db_exec_sql(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   return sq_run_update(vm, d, sql, NULL, NULL, NULL);
 }
 
+static void binds_destroy(void *p);
 static bool db_raw_query(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                          int nargs, union dvm_value *out)
 {
@@ -1980,6 +1989,33 @@ static bool db_raw_query(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   }
   struct sq_binds *b = binds_from_array(vm, ARG(a + 1).l, false);
   if (!b) return false;
+  if (a && ARG(0).l) {
+    /* A CursorFactory (androidx.sqlite's FrameworkSQLiteDatabase hands every Room
+     * query through one): it receives the SQLiteQuery, binds its own arguments
+     * into it and builds the SQLiteCursor, which is what runs the statement. */
+    struct dvm_class *qc = dvm__class_by_desc(vm, QUERY_DESC);
+    dvm_ref q = qc ? dvm_new_object(vm, qc) : 0;
+    if (!q) {
+      binds_free(b);
+      RETL(0);
+    }
+    dvm_pin(vm, q);
+    (void)dvm_set_field(vm, q, "database", "Landroid/database/sqlite/SQLiteDatabase;", (union dvm_value) {
+      .l = self
+    });
+    (void)dvm_set_field(vm, q, "sql", "Ljava/lang/String;", ARG(1));
+    host_data_set(vm, q, b, binds_destroy);   /* the query owns its arguments now */
+    struct dvm_class *fc = dvm_object_class(vm, ARG(0).l);
+    struct dvm_method *nc = fc ? dvm_find_method(vm, fc, "newCursor",
+                            "(Landroid/database/sqlite/SQLiteDatabase;Landroid/database/sqlite/SQLiteCursorDriver;"
+                            "Ljava/lang/String;Landroid/database/sqlite/SQLiteQuery;)Landroid/database/Cursor;") : NULL;
+    union dvm_value call[4] = { { .l = self }, { .l = 0 }, ARG(3), { .l = q } }, cursor = { 0 };
+    const bool ok = nc ? dvm_call(vm, nc, ARG(0).l, call, 4, &cursor)
+                    : (dvm__throw(vm, "java/lang/AbstractMethodError", "CursorFactory.newCursor"), false);
+    dvm_unpin(vm, q);
+    if (!ok) return false;
+    RETL(cursor.l);
+  }
   dvm_ref c = sq_run_query(vm, d, sql, b);
   binds_free(b);
   if (!c) return false;
@@ -3109,6 +3145,38 @@ const struct dvm_sqlite_method dvm_sqlite_program_methods[] = {
   { NULL, NULL, NULL, 0 }
 };
 
+/* new SQLiteCursor(driver, editTable, query): runs the query's SQL with the
+ * arguments the CursorFactory bound into it, and becomes its result. */
+static bool sqcur_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                       int nargs, union dvm_value *out)
+{
+  (void)out;
+  dvm_ref q = ARG(2).l;
+  union dvm_value db = { 0 }, sql = { 0 };
+  if (!q) {
+    dvm__throw(vm, "java/lang/NullPointerException", "query");
+    return false;
+  }
+  (void)dvm_get_field(vm, q, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
+  (void)dvm_get_field(vm, q, "sql", "Ljava/lang/String;", &sql);
+  struct sq_db *d = db.l ? db_of(vm, db.l) : NULL;
+  const char *text;
+  if (!d || !sq_str(vm, sql.l, &text)) return false;
+  struct sq_cursor *c = sq_query_data(vm, d, text, host_data(vm, q));
+  if (!c) return false;
+  host_data_set(vm, self, c, cursor_destroy);
+  (void)dvm_set_field(vm, self, "position", "I", (union dvm_value) {
+    .i = -1
+  });
+  return true;
+}
+
+const struct dvm_sqlite_method dvm_sqlite_query_cursor_methods[] = {
+  { "<init>", "(Landroid/database/sqlite/SQLiteCursorDriver;Ljava/lang/String;Landroid/database/sqlite/SQLiteQuery;)V",
+    sqcur_init, 0 },
+  { NULL, NULL, NULL, 0 }
+};
+
 const struct dvm_sqlite_method dvm_sqlite_statement_methods[] = {
   { "execute", "()V", stmt_execute, 0 },
   { "executeInsert", "()J", stmt_execute_insert, 0 },
@@ -3312,6 +3380,7 @@ const struct dvm_sqlite_method dvm_sqlite_helper_methods[] = {
 };
 
 const struct dvm_sqlite_field dvm_sqlite_helper_fields[] = {
+  { "idleConnectionTimeout", "J" },
   { "name", "Ljava/lang/String;" }, { "database", "Landroid/database/sqlite/SQLiteDatabase;" },
   { "version", "I" }, { "wal", "Z" }, { NULL, NULL }
 };

@@ -530,6 +530,12 @@ static bool x_ssl_context_delegate(struct dvm *vm, dvm_ref self, const union dvm
   /* Sockets are the host's TLS (the platform's own socket layer); what the
    * built-in context cannot make -- an SSLEngine, session contexts, the
    * parameter sets -- is the provider's. */
+  if (!spi && !strcmp(m->name, "createSSLEngine")) {
+    const char *host = nargs >= 2 && args[0].l ? dvm_string_utf8(vm, args[0].l) : NULL;
+    dvm_ref e = host_engine_new(vm, host, nargs >= 2 ? args[1].i : -1);
+    if (!e) return false;
+    RETL(e);
+  }
   if (!spi) {
     dvm__throw(vm, "java/lang/UnsupportedOperationException", "SSLContext.%s", m->name);
     return false;

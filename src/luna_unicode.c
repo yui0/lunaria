@@ -11,6 +11,7 @@
  * * Unicode tables are compiled into this file; no external Unicode library.
  */
 #include "luna_unicode.h"
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -647,3 +648,36 @@ char *luna_idn_convert(const char *input, unsigned flags, bool ascii)
 }
 
 #include "unicode/breaks.h"
+
+const char *luna_uc_grapheme_break(int32_t cp)
+{
+  static const char *const names[] = {
+    "Other", "CR", "LF", "Control", "Extend", "ZWJ", "Regional_Indicator", "Prepend",
+    "SpacingMark", "L", "V", "T", "LV", "LVT",
+  };
+  if (cp < 0 || cp > 0x10ffff) return "Other";
+  return names[uc_break_property((uint32_t)cp)->gb];
+}
+
+#include "unicode/block_data.h"
+static void uc_loose_name(const char *in, char *out, size_t cap)
+{
+  size_t n = 0;
+  for (; *in && n + 1 < cap; ++in)
+    if (*in != ' ' && *in != '_' && *in != '-') out[n++] = (char)tolower((unsigned char)*in);
+  out[n] = 0;
+}
+
+bool luna_uc_block(const char *name, int32_t *first, int32_t *last)
+{
+  char want[96], have[96];
+  uc_loose_name(name, want, sizeof want);
+  for (size_t i = 0; i < sizeof uc_blocks / sizeof uc_blocks[0]; ++i) {
+    uc_loose_name(uc_blocks[i].name, have, sizeof have);
+    if (strcmp(want, have)) continue;
+    *first = (int32_t)uc_blocks[i].first;
+    *last = (int32_t)uc_blocks[i].last;
+    return true;
+  }
+  return false;
+}
