@@ -1078,6 +1078,8 @@ static const EVP_MD *pbe_pbkdf2_digest(const char *name)
 {
   if(!name)return NULL;
   if(!strcasecmp(name,"PBKDF2WithHmacSHA1"))return EVP_sha1();
+  /* BouncyCastle's 8-bit variant: same PRF, the password taken as one byte per char. */
+  if(!strcasecmp(name,"PBKDF2WithHmacSHA1And8BIT"))return EVP_sha1();
   if(!strcasecmp(name,"PBKDF2WithHmacSHA224"))return EVP_sha224();
   if(!strcasecmp(name,"PBKDF2WithHmacSHA256"))return EVP_sha256();
   if(!strcasecmp(name,"PBKDF2WithHmacSHA384"))return EVP_sha384();
@@ -1301,8 +1303,13 @@ static bool skf_generateSecret(struct dvm *vm,dvm_ref self,const union dvm_value
     return false;
   }
   size_t length=0;
+  const bool eight_bit=name && strcasestr(name,"And8BIT");
   for(uint32_t i=0; i<n; ++i) {
     uint32_t cp=chars[i];
+    if(eight_bit) {
+      password[length++]=(uint8_t)cp;               /* PBKDF2WithHmacSHA1And8BIT: the low byte of each char */
+      continue;
+    }
     if(cp>=0xd800 && cp<=0xdbff && i+1<n && chars[i+1]>=0xdc00 && chars[i+1]<=0xdfff) {
       cp=0x10000+((cp-0xd800)<<10)+(chars[++i]-0xdc00);
     }
@@ -1448,7 +1455,7 @@ static bool cipher_validate_transform(struct dvm *vm, const char *t)
   if (*mode && strcasecmp(mode, "ECB") &&
       !(rsa && !strcasecmp(mode, "NONE")) &&
       !((aes || des) && !strcasecmp(mode, "CBC")) &&
-      !(aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "GCM"))))
+      !(aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "OFB") || !strcasecmp(mode, "GCM"))))
     goto algorithm_error;
   bool padding = !*pad || !strcasecmp(pad, "NoPadding") ||
                  (!rsa && !rc4 && (!strcasecmp(pad, "PKCS5Padding") || !strcasecmp(pad, "PKCS7Padding"))) ||
@@ -1458,8 +1465,8 @@ static bool cipher_validate_transform(struct dvm *vm, const char *t)
                           !strcasecmp(pad, "OAEPWithSHA-256AndMGF1Padding") ||
                           !strcasecmp(pad, "OAEPWithSHA-384AndMGF1Padding") ||
                           !strcasecmp(pad, "OAEPWithSHA-512AndMGF1Padding")));
-  if (aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "GCM")))
-    padding = !strcasecmp(pad, "NoPadding");
+  if (aes && (!strcasecmp(mode, "CTR") || !strcasecmp(mode, "OFB") || !strcasecmp(mode, "GCM")))
+    padding = !strcasecmp(pad, "NoPadding");        /* stream modes take no padding */
   if (!padding) {
     dvm__throw(vm, "javax/crypto/NoSuchPaddingException", "%s", pad);
     return false;
@@ -1585,7 +1592,7 @@ static bool cipher_init(struct dvm *vm, dvm_ref self,
   const bool rsa = !strcasecmp(alg, "RSA");
   const bool gcm = !strcasecmp(mode, "GCM");
   const bool encrypting = ARG(0).i == JCE_ENCRYPT || ARG(0).i == JCE_WRAP;
-  int expected = gcm ? 12 : (!strcasecmp(mode, "CBC") || !strcasecmp(mode, "CTR"))
+  int expected = gcm ? 12 : (!strcasecmp(mode, "CBC") || !strcasecmp(mode, "CTR") || !strcasecmp(mode, "OFB"))
                  ? (!strcasecmp(alg, "AES") ? 16 : 8) : 0;
   if (!rsa) {
     if (params && !iv.l) {
@@ -1791,6 +1798,9 @@ static const EVP_CIPHER *cipher_pick(const char *alg, const char *mode,
   bool ecb = !strcasecmp(mode, "ECB") || !*mode;
   bool gcm = !strcasecmp(mode, "GCM");
   bool ctr = !strcasecmp(mode, "CTR");
+  bool ofb = !strcasecmp(mode, "OFB");
+  if (ofb && !strcasecmp(alg, "AES"))           /* stream mode: no padding, the key size picks the cipher */
+    return keylen == 16 ? EVP_aes_128_ofb() : keylen == 24 ? EVP_aes_192_ofb() : keylen == 32 ? EVP_aes_256_ofb() : NULL;
   if (!strcasecmp(alg, "AES")) {
     if (keylen == 16)
       return gcm ? EVP_aes_128_gcm() : ctr ? EVP_aes_128_ctr()
@@ -4218,7 +4228,7 @@ static bool cipher_getOutputSize(struct dvm *vm,dvm_ref self,
   } else {
     int block=!strcasecmp(alg,"AES") ? 16 :
               (!strcasecmp(alg,"DES") || !strcasecmp(alg,"DESede") || !strcasecmp(alg,"TripleDES")) ? 8 : 1;
-    if (encrypting && block>1 && strcasecmp(pad,"NoPadding") && strcasecmp(mode,"CTR"))
+    if (encrypting && block>1 && strcasecmp(pad,"NoPadding") && strcasecmp(mode,"CTR") && strcasecmp(mode,"OFB"))
       total=(total/block+1)*block;
   }
   if (total>INT32_MAX) {

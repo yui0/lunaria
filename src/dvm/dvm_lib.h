@@ -96,6 +96,22 @@ void jcs_decoder_free(struct jcs_decoder *d);
 int jcs_decoder_next(struct jcs_decoder *d, int (*next_byte)(void *ctx),
                      void *ctx);
 
+/* Incremental UTF-16 encoding. Errors leave the offending units unconsumed;
+ * an unfinished high surrogate is underflow until end_of_input. Native
+ * converters retain shift state across calls and flush it explicitly. */
+enum jcs_coder_result { JCS_UNDERFLOW, JCS_OVERFLOW, JCS_MALFORMED, JCS_UNMAPPABLE, JCS_CODER_FAILURE };
+struct jcs_encoder;
+struct jcs_coder_progress {
+  size_t consumed, produced, error_length;
+  enum jcs_coder_result result;
+};
+struct jcs_encoder *jcs_encoder_new(const struct jcs *cs);
+void jcs_encoder_free(struct jcs_encoder *encoder);
+void jcs_encoder_reset(struct jcs_encoder *encoder);
+struct jcs_coder_progress jcs_encoder_encode(struct jcs_encoder *encoder,
+    const uint16_t *input,size_t count,uint8_t *output,size_t capacity,bool end_of_input);
+struct jcs_coder_progress jcs_encoder_flush(struct jcs_encoder *encoder,uint8_t *output,size_t capacity);
+
 /* ---- java.util.regex engine ---- */
 
 /* A java.util.regex engine.
@@ -390,6 +406,9 @@ bool luna_path_round_rect(luna_path *path,const float rect[4],const float radii[
 bool luna_path_parse(luna_path *path,const char *data);
 bool luna_path_trim(luna_path *out,const luna_path *path,float start,float end,float offset);
 void luna_path_bounds(const luna_path *path,float bounds[4]);
+/* Android Path.Op order: difference, intersection, union, XOR, reverse
+ * difference. Failure leaves out unchanged; either input may alias out. */
+bool luna_path_boolean(luna_path *out,const luna_path *a,const luna_path *b,int operation);
 typedef struct luna_path_measure luna_path_measure;
 luna_path_measure *luna_path_measure_new(void);
 void luna_path_measure_free(void *measure);

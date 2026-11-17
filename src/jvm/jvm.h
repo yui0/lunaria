@@ -355,6 +355,8 @@ struct jvm {
   // Rotating free-slot hint for jvm_add_object(): allocation resumes here
   // instead of rescanning the whole table from index 0 on every call.
   size_t next_object;
+  size_t live_objects;
+  uint64_t object_allocations;
 
   // Native methods registered by the application.
   // Nothing special, but there's no need to access this array either really.
@@ -542,3 +544,13 @@ void luna_providers_close(struct luna_providers *);
 int luna_providers_open(struct luna_providers *,const char *text,const char *package);
 int luna_provider_local(const struct luna_provider *,const char *process);
 int luna_provider_authority(const struct luna_provider *,const char *authority);
+
+/* Caller may hold the interpreter lock; these only take the JVM metadata lock. */
+size_t jvm_live_objects(struct jvm *jvm,uint64_t *allocations);
+/* Hold reference mutations across the complete managed mark/sweep: a weak
+ * promotion must not introduce a new root between tracing and reclamation. */
+void jvm_binding_collection_begin(void);
+void jvm_binding_collection_end(void);
+
+/* Atomically release a bridge global only if no native strong reference remains. */
+bool jvm_release_unreachable_binding(struct jvm *jvm,jobject object,bool managed_instance);

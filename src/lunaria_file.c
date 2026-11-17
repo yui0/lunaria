@@ -8,12 +8,18 @@
 
 /* Host file management; plain C, shared by the VM and native engine.
  * Owns process scratch files and the .sym. guest-link representation. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #define LUNARIA_SYMLINK_NATIVE
 #include "lunaria_os.h"
 #include "lunaria_file.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(__linux__)
+#include <stdio_ext.h>
+#endif
 
 static pthread_mutex_t temp_lock = PTHREAD_MUTEX_INITIALIZER;
 static char temp_root[4096];
@@ -1353,4 +1359,110 @@ int luna_android_fs_prepare(const char *root)
   /* /data/user/0 is a bind alias of /data/data. The path mapper implements
    * that binding, including the parent directory and not only app children. */
   return 0;
+}
+
+/* Callback-backed host streams. */
+struct cookie_file { void *cookie; struct luna_cookie_io io; };
+static ptrdiff_t cookie_read(void *p,void *buffer,size_t size)
+{
+  struct cookie_file *f=p;
+  ptrdiff_t n=f->io.read(f->cookie,buffer,size);
+  if(n>=0 && (size_t)n>size) { errno=EIO; return -1; }
+  return n;
+}
+static ptrdiff_t cookie_write(void *p,const void *buffer,size_t size)
+{
+  struct cookie_file *f=p;
+  size_t done=0;
+  while(done<size) {
+    ptrdiff_t n=f->io.write(f->cookie,(const unsigned char *)buffer+done,size-done);
+    if(n<=0) return done ? (ptrdiff_t)done : n;
+    if((size_t)n>size-done) { errno=EIO; return done ? (ptrdiff_t)done : -1; }
+    done+=(size_t)n;
+  }
+  return (ptrdiff_t)done;
+}
+static int cookie_close(void *p)
+{
+  struct cookie_file *f=p;
+  int result=f->io.close ? f->io.close(f->cookie) : 0;
+  int error=errno;
+  free(f); errno=error;
+  return result;
+}
+#if defined(__linux__)
+static ssize_t host_read(void *p,char *buffer,size_t size) { return cookie_read(p,buffer,size); }
+static ssize_t host_write(void *p,const char *buffer,size_t size) { return cookie_write(p,buffer,size); }
+static int host_seek(void *p,off64_t *offset,int whence)
+{
+  struct cookie_file *f=p;
+  int64_t value=(int64_t)*offset;
+  int result=f->io.seek(f->cookie,&value,whence);
+  if(!result) *offset=(off64_t)value;
+  return result;
+}
+#elif defined(__APPLE__)
+static int host_read(void *p,char *buffer,int size) { return (int)cookie_read(p,buffer,(size_t)size); }
+static int host_write(void *p,const char *buffer,int size) { return (int)cookie_write(p,buffer,(size_t)size); }
+static fpos_t host_seek(void *p,fpos_t offset,int whence)
+{
+  struct cookie_file *f=p;
+  int64_t value=(int64_t)offset;
+  return f->io.seek(f->cookie,&value,whence) ? (fpos_t)-1 : (fpos_t)value;
+}
+#endif
+FILE *luna_cookie_file_open(void *cookie,const struct luna_cookie_io *io)
+{
+  if(!io || (!io->read && !io->write)) { errno=EINVAL; return NULL; }
+#if defined(__linux__) || defined(__APPLE__)
+  struct cookie_file *f=malloc(sizeof *f);
+  if(!f) return NULL;
+  f->cookie=cookie; f->io=*io;
+  FILE *stream;
+#if defined(__linux__)
+  cookie_io_functions_t functions={0};
+  functions.read=io->read ? host_read : NULL;
+  functions.write=io->write ? host_write : NULL;
+  functions.seek=io->seek ? host_seek : NULL;
+  functions.close=cookie_close;
+  stream=fopencookie(f,io->read ? (io->write ? "w+" : "r") : "w",functions);
+#else
+  stream=funopen(f,io->read ? host_read : NULL,io->write ? host_write : NULL,
+                  io->seek ? host_seek : NULL,cookie_close);
+#endif
+  if(!stream) { int error=errno; free(f); errno=error; }
+  return stream;
+#else
+  (void)cookie;
+  errno=ENOSYS; return NULL;
+#endif
+}
+int luna_stdio_flush_output(FILE *stream)
+{
+#if defined(__linux__)
+  flockfile(stream);
+  int result=__fpending(stream) ? fflush(stream) : 0;
+  int error=errno;
+  funlockfile(stream); errno=error;
+  return result;
+#elif defined(__APPLE__)
+  flockfile(stream);
+  int result=(stream->_flags & __SWR) ? fflush(stream) : 0;
+  int error=errno;
+  funlockfile(stream); errno=error;
+  return result;
+#else
+  return fflush(stream);
+#endif
+}
+
+int luna_file_allocate(int fd,int mode,int64_t offset,int64_t length)
+{
+#if defined(__linux__)
+  return fallocate64(fd,mode,(off64_t)offset,(off64_t)length);
+#else
+  (void)fd; (void)mode; (void)offset; (void)length;
+  errno=ENOSYS;
+  return -1;
+#endif
 }

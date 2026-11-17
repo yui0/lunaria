@@ -26,9 +26,22 @@ typedef bool (*dvm_builtin_fn)(struct dvm *vm, dvm_ref self,
 
 /* Live invocation chain, including C builtins and native bridges. Nodes
  * belong to the invoking thread's C stack; the GIL switches only its head. */
+struct dvm_local_root {
+  dvm_ref ref;
+  struct dvm_local_root *next;
+};
 struct dvm_call_frame {
   struct dvm_method *method;
   struct dvm_call_frame *previous;
+  /* All live invocations, including parked Java threads, remain registered
+   * under the GIL. Registers are conservative 32-bit Dalvik root slots. */
+  struct dvm_call_frame *live_next, *live_previous;
+  dvm_ref self;
+  const uint32_t *arguments, *registers;
+  uint32_t argument_count, register_count;
+  const uint64_t *result;
+  uint64_t serial;
+  struct dvm_local_root *locals;
 };
 
 struct dvm_field {
@@ -142,6 +155,9 @@ struct dvm_object {
   enum dvm_obj_kind kind;
   uint32_t pins;
   uint32_t host_handle;   /* jobject, for DVM_OBJ_EXTERNAL and lazily bound */
+  bool managed_retained; /* managed edges protect temporary storage, not GC roots */
+  bool host_binding_owned; /* one bridge global/pin, not a managed root */
+  uint64_t builtin_frame; /* native temporaries live until their builtin returns */
 
   /* strings */
   char *utf8;
@@ -285,6 +301,8 @@ struct dvm {
   uint32_t heap_nblocks;
   uint32_t heap_size, heap_cap;
   uint32_t free_head;
+  struct dvm_call_frame *live_frames;
+  uint64_t next_frame_serial;
 
   dvm_ref exception;
   dvm_ref content_observers; /* process ContentResolver registrations */
@@ -825,3 +843,9 @@ dvm_ref dvm_sqlite_empty_cursor(struct dvm *vm);
 
 /* The file a database name refers to (Context.getDatabasePath). */
 void dvm_sqlite_database_path(const char *name, char *path, size_t cap);
+
+/* Enumerate references stored in native collection payloads. */
+void dvm_runtime_visit_payload_refs(const struct dvm_object *object,
+                                    void (*visit)(dvm_ref,void *),void *context);
+
+void dvm_keep_managed(struct dvm *vm,dvm_ref ref);

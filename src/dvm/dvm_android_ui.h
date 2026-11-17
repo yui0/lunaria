@@ -2703,7 +2703,8 @@ static const struct rt_field rt_context_fields[] = {
   { "themeObject", "Landroid/content/res/Resources$Theme;" },
   { "layoutInflater", "Landroid/view/LayoutInflater;" },
   { "attributionSource", "Landroid/content/AttributionSource;" },
-  { "attributionTag", "Ljava/lang/String;" }, F_END
+  { "attributionTag", "Ljava/lang/String;" },
+  { "display", "Landroid/view/Display;" }, F_END
 };
 
 static bool context_get_package_name(struct dvm *vm, dvm_ref self,
@@ -3136,7 +3137,13 @@ static bool text_change_watcher(struct dvm *vm, dvm_ref self, const union dvm_va
   }
   (void)dvm_get_field(vm, view.l, "textWatchers", "Ljava/util/List;", &list);
   struct rt_list *l = list.l ? list_of(vm, list.l) : NULL;
-  if (!l || !l->size) RETV();
+  if (!l || !l->size) {
+    if (!strcmp(builtin_name(), "afterTextChanged")) {
+      ui_view_layout_changed(vm, view.l);
+      ui_invalidate_view(vm, view.l, NULL, 0);
+    }
+    RETV();
+  }
   /* A listener may add or remove listeners: walk a snapshot. */
   dvm_ref snapshot[64];
   uint32_t n = l->size < 64 ? l->size : 64;
@@ -3152,6 +3159,12 @@ static bool text_change_watcher(struct dvm *vm, dvm_ref self, const union dvm_va
     ok = am_vcall(vm, snapshot[i], name, sig, args, nargs, &ignored);
   }
   for (uint32_t i = 0; i < n; ++i) dvm_unpin(vm, snapshot[i]);
+  if (ok && !strcmp(name, "afterTextChanged")) {
+    /* The edit is done: the text may be a different width (TextView.checkForRelayout) and the field is
+     * painted again, however it was edited (a typed key, an input method's commit, the app's own replace()). */
+    ui_view_layout_changed(vm, view.l);
+    ui_invalidate_view(vm, view.l, NULL, 0);
+  }
   return ok;
 }
 static const struct rt_method rt_text_change_watcher[] = {
@@ -3611,6 +3624,11 @@ static const struct rt_field rt_text_view_fields[] = {
   { "textPaint", "Landroid/text/TextPaint;" },
   { "drawablePadding", "I" },
   { "autoSizeMin", "I" }, { "autoSizeMax", "I" }, { "autoSizeStep", "I" },
+  { "autoSizePresets", "[I" },
+  { "cursorHidden", "Z" }, { "linkTextColor", "I" }, { "linkTextColors", "Landroid/content/res/ColorStateList;" },
+  { "textMinWidth", "I" }, { "textMaxWidth", "I" }, { "textMaxWidthSet", "Z" },
+  { "compoundTint", "Landroid/content/res/ColorStateList;" },
+  { "compoundTintMode", "Landroid/graphics/PorterDuff$Mode;" },
   { "drawableLeft", "Landroid/graphics/drawable/Drawable;" },
   { "drawableTop", "Landroid/graphics/drawable/Drawable;" },
   { "drawableRight", "Landroid/graphics/drawable/Drawable;" },
@@ -3717,6 +3735,9 @@ static bool text_set_hint(struct dvm *vm, dvm_ref self,
 {
   (void)out;
   union dvm_value v = { .l = nargs ? ARG(0).l : 0 };
+  if (dvm__env("LUNARIA_TRACE_HINT"))
+    fprintf(stderr, "[hint] %s view=%u setHint(%s)\n", dvm_class_name(dvm_object_class(vm, self)), (unsigned)self,
+            v.l ? rt_charseq_utf8(vm, v.l) : "null");
   (void)dvm_set_field(vm, self, "hint", "Ljava/lang/CharSequence;", v);
   ui_view_layout_changed(vm, self);
   ui_invalidate();
@@ -5127,11 +5148,22 @@ static bool res_get_text(struct dvm *vm, dvm_ref self,
                          union dvm_value *out)
 {
   (void)self;
-  const char *value = luna_framework_string_value((uint32_t)ARG(0).i);
+  uint32_t id = (uint32_t)ARG(0).i;
+  const char *value = luna_framework_string_value(id);
   int32_t iv = 0;
-  if (value || (ARG(0).i &&
-                arm_exec_apk_resource_value((uint32_t)ARG(0).i, &iv, &value) == 'L' && value)) {
-    dvm_ref text=resource_styled_text(vm,(uint32_t)ARG(0).i,value);
+  /* A string entry may be an alias of another (@string/a = @string/b), which
+   * ResTable resolves when the text is requested; the styled spans belong to
+   * the entry that finally holds the string. */
+  for (unsigned hop = 0; !value && id && hop < 32; ++hop) {
+    int kind = arm_exec_apk_resource_value(id, &iv, &value);
+    if (kind == 'L') break;
+    value = NULL;
+    if (kind != 1 || (uint32_t)iv == id) break;
+    id = (uint32_t)iv;
+    value = luna_framework_string_value(id);
+  }
+  if (value) {
+    dvm_ref text=resource_styled_text(vm,id,value);
     if (dvm_exception(vm)) return false;
     RETL(text);
   }
@@ -5948,7 +5980,9 @@ static bool res_get_value(struct dvm *vm, dvm_ref self,
   (void)self;
   int32_t value = 0;
   const char *string = NULL;
-  int kind = arm_exec_apk_resource_value((uint32_t)ARG(0).i, &value, &string);
+  /* resolveRefs: an alias answers the entry it names. */
+  int kind = nargs > 2 && ARG(2).i ? res_value_resolved((uint32_t)ARG(0).i, &value, &string)
+                                   : arm_exec_apk_resource_value((uint32_t)ARG(0).i, &value, &string);
   if (nargs > 1) typed_value_assign(vm, ARG(1).l, kind, value, string);
   RETV();
 }
@@ -5982,7 +6016,8 @@ static bool res_open_raw_resource(struct dvm *vm, dvm_ref self,
   uint32_t id = nargs ? (uint32_t)ARG(0).i : 0;
   int32_t data_value = 0;
   const char *path = NULL;
-  int kind = arm_exec_apk_resource_value(id, &data_value, &path);
+  /* An alias (@raw/a = @raw/b) names the file that is meant. */
+  int kind = res_value_resolved(id, &data_value, &path);
   if (nargs > 1 && ARG(1).l) {
     typed_value_assign(vm, ARG(1).l, kind, data_value, path);
     union dvm_value resource = {.i = (int32_t)id};
@@ -6630,7 +6665,8 @@ static bool typed_value_apply_dimension(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_method rt_typed_value[] = {
-  M("<init>", "()V", nop_void),
+  /* TypedValue has no constructor body: its fields start at zero. */
+  M("<init>", "()V", empty_void),
   SM("applyDimension", "(IFLandroid/util/DisplayMetrics;)F", typed_value_apply_dimension),
   SM("complexToFloat", "(I)F", typed_value_complexToFloat),
   SM("complexToFraction", "(IFF)F", typed_value_complexToFloat),
@@ -8014,8 +8050,13 @@ static bool xml_parser_next(struct dvm *vm, dvm_ref self,
   } else {
     int32_t iv = 0;
     const char *path = NULL;
-    if (arm_exec_apk_resource_value((uint32_t)resource.i, &iv, &path) != 'L' ||
-        !path) RETI(1);
+    /* getXml(id) follows an alias (@color/a = @color/b) to the file it names. */
+    const int kind = res_value_resolved((uint32_t)resource.i, &iv, &path);
+    if (kind != 'L' || !path) {
+      if (dvm__env("LUNARIA_DVM_TRACE_LAYOUT"))
+        fprintf(stderr, "[dvm] xml parser: resource 0x%08x is not a file (kind=0x%x)\n", (unsigned)resource.i, kind);
+      RETI(1);
+    }
     bytes = arm_exec_asset_read(path, &n);
   }
   if (!bytes || n < 8 || ax_u16(bytes) != 3) {
@@ -8599,7 +8640,8 @@ static const struct rt_method rt_resources_theme[] = {
   M("getResources","()Landroid/content/res/Resources;",view_get_resources),
   M("resolveAttribute", "(ILandroid/util/TypedValue;Z)Z",
   theme_resolve_attribute),
-  M("rebase", "()V", nop_void),
+  /* Theme.rebase() only re-resolves theme state against a changed Resources; this emulator's themes resolve lazily. */
+  M("rebase", "()V", empty_void),
   M_END,
 };
 
@@ -9523,8 +9565,10 @@ static void svc_bind_deliver(struct dvm *vm, dvm_ref intent, dvm_ref conn, int f
     if (remote) {
       if (svc_conn_find(conn)) {
         int rc = dvm_binder_remote_bind(vm, remote, intent, conn);
-        if (rc < 0)
+        if (rc < 0) {
           fprintf(stderr, "[binder] bindService into %s failed: %s\n", remote, strerror(-rc));
+          luna_overlay_google_service(remote, false);
+        } else luna_overlay_google_service(remote, true);
       }
       free(remote);
       return;
@@ -9635,9 +9679,11 @@ static bool ctx_bindService(struct dvm *vm, dvm_ref self,
     const int rc = dvm_binder_remote_bind(vm, remote, intent, conn);
     if (rc < 0) {
       fprintf(stderr, "[binder] bindService into %s failed: %s\n", remote, strerror(-rc));
+      luna_overlay_google_service(remote, false);
       free(remote);
       RETI(0);
     }
+    luna_overlay_google_service(remote, true);
     free(remote);
     RETI(1);
   }
@@ -9647,6 +9693,13 @@ static bool ctx_bindService(struct dvm *vm, dvm_ref self,
     union dvm_value action = { 0 }, package = { 0 };
     (void)dvm_get_field(vm, intent, "action", "Ljava/lang/String;", &action);
     (void)dvm_get_field(vm, intent, "package", "Ljava/lang/String;", &package);
+    if (!package.l) {
+      union dvm_value component = {0};
+      (void)dvm_get_field(vm, intent, "component", "Landroid/content/ComponentName;", &component);
+      if (component.l)
+        (void)dvm_get_field(vm, component.l, "pkg", "Ljava/lang/String;", &package);
+    }
+    luna_overlay_google_service(package.l ? dvm_string_utf8(vm, package.l) : NULL, false);
     fprintf(stderr, "[service] bindService: nothing answers action=%s package=%s\n",
             action.l ? dvm_string_utf8(vm, action.l) : "-", package.l ? dvm_string_utf8(vm, package.l) : "-");
     RETI(0);
@@ -10066,6 +10119,7 @@ struct act_rec {
   bool stopped, visible;
   int importance;        /* ActivityThread lifecycle state, zero before launch */
   bool attached_only;    /* in the stack, window not shown yet */
+  uint32_t remote_sender, remote_token;
 };
 static struct act_rec g_acts[ACT_MAX];
 static int g_nacts;
@@ -10079,6 +10133,7 @@ struct act_launch {
   bool for_result;
   dvm_ref saved;         /* recreate(): the state onSaveInstanceState() wrote */
   int replace_at;        /* recreate(): the stack slot the new instance takes */
+  uint32_t remote_sender, remote_token;
 };
 static struct act_launch g_act_launches[8];
 static int g_nact_launches;
@@ -10086,7 +10141,7 @@ static dvm_ref g_act_finishes[8];
 static int g_nact_finishes;
 static dvm_ref g_act_recreates[8];
 static int g_nact_recreates;
-static bool g_task_background, g_task_move_back;
+static bool g_task_background, g_task_move_back, g_external_paused;
 
 static void ui_window_shown(struct dvm *vm, dvm_ref window);
 static void ui_window_hidden(struct dvm *vm, dvm_ref window);
@@ -10208,9 +10263,12 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
   }
   /* Activities and services have separate manifest resolvers. An alias is
    * the public component, while targetActivity is the class to instantiate. */
-  union dvm_value query[2]= {{.l=intent},{.i=0x10000}}, resolved= {0};
-  if (!pm_resolveActivity(vm,0,query,2,&resolved)) return false;
+  union dvm_value candidates={0}, resolved={0};
+  if (!pm_query_activities(vm,intent,0x10000,true,&candidates)) return false;
+  struct rt_list *matches=candidates.l ? list_of(vm,candidates.l) : NULL;
+  if (matches && matches->size) resolved.l=matches->items[0];
   struct dvm_class *cls=NULL;
+  const char *remote_owner=NULL;
   dvm_ref component=0;
   if (resolved.l) {
     union dvm_value info= {0}, target= {0}, name= {0};
@@ -10222,7 +10280,53 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
     component=dvm_new_object(vm,dvm_find_class(vm,"android/content/ComponentName"));
     union dvm_value pair[2]= {package,name};
     if (!component || !cn_init(vm,component,pair,2,&ignored)) return false;
-    const char *dotted=dvm_string_utf8(vm,target.l ? target.l : name.l);
+    const char *owner=package.l ? dvm_string_utf8(vm,package.l) : NULL;
+    const char *current=getenv("ANDROID_PACKAGE_NAME");
+    /* A foreign component belongs to that package's VM, never a same-named
+     * class in this app's ClassLoader. Remote Activity dispatch needs the
+     * component broker; it must not import another app's dex here. */
+    const char *dotted=owner && current && !strcmp(owner,current) ?
+                       dvm_string_utf8(vm,target.l ? target.l : name.l) : NULL;
+    union dvm_value process={0};
+    dvm_get_field(vm,info.l,"processName","Ljava/lang/String;",&process);
+    const char *destination=process.l ? dvm_string_utf8(vm,process.l) : owner;
+    const char *running=getenv("ANDROID_PROCESS_NAME");
+    if (owner && ((!current || strcmp(owner,current)) ||
+        (running && destination && strcmp(running,destination)))) remote_owner=owner;
+    if (remote_owner) {
+      union dvm_value exported={0}, permission={0}, app_info={0}, uid={0};
+      dvm_get_field(vm,info.l,"exported","Z",&exported);
+      dvm_get_field(vm,info.l,"permission","Ljava/lang/String;",&permission);
+      dvm_get_field(vm,info.l,"applicationInfo","Landroid/content/pm/ApplicationInfo;",&app_info);
+      if (app_info.l) dvm_get_field(vm,app_info.l,"uid","I",&uid);
+      if (uid.i!=arm_exec_guest_uid() && !exported.i) {
+        dvm__throw(vm,"java/lang/SecurityException","Activity %s is not exported",dvm_string_utf8(vm,name.l));
+        return false;
+      }
+      if (permission.l) {
+        union dvm_value check_args[2]={permission,{.l=dvm_new_string(vm,current ? current : "")}}, granted={0};
+        if (!pm_check_permission(vm,0,check_args,2,&granted) || granted.i!=0) {
+          if (!dvm_exception(vm)) dvm__throw(vm,"java/lang/SecurityException","Activity permission denied");
+          return false;
+        }
+      }
+      dvm_ref snapshot=dvm_new_object(vm,dvm_find_class(vm,"android/content/Intent"));
+      if (!snapshot) return false;
+      dvm_pin(vm,snapshot);
+      if (!intent_copy_into(vm,snapshot,intent,false)) { dvm_unpin(vm,snapshot);return false; }
+      dvm_set_field(vm,snapshot,"component","Landroid/content/ComponentName;",(union dvm_value){.l=component});
+      if (from_activity && self && !g_nacts) {
+        dvm_pin(vm,self);
+        g_acts[g_nacts++]=(struct act_rec){.activity=self,.visible=true};
+      }
+      int rc=dvm_binder_remote_activity(vm,owner,snapshot,dvm_string_utf8(vm,name.l),self,request_code,for_result);
+      dvm_unpin(vm,snapshot);
+      if (!rc) { luna_overlay_google_activity(owner,true); return true; }
+      luna_overlay_google_activity(owner,false);
+      if (!dvm_exception(vm)) dvm__throw(vm,rc==-EACCES ? "java/lang/SecurityException" :
+          "android/content/ActivityNotFoundException","Cannot start %s: %s",dvm_string_utf8(vm,name.l),strerror(-rc));
+      return false;
+    }
     char *descriptor=dotted ? strdup(dotted) : NULL;
     if (descriptor) {
       for (char *p=descriptor; *p; ++p) if (*p=='.') *p='/';
@@ -10246,6 +10350,7 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
     }
   }
   if (!cls || !cls->dex) {
+    if (remote_owner) luna_overlay_google_activity(remote_owner,false);
     union dvm_value act = { 0 };
     (void)dvm_get_field(vm, intent, "action", "Ljava/lang/String;", &act);
     const char *a = act.l ? dvm_string_utf8(vm, act.l) : NULL;
@@ -10260,7 +10365,7 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
   }
   /* The activity that asked is the one on top; the first one to ask is the
    * launcher, which the loader started before this stack existed. */
-  if (from_activity && g_nacts == 0) {
+  if (from_activity && self && g_nacts == 0) {
     dvm_pin(vm, self);
     g_acts[g_nacts++] = (struct act_rec) {
       .activity = self, .visible = true
@@ -10373,6 +10478,11 @@ static bool act_getIntent(struct dvm *vm, dvm_ref self, const union dvm_value *a
   dvm_pin(vm, intent);
   union dvm_value f = { .l = dvm_new_string(vm, "android.intent.action.MAIN") };
   (void)dvm_set_field(vm, intent, "action", "Ljava/lang/String;", f);
+  union dvm_value category = { .l = dvm_new_string(vm, "android.intent.category.LAUNCHER") }, ignored = {0};
+  if (!intent_addCategory(vm, intent, &category, 1, &ignored)) {
+    dvm_unpin(vm, intent);
+    return false;
+  }
   f.i = 0x10200000;
   (void)dvm_set_field(vm, intent, "flags", "I", f);
   f.l = service_component_name(vm, dvm_object_class(vm, self));
@@ -10485,6 +10595,7 @@ static void act_do_launch(struct dvm *vm, const struct act_launch *l)
   if (!base.l && g_nacts)
     (void)dvm_get_field(vm, g_acts[0].activity, "mBase",
                         "Landroid/content/Context;", &base);
+  if (!app.l) app.l=g_process_application;
   if (!base.l) base.l = app.l;
   if (base.l) act_call(vm, obj, "attachBaseContext", "(Landroid/content/Context;)V",
                          &base, 1);
@@ -10520,10 +10631,12 @@ static void act_do_launch(struct dvm *vm, const struct act_launch *l)
     /* The activity it covers is paused first. */
     if (g_nacts && !g_task_background) act_perform(vm, g_acts[g_nacts - 1].activity, "Paused", "onPause", "()V", NULL, 0);
     g_task_background = false;
+    g_external_paused = false;
     if (g_nacts < ACT_MAX)
       g_acts[g_nacts++] = (struct act_rec) {
       .activity = obj, .caller = l->caller,
                        .request_code = l->request_code, .for_result = l->for_result,
+                       .remote_sender=l->remote_sender, .remote_token=l->remote_token,
     };
     if (l->caller && l->for_result) dvm_pin(vm, l->caller);
   }
@@ -10546,7 +10659,7 @@ static void act_do_finish(struct dvm *vm, dvm_ref activity)
   if (i < 0) return;
   const bool top = i == g_nacts - 1;
   struct act_rec rec = g_acts[i];
-  if (top && !g_task_background) act_perform(vm, activity, "Paused", "onPause", "()V", NULL, 0);
+  if (top && !g_task_background && !g_external_paused) act_perform(vm, activity, "Paused", "onPause", "()V", NULL, 0);
   if(!rec.stopped) act_perform(vm, activity, "Stopped", "onStop", "()V", NULL, 0);
   act_perform(vm, activity, "Destroyed", "onDestroy", "()V", NULL, 0);
   ui_window_hidden(vm, activity);
@@ -10554,6 +10667,12 @@ static void act_do_finish(struct dvm *vm, dvm_ref activity)
   --g_nacts;
   if (!g_nacts) g_task_background=false;
   act_reconcile_visibility(vm);
+  if (rec.remote_sender && rec.remote_token) {
+    union dvm_value code={0}, data={0};
+    dvm_get_field(vm,activity,"resultCode","I",&code);
+    dvm_get_field(vm,activity,"resultData","Landroid/content/Intent;",&data);
+    dvm_binder_activity_finished(vm,rec.remote_sender,rec.remote_token,code.i,data.l);
+  }
   if (rec.for_result && rec.caller) {
     union dvm_value code = { 0 }, data = { 0 };
     (void)dvm_get_field(vm, activity, "resultCode", "I", &code);
@@ -10616,6 +10735,7 @@ static void act_do_recreate(struct dvm *vm, dvm_ref activity)
     .cls = cls, .component = component.l, .intent = intent.l, .caller = rec.caller,
     .request_code = rec.request_code, .for_result = rec.for_result,
     .saved = saved, .replace_at = i,
+    .remote_sender=rec.remote_sender,.remote_token=rec.remote_token,
   };
   act_do_launch(vm, &launch);
   if (top) {
@@ -10632,6 +10752,7 @@ static void act_do_recreate(struct dvm *vm, dvm_ref activity)
  * asked for. */
 static void act_tick(struct dvm *vm)
 {
+  dvm_binder_activity_tick(vm);
   while (g_nact_recreates) {
     dvm_ref a = g_act_recreates[0];
     memmove(&g_act_recreates[0], &g_act_recreates[1],
@@ -10663,6 +10784,86 @@ static void act_tick(struct dvm *vm)
     if (l.component) dvm_unpin(vm, l.component);
     if (l.caller) dvm_unpin(vm, l.caller);
   }
+}
+
+unsigned dvm_activity_state(struct dvm *vm)
+{
+  unsigned cookie=dvm_gil_enter_from_guest(vm);
+  unsigned state=(g_nacts ? 1u : 0u) | (g_nacts && !g_task_background && !g_external_paused ? 2u : 0u) |
+                 (g_nact_launches ? 4u : 0u) | (g_task_background ? 8u : 0u);
+  dvm_gil_leave_to_guest(vm,cookie);
+  return state;
+}
+void dvm_activity_pause(struct dvm *vm)
+{
+  unsigned cookie=dvm_gil_enter_from_guest(vm);
+  struct dvm_tstate saved,turn={0};
+  dvm__tstate_save(vm,&saved);turn.cur_thread=vm->main_thread;dvm__tstate_load(vm,&turn);
+  ++vm->main_transaction_depth; ++vm->drain_depth;
+  if(g_nacts && !g_task_background && !g_external_paused) {
+    act_perform(vm,g_acts[g_nacts-1].activity,"Paused","onPause","()V",NULL,0);
+    g_external_paused=true;
+  }
+  --vm->drain_depth; --vm->main_transaction_depth;
+  dvm__tstate_load(vm,&saved);dvm_gil_leave_to_guest(vm,cookie);
+}
+void dvm_activity_foreground(struct dvm *vm,bool foreground)
+{
+  unsigned cookie=dvm_gil_enter_from_guest(vm);
+  struct dvm_tstate saved,turn={0};
+  dvm__tstate_save(vm,&saved);turn.cur_thread=vm->main_thread;dvm__tstate_load(vm,&turn);
+  ++vm->main_transaction_depth; ++vm->drain_depth;
+  if (g_nacts && (foreground==g_task_background || (foreground && g_external_paused))) {
+    if (!foreground && !g_external_paused) act_perform(vm,g_acts[g_nacts-1].activity,"Paused","onPause","()V",NULL,0);
+    g_task_background=!foreground;
+    act_reconcile_visibility(vm);
+    if (foreground) {
+      g_external_paused=false;
+      dvm_binder_activity_tick(vm);
+      act_perform(vm,g_acts[g_nacts-1].activity,"Resumed","onResume","()V",NULL,0);
+    }
+  }
+  --vm->drain_depth; --vm->main_transaction_depth;
+  dvm__tstate_load(vm,&saved);
+  dvm_gil_leave_to_guest(vm,cookie);
+}
+void dvm_activity_back(struct dvm *vm)
+{
+  unsigned cookie=dvm_gil_enter_from_guest(vm);
+  struct dvm_tstate saved,turn={0};
+  dvm__tstate_save(vm,&saved);turn.cur_thread=vm->main_thread;dvm__tstate_load(vm,&turn);
+  ++vm->main_transaction_depth; ++vm->drain_depth;
+  if (g_nacts) act_call(vm,g_acts[g_nacts-1].activity,"onBackPressed","()V",NULL,0);
+  --vm->drain_depth; --vm->main_transaction_depth;
+  dvm__tstate_load(vm,&saved);
+  dvm_gil_leave_to_guest(vm,cookie);
+}
+void dvm_activity_result(struct dvm *vm,uint32_t caller,int32_t request,int32_t code,uint32_t data)
+{
+  union dvm_value a[3]={ {.i=request},{.i=code},{.l=data} };
+  act_call(vm,caller,"onActivityResult","(IILandroid/content/Intent;)V",a,3);
+}
+int dvm_activity_accept(struct dvm *vm,uint32_t intent,uint32_t uid,uint32_t sender,uint32_t token)
+{
+  union dvm_value list={0},info={0},package={0},process={0},exported={0};
+  if (!pm_query_activities(vm,intent,0x10000,true,&list)) return -EINVAL;
+  struct rt_list *matches=list.l ? list_of(vm,list.l) : NULL;
+  if (!matches || !matches->size) return -ENOENT;
+  dvm_get_field(vm,matches->items[0],"activityInfo","Landroid/content/pm/ActivityInfo;",&info);
+  dvm_get_field(vm,info.l,"packageName","Ljava/lang/String;",&package);
+  dvm_get_field(vm,info.l,"processName","Ljava/lang/String;",&process);
+  dvm_get_field(vm,info.l,"exported","Z",&exported);
+  const char *self=getenv("ANDROID_PACKAGE_NAME"),*running=getenv("ANDROID_PROCESS_NAME");
+  if (!self || !package.l || strcmp(self,dvm_string_utf8(vm,package.l)) ||
+      (running && process.l && strcmp(running,dvm_string_utf8(vm,process.l)))) return -EXDEV;
+  if (uid!=(uint32_t)arm_exec_guest_uid() && !exported.i) return -EACCES;
+  if (g_nact_launches>=8) return -EAGAIN;
+  int before=g_nact_launches;
+  if (!act_start_common(vm,0,intent,true,false,0) || dvm_exception(vm)) return -EIO;
+  if (g_nact_launches!=before+1) return -EIO;
+  g_act_launches[before].remote_sender=sender;
+  g_act_launches[before].remote_token=token;
+  return 0;
 }
 
 static bool act_runOnUiThread(struct dvm *vm, dvm_ref self,
@@ -10721,10 +10922,16 @@ static bool act_getTitle(struct dvm *vm, dvm_ref self, const union dvm_value *ar
 static bool act_isTaskRoot(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
-  (void)vm;
   (void)args;
   (void)nargs;
-  RETI(act_index(self) == 0);
+  if(act_index(self)!=0)RETI(0);
+  if(g_acts[0].remote_sender) {
+    union dvm_value intent={0},flags={0};
+    if(!act_getIntent(vm,self,NULL,0,&intent))return false;
+    if(intent.l)dvm_get_field(vm,intent.l,"flags","I",&flags);
+    if(!(flags.i & ACT_FLAG_NEW_TASK))RETI(0);
+  }
+  RETI(1);
 }
 
 /* Android numbers tasks from 1; 0 is never a live task.  Task trackers
@@ -10994,7 +11201,8 @@ static bool act_move_task_back(struct dvm *vm,dvm_ref self,const union dvm_value
   (void)vm;
   (void)nargs;
   int index=act_index(self);
-  if(index<0 || (!ARG(0).i && index!=0)) RETI(0);
+  union dvm_value root={0};
+  if(index<0 || !act_isTaskRoot(vm,self,NULL,0,&root) || (!ARG(0).i && !root.i)) RETI(0);
   g_task_move_back=true;
   RETI(1);
 }
@@ -11051,8 +11259,15 @@ static bool act_back_pressed(struct dvm *vm,dvm_ref self,const union dvm_value *
         ++b;
       }
       if(!*a && !*b) {
-        g_task_move_back=true;
-        RETV();
+        union dvm_value root={0},intent={0},action={0},category={.l=dvm_new_string(vm,"android.intent.category.LAUNCHER")},matches={0};
+        if(!act_isTaskRoot(vm,self,NULL,0,&root) || !act_getIntent(vm,self,NULL,0,&intent))return false;
+        if(intent.l)dvm_get_field(vm,intent.l,"action","Ljava/lang/String;",&action);
+        const char *value=action.l ? dvm_string_utf8(vm,action.l) : NULL;
+        if(root.i && value && !strcmp(value,"android.intent.action.MAIN") &&
+            intent_hasCategory(vm,intent.l,&category,1,&matches) && matches.i) {
+          g_task_move_back=true;
+          RETV();
+        }
       }
     }
   }
@@ -11410,6 +11625,36 @@ static size_t ax_len8(const unsigned char *p, size_t left, uint32_t *value)
   return 2;
 }
 
+/* A compiled XML document may leave the names of its attributes out of the
+ * string pool (the strings are empty) and identify each attribute only by the
+ * resource id in the RES_XML_RESOURCE_MAP chunk, whose entry N belongs to pool
+ * string N.  Android reads attributes by id, never by name.  Name-based
+ * consumers (the inflater, drawable and animator parsers) are given the name
+ * that id has in its package, so both spellings of a document read the same. */
+static void ax_name_attributes(const unsigned char *b, size_t n, size_t pos,
+                               char **strings, uint32_t count)
+{
+  while (pos + 8 <= n) {
+    uint16_t type = ax_u16(b + pos), hs = ax_u16(b + pos + 2);
+    uint32_t size = ax_u32(b + pos + 4);
+    if (size < hs || size < 8 || pos + size > n) return;
+    if (type == 0x0180 && hs >= 8) {
+      uint32_t entries = (size - hs) / 4;
+      for (uint32_t i = 0; i < entries && i < count; ++i) {
+        if (strings[i] && *strings[i]) continue;
+        uint32_t id = ax_u32(b + pos + hs + (size_t)i * 4u);
+        char kind[32], entry[128];
+        if (!id || !arm_exec_apk_resource_name(id, kind, sizeof kind, entry, sizeof entry) ||
+            strcmp(kind, "attr") || !*entry) continue;
+        free(strings[i]);
+        strings[i] = luna_strndup(entry, strlen(entry));
+      }
+      return;
+    }
+    pos += size;
+  }
+}
+
 static char **ax_string_pool(const unsigned char *b, size_t n,
                              uint32_t *count_out)
 {
@@ -11462,10 +11707,41 @@ static char **ax_string_pool(const unsigned char *b, size_t n,
         strings[i][chars] = '\0';
       }
     }
+    ax_name_attributes(b, n, pos + size, strings, count);
     *count_out = count;
     return strings;
   }
   return NULL;
+}
+
+static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name, uint8_t type, uint32_t data,
+                               char *const *strings, uint32_t nstrings);
+/* Applies a style resource's attributes to a view, parents first (the bag already merges them), through the same
+ * per-attribute path an XML attribute takes. */
+static void ax_apply_style(struct dvm *vm, dvm_ref view, uint32_t style)
+{
+  ArmExecResourceValue *items = NULL;
+  size_t count = 0;
+  if (!style || !arm_exec_apk_resource_bag(style, &items, &count)) return;
+  for (size_t i = 0; i < count; ++i) {
+    char kind[32], entry[128];
+    if (!arm_exec_apk_resource_name(items[i].key, kind, sizeof kind, entry, sizeof entry) || strcmp(kind, "attr"))
+      continue;
+    /* LayoutParams read layout_* from the element's own attributes only; a style never supplies them. */
+    if (!strncmp(entry, "layout_", 7)) continue;
+    char *pool[1] = { (char *)items[i].text };
+    uint32_t data = items[i].data;
+    if (dvm__env("LUNARIA_DVM_TRACE_LAYOUT"))
+      fprintf(stderr, "[dvm] style 0x%08x: %s type=0x%x data=0x%x\n", (unsigned)style, entry, items[i].type, (unsigned)items[i].data);
+    if (items[i].type == 0x03) {
+      if (!items[i].text) continue;
+      data = 0;                                  /* the text travels in the one-entry pool */
+    }
+    ax_apply_attribute(vm, view, entry, (uint8_t)items[i].type, data, pool, 1);
+    /* A style item whose theme attribute or resource is not defined is simply not applied. */
+    if (dvm_exception(vm)) dvm_clear_exception(vm);
+  }
+  free(items);
 }
 
 static dvm_ref li_make_view(struct dvm *vm, const char *tag, dvm_ref context, dvm_ref attributes)
@@ -11572,23 +11848,25 @@ enum {
   AX_COLOR_RGB4  = 0x1f,
 };
 
+/* What a theme answers for an attribute: every style applied to it, in order (defined with the Resources.Theme). */
+static int theme_style_value(struct dvm *vm, dvm_ref self, uint32_t attr, int32_t *value, const char **string);
+
 /* A length in device pixels.  MATCH_PARENT (-1) and WRAP_CONTENT (-2) arrive
  * as plain ints and have to survive as themselves. */
 static int32_t ax_dimension_px(struct dvm *vm, dvm_ref context, uint8_t type, uint32_t data)
 {
-  union dvm_value theme = {0}, style = {0};
+  union dvm_value theme = {0};
   if (type == AX_ATTRIBUTE) {
     struct dvm_class *c = dvm_object_class(vm, context);
     struct dvm_method *get = c ? dvm_find_method(vm, c, "getTheme", "()Landroid/content/res/Resources$Theme;") : NULL;
     if (get && !dvm_call(vm, get, context, NULL, 0, &theme)) return 0;
-    (void)dvm_get_field(vm, theme.l, "style", "I", &style);
   }
   unsigned depth = 0;
   while ((type == AX_ATTRIBUTE || type == AX_REFERENCE) && data && depth++ < 32) {
     int32_t resolved = 0;
     const char *text = NULL;
     int kind = type == AX_ATTRIBUTE
-               ? arm_exec_apk_style_value((uint32_t)style.i, data, &resolved, &text)
+               ? theme_style_value(vm, theme.l, data, &resolved, &text)
                : arm_exec_apk_resource_value(data, &resolved, &text);
     if (!kind || text) {
       dvm__throw(vm, "java/lang/UnsupportedOperationException", "unresolved dimension #0x%08x", data);
@@ -13101,7 +13379,7 @@ static dvm_ref drawable_from_resource(struct dvm *vm, uint32_t id, unsigned dept
 {
   int32_t iv = 0;
   const char *path = NULL;
-  if (depth > 8 || !id || arm_exec_apk_resource_value(id, &iv, &path) != 'L' || !path)
+  if (depth > 8 || !id || res_value_resolved(id, &iv, &path) != 'L' || !path)
     return 0;
   const size_t len = strlen(path);
   if (dvm__env("LUNARIA_TRACE_DRAWABLE"))
@@ -13486,6 +13764,24 @@ static void ax_apply_attribute(struct dvm *vm, dvm_ref view, const char *name,
   /* Backgrounds arrive as a colour, a drawable reference, or a state list.
    * Only a resolved colour can be painted; the reference is kept either way
    * so a widget that reads it back sees what the layout said. */
+  if (!strcmp(name, "background") && type == 0x02 /* ?attr: a theme attribute */) {
+    /* The background is whatever the theme says the attribute is (AppCompat's EditText: editTextBackground,
+     * the underline drawable); resolve it, then take the ordinary path with the resource or colour it names. */
+    union dvm_value theme = {0};
+    dvm_ref tv = dvm_new_object(vm, dvm_find_class(vm, "android/util/TypedValue"));
+    if (!tv || !view_drawable_theme(vm, view, &theme) || !theme.l) return;
+    dvm_pin(vm, tv);
+    union dvm_value a[3] = { { .i = (int32_t)data }, { .l = tv }, { .i = 1 } }, found = {0};
+    if (am_vcall(vm, theme.l, "resolveAttribute", "(ILandroid/util/TypedValue;Z)Z", a, 3, &found) && found.i) {
+      const uint32_t rid = (uint32_t)rt_get_int(vm, tv, "resourceId");
+      const int32_t rtype = rt_get_int(vm, tv, "type"), rdata = rt_get_int(vm, tv, "data");
+      if (rid) ax_apply_attribute(vm, view, name, 0x01 /* reference */, rid, strings, nstrings);
+      else if (rtype >= 0x1c && rtype <= 0x1f) ax_apply_attribute(vm, view, name, (uint8_t)rtype, (uint32_t)rdata, strings, nstrings);
+    }
+    dvm_unpin(vm, tv);
+    if (dvm_exception(vm)) dvm_clear_exception(vm);
+    return;
+  }
   if (!strcmp(name, "background")) {
     int32_t argb = 0;
     if (ax_color(vm, type, data, &argb))
@@ -15122,7 +15418,7 @@ static const char *ui_drawable_path(int32_t res_id)
   if (res_id <= 0) return NULL;
   int32_t iv = 0;
   const char *entry = NULL;
-  if (!arm_exec_apk_resource_value((uint32_t)res_id, &iv, &entry)) return NULL;
+  if (!res_value_resolved((uint32_t)res_id, &iv, &entry)) return NULL;
   if (!entry || !*entry) return NULL;
   const char *dot = strrchr(entry, '.');
   if (!dot) return NULL;
@@ -15275,7 +15571,7 @@ static const char *ui_drawable_src_uncached(struct dvm *vm, int32_t res_id)
   if (png || res_id <= 0) return png;
   int32_t iv = 0;
   const char *entry = NULL;
-  if (arm_exec_apk_resource_value((uint32_t)res_id, &iv, &entry) != 'L' || !entry) return NULL;
+  if (res_value_resolved((uint32_t)res_id, &iv, &entry) != 'L' || !entry) return NULL;
   const size_t len = strlen(entry);
   if (len <= 4 || strcasecmp(entry + len - 4, ".xml")) return NULL;
   const char *host = arm_exec_apk_entry_path(entry);
@@ -16145,6 +16441,9 @@ static void ui_measure_leaf(struct dvm *vm, dvm_ref view, struct ui_ms ws,
       int32_t min_w = view_suggested_minimum(vm, view, false);
       if (w < min_w) w = min_w;
       if (is_button && w < 88) w = 88;         /* Widget.Button minWidth */
+      /* TextView.setMaxWidth()/setMinWidth(): the content-sized width, bounded. */
+      if (ui_int(vm, view, "textMaxWidthSet") && w > ui_int(vm, view, "textMaxWidth")) w = ui_int(vm, view, "textMaxWidth");
+      if (w < ui_int(vm, view, "textMinWidth")) w = ui_int(vm, view, "textMinWidth");
       if (ws.mode == UI_MS_ATMOST && w > ws.size) w = ws.size;
     }
     /* Soft wrapping inside what is left of the width. */

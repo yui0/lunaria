@@ -156,9 +156,84 @@ static const struct rt_field rt_decimal_format_fields[] = {
   { "pattern", "Ljava/lang/String;" },
   { "minFrac", "I" }, { "maxFrac", "I" }, { "minInt", "I" }, { "maxInt", "I" },
   { "primaryGroup", "I" }, { "secondaryGroup", "I" },
-  { "grouping", "Z" }, { "parseIntegerOnly", "Z" }, { "symbols", "Ljava/text/DecimalFormatSymbols;" }, F_END
+  { "grouping", "Z" }, { "parseIntegerOnly", "Z" }, { "symbols", "Ljava/text/DecimalFormatSymbols;" },
+  { "posPrefix", "Ljava/lang/String;" }, { "posSuffix", "Ljava/lang/String;" },
+  { "negPrefix", "Ljava/lang/String;" }, { "negSuffix", "Ljava/lang/String;" },
+  { "multiplier", "I" }, F_END
 };
 
+/* One affix of a DecimalFormat pattern: the text outside the digit
+ * placeholders of a (sub)pattern.  Quotes make characters literal ('' is a
+ * quote), and an unquoted % or U+2030 (per mille) both prints itself and sets
+ * the multiplier, as java.text.DecimalFormat.applyPattern does. */
+static bool decfmt_is_digit_char(char c)
+{
+  return c=='#' || c=='0' || c==',' || c=='.';
+}
+static void decfmt_affix(const char *begin,const char *end,char *out,size_t capacity,int *multiplier)
+{
+  size_t used=0;
+  bool quote=false;
+  for(const char *p=begin; p<end && used+4<capacity; ++p) {
+    if(*p=='\'') {
+      if(p+1<end && p[1]=='\'') out[used++]=*++p;
+      else quote=!quote;
+      continue;
+    }
+    if(!quote) {
+      if(*p=='%') *multiplier=100;
+      else if(end-p>=3 && (unsigned char)p[0]==0xe2 && (unsigned char)p[1]==0x80 && (unsigned char)p[2]==0xb0) *multiplier=1000;
+    }
+    out[used++]=*p;
+  }
+  out[used]=0;
+}
+/* Splits one subpattern at its first and last digit placeholder. */
+static void decfmt_subpattern(const char *begin,const char *end,char *prefix,char *suffix,size_t capacity,int *multiplier)
+{
+  const char *first=NULL,*last=NULL;
+  bool quote=false;
+  for(const char *p=begin; p<end; ++p) {
+    if(*p=='\'') {
+      quote=!quote;
+      continue;
+    }
+    if(quote || !decfmt_is_digit_char(*p)) continue;
+    if(!first) first=p;
+    last=p;
+  }
+  if(!first) first=last=end-1;
+  decfmt_affix(begin,first,prefix,capacity,multiplier);
+  decfmt_affix(last+1,end,suffix,capacity,multiplier);
+}
+static void decfmt_apply_affixes(struct dvm *vm,dvm_ref self,const char *pattern)
+{
+  char pp[128]="",ps[128]="",np[128]="",ns[128]="";
+  int multiplier=1,ignored=1;
+  const char *end=pattern ? pattern+strlen(pattern) : NULL,*semi=NULL;
+  bool quote=false;
+  for(const char *p=pattern; p && p<end; ++p) {
+    if(*p=='\'') quote=!quote;
+    else if(*p==';' && !quote) {
+      semi=p;
+      break;
+    }
+  }
+  if(pattern) decfmt_subpattern(pattern,semi ? semi : end,pp,ps,sizeof pp,&multiplier);
+  if(semi) decfmt_subpattern(semi+1,end,np,ns,sizeof np,&ignored);
+  union dvm_value v= {0};
+  v.l=dvm_new_string(vm,pp);
+  (void)dvm_set_field(vm,self,"posPrefix","Ljava/lang/String;",v);
+  v.l=dvm_new_string(vm,ps);
+  (void)dvm_set_field(vm,self,"posSuffix","Ljava/lang/String;",v);
+  /* Without an explicit negative subpattern the negative form is the minus
+   * sign in front of the positive prefix, and the same suffix. */
+  v.l=semi ? dvm_new_string(vm,np) : 0;
+  (void)dvm_set_field(vm,self,"negPrefix","Ljava/lang/String;",v);
+  v.l=semi ? dvm_new_string(vm,ns) : 0;
+  (void)dvm_set_field(vm,self,"negSuffix","Ljava/lang/String;",v);
+  rt_set_int(vm,self,"multiplier",multiplier);
+}
 static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
 {
   int min=0,max=0,min_integer=0,digits=0,last=-1,previous=-1;
@@ -202,6 +277,7 @@ static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
   (void)dvm_set_field(vm,self,"grouping","Z",(union dvm_value) {
     .i=last>=0
   });
+  decfmt_apply_affixes(vm,self,pattern);
 }
 
 static bool decfmt_init(struct dvm *vm, dvm_ref self,
@@ -266,9 +342,23 @@ static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm
 {
   uint16_t units[2048];
   size_t used=0;
-  if(*ascii=='-') {
-    units[used++]=(uint16_t)decfmt_symbol(vm,self,"minusSign",'-');
+  const bool negative=*ascii=='-';
+  union dvm_value prefix= {0},suffix= {0};
+  (void)dvm_get_field(vm,self,"posPrefix","Ljava/lang/String;",&prefix);
+  (void)dvm_get_field(vm,self,"posSuffix","Ljava/lang/String;",&suffix);
+  if(negative) {
+    union dvm_value np= {0},ns= {0};
+    (void)dvm_get_field(vm,self,"negPrefix","Ljava/lang/String;",&np);
+    (void)dvm_get_field(vm,self,"negSuffix","Ljava/lang/String;",&ns);
+    if(np.l) {
+      prefix=np;
+      if(ns.l) suffix=ns;
+    } else units[used++]=(uint16_t)decfmt_symbol(vm,self,"minusSign",'-');
     ++ascii;
+  }
+  if(prefix.l) {
+    const char *text=dvm_string_utf8(vm,prefix.l);
+    if(text && used+jcs_wtf8_to_utf16(text,strlen(text),NULL)<512) used+=jcs_wtf8_to_utf16(text,strlen(text),units+used);
   }
   uint16_t zero=(uint16_t)decfmt_symbol(vm,self,"zeroDigit",'0');
   uint16_t decimal=(uint16_t)decfmt_symbol(vm,self,"decimalSeparator",'.');
@@ -301,6 +391,10 @@ static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm
     units[used++]=decimal;
     for(const char *p=dot+1; *p; ++p) units[used++]=(uint16_t)(zero+*p-'0');
   }
+  if(suffix.l) {
+    const char *text=dvm_string_utf8(vm,suffix.l);
+    if(text && used+jcs_wtf8_to_utf16(text,strlen(text),NULL)<sizeof units/sizeof units[0]) used+=jcs_wtf8_to_utf16(text,strlen(text),units+used);
+  }
   dvm_ref text=text_from_utf16(vm,units,used);
   if(!text) return false;
   RETL(text);
@@ -312,6 +406,8 @@ static bool decfmt_render(struct dvm *vm,dvm_ref self,double value,union dvm_val
     uint16_t units[2]= {(uint16_t)decfmt_symbol(vm,self,"minusSign",'-'),0x221e};
     RETL(text_from_utf16(vm,units+(value>0),value>0 ? 1 : 2));
   }
+  int multiplier=rt_get_int(vm,self,"multiplier");
+  if(multiplier>1) value*=multiplier;
   int min=rt_get_int(vm,self,"minFrac"),max=rt_get_int(vm,self,"maxFrac");
   if(min<0) min=0;
   if(min>340) min=340;
@@ -364,6 +460,9 @@ static bool decfmt_format_j(struct dvm *vm,dvm_ref self,const union dvm_value *a
   while(magnitude);
   if(value<0) ascii[used++]='-';
   while(count) ascii[used++]=digits[--count];
+  /* The multipliers (percent, per mille) are powers of ten, so multiplying
+   * an integer cannot overflow int64 if it is done on its digits. */
+  for(int m=rt_get_int(vm,self,"multiplier"); m>1 && m%10==0; m/=10) ascii[used++]='0';
   int min=rt_get_int(vm,self,"minFrac");
   if(min<0) min=0;
   if(min>340) min=340;
@@ -557,6 +656,18 @@ static bool numfmt_format_object(struct dvm *vm,dvm_ref self,const union dvm_val
   union dvm_value arguments[3]= {number,args[1],args[2]};
   return format && dvm_call(vm,format,self,arguments,3,out);
 }
+/* CLDR percentFormat: the percent sign follows the number, separated by a
+ * no-break space in the languages that write it that way, and Turkish puts it
+ * in front.  Everything else (English, Japanese, ...) is "#,##0%". */
+static const char *numfmt_percent_pattern(const char *language,bool indian)
+{
+  static const char *const spaced[]= {"de","es","ru","sv","cs","fi","nb","nn","da","sk","sl","bg","et","hr","lt","lv","sq",NULL};
+  if(!language) language="";
+  if(!strcmp(language,"tr")) return "%#,##0";
+  if(!strcmp(language,"fr")) return "#,##0\xe2\x80\xaf%";
+  for(size_t i=0; spaced[i]; ++i) if(!strcmp(language,spaced[i])) return "#,##0\xc2\xa0%";
+  return indian ? "#,##,##0%" : "#,##0%";
+}
 /* Each factory result owns its symbols and digit settings. */
 static bool numfmt_factory(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -571,7 +682,23 @@ static bool numfmt_factory(struct dvm *vm,dvm_ref self,const union dvm_value *ar
   }
   dvm_pin(vm,format);
   bool good=dvm_set_field(vm,format,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
-  if(good) decfmt_apply(vm,format,rt_get_int(vm,symbols.l,"secondaryGroup")==2 ? "#,##,##0.###" : "#,##0.###");
+  if(good) {
+    const char *name=builtin_name();
+    const bool indian=rt_get_int(vm,symbols.l,"secondaryGroup")==2;
+    const char *pattern=indian ? "#,##,##0.###" : "#,##0.###";
+    if(!strcmp(name,"getIntegerInstance")) {
+      pattern=indian ? "#,##,##0" : "#,##0";
+      (void)dvm_set_field(vm,format,"parseIntegerOnly","Z",(union dvm_value) {
+        .i=1
+      });
+    } else if(!strcmp(name,"getPercentInstance")) {
+      union dvm_value locale= {0};
+      if(nargs) locale=args[0];
+      else if(!loc_getDefault(vm,0,NULL,0,&locale)) good=false;
+      pattern=good ? numfmt_percent_pattern(loc_field_utf8(vm,locale.l,"language"),indian) : pattern;
+    }
+    if(good) decfmt_apply(vm,format,pattern);
+  }
   dvm_unpin(vm,format);
   dvm_unpin(vm,symbols.l);
   if(!good) return false;
@@ -582,6 +709,10 @@ static const struct rt_method rt_decimal_format[] = {
   SM("getInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
   SM("getNumberInstance","()Ljava/text/NumberFormat;",numfmt_factory),
   SM("getNumberInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
+  SM("getPercentInstance","()Ljava/text/NumberFormat;",numfmt_factory),
+  SM("getPercentInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
+  SM("getIntegerInstance","()Ljava/text/NumberFormat;",numfmt_factory),
+  SM("getIntegerInstance","(Ljava/util/Locale;)Ljava/text/NumberFormat;",numfmt_factory),
   M("<init>", "()V", decfmt_init),
   M("<init>", "(Ljava/lang/String;)V", decfmt_init),
   M("<init>", "(Ljava/lang/String;Ljava/text/DecimalFormatSymbols;)V", decfmt_init),

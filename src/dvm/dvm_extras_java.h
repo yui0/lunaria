@@ -836,7 +836,8 @@ static const struct rt_method rt_x_system[] = {
 /* ---------------------------------------------------------- ProcessBuilder */
 
 static const struct rt_field rt_x_process_builder_fields[] = {
-  { "command", "Ljava/util/List;" }, F_END
+  { "command", "Ljava/util/List;" }, { "redirectErrorStream", "Z" },
+  { "directory", "Ljava/io/File;" }, { "environment", "Ljava/util/Map;" }, F_END
 };
 
 static bool x_pb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,

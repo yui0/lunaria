@@ -417,6 +417,11 @@ struct arm_zip_metadata {
 int arm_exec_zip_metadata(const char *archive, const char *name,
                           struct arm_zip_metadata *out);
 
+/* Names and metadata of every member in one pass, in central-directory order.
+ * Returns malloc'd names (free each, then the array) and fills *meta (malloc'd,
+ * `count` items); NULL on failure. */
+char **arm_exec_zip_entries(const char *archive, struct arm_zip_metadata **meta, size_t *count);
+
 /* The member names of a zip/jar/apk, malloc'd array of malloc'd strings. */
 char **arm_exec_zip_list(const char *archive, size_t *count);
 
@@ -865,6 +870,11 @@ int arm_exec_load_library(const char *path, uint32_t base_addr);
  * Must be called before nativeRecreateGfxState so Unity's GL calls use a real context.
  * Returns 1 on success, 0 on failure. */
 int arm_exec_host_egl_init(void);
+/* Promote a component process when its first Activity needs a window. */
+int arm_exec_host_activity_egl_init(void);
+/* Main host thread only. Hiding an Activity window does not kill its Service. */
+void arm_exec_host_window_visible(int visible);
+int arm_exec_host_window_close_requested(void);
 
 /* Call eglSwapBuffers on the host EGL surface (present the rendered frame). */
 void arm_exec_egl_swap(void);

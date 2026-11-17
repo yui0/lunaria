@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <float.h>
+#include <limits.h>
+#define LUNA_POLY_OPS_IMPLEMENTATION
+#include "../luna_poly_ops.h"
 
 struct path_contour {
   NSVGpath node;
@@ -425,6 +428,46 @@ float *luna_path_approximate(const luna_path *p,float error,size_t *count)
   *count=s.count;
   return s.values;
 }
+/* Curve subdivision stays independent of display resolution. The polygon
+ * engine lives entirely in luna_poly_ops.h and has no external dependency. */
+static bool boolean_add_path(luna_poly_ops *ops,const luna_path *path,unsigned operand)
+{
+  for(const NSVGpath *n=path->first;n;n=n->next) {
+    if(n->npts<4) continue;
+    float scale=1;
+    for(int i=0;i<n->npts*2;++i) {
+      if(!isfinite(n->pts[i])) return false;
+      scale=fmaxf(scale,fabsf(n->pts[i]));
+    }
+    NSVGpath node=*n;node.next=NULL;
+    luna_path contour={.first=&node,.last=&node};
+    size_t count=0;
+    float *points=luna_path_approximate(&contour,fmaxf(1e-5f,2*FLT_EPSILON*scale),&count);
+    if(!points) return false;
+    bool good=luna_poly_add(ops,operand,points+1,count,3*sizeof(float));
+    free(points);
+    if(!good)return false;
+  }
+  return true;
+}
+static bool boolean_emit(void *user,int action,float x,float y)
+{
+  luna_path *path=user;
+  return action==0 ? luna_path_move(path,x,y) : action==1 ? luna_path_line(path,x,y) : luna_path_close(path);
+}
+bool luna_path_boolean(luna_path *out,const luna_path *a,const luna_path *b,int operation)
+{
+  if(operation<0 || operation>4)return false;
+  luna_path result={0};
+  luna_poly_ops ops={0};
+  bool good=boolean_add_path(&ops,a,0) && boolean_add_path(&ops,b,1) &&
+            luna_poly_compute(&ops,(unsigned)a->fill,(unsigned)b->fill,operation,boolean_emit,&result);
+  if(good)result.fill=(int)ops.result_fill;
+  luna_poly_free(&ops);
+  if(!good) { luna_path_clear(&result,true);return false; }
+  luna_path_clear(out,true);*out=result;return true;
+}
+
 unsigned char *luna_path_mask(const luna_path *p,int w,int h,const float matrix[9],
                               int style,float stroke,int cap,int join,float miter,bool aa)
 {

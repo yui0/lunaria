@@ -317,6 +317,44 @@ int arm_exec_zip_metadata(const char *archive, const char *name,
   return found;
 }
 
+/* Every member with its metadata from one index of the archive, in central
+ * directory order (ZipFile.entries() order).  Indexing once matters: asking for
+ * each member's metadata separately re-indexes the archive per member, which is
+ * quadratic for the tens of thousands of entries a bundled APK has. */
+char **arm_exec_zip_entries(const char *archive, struct arm_zip_metadata **meta, size_t *count)
+{
+  if (count) *count = 0;
+  if (meta) *meta = NULL;
+  if (!archive || !count || !meta) return NULL;
+  char mapped[APK_PATH];
+  const char *path = arm_exec_map_guest_path(archive, mapped, sizeof mapped);
+  struct zip zip = {0};
+  if (!path || zip_open(&zip, path)) return NULL;
+  char **names = calloc(zip.count + 1, sizeof *names);
+  struct arm_zip_metadata *info = calloc(zip.count + 1, sizeof *info);
+  size_t n = 0;
+  for (; names && info && n < zip.count; n++) {
+    const struct zip_entry *e = zip.entries + n;
+    names[n] = strdup(e->name);
+    if (!names[n]) break;
+    info[n].size = e->size;
+    info[n].compressed_size = e->compressed;
+    info[n].crc = e->crc;
+    info[n].method = e->method;
+  }
+  const int complete = names && info && n == zip.count;
+  zip_close(&zip);
+  if (!complete) {
+    for (size_t i = 0; names && i < n; i++) free(names[i]);
+    free(names);
+    free(info);
+    return NULL;
+  }
+  *count = n;
+  *meta = info;
+  return names;
+}
+
 /* ZIP paths must stay under the installed tree on all three platforms. */
 static bool entry_safe(const char *name)
 {
@@ -810,7 +848,9 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
   struct text provider = {0}, filter_actions = {0}, filter_categories = {0}, filter_specs = {0}, service_actions = {0}, receiver_actions = {0};
   char activity[512] = "", target[512] = "", orient[32] = "", theme[32] = "", app_theme[32] = "", changes[32] = "";
   bool main = false, launcher = false, activity_launch = false;
-  int activity_enabled = 1, filter_data = 0, filter_priority = 0;
+  int activity_enabled = 1, activity_exported = -1, filter_data = 0, filter_priority = 0;
+  bool activity_filter = false;
+  char activity_permission[512] = "";
   int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
   bool receiver_filter = false;
   int service_depth = -1, service_enabled = 1, service_exported = -1, application_depth=-1;
@@ -955,9 +995,16 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
           goto done;
         const struct attr *av = attribute(a, count, "enabled");
         activity_enabled = app_enabled && (!av || attr_boolean(av));
+        av = attribute(a, count, "exported");
+        activity_exported = av ? attr_boolean(av) : -1;
+        av = attribute(a, count, "permission");
+        if (copy_text(activity_permission, sizeof activity_permission,
+                      av ? av->text : !strcmp(tag,"activity-alias") ? "" : app_permission)) goto done;
+        activity_filter = false;
         activity_depth = depth;
         activity_launch = false;
       } else if (!strcmp(tag, "intent-filter") && activity_depth >= 0) {
+        activity_filter = true;
         intent_depth = depth;
         main = launcher = false;
         const struct attr *priority = attribute(a, count, "priority");
@@ -1083,7 +1130,27 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
         char component[512], target_class[512] = "";
         if (class_name(component, sizeof component, m->package, activity) ||
             (*target && class_name(target_class, sizeof target_class, m->package, target))) goto done;
-        if (text_add_row(&m->activities, "\n", "%s|%s|%d", component, target_class, activity_enabled))
+        if (*target_class) {
+          /* An alias has no process attribute: it executes its previously
+           * declared target, but owns its enabled/exported/filter state. */
+          char *rows = strdup(text_get(&m->activities));
+          if (!rows) goto done;
+          bool found = false;
+          for (char *cursor=rows,*row; (row=luna_strsep(&cursor,"\n"));) {
+            char *name=luna_strsep(&row,"|"), *alias=luna_strsep(&row,"|");
+            (void)luna_strsep(&row,"|");
+            (void)luna_strsep(&row,"|");
+            char *proc=luna_strsep(&row,"|");
+            if (!strcmp(name,target_class) && alias && !*alias && proc) {
+              found = copy_text(activity_process,sizeof activity_process,proc)==0;
+              break;
+            }
+          }
+          free(rows);
+          if (!found) goto done;
+        }
+        if (text_add_row(&m->activities, "\n", "%s|%s|%d|%d|%s|%s", component, target_class, activity_enabled,
+                         activity_exported < 0 ? activity_filter : activity_exported, activity_process, activity_permission))
           goto done;
         if (activity_launch && activity_enabled && !*m->activity) {
           if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
@@ -1626,6 +1693,74 @@ done:
   zip_close(&zip);
   return status;
 }
+struct activity_manifest_cache {
+  struct activity_manifest_cache *next;
+  char *path, *package, *activities, *filters;
+  uint64_t device, inode;
+  int64_t size;
+  luna_file_time modified;
+  unsigned sdk;
+  bool loaded, valid;
+};
+static pthread_mutex_t activity_manifest_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct activity_manifest_cache *activity_manifests;
+int luna_apk_activity_manifest(const char *apk, const char *package,
+                               char **activities, char **filters)
+{
+  luna_file_info info;
+  if (activities) *activities=NULL;
+  if (filters) *filters=NULL;
+  if (!apk || !package || !activities || !filters ||
+      luna_file_infoat(LUNA_AT_FDCWD,apk,&info,0)) return -1;
+  unsigned sdk=(unsigned)lunaria_sdk_int();
+  int result=-1;
+  pthread_mutex_lock(&activity_manifest_lock);
+  struct activity_manifest_cache *cache=activity_manifests;
+  while (cache && strcmp(cache->path,apk)) cache=cache->next;
+  if (!cache) {
+    cache=calloc(1,sizeof *cache);
+    if (!cache) goto done;
+    cache->path=strdup(apk);
+    if (!cache->path) { free(cache); goto done; }
+    cache->next=activity_manifests;
+    activity_manifests=cache;
+  }
+  if (!cache->loaded || cache->device!=info.device || cache->inode!=info.inode ||
+      cache->size!=info.size || cache->modified.seconds!=info.modified.seconds ||
+      cache->modified.nanoseconds!=info.modified.nanoseconds || cache->sdk!=sdk) {
+    struct zip zip={0};
+    struct manifest *manifest=calloc(1,sizeof *manifest);
+    if (!manifest) goto done;
+    bool ok=manifest && !zip_open(&zip,apk) && !manifest_zip(&zip,manifest);
+    char *name=ok ? strdup(manifest->package) : NULL;
+    char *rows=ok ? strdup(text_get(&manifest->activities)) : NULL;
+    char *matches=ok ? strdup(text_get(&manifest->activity_filters)) : NULL;
+    manifest_free(manifest);
+    zip_close(&zip);
+    cache->device=info.device; cache->inode=info.inode; cache->size=info.size;
+    cache->modified=info.modified; cache->sdk=sdk;
+    cache->valid=false;
+    cache->loaded=!ok;
+    if (!name || !rows || !matches) {
+      free(name); free(rows); free(matches);
+      goto done;
+    }
+    free(cache->package); free(cache->activities); free(cache->filters);
+    cache->package=name; cache->activities=rows; cache->filters=matches;
+    cache->loaded=cache->valid=true;
+  }
+  if (!cache->valid || strcmp(cache->package,package)) goto done;
+  *activities=strdup(cache->activities);
+  *filters=strdup(cache->filters);
+  if (!*activities || !*filters) {
+    free(*activities); free(*filters);
+    *activities=NULL; *filters=NULL;
+  } else result=0;
+done:
+  pthread_mutex_unlock(&activity_manifest_lock);
+  return result;
+}
+
 int luna_apk_service_manifest(const char *apk, char **services, char **providers, char *process, size_t cap)
 {
   struct zip zip = {0};

@@ -114,6 +114,10 @@ int luna_apk_google_profile_create(char *out, size_t cap);
 int luna_apk_system_archive(const char *package, char *out, size_t cap);
 /* Caller owns the returned manifest service table. */
 int luna_apk_service_manifest(const char *apk, char **services, char **providers, char *process, size_t cap);
+/* Cached installed-APK activity metadata. Caller owns both returned tables.
+ * Rows: name|targetActivity|enabled|exported|processName|permission. */
+int luna_apk_activity_manifest(const char *apk, const char *package,
+                               char **activities, char **filters);
 
 /* Touch input, keymaps and recording */
 #define LUNA_TOUCH_MAX 10
@@ -240,6 +244,9 @@ void luna_overlay_present_boot(int w, int h);
 /* True while at least one window is up.  Input routing asks this before
  * handing a touch to the guest. */
 bool luna_overlay_active(void);
+/* False once the overlay has presented a settled page: nothing on it moves by
+ * itself, so only luna_overlay_wake() (a change from outside) needs a frame. */
+bool luna_overlay_wants_frame(void);
 
 /* True while a window from the guest's own View layer is up — a dialog, a
  * notification banner — as opposed to the emulator's status card or the IME.
@@ -282,6 +289,11 @@ void luna_overlay_set_ime(const char *html, const char *css);
  * below the input method.  It never takes pointer input.  NULL html clears
  * it. */
 void luna_overlay_set_toast(const char *html, const char *css);
+/* Host guidance after a requested Google service cannot be bound.
+ * Successful rebinding clears it. Guest return values are unchanged. */
+void luna_overlay_google_service(const char *package, bool connected);
+/* A resolved Google Activity could not be launched in its destination VM. */
+void luna_overlay_google_activity(const char *package, bool started);
 
 /* The emulator's own menu (right click): the topmost layer, over the boot
  * card too.  While a modal one is up every pointer event goes to it (a

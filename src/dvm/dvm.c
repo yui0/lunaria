@@ -275,6 +275,8 @@ static dvm_ref heap_alloc(struct dvm *vm)
     vm->free_head = o->next_free;
     memset(o, 0, sizeof *o);
     o->live = true;
+    if (vm->invoke_frame && vm->invoke_frame->method && vm->invoke_frame->method->builtin)
+      o->builtin_frame = vm->invoke_frame->serial;
     return r;
   }
   if (vm->heap_size == vm->heap_cap) {
@@ -288,7 +290,10 @@ static dvm_ref heap_alloc(struct dvm *vm)
     vm->heap_cap += DVM_HEAP_BLOCK;
   }
   dvm_ref r = ++vm->heap_size;
-  heap_slot(vm, r)->live = true;
+  struct dvm_object *o = heap_slot(vm, r);
+  o->live = true;
+  if (vm->invoke_frame && vm->invoke_frame->method && vm->invoke_frame->method->builtin)
+    o->builtin_frame = vm->invoke_frame->serial;
   return r;
 }
 
@@ -296,6 +301,12 @@ void dvm_pin(struct dvm *vm, dvm_ref ref)
 {
   struct dvm_object *o = dvm__obj(vm, ref);
   if (o) ++o->pins;
+}
+
+void dvm_keep_managed(struct dvm *vm,dvm_ref ref)
+{
+  struct dvm_object *object=dvm__obj(vm,ref);
+  if (object) object->managed_retained=true;
 }
 
 void dvm_unpin(struct dvm *vm, dvm_ref ref)
@@ -323,7 +334,7 @@ static void object_data_destroy(struct dvm_object *o)
 static void heap_free(struct dvm *vm, dvm_ref ref)
 {
   struct dvm_object *o = dvm__obj(vm, ref);
-  if (!o || o->pins) return;
+  if (!o || o->pins || o->managed_retained) return;
   free(o->utf8);
   free(o->string_units);
   object_data_destroy(o);
@@ -5059,7 +5070,13 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
                    const uint32_t *slots, int nslots, union dvm_value *out)
 {
   call_histogram(m);
-  struct dvm_call_frame frame = { .method = m, .previous = vm->invoke_frame };
+  struct dvm_call_frame frame = {
+    .method=m, .previous=vm->invoke_frame, .self=self,
+    .arguments=slots, .argument_count=nslots>0 ? (uint32_t)nslots : 0,
+    .serial=++vm->next_frame_serial, .live_next=vm->live_frames
+  };
+  if (frame.live_next) frame.live_next->live_previous=&frame;
+  vm->live_frames=&frame;
   struct dvm_method *caller = vm->cur_method;
   const uint32_t caller_pc = vm->cur_pc;
   vm->invoke_frame = &frame;
@@ -5067,6 +5084,22 @@ static bool invoke(struct dvm *vm, struct dvm_method *m, dvm_ref self,
   if (ok && m && trace_call_enabled(vm, m, frame.previous))
     trace_return(vm, m, m->ret_kind, out);
   vm->invoke_frame = frame.previous;
+  if (ok && m && m->ret_kind=='L' && out->l && frame.previous &&
+      frame.previous->method && frame.previous->method->builtin) {
+    struct dvm_local_root *root=malloc(sizeof *root);
+    if (root) {
+      *root=(struct dvm_local_root){out->l,frame.previous->locals};
+      frame.previous->locals=root;
+    } else dvm_pin(vm,out->l); /* OOM must retain rather than lose a live value. */
+  }
+  while (frame.locals) {
+    struct dvm_local_root *next=frame.locals->next;
+    free(frame.locals);
+    frame.locals=next;
+  }
+  if (frame.live_previous) frame.live_previous->live_next=frame.live_next;
+  else vm->live_frames=frame.live_next;
+  if (frame.live_next) frame.live_next->live_previous=frame.live_previous;
   /* A returned bytecode frame is no longer the current frame. Retaining it
    * misattributes later builtin exceptions and can outlive the method. */
   vm->cur_method = caller;
@@ -5243,11 +5276,18 @@ static bool invoke_body(struct dvm *vm, struct dvm_method *m, dvm_ref self,
     regs[w++] = slots[i];
 
   struct frame fr = { .m = m, .regs = regs, .nregs = nregs, .pc = 0 };
+  struct dvm_call_frame *roots=vm->invoke_frame;
+  roots->registers=regs;
+  roots->register_count=nregs;
+  roots->result=&fr.result;
   ++vm->depth;
   bool pushed = vm->ncallstack <
                 (int)(sizeof vm->callstack / sizeof vm->callstack[0]);
   if (pushed) vm->callstack[vm->ncallstack++] = m;
   bool ok = execute(vm, &fr, out);
+  roots->registers=NULL;
+  roots->register_count=0;
+  roots->result=NULL;
   if (pushed) --vm->ncallstack;
   --vm->depth;
 
@@ -6855,6 +6895,7 @@ void dvm_destroy(struct dvm *vm)
   if (!vm) return;
   dvm_request_stop(vm);
   dvm_threads_finish(vm);
+  dvm_binder_activity_dispose(vm);
   free(vm->shutdown_hooks);
   free(vm->network_callbacks);
   /* A pending apply() must reach the disk before the process goes away. */

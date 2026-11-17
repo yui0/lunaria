@@ -219,7 +219,7 @@ struct child {
 struct exit_notice {
   struct exit_notice *next;
   char *name;
-  uint32_t pid;
+  uint32_t pid,host_pid;
   int status;
 };
 struct luna_process_pool {
@@ -244,6 +244,8 @@ struct fd_scope {
   size_t count;
 };
 static _Thread_local struct fd_scope current_fds;
+static _Thread_local uint32_t current_message_host;
+uint32_t luna_process_message_host_pid(void) { return current_message_host; }
 const int *luna_process_message_fds(size_t *count)
 {
   if(count)*count=current_fds.count;
@@ -744,6 +746,7 @@ static void reap(struct luna_process_pool *pool)
         notice->name=child->name;
         child->name=NULL;
         notice->pid=child->guest_pid;
+        notice->host_pid=(uint32_t)child->host_pid;
         notice->status=child->status;
         if(pool->exits_tail)pool->exits_tail->next=notice;
         else pool->exits=notice;
@@ -812,6 +815,17 @@ int luna_process_pool_running(struct luna_process_pool *pool,const char *name)
   pthread_mutex_unlock(&pool->lock);
   return running;
 }
+uint32_t luna_process_pool_host_pid(struct luna_process_pool *pool,const char *name)
+{
+  if(!pool || !name)return 0;
+  pthread_mutex_lock(&pool->lock);
+  uint32_t pid=0;
+  for(struct child *child=pool->children; child && !pid; child=child->next) {
+    if(!strcmp(child->name,name))pid=(uint32_t)child->host_pid;
+  }
+  pthread_mutex_unlock(&pool->lock);
+  return pid;
+}
 int luna_process_pool_publish_fds(struct luna_process_pool *pool,uint32_t exclude,const void *data,size_t size,const int *fds,size_t nfds)
 {
   if(!pool || (!data && size))return -EINVAL;
@@ -836,7 +850,7 @@ int luna_process_pool_publish(struct luna_process_pool *pool,uint32_t exclude,co
 struct reply {
   struct reply *next;
   char *name;
-  uint32_t pid;
+  uint32_t pid,host_pid;
   size_t size,nfds;
   int *fds;
   unsigned char data[];
@@ -870,6 +884,7 @@ static void collect_reply(void *user,const void *data,size_t size)
   }
   p->next=NULL;
   p->pid=r->child->guest_pid;
+  p->host_pid=(uint32_t)r->child->host_pid;
   p->size=size;
   if(size)memcpy(p->data,data,size);
   if(r->tail)r->tail->next=p;
@@ -915,7 +930,10 @@ int luna_process_pool_tick(struct luna_process_pool *pool,luna_process_reply_fn 
     current_fds=(struct fd_scope) {
       p->fds,p->nfds
     };
+    uint32_t saved_host=current_message_host;
+    current_message_host=p->host_pid;
     if(callback)callback(user,p->name,p->pid,p->data,p->size);
+    current_message_host=saved_host;
     current_fds=saved;
     fds_free(p->fds,p->nfds);
     free(p->name);
@@ -923,7 +941,7 @@ int luna_process_pool_tick(struct luna_process_pool *pool,luna_process_reply_fn 
   }
   return replies.error ? -replies.error : error ? -error : count;
 }
-int luna_process_pool_next_exit(struct luna_process_pool *pool,char *name,size_t capacity,uint32_t *pid,int *status)
+int luna_process_pool_next_exit_host(struct luna_process_pool *pool,char *name,size_t capacity,uint32_t *pid,uint32_t *host,int *status)
 {
   if(!pool || !name || !capacity)return -EINVAL;
   pthread_mutex_lock(&pool->lock);
@@ -934,6 +952,7 @@ int luna_process_pool_next_exit(struct luna_process_pool *pool,char *name,size_t
     else {
       memcpy(name,n->name,strlen(n->name)+1);
       if(pid)*pid=n->pid;
+      if(host)*host=n->host_pid;
       if(status)*status=n->status;
       pool->exits=n->next;
       if(!pool->exits)pool->exits_tail=NULL;
@@ -944,6 +963,10 @@ int luna_process_pool_next_exit(struct luna_process_pool *pool,char *name,size_t
   }
   pthread_mutex_unlock(&pool->lock);
   return rc;
+}
+int luna_process_pool_next_exit(struct luna_process_pool *pool,char *name,size_t capacity,uint32_t *pid,int *status)
+{
+  return luna_process_pool_next_exit_host(pool,name,capacity,pid,NULL,status);
 }
 void luna_process_pool_close(struct luna_process_pool *pool)
 {
@@ -1024,6 +1047,7 @@ int luna_process_channel_send_fds(struct luna_process_channel *c,const void *p,s
   (void)nf;
   return -ENOSYS;
 }
+uint32_t luna_process_message_host_pid(void) { return 0; }
 const int *luna_process_message_fds(size_t *count)
 {
   if(count)*count=0;
@@ -1068,6 +1092,11 @@ int luna_process_pool_running(struct luna_process_pool *p,const char *n)
 {
   (void)p;
   (void)n;
+  return 0;
+}
+uint32_t luna_process_pool_host_pid(struct luna_process_pool *p,const char *n)
+{
+  (void)p; (void)n;
   return 0;
 }
 int luna_process_pool_send_to_host(struct luna_process_pool *p,uint32_t h,const void *d,size_t s)
@@ -1141,6 +1170,11 @@ int luna_process_pool_next_exit(struct luna_process_pool *p,char *n,size_t c,uin
   (void)g;
   (void)s;
   return -ENOSYS;
+}
+int luna_process_pool_next_exit_host(struct luna_process_pool *p,char *n,size_t c,uint32_t *g,uint32_t *h,int *s)
+{
+  (void)h;
+  return luna_process_pool_next_exit(p,n,c,g,s);
 }
 void luna_process_pool_close(struct luna_process_pool *p) {
   (void)p;

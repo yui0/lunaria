@@ -475,6 +475,7 @@ static int touch_parse_xy(const char *s, float *x, float *y, const char **end)
   return 1;
 }
 
+static bool activity_forward_key(int key);
 static void touch_fifo_line(const char *line, int frame_count)
 {
   float x = -1, y = -1;
@@ -485,7 +486,7 @@ static void touch_fifo_line(const char *line, int frame_count)
   if (!strncmp(line, "key ", 4)) {
     const int code = atoi(line + 4);
     if (code > 0) {
-      arm_exec_android_key(code);
+      if(!activity_forward_key(code))arm_exec_android_key(code);
       fprintf(stderr, "[loader] TOUCH_FIFO key %d frame %d\n", code, frame_count);
     }
     return;
@@ -1226,6 +1227,269 @@ static int binder_provider_process(const char *package,const char *table,
   luna_providers_close(&providers);
   return rc;
 }
+/* ActivityManager admission is synchronous; lifecycle work is serialized on
+ * the broker's main thread. In particular onPause may itself start an Activity
+ * without waiting for its own lifecycle callback to return. */
+struct activity_command {
+  struct activity_command *next;
+  char *package;
+  char process[512];
+  unsigned char *message;
+  size_t size;
+  uint32_t source,seq,destination,previous,serial;
+  int phase,status;
+  uint64_t deadline;
+};
+static pthread_mutex_t activity_lock=PTHREAD_MUTEX_INITIALIZER;
+static struct activity_command *activity_head,*activity_tail,*activity_current;
+static unsigned activity_queued;
+static uint32_t activity_serial,activity_stack[32];
+static int activity_depth;
+static atomic_uint activity_focused;
+static uint32_t activity_closed[32];
+static unsigned activity_nclosed;
+static uint32_t activity_visible[32];
+static unsigned activity_nvisible;
+static void activity_put(unsigned char *p,uint32_t v)
+{
+  for(unsigned i=0;i<4;++i)p[i]=(unsigned char)(v>>(8*i));
+}
+static int activity_send_host(uint32_t pid,const void *bytes,size_t size)
+{
+  if(pid==(uint32_t)getpid())return dvm_binder_receive(dvm_jni_vm(),NULL,bytes,size) ? 0 : -EPROTO;
+  for(int i=0;i<PACKAGE_POOL_MAX;++i) {
+    if(!g_package_pools[i].pool)continue;
+    int rc=luna_process_pool_send_to_host(g_package_pools[i].pool,pid,bytes,size);
+    if(rc!=-ESRCH)return rc;
+  }
+  return g_component_pool ? luna_process_pool_send_to_host(g_component_pool,pid,bytes,size) : -ESRCH;
+}
+static bool activity_forward_key(int key)
+{
+  uint32_t focused=atomic_load(&activity_focused);
+  if(!focused || focused==(uint32_t)getpid())return false;
+  unsigned char message[20]={'L','A','K','1'};
+  activity_put(message+8,(uint32_t)key);
+  for(unsigned action=0;action<2;++action) {
+    activity_put(message+4,action);
+    (void)activity_send_host(focused,message,sizeof message);
+  }
+  return true;
+}
+static bool activity_forward_touch(const ArmExecTouchEvent *touch)
+{
+  uint32_t focused=atomic_load(&activity_focused);
+  if(!focused || focused==(uint32_t)getpid())return false;
+  if(touch->pointer_count<0 || touch->pointer_count>LUNA_TOUCH_MAX)return true;
+  unsigned char message[36+12*LUNA_TOUCH_MAX]={'L','A','T','1'};
+  activity_put(message+4,(uint32_t)touch->action);
+  for(unsigned j=0;j<8;++j) {
+    message[8+j]=(unsigned char)((uint64_t)touch->event_ms>>(8*j));
+    message[16+j]=(unsigned char)((uint64_t)touch->down_ms>>(8*j));
+  }
+  activity_put(message+24,(uint32_t)touch->pointer_count);
+  uint32_t bits;
+  memcpy(&bits,&touch->x,4);activity_put(message+28,bits);
+  memcpy(&bits,&touch->y,4);activity_put(message+32,bits);
+  for(int i=0;i<touch->pointer_count;++i) {
+    activity_put(message+36+12*i,(uint32_t)touch->pointers[i].id);
+    memcpy(&bits,&touch->pointers[i].x,4);activity_put(message+40+12*i,bits);
+    memcpy(&bits,&touch->pointers[i].y,4);activity_put(message+44+12*i,bits);
+  }
+  (void)activity_send_host(focused,message,36+12*(size_t)touch->pointer_count);
+  return true;
+}
+static void activity_reply(uint32_t pid,uint32_t seq,int status)
+{
+  unsigned char reply[36]={ 'L','B','R','1' };
+  activity_put(reply+4,(uint32_t)getpid()); activity_put(reply+8,seq);
+  activity_put(reply+12,1000); activity_put(reply+24,(uint32_t)status);
+  (void)activity_send_host(pid,reply,sizeof reply);
+}
+static int activity_route(const char *package,const unsigned char *message,size_t size,char *process,size_t cap)
+{
+  const unsigned char *body=NULL; size_t length=0;
+  if(binder_route_body(message,size,&body,&length) || length<16)return -EINVAL;
+  size_t cn=binder_route_u32(body),pn=binder_route_u32(body+12);
+  if(!cn || cn>511 || cn>length-16 || pn!=length-16-cn || memchr(body+16,0,cn))return -EINVAL;
+  char component[512]; memcpy(component,body+16,cn); component[cn]=0;
+  struct lunaria_android_package record;
+  if(!lunaria_android_package_find(package,&record))return -ENOENT;
+  const char *self=getenv("ANDROID_PACKAGE_NAME"),*table=NULL;
+  char host[4096],*rows=NULL,*filters=NULL;
+  if(self && !strcmp(self,package))table=getenv("ANDROID_ACTIVITIES");
+  else {
+    const char *path=record.source_dir ? arm_exec_map_guest_path(record.source_dir,host,sizeof host) : NULL;
+    if(!path || luna_apk_activity_manifest(path,package,&rows,&filters))return -ENOENT;
+    table=rows;
+  }
+  char *copy=strdup(table ? table : "");
+  int rc=copy ? -ENOENT : -ENOMEM;
+  for(char *p=copy,*row;p && (row=luna_strsep(&p,"\n"));) {
+    char *name=luna_strsep(&row,"|"),*target=luna_strsep(&row,"|");
+    char *enabled=luna_strsep(&row,"|"),*exported=luna_strsep(&row,"|"),*proc=luna_strsep(&row,"|");
+    (void)target;
+    if(!enabled || !atoi(enabled) || strcmp(name,component))continue;
+    if(binder_route_u32(message+12)!=(uint32_t)record.uid && (!exported || !atoi(exported))) { rc=-EACCES; break; }
+    int n=snprintf(process,cap,"%s",proc && *proc ? proc : package);
+    rc=n<0 || (size_t)n>=cap ? -ENAMETOOLONG : 0;
+    break;
+  }
+  free(copy);free(rows);free(filters);
+  return rc;
+}
+static int activity_enqueue(const char *package,const void *bytes,size_t size)
+{
+  if(!package || size<24 || size>LUNA_PROCESS_MESSAGE_MAX)return -EINVAL;
+  struct activity_command *command=calloc(1,sizeof *command);
+  if(!command)return -ENOMEM;
+  int rc=activity_route(package,bytes,size,command->process,sizeof command->process);
+  if(rc) { free(command);return rc; }
+  command->package=strdup(package);command->message=malloc(size);command->size=size;
+  if(!command->package || !command->message) { free(command->package);free(command->message);free(command);return -ENOMEM; }
+  memcpy(command->message,bytes,size);
+  command->source=binder_route_u32((const unsigned char *)bytes+4);
+  command->seq=binder_route_u32((const unsigned char *)bytes+8);
+  pthread_mutex_lock(&activity_lock);
+  if(activity_queued>=32) {
+    pthread_mutex_unlock(&activity_lock);
+    free(command->package);free(command->message);free(command);return -EAGAIN;
+  }
+  if(activity_tail)activity_tail->next=command;else activity_head=command;
+  activity_tail=command;++activity_queued;
+  pthread_mutex_unlock(&activity_lock);
+  /* The queued command may be taken by another main-loop turn immediately. */
+  activity_reply(binder_route_u32((const unsigned char *)bytes+4),binder_route_u32((const unsigned char *)bytes+8),0);
+  return 0;
+}
+static void activity_process_closed(uint32_t host)
+{
+  if(!host)return;
+  pthread_mutex_lock(&activity_lock);
+  if(activity_nclosed<32)activity_closed[activity_nclosed++]=host;
+  if(activity_current) {
+    if(activity_current->phase==-1 && activity_current->previous==host)activity_current->phase=1;
+    if(activity_current->phase==2 && activity_current->destination==host) {
+      activity_current->status=-EPIPE;activity_current->phase=3;
+    }
+  }
+  pthread_mutex_unlock(&activity_lock);
+}
+static void activity_observe_reply(const unsigned char *message,size_t size,uint32_t target)
+{
+  if(size<24 || memcmp(message,"LBR1",4))return;
+  const unsigned char *body=NULL;size_t length=0;
+  if(binder_route_body(message,size,&body,&length) || length<12)return;
+  pthread_mutex_lock(&activity_lock);
+  struct activity_command *c=activity_current;
+  if(c && c->phase==2 && c->source==target && c->seq==binder_route_u32(message+8) &&
+      (!c->destination || c->destination==binder_route_u32(message+4))) {
+    c->status=(int32_t)binder_route_u32(body);c->phase=3;
+  }
+  pthread_mutex_unlock(&activity_lock);
+}
+/* mode: 0=stop/hidden, 1=restart/resume, 2=pause before the new window. */
+static void activity_set_foreground(uint32_t pid,int mode,uint32_t serial)
+{
+  if(pid==(uint32_t)getpid()) {
+    if(mode==2)dvm_activity_pause(dvm_jni_vm());
+    else { dvm_activity_foreground(dvm_jni_vm(),mode==1);arm_exec_host_window_visible(mode==1); }
+    if(mode==2) {
+      pthread_mutex_lock(&activity_lock);
+      if(activity_current && activity_current->serial==serial)activity_current->phase=1;
+      pthread_mutex_unlock(&activity_lock);
+    }
+  } else {
+    unsigned char message[12]={'L','A','F','1'};
+    activity_put(message+4,serial);activity_put(message+8,(uint32_t)mode);
+    if(activity_send_host(pid,message,sizeof message)<0 && mode==2) {
+      pthread_mutex_lock(&activity_lock);
+      if(activity_current && activity_current->serial==serial)activity_current->phase=1;
+      pthread_mutex_unlock(&activity_lock);
+    }
+  }
+}
+static void activity_broker_tick(void)
+{
+  if(!dvm_on_main_thread())return;
+  if(!activity_depth) { activity_stack[activity_depth++]=(uint32_t)getpid();atomic_store(&activity_focused,(uint32_t)getpid()); }
+  /* Death / last-window notifications can arrive on a Binder pumping thread. */
+  pthread_mutex_lock(&activity_lock);
+  uint32_t closed[32];unsigned count=activity_current ? 0 : activity_nclosed;
+  memcpy(closed,activity_closed,count*sizeof *closed);
+  if(count)activity_nclosed=0;
+  pthread_mutex_unlock(&activity_lock);
+  for(unsigned k=0;k<count;++k) {
+    uint32_t previous=activity_stack[activity_depth-1];
+    for(int i=activity_depth;i-->1;)if(activity_stack[i]==closed[k]) {
+      memmove(activity_stack+i,activity_stack+i+1,(size_t)(--activity_depth-i)*sizeof *activity_stack);
+    }
+    pthread_mutex_lock(&activity_lock);
+    bool successor=activity_head!=NULL;
+    pthread_mutex_unlock(&activity_lock);
+    if(previous!=activity_stack[activity_depth-1] && !successor) {
+      atomic_store(&activity_focused,activity_stack[activity_depth-1]);
+      activity_set_foreground(activity_stack[activity_depth-1],true,0);
+    }
+  }
+  pthread_mutex_lock(&activity_lock);
+  if(!activity_current && activity_head) {
+    activity_current=activity_head;activity_head=activity_head->next;
+    if(!activity_head)activity_tail=NULL;
+    --activity_queued;
+    activity_current->previous=activity_stack[activity_depth-1];
+    activity_current->serial=++activity_serial;
+    activity_current->phase=-1;
+    activity_current->deadline=pump_now_us()+15000000u;
+  }
+  if(activity_current && activity_current->phase!=3 && pump_now_us()>activity_current->deadline) {
+    activity_current->status=-ETIMEDOUT;activity_current->phase=3;
+  }
+  struct activity_command *c=activity_current;
+  int phase=c ? c->phase : -2;
+  pthread_mutex_unlock(&activity_lock);
+  if(!c) {
+    uint32_t visible[32];unsigned n=0;
+    pthread_mutex_lock(&activity_lock);
+    n=activity_nvisible;memcpy(visible,activity_visible,n*sizeof *visible);activity_nvisible=0;
+    pthread_mutex_unlock(&activity_lock);
+    for(unsigned k=0;k<n;++k)if(activity_depth>1 && visible[k]==activity_stack[activity_depth-1])
+      activity_set_foreground(activity_stack[activity_depth-2],0,0);
+    return;
+  }
+  if(phase==-1) { activity_set_foreground(c->previous,2,c->serial);return; }
+  if(phase==1) {
+    const char *self=getenv("ANDROID_PACKAGE_NAME");
+    bool own=self && !strcmp(self,c->package);
+    struct luna_process_pool *pool=own ? g_component_pool : package_pool(c->package);
+    uint32_t guest=0;
+    pthread_mutex_lock(&activity_lock);c->phase=2;pthread_mutex_unlock(&activity_lock);
+    int rc=pool ? luna_process_pool_send(pool,c->process,c->message,c->size,&guest) : -ENOENT;
+    pthread_mutex_lock(&activity_lock);
+    c->destination=rc ? 0 : luna_process_pool_host_pid(pool,c->process);
+    if(rc) {c->status=rc;c->phase=3;}
+    pthread_mutex_unlock(&activity_lock);
+    return;
+  }
+  if(phase==3) {
+    if(!c->status && c->destination) {
+      if(activity_depth==32) {
+        /* Keep the foreground entry and root when the bounded history fills. */
+        memmove(activity_stack+1,activity_stack+2,30*sizeof *activity_stack);--activity_depth;
+      }
+      if(activity_stack[activity_depth-1]!=c->destination)activity_stack[activity_depth++]=c->destination;
+      atomic_store(&activity_focused,c->destination);
+      luna_overlay_google_activity(c->package,true);
+    } else {
+      activity_set_foreground(c->previous,true,0);
+      luna_overlay_google_activity(c->package,false);
+      fprintf(stderr,"[activity-broker] destination rejected launch: %s\n",strerror(-c->status));
+    }
+    pthread_mutex_lock(&activity_lock);activity_current=NULL;pthread_mutex_unlock(&activity_lock);
+    free(c->package);free(c->message);free(c);
+  }
+}
+
 /* The Binder transport.  A parent addresses a child by package name; a child
  * has only its parent, reached through its control channel (peer == NULL). */
 /* A host never starts another host: every message for a package goes up to the
@@ -1248,9 +1512,15 @@ static int binder_transport_send_fds(void *user,const char *peer,const void *byt
     return rc;
   }
   const unsigned char *direct=bytes;
+  if(size>=24 && !memcmp(bytes,"LBA1",4)) {
+    int rc=activity_enqueue(peer,bytes,size);
+    if(rc)activity_reply(binder_route_u32(direct+4),binder_route_u32(direct+8),rc);
+    return 0;
+  }
   if(size>=8 && !memcmp(direct,"LBD1",4)) {
     uint32_t target=0;
     for(unsigned i=0; i<4; ++i)target|=(uint32_t)direct[4+i]<<(8*i);
+    activity_observe_reply(direct+8,size-8,target);
     if(target==(uint32_t)getpid())
       return dvm_binder_receive_fds(dvm_jni_vm(),peer,direct+8,size-8,fds,nfds) ? 0 : -EPROTO;
     for(int i=0; i<PACKAGE_POOL_MAX; ++i) {
@@ -1327,6 +1597,24 @@ static void component_reply(void *user,const char *name,uint32_t pid,const void 
   size_t nfds=0;
   const int *fds=luna_process_message_fds(&nfds);
   const unsigned char *p=bytes;
+  uint32_t host=luna_process_message_host_pid();
+  if(size==12 && !memcmp(p,"LAF2",4)) {
+    pthread_mutex_lock(&activity_lock);
+    if(activity_current && activity_current->phase==-1 && activity_current->previous==host && activity_current->serial==binder_route_u32(p+4))activity_current->phase=1;
+    pthread_mutex_unlock(&activity_lock);
+    return;
+  }
+  if(size==8 && !memcmp(p,"LAV1",4)) {
+    unsigned state=binder_route_u32(p+4);
+    if(!(state&1u) || (state&8u))activity_process_closed(host);
+    if(state&2u) {
+      pthread_mutex_lock(&activity_lock);
+      if(activity_nvisible<32)activity_visible[activity_nvisible++]=host;
+      pthread_mutex_unlock(&activity_lock);
+    }
+    return;
+  }
+  if(size>=24 && !memcmp(p,"LBR1",4))activity_observe_reply(p,size,(uint32_t)getpid());
   if(size>=8 && !memcmp(p,"LBF1",4)) {
     uint32_t n=0;
     for(unsigned i=0; i<4; ++i)n|=(uint32_t)p[4+i]<<(i*8);
@@ -1342,7 +1630,7 @@ static void component_reply(void *user,const char *name,uint32_t pid,const void 
       (void)binder_transport_send_fds(NULL,dest,p+8+n,size-8-n,fds,nfds);
       return;
     }
-    if(self && !strcmp(dest,self) && memcmp(p+8+n,"LBB1",4) && memcmp(p+8+n,"LBQ1",4) && memcmp(p+8+n,"LBC1",4)) {
+    if(self && !strcmp(dest,self) && memcmp(p+8+n,"LBB1",4) && memcmp(p+8+n,"LBQ1",4) && memcmp(p+8+n,"LBC1",4) && memcmp(p+8+n,"LBA1",4)) {
       (void)dvm_binder_receive(dvm_jni_vm(),NULL,p+8+n,size-8-n);
       return;
     }
@@ -1371,22 +1659,27 @@ static void component_pool_tick(void)
 {
   for(int i=0; i<PACKAGE_POOL_MAX; ++i) {
     if(!g_package_pools[i].pool)continue;
-    int rc=luna_process_pool_tick(g_package_pools[i].pool,component_reply,NULL);
+    int rc=luna_process_pool_tick(g_package_pools[i].pool,component_reply,g_package_pools[i].pool);
     if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[binder] IPC error from %s: %s\n",g_package_pools[i].package,strerror(-rc));
     char name[512];
-    uint32_t pid;
+    uint32_t pid,host;
     int status;
-    while(luna_process_pool_next_exit(g_package_pools[i].pool,name,sizeof name,&pid,&status)>0)
+    while(luna_process_pool_next_exit_host(g_package_pools[i].pool,name,sizeof name,&pid,&host,&status)>0) {
+      activity_process_closed(host);
       fprintf(stderr,"[binder] %s pid=%u exited status=%d\n",name,pid,status);
+    }
   }
+  if(!g_service_channel)activity_broker_tick();
   if(!g_component_pool)return;
-  int rc=luna_process_pool_tick(g_component_pool,component_reply,NULL);
+  int rc=luna_process_pool_tick(g_component_pool,component_reply,g_component_pool);
   if(rc<0 && rc!=-EPIPE)fprintf(stderr,"[service-broker] IPC error: %s\n",strerror(-rc));
   char name[512];
-  uint32_t pid;
+  uint32_t pid,host;
   int status;
-  while(luna_process_pool_next_exit(g_component_pool,name,sizeof name,&pid,&status)>0)
+  while(luna_process_pool_next_exit_host(g_component_pool,name,sizeof name,&pid,&host,&status)>0) {
+    activity_process_closed(host);
     fprintf(stderr,"[service-broker] %s pid=%u exited status=%d\n",name,pid,status);
+  }
 }
 static void component_pool_install(struct dvm *vm,int is_a64)
 {
@@ -1885,10 +2178,17 @@ run_dex_activity(struct jvm *jvm, int is_a64)
     ArmExecTouchEvent touch;
     struct dvm *input_vm=dvm_jni_vm();
     for (int n=0; input_vm && n<64 && arm_exec_touch_next(&touch); ++n)
-      (void)dvm_ui_dispatch_touch(input_vm,&touch);
+      if(!activity_forward_touch(&touch))(void)dvm_ui_dispatch_touch(input_vm,&touch);
     int key_action,key_code,key_meta,key_repeat;
-    for (int n=0; input_vm && n<16 && arm_exec_java_key_next(&key_action,&key_code,&key_meta,&key_repeat); ++n)
-      (void)dvm_ui_dispatch_key(input_vm,key_action,key_code,key_meta,key_repeat);
+    for (int n=0; input_vm && n<16 && arm_exec_java_key_next(&key_action,&key_code,&key_meta,&key_repeat); ++n) {
+      uint32_t focused=atomic_load(&activity_focused);
+      if(focused && focused!=(uint32_t)getpid()) {
+        unsigned char message[20]={'L','A','K','1'};
+        activity_put(message+4,(uint32_t)key_action);activity_put(message+8,(uint32_t)key_code);
+        activity_put(message+12,(uint32_t)key_meta);activity_put(message+16,(uint32_t)key_repeat);
+        (void)activity_send_host(focused,message,sizeof message);
+      } else (void)dvm_ui_dispatch_key(input_vm,key_action,key_code,key_meta,key_repeat);
+    }
     stall_watch_tick();
     watchdog_tick();
     if (frame < 5 || frame % 50 == 0)
@@ -1918,11 +2218,68 @@ struct service_process {
   pthread_mutex_t inbox_lock;
   struct service_inbox *inbox_head, *inbox_tail;
   int control_fd;
+  bool ui;
+  unsigned published_state;
 };
+static bool service_process_ui(struct service_process *process)
+{
+  if(process->ui)return true;
+  const char *dir=getenv("LUNARIA_DUMP_DIR");
+  if(dir && *dir) {
+    char path[4096];
+    int n=snprintf(path,sizeof path,"%s/component-%d",dir,arm_exec_guest_pid());
+    if(n>0 && (size_t)n<sizeof path && (!luna_file_mkdir(path,0700) || errno==EEXIST))setenv("LUNARIA_DUMP_DIR",path,1);
+  }
+  if(!arm_exec_host_activity_egl_init()) { process->fatal=1;return false; }
+  luna_boot_finish("component Activity");
+  arm_exec_host_window_visible(0);
+  process->ui=true;
+  fprintf(stderr,"[activity-process] UI ready for %s\n",getenv("ANDROID_PROCESS_NAME"));
+  return true;
+}
 static void service_process_command(void *user,const void *bytes,size_t size,const int *fds,size_t nfds)
 {
   struct service_process *process=user;
   if(process->fatal)return;
+  const unsigned char *command=bytes;
+  if(size==12 && !memcmp(command,"LAF1",4)) {
+    if((dvm_activity_state(process->vm)&4u) && !service_process_ui(process))return;
+    /* Complete an already-admitted launch before acknowledging its pause. */
+    dvm_main_looper_tick(process->vm);
+    unsigned mode=binder_route_u32(command+8);
+    if(mode==2)dvm_activity_pause(process->vm);
+    else {
+      dvm_activity_foreground(process->vm,mode==1);
+      if(process->ui)arm_exec_host_window_visible(mode==1);
+    }
+    unsigned char reply[12]={'L','A','F','2'};
+    memcpy(reply+4,command+4,8);
+    (void)luna_process_channel_send(process->channel,reply,sizeof reply);
+    return;
+  }
+  if(size>=36 && !memcmp(command,"LAT1",4)) {
+    uint32_t count=binder_route_u32(command+24);
+    if(count>LUNA_TOUCH_MAX || size!=36+12*(size_t)count)return;
+    ArmExecTouchEvent touch={0};
+    touch.action=(int32_t)binder_route_u32(command+4);touch.pointer_count=(int)count;
+    uint64_t event=0,down=0;
+    for(unsigned j=0;j<8;++j) { event|=(uint64_t)command[8+j]<<(8*j);down|=(uint64_t)command[16+j]<<(8*j); }
+    touch.event_ms=(long long)event;touch.down_ms=(long long)down;
+    uint32_t bits=binder_route_u32(command+28);memcpy(&touch.x,&bits,4);
+    bits=binder_route_u32(command+32);memcpy(&touch.y,&bits,4);
+    for(uint32_t i=0;i<count;++i) {
+      touch.pointers[i].id=(int32_t)binder_route_u32(command+36+12*i);
+      bits=binder_route_u32(command+40+12*i);memcpy(&touch.pointers[i].x,&bits,4);
+      bits=binder_route_u32(command+44+12*i);memcpy(&touch.pointers[i].y,&bits,4);
+    }
+    (void)dvm_ui_dispatch_touch(process->vm,&touch);
+    return;
+  }
+  if(size==20 && !memcmp(command,"LAK1",4)) {
+    (void)dvm_ui_dispatch_key(process->vm,(int32_t)binder_route_u32(command+4),(int32_t)binder_route_u32(command+8),
+        (int32_t)binder_route_u32(command+12),(int32_t)binder_route_u32(command+16));
+    return;
+  }
   if(dvm_binder_receive_fds(process->vm,NULL,bytes,size,fds,nfds))return;
   int status=dvm_service_dispatch(process->vm,bytes,size);
   unsigned char reply[8]= {'L','S','R','1',0,0,0,0};
@@ -2009,6 +2366,7 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
   process.control_fd=control_fd;
   atomic_init(&process.fatal,0);
   atomic_init(&process.io_stop,0);
+  process.published_state=0;
   int io_error=pthread_mutex_init(&process.inbox_lock,NULL);
   if(io_error) {
     luna_process_channel_close(process.channel);
@@ -2045,13 +2403,43 @@ static int run_service_process(struct jvm *jvm,int is_a64,int control_fd)
       break;
     }
     service_process_drain(&process);
-    run_threads();
-    dvm_main_looper_tick(process.vm);
-    dvm_prefs_flush(process.vm);
-    usleep(1000);
+    unsigned state=dvm_activity_state(process.vm);
+    if((state&4u) && !service_process_ui(&process))break;
+    if(process.ui && (state&6u)) {
+      pump_run_frame(run_threads);
+      if(is_a64)arm64_exec_egl_swap();else arm_exec_egl_swap();
+      arm_exec_glfw_poll();
+      ArmExecTouchEvent touch;
+      for(int n=0;n<64 && arm_exec_touch_next(&touch);++n)(void)dvm_ui_dispatch_touch(process.vm,&touch);
+      int action,key,meta,repeat;
+      for(int n=0;n<16 && arm_exec_java_key_next(&action,&key,&meta,&repeat);++n)
+        (void)dvm_ui_dispatch_key(process.vm,action,key,meta,repeat);
+      if(arm_exec_glfw_should_close()) {
+        if(!arm_exec_host_window_close_requested())break;
+        arm_exec_host_window_visible(1);
+        dvm_activity_back(process.vm);
+      }
+    } else {
+      run_threads();
+      dvm_main_looper_tick(process.vm);
+      dvm_prefs_flush(process.vm);
+      usleep(1000);
+    }
+    state=dvm_activity_state(process.vm);
+    if(state!=process.published_state) {
+      unsigned char message[8]={'L','A','V','1'};
+      activity_put(message+4,state);
+      (void)luna_process_channel_send(process.channel,message,sizeof message);
+      process.published_state=state;
+      if(process.ui)arm_exec_host_window_visible((state&1u) && !(state&8u));
+    }
   }
   if(process.fatal)result=EXIT_FAILURE;
 done:
+  if(process.ui) {
+    unsigned char closed[8]={'L','A','V','1'};
+    (void)luna_process_channel_send(process.channel,closed,sizeof closed);
+  }
   dvm_content_providers_startup(process.vm,false);
   atomic_store(&process.io_stop,1);
   pthread_join(process.io_thread,NULL);
@@ -2567,15 +2955,19 @@ main(int argc, const char *argv[])
 
     if(!service_process)component_pool_install(dvm_jni_vm(),is_a64);
     int ret = service_process ? run_service_process(&jvm,is_a64,3) : run_dex_activity(&jvm, is_a64);
-    if(g_component_pool) {
-      dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);
-      luna_process_pool_close(g_component_pool);
-      g_component_pool=NULL;
-    }
+    if(g_component_pool)dvm_service_set_submit(dvm_jni_vm(),NULL,NULL);
     (void)process_exit_status(&ret);
     luna_comp_stop();
     arm_exec_begin_shutdown();
     dvm_jni_shutdown();
+    /* Close and reap every owned process before the host display goes away.
+     * Stopping the VM first prevents workers from entering a closing pool. */
+    for(int i=0;i<PACKAGE_POOL_MAX;++i) {
+      if(g_package_pools[i].pool)luna_process_pool_close(g_package_pools[i].pool);
+      free(g_package_pools[i].package);free(g_package_pools[i].services);free(g_package_pools[i].providers);
+      memset(&g_package_pools[i],0,sizeof g_package_pools[i]);
+    }
+    if(g_component_pool) {luna_process_pool_close(g_component_pool);g_component_pool=NULL;}
     arm_exec_shutdown_engines();
     jvm_release(&jvm);
     printf("exiting\n");

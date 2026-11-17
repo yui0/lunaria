@@ -1775,6 +1775,10 @@ int dvm_binder_request(struct dvm *vm, const char *package, const char *magic,
   const unsigned depth = dvm_gil_unlock_all(vm);
   bool done = false;
   for (int waited = 0; waited < BINDER_WAIT_MS && !done; ++waited) {
+    pthread_mutex_lock(&g_binder_lock);
+    done=wait->done;
+    pthread_mutex_unlock(&g_binder_lock);
+    if(done)break;
     binder_pump_once();
     pthread_mutex_lock(&g_binder_lock);
     done = wait->done;
@@ -1844,6 +1848,24 @@ static bool parcel_writeStrongBinder(struct dvm *vm, dvm_ref self, const union d
   }
   return parcel_put_i32(vm, p, (int32_t)PARCEL_BINDER_TAG) && parcel_put_i32(vm, p, handle) &&
          parcel_put_i32(vm, p, (int32_t)owner);
+}
+/* Parcel.writeStrongInterface delegates through IInterface.asBinder(), which
+ * may return a BinderProxy rather than the Java interface wrapper itself. */
+static bool parcel_writeStrongInterface(struct dvm *vm, dvm_ref self,
+    const union dvm_value *args, int nargs, union dvm_value *out)
+{
+  union dvm_value binder = {0};
+  dvm_ref iface = nargs > 0 ? ARG(0).l : 0;
+  if (iface) {
+    struct dvm_class *cls = dvm_object_class(vm, iface);
+    struct dvm_method *method = cls ? dvm_find_method(vm, cls, "asBinder", "()Landroid/os/IBinder;") : NULL;
+    if (!method) {
+      dvm__throw(vm, "java/lang/NoSuchMethodError", "IInterface.asBinder");
+      return false;
+    }
+    if (!dvm_call(vm, method, iface, NULL, 0, &binder)) return false;
+  }
+  return parcel_writeStrongBinder(vm, self, &binder, 1, out);
 }
 static bool parcel_readStrongBinder(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
 {
@@ -2043,6 +2065,7 @@ static const struct rt_method rt_parcel_methods[] = {
   M("writeList", "(Ljava/util/List;)V", parcel_writeList),
   M("readArrayList", "(Ljava/lang/ClassLoader;)Ljava/util/ArrayList;", parcel_readArrayList),
   M("writeStrongBinder", "(Landroid/os/IBinder;)V", parcel_writeStrongBinder),
+  M("writeStrongInterface", "(Landroid/os/IInterface;)V", parcel_writeStrongInterface),
   M("readStrongBinder", "()Landroid/os/IBinder;", parcel_readStrongBinder),
   M("writeInterfaceToken", "(Ljava/lang/String;)V", parcel_writeInterfaceToken),
   M("enforceInterface", "(Ljava/lang/String;)V", parcel_enforceInterface),
@@ -2099,7 +2122,7 @@ int dvm_service_pack(struct dvm *vm,uint32_t intent,int operation,void **bytes,s
 {
   *bytes=NULL;
   *size=0;
-  if(!intent || (operation!=1 && operation!=2 && operation!=3))return -EINVAL;
+  if(!intent || (operation<1 || operation>4))return -EINVAL;
   union dvm_value parcel= {0},value= {0},ignored= {0};
   if(!parcel_obtain(vm,0,NULL,0,&parcel))return -ENOMEM;
   dvm_pin(vm,parcel.l);
@@ -2212,7 +2235,7 @@ int dvm_service_unpack(struct dvm *vm,const void *bytes,size_t size,int *operati
   if(ok) {
     ok=parcel_take_i32(p)==0x3156534c;
     op=parcel_take_i32(p);
-    ok=ok && (op==1 || op==2 || op==3);
+    ok=ok && (op>=1 && op<=4);
   }
   dvm_ref result=ok ? dvm_new_object(vm,dvm_find_class(vm,"android/content/Intent")) : 0;
   if(result)dvm_pin(vm,result);
@@ -2228,6 +2251,104 @@ int dvm_service_unpack(struct dvm *vm,const void *bytes,size_t size,int *operati
   (void)parcel_recycle(vm,parcel.l,NULL,0,&ignored);
   dvm_unpin(vm,parcel.l);
   return ok ? 0 : -EINVAL;
+}
+
+/* Result callbacks are retained by the calling process and delivered only
+ * on its real main-Looper turn, never on a Binder/socket receiving thread. */
+struct activity_result_wait {
+  struct activity_result_wait *next;
+  struct dvm *vm;
+  uint32_t token;
+  dvm_ref caller,data;
+  int32_t request,code;
+  bool ready;
+  char *package;
+};
+static struct activity_result_wait *activity_results;
+static uint32_t activity_next_token;
+void dvm_binder_activity_dispose(struct dvm *vm)
+{
+  struct activity_result_wait **at=&activity_results;
+  while (*at) {
+    struct activity_result_wait *wait=*at;
+    if (wait->vm!=vm) { at=&wait->next; continue; }
+    *at=wait->next;
+    dvm_unpin(vm,wait->caller);
+    if(wait->data)dvm_unpin(vm,wait->data);
+    free(wait->package); free(wait);
+  }
+}
+void dvm_binder_activity_tick(struct dvm *vm)
+{
+  /* Already in the main dispatch: acquiring the VM lock here would reload
+   * a saved native-entry state over this turn's drain_depth / call stack. */
+  if(!activity_results || g_task_background || g_external_paused)return;
+  for (;;) {
+    struct activity_result_wait **at=&activity_results;
+    while (*at && ((*at)->vm!=vm || !(*at)->ready)) at=&(*at)->next;
+    struct activity_result_wait *wait=*at;
+    if (!wait) break;
+    *at=wait->next;
+    dvm_activity_result(vm,wait->caller,wait->request,wait->code,wait->data);
+    dvm_unpin(vm,wait->caller);
+    if(wait->data)dvm_unpin(vm,wait->data);
+    free(wait->package); free(wait);
+  }
+}
+int dvm_binder_remote_activity(struct dvm *vm,const char *package,dvm_ref intent,
+    const char *component,dvm_ref caller,int32_t request,bool for_result)
+{
+  void *packed=NULL;
+  size_t psize=0,cn=component ? strlen(component) : 0;
+  if (!cn || cn>511) return -EINVAL;
+  int rc=dvm_service_pack(vm,intent,4,&packed,&psize);
+  if(rc)return rc;
+  struct activity_result_wait *wait=NULL;
+  uint32_t token=0;
+  if (for_result && request>=0) {
+    wait=calloc(1,sizeof *wait);
+    if (wait) wait->package=strdup(package);
+    if (!wait || !wait->package) { free(wait); free(packed); return -ENOMEM; }
+    token=++activity_next_token;
+    if (!token) token=++activity_next_token;
+    wait->vm=vm; wait->token=token; wait->caller=caller; wait->request=request;
+    wait->next=activity_results; activity_results=wait;
+    dvm_pin(vm,caller);
+  }
+  uint8_t *body=malloc(16+cn+psize);
+  if (!body) rc=-ENOMEM;
+  else {
+    bput(body,(uint32_t)cn); bput(body+4,token); bput(body+8,0); bput(body+12,(uint32_t)psize);
+    memcpy(body+16,component,cn); memcpy(body+16+cn,packed,psize);
+    int32_t status=0; uint8_t *reply=NULL; size_t reply_size=0;
+    rc=dvm_binder_request(vm,package,"LBA1",body,16+cn+psize,&status,&reply,&reply_size);
+    if (!rc) rc=status;
+    free(reply); free(body);
+  }
+  free(packed);
+  if (rc && wait) {
+    struct activity_result_wait **at=&activity_results;
+    while (*at && *at!=wait) at=&(*at)->next;
+    if (*at) *at=wait->next;
+    dvm_unpin(vm,caller);
+    if(wait->data)dvm_unpin(vm,wait->data);
+    free(wait->package); free(wait);
+  }
+  return rc;
+}
+void dvm_binder_activity_finished(struct dvm *vm,uint32_t sender,uint32_t token,int32_t code,dvm_ref data)
+{
+  void *packed=NULL; size_t psize=0;
+  if (data && dvm_service_pack(vm,data,4,&packed,&psize)) return;
+  uint8_t *body=NULL; size_t size=0;
+  uint8_t *message=binder_message("LBE1",token,8+psize,&body,&size);
+  if (message) {
+    bput(body,(uint32_t)code); bput(body+4,(uint32_t)psize);
+    if(psize)memcpy(body+8,packed,psize);
+    (void)binder_send_peer_fds(sender,message,size,NULL);
+    free(message);
+  }
+  free(packed);
 }
 
 /* Intent as a Parcelable: the bytes of intent_write_body, and the Creator that
@@ -2260,7 +2381,8 @@ static const struct rt_method rt_x_intent_parcel[] = {
   M("writeToParcel", "(Landroid/os/Parcel;I)V", intent_writeToParcel),
   M("describeContents", "()I", intent_describeContents),
   /* The loader that resolves the Parcelables of the extras; classes are found by name through the VM's own loader. */
-  M("setExtrasClassLoader", "(Ljava/lang/ClassLoader;)V", nop_void),
+  /* Intent.setExtrasClassLoader(): the guest runs in one class loader, so there is no other loader to bind. */
+  M("setExtrasClassLoader", "(Ljava/lang/ClassLoader;)V", empty_void),
   M_END,
 };
 static bool intent_creator_create(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -2688,9 +2810,10 @@ static int binder_receive(struct dvm *vm, const char *name, const void *bytes, s
   const uint8_t *m = bytes;
   if (!vm || !m || size < 24 || memcmp(m, "LB", 2)) return 0;
   const bool bind = !memcmp(m, "LBB1", 4), transact = !memcmp(m, "LBT1", 4), reply = !memcmp(m, "LBR1", 4);
+  const bool activity = !memcmp(m,"LBA1",4), result = !memcmp(m,"LBE1",4);
   const bool provider_op = !memcmp(m, "LBQ1", 4);
   const bool broadcast = !memcmp(m, "LBC1", 4);
-  if (!bind && !transact && !reply && !provider_op && !broadcast) return 0;
+  if (!bind && !transact && !reply && !provider_op && !broadcast && !activity && !result) return 0;
   const uint32_t sender = bget(m + 4), seq = bget(m + 8), caller_uid = bget(m + 12), pkglen = bget(m + 16);
   if (pkglen > BINDER_PACKAGE_MAX || size < 24 + (size_t)pkglen) return 1;
   const uint32_t apklen = bget(m + 20 + pkglen);
@@ -2777,6 +2900,46 @@ static int binder_receive(struct dvm *vm, const char *name, const void *bytes, s
   dvm__tstate_load(vm, &main_turn);
   g_binder_caller_uid = caller_uid;
   g_binder_caller_pid = sender;
+  if (activity) {
+    int32_t status=-EINVAL;
+    if (blen>=16) {
+      size_t cn=bget(body), length=bget(body+12);
+      if (cn>0 && cn<=511 && cn<=blen-16 && length==blen-16-cn) {
+        uint32_t intent=0; int operation=0;
+        status=dvm_service_unpack(vm,body+16+cn,length,&operation,&intent);
+        if (!status && operation==4) {
+          dvm_pin(vm,intent);
+          union dvm_value component={0},name={0};
+          dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
+          if(component.l)dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&name);
+          const char *actual=name.l ? dvm_string_utf8(vm,name.l) : NULL;
+          status=actual && strlen(actual)==cn && !memcmp(actual,body+16,cn) ?
+            dvm_activity_accept(vm,intent,caller_uid,sender,bget(body+4)) : -EINVAL;
+          dvm_unpin(vm,intent);
+        } else if (!status) status=-EINVAL;
+      }
+    }
+    if (dvm_exception(vm)) { dvm_clear_exception(vm); if(!status)status=-EIO; }
+    binder_reply(sender,seq,status,0,NULL,0);
+    g_binder_caller_uid=g_binder_caller_pid=0;
+    dvm__tstate_load(vm,&saved); dvm_gil_leave_to_guest(vm,cookie);
+    return 1;
+  }
+  if (result) {
+    struct activity_result_wait *wait=activity_results;
+    while(wait && (wait->vm!=vm || wait->token!=seq || strcmp(wait->package,from))) wait=wait->next;
+    if(wait && !wait->ready && blen>=8 && bget(body+4)==blen-8) {
+      uint32_t data=0; int operation=0;
+      if(blen==8 || (!dvm_service_unpack(vm,body+8,blen-8,&operation,&data) && operation==4)) {
+        wait->data=data; if(data)dvm_pin(vm,data);
+        wait->code=(int32_t)bget(body); wait->ready=true;
+      }
+    }
+    if(dvm_exception(vm))dvm_clear_exception(vm);
+    g_binder_caller_uid=g_binder_caller_pid=0;
+    dvm__tstate_load(vm,&saved); dvm_gil_leave_to_guest(vm,cookie);
+    return 1;
+  }
   if (provider_op) {
     binder_dispatch_request(vm, sender, seq, caller_uid, body, blen, true);
     g_binder_caller_uid = g_binder_caller_pid = 0;

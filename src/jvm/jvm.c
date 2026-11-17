@@ -92,6 +92,9 @@ static void jvm_meta_unlock(void)
   pthread_mutex_unlock(&g_jvm_meta_mutex);
 }
 
+void jvm_binding_collection_begin(void) { jvm_meta_lock(); }
+void jvm_binding_collection_end(void) { jvm_meta_unlock(); }
+
 static uint64_t jni_monitor_token(void)
 {
   if (arm_exec_jni_thread_token) {
@@ -495,6 +498,8 @@ jvm_add_object(struct jvm *jvm, const struct jvm_object *o)
   }
   jvm->next_object = i + 1;
   jvm->objects[i] = *o;
+  ++jvm->live_objects;
+  ++jvm->object_allocations;
   ++jvm->object_generation[i];
   jvm->objects[i].refs = 1;
   /* Slots are recycled, so a stale stub pointer from the previous tenant
@@ -590,6 +595,7 @@ jvm_deref_object(struct jvm *jvm, jobject object)
   jvm_index_remove(jvm, idx);
   jvm_array_release_refs(jvm, o);
   jvm_object_release(o);
+  --jvm->live_objects;
   if (idx < jvm->next_object)
     jvm->next_object = idx;
   jvm_meta_unlock();
@@ -622,6 +628,15 @@ jvm_bridge_ref_count(struct jvm *jvm, jobject object)
   int refs = o->type == JVM_OBJECT_NONE ? 0 : o->refs;
   jvm_meta_unlock();
   return refs;
+}
+
+size_t jvm_live_objects(struct jvm *jvm,uint64_t *allocations)
+{
+  jvm_meta_lock();
+  size_t count=jvm->live_objects;
+  if (allocations) *allocations=jvm->object_allocations;
+  jvm_meta_unlock();
+  return count;
 }
 
 /* Which tenant of a handle slot this is: the slot's allocation count.  A
@@ -676,6 +691,7 @@ jvm_release_bridge_local(struct jvm *jvm, jobject object)
   jvm_index_remove(jvm, idx);
   jvm_array_release_refs(jvm, o);
   jvm_object_release(o);
+  --jvm->live_objects;
   jvm->wrap_cached[idx] = false;
   jvm->wrap_cache[idx] = NULL;
   if (idx < jvm->next_object) jvm->next_object = idx;
@@ -1341,6 +1357,21 @@ JNIEnv_DeleteGlobalRef(JNIEnv* p0, jobject p1)
   if (o && o->global_refs > 0) --o->global_refs;
   jvm_deref_object(jvm,p1);
   jvm_meta_unlock();
+}
+
+bool jvm_release_unreachable_binding(struct jvm *jvm,jobject object,bool managed_instance)
+{
+  jvm_meta_lock();
+  struct jvm_object *value=jvm_get_object(jvm,object);
+  bool sole=value && value->type!=JVM_OBJECT_NONE && value->refs==1 && value->global_refs==1;
+  if (sole) {
+    /* DEX instances keep their state in the interpreter. They are not the
+     * process-lifetime host-stub singletons, even when JNI created them. */
+    if (managed_instance && value->type==JVM_OBJECT_OPAQUE) value->bridge_owned=true;
+    JNIEnv_DeleteGlobalRef(&jvm->env,object);
+  }
+  jvm_meta_unlock();
+  return sole;
 }
 
 static void

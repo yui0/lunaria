@@ -562,14 +562,16 @@ runtime/libOpenSLES.so: src/trace.h
 # shortcut. Implement missing Android/Java behavior in C with existing tools.
 # IMPORTANT: The user requires ICU-independent number formatting. Do not add
 # ICU compile/link flags or an ICU package dependency to implement DVM APIs.
-DVM_SRC = src/apkpure.c src/dvm/calendar.c src/dvm/dvm_path.c src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
+PATH_GEOMETRY_SRC = src/dvm/dvm_path.c
+PATH_GEOMETRY_HDR = src/luna_poly_ops.h
+DVM_SRC = src/apkpure.c src/dvm/calendar.c $(PATH_GEOMETRY_SRC) src/luna_unicode.c src/dvm/dex.c src/dvm/dvm.c src/dvm/dvm_runtime.c src/dvm/dvm_jni.c \
           src/dvm/dvm_net.c src/dvm/dvm_media.c src/dvm/regex.c src/dvm/charset.c src/dvm/apk_signers.c src/dvm/dvm_sqlite.c \
           src/webview_cdp.c $(WEBVIEW_CDP_HOST_SRC)
 DVM_SRC += src/luna_process_ipc.c src/luna_certs.c
 # Every header under src/ is an input of the emulator: dvm_runtime.c is a unity
 # build that #includes the dvm_*.h family, so a hand-kept list silently misses new
 # ones (an edited header then did not rebuild libjvm.so).  Track them all.
-DVM_HDR = $(wildcard src/*.h src/dvm/*.h src/jvm/*.h src/unicode/*.h)
+DVM_HDR = $(wildcard src/*.h src/dvm/*.h src/jvm/*.h src/unicode/*.h) $(PATH_GEOMETRY_HDR)
 # The Dalvik bytecode emulator lives in libjvm.so: it is reached from jvm.c
 # (a JNI call with no host stub) and it calls back out through the same JNI
 # table, so the two have to be in one object.
@@ -760,10 +762,20 @@ temp-cleanup-test: test/temp_cleanup_test.c src/lunaria_file.c src/lunaria_file.
 	$(CC) -std=c11 -D_GNU_SOURCE -Wall -Wextra -Werror -Isrc test/temp_cleanup_test.c src/lunaria_file.c -lpthread -o $(BUILD_DIR)/temp_cleanup_test
 	$(BUILD_DIR)/temp_cleanup_test
 
+.PHONY: poly-ops-test
+poly-ops-test: test/poly_ops_test.c src/luna_poly_ops.h | $(BUILD_DIR)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Wpedantic -Werror $(DVM_TEST_SAN) $< -lm -o $(BUILD_DIR)/poly_ops_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/poly_ops_test
+
 .PHONY: path-geometry-test
-path-geometry-test: test/path_geometry_test.c src/dvm/dvm_path.c src/dvm/dvm_lib.h | $(BUILD_DIR)
-	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/path_geometry_test.c src/dvm/dvm_path.c -lm -o $(BUILD_DIR)/path_geometry_test
+path-geometry-test: test/path_geometry_test.c $(PATH_GEOMETRY_SRC) $(PATH_GEOMETRY_HDR) src/dvm/dvm_lib.h | $(BUILD_DIR)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/path_geometry_test.c $(PATH_GEOMETRY_SRC) -lm -o $(BUILD_DIR)/path_geometry_test
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/path_geometry_test
+
+.PHONY: path-boolean-alloc-test
+path-boolean-alloc-test: test/path_boolean_alloc_test.c $(PATH_GEOMETRY_SRC) $(PATH_GEOMETRY_HDR) src/dvm/dvm_lib.h | $(BUILD_DIR)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -Isrc test/path_boolean_alloc_test.c $(PATH_GEOMETRY_SRC) -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc -lm -o $(BUILD_DIR)/path_boolean_alloc_test
+	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/path_boolean_alloc_test
 
 $(BUILD_DIR)/aeabi-memory32.so: test/aeabi_memory_test.c | $(BUILD_DIR)
 	$(ABI32_HFBARE_CC) -std=c11 -o $@ $<
@@ -1025,6 +1037,10 @@ window-input-test: test/test_boot_card
 
 profile-menu-test: test/test_boot_card
 	./test/test_boot_card --profile-menu-test
+
+.PHONY: google-service-help-test
+google-service-help-test: test/test_boot_card
+	./test/test_boot_card --google-service-help-test
 
 .PHONY: google-services-menu-test google-services-test
 google-services-menu-test: test/test_boot_card
@@ -2474,8 +2490,8 @@ HOST_MEMORY_TEST = $(BUILD_DIR)/test_host_memory$(HOST_TEST_EXE_SUFFIX)
 ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
 HOST_OS_TEST_LIBS = $(HOST_NATIVE_LIBS)
 endif
-$(HOST_MEMORY_TEST): test/host_memory_test.c src/lunaria_os.h $(LUNA_OS_OBJ)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE test/host_memory_test.c $(LUNA_OS_OBJ) \
+$(HOST_MEMORY_TEST): test/host_memory_test.c src/lunaria_os.h src/arm.h $(LUNA_OS_OBJ) $(BUILD_DIR)/arm.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE test/host_memory_test.c $(LUNA_OS_OBJ) $(BUILD_DIR)/arm.o \
 	    $(HOST_WINDOW_LIBS) $(HOST_AUDIO_LIBS) $(HOST_SYSTEM_DL_LIBS) \
 	    $(HOST_CHARSET_LIBS) $(HOST_OS_TEST_LIBS) -lpthread -o $@
 host-memory-test: $(HOST_MEMORY_TEST)
@@ -2701,6 +2717,15 @@ mmap-image-test: lunaria $(BUILD_DIR)/mmap-image64.so
 $(BUILD_DIR)/test_ui_lifecycle: test/ui_lifecycle_test.c $(LUNA_UI_DIR)/luna-ui.h | $(BUILD_DIR)
 	clang -std=c11 -g -O1 -fsanitize=address -D_GNU_SOURCE -I$(LUNA_UI_DIR) $< \
 	    -lm -ldl -lglfw -lGLESv2 -o $@
+# luna-ui render/memory benchmark (EGL pbuffer, GLES3).  Compare against an
+# older tree with:  make ui-bench LUNA_UI_DIR=/path/to/older/luna-ui
+$(BUILD_DIR)/test_ui_bench: test/ui_bench.c $(LUNA_UI_DIR)/luna-ui.h | $(BUILD_DIR)
+	$(CC) -std=c11 -O2 -g -D_GNU_SOURCE -w -I$(LUNA_UI_DIR) $< \
+	    -lm -ldl -lEGL -lGLESv2 -o $@
+.PHONY: ui-bench
+ui-bench: $(BUILD_DIR)/test_ui_bench
+	$(BUILD_DIR)/test_ui_bench
+
 .PHONY: ui-lifecycle-test
 ui-lifecycle-test: $(BUILD_DIR)/test_ui_lifecycle
 	ASAN_OPTIONS=detect_leaks=0 $(BUILD_DIR)/test_ui_lifecycle
@@ -2988,6 +3013,13 @@ $(eval $(call GUEST_ABI_TEST,jni-payload-lifetime,test/jni_payload_lifetime_test
 jni-payload-lifetime-test: lunaria $(BUILD_DIR)/jni-array-owner/code/classes.dex $(BUILD_DIR)/jni-payload-lifetime64.so $(BUILD_DIR)/jni-payload-lifetime32.so
 	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-array-owner/code" python3 test/run_guest_results.py $(BUILD_DIR)/jni-payload-lifetime64.so $(BUILD_DIR)/jni-payload-lifetime32.so
 
+# JNI-created Java objects must be reclaimable once native and Java roots die.
+$(eval $(call GUEST_ABI_TEST,jni-managed-lifetime,test/jni_managed_lifetime_test.c,$(ABI32_CC),-std=c11))
+
+.PHONY: jni-managed-lifetime-test
+jni-managed-lifetime-test: lunaria $(BUILD_DIR)/jni-array-owner/code/classes.dex $(BUILD_DIR)/jni-managed-lifetime64.so $(BUILD_DIR)/jni-managed-lifetime32.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-array-owner/code" python3 test/run_guest_results.py $(BUILD_DIR)/jni-managed-lifetime64.so $(BUILD_DIR)/jni-managed-lifetime32.so
+
 $(eval $(call GUEST_ABI_TEST,jni-many-args,test/jni_many_args_test.c,$(ABI32_CC),-std=c11))
 
 .PHONY: jni-many-args-test
@@ -3001,7 +3033,7 @@ $(eval $(call GUEST_ABI_TEST,jni-lifecycle,test/jni_lifecycle_transaction_test.c
 
 .PHONY: jni-lifecycle-transaction-test
 jni-lifecycle-transaction-test: lunaria $(BUILD_DIR)/jni-lifecycle/code/classes.dex $(BUILD_DIR)/jni-lifecycle64.so $(BUILD_DIR)/jni-lifecycle32.so
-	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-lifecycle/code" ANDROID_PACKAGE_NAME=test.lifecycle ANDROID_LAUNCH_ACTIVITY=test.LifecycleParent python3 test/run_guest_results.py $(BUILD_DIR)/jni-lifecycle64.so $(BUILD_DIR)/jni-lifecycle32.so
+	@ANDROID_PACKAGE_CODE_PATH="$(BUILD_DIR)/jni-lifecycle/code" ANDROID_PACKAGE_NAME=test.lifecycle ANDROID_LAUNCH_ACTIVITY=test.LifecycleParent ANDROID_ACTIVITIES="$$(cat $(BUILD_DIR)/jni-lifecycle/code/activities.txt)" python3 test/run_guest_results.py $(BUILD_DIR)/jni-lifecycle64.so $(BUILD_DIR)/jni-lifecycle32.so
 
 # Real A64 instruction fetch must reach the Vulkan host-call dispatcher.
 $(BUILD_DIR)/vulkan-guest64.so: test/vulkan_guest_test.c | $(BUILD_DIR)
@@ -3078,6 +3110,11 @@ $(BUILD_DIR)/process_ipc_test: test/process_ipc_test.c src/luna_process_ipc.c sr
 .PHONY: process-ipc-test
 process-ipc-test: $(BUILD_DIR)/process_ipc_test
 	$(BUILD_DIR)/process_ipc_test
+
+# Linux integration: real component processes and GLFW/EGL windows on Xvfb.
+.PHONY: remote-activity-test
+remote-activity-test: lunaria
+	xvfb-run -a python3 test/remote_activity_test.py ./lunaria
 
 $(BUILD_DIR)/provider_plan_test: test/provider_plan_test.c src/jvm/jvm.h src/jvm/packages.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_GNU_SOURCE -g -O1 -Wall -Wextra $(DVM_TEST_SAN) -ffunction-sections -fdata-sections -Isrc $< src/jvm/packages.c -Wl,--gc-sections -o $@
@@ -3761,3 +3798,37 @@ $(BUILD_DIR)/file_read_cache_test: test/file_read_cache_test.c src/lunaria_file.
 .PHONY: file-read-cache-test
 file-read-cache-test: $(BUILD_DIR)/file_read_cache_test
 	$(BUILD_DIR)/file_read_cache_test
+
+# Fixed-capacity queue and concurrent admission regression.
+test/test_dvm: test/array_queue_tests.h
+
+.PHONY: charset-stream-test
+charset-stream-test: $(BUILD_DIR)/test_charset_stream
+	$(BUILD_DIR)/test_charset_stream
+$(BUILD_DIR)/test_charset_stream: test/charset_stream_test.c src/dvm/charset.c src/dvm/dvm_lib.h | $(BUILD_DIR)
+	$(CC) -std=c11 -D_GNU_SOURCE -O1 -g $(DVM_TEST_SAN) -Isrc test/charset_stream_test.c src/dvm/charset.c $(HOST_CHARSET_LIBS) -lm -o $@
+
+# Channel adapters and real PrintStream ownership/encoding.
+test/test_dvm: test/print_stream_tests.h
+
+# Actual Linux initial-stack consumption by ELF entrypoints on both ABIs.
+$(BUILD_DIR)/exec-stack-root64/data/local/tmp/stack-probe: test/atfork_test.c | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	clang -target aarch64-linux-gnu -fPIE -ffreestanding -nostdlib -O1 -fuse-ld=lld \
+	    -DEXEC_STACK_IMAGE -Wl,-pie,--no-dynamic-linker,-e,_start $< -o $@
+$(BUILD_DIR)/exec-stack-root32/data/local/tmp/stack-probe: test/atfork_test.c | $(BUILD_DIR)
+	mkdir -p $(dir $@)
+	clang -target armv7a-linux-gnueabi -fPIE -ffreestanding -nostdlib -O1 -fuse-ld=lld \
+	    -DEXEC_STACK_IMAGE -Wl,-pie,--no-dynamic-linker,-e,_start $< -o $@
+$(BUILD_DIR)/exec-stack-driver64.so: test/atfork_test.c | $(BUILD_DIR)
+	$(ABI64_CC) -DEXEC_STACK_DRIVER $< -o $@
+$(BUILD_DIR)/exec-stack-driver32.so: test/atfork_test.c | $(BUILD_DIR)
+	$(ABI32_CC) -DEXEC_STACK_DRIVER $< -o $@
+.PHONY: exec-stack-test
+exec-stack-test: lunaria $(BUILD_DIR)/exec-stack-root64/data/local/tmp/stack-probe $(BUILD_DIR)/exec-stack-root32/data/local/tmp/stack-probe $(BUILD_DIR)/exec-stack-driver64.so $(BUILD_DIR)/exec-stack-driver32.so
+	@set -e; for abi in 64 32; do \
+	    env LUNARIA_GUEST_ROOT=$(abspath $(BUILD_DIR)/exec-stack-root)$$abi LUNARIA_PBUFFER=1 LUNARIA_AUDIO_MUTE=1 \
+	        python3 test/run_guest_results.py $(BUILD_DIR)/exec-stack-driver$$abi.so; \
+	    grep -q '^exec-stack-image RESULT PASS' $(BUILD_DIR)/exec-stack-driver$$abi.out; \
+	    grep -q 'system returned 5888; RESULT PASS' $(BUILD_DIR)/exec-stack-driver$$abi.out; \
+	done

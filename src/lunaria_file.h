@@ -19,6 +19,21 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+struct luna_cookie_io {
+  ptrdiff_t (*read)(void *,void *,size_t);
+  ptrdiff_t (*write)(void *,const void *,size_t);
+  int (*seek)(void *,int64_t *,int);
+  int (*close)(void *);
+};
+/* On success fclose owns cookie through close. On failure ownership stays
+ * with the caller, and no guest close callback has run. */
+FILE *luna_cookie_file_open(void *cookie,const struct luna_cookie_io *io);
+/* Flush pending output only, not an input stream's read-ahead cursor.
+ * Caller must not hold a guest execution/table lock: FILE locks can call back. */
+int luna_stdio_flush_output(FILE *stream);
+/* Linux/Android allocation flags; performs a real host allocation. */
+int luna_file_allocate(int fd,int mode,int64_t offset,int64_t length);
+
 int luna_temp_path(char *path,size_t capacity,const char *name);
 int luna_temp_mkstemp(char *pattern,size_t capacity);
 char *luna_temp_mkdtemp(char *pattern,size_t capacity);

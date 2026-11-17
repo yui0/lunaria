@@ -521,6 +521,46 @@ static bool x_ssl_context_protocol(struct dvm *vm, dvm_ref self, const union dvm
   (void)dvm_get_field(vm, self, "protocol", "Ljava/lang/String;", &v);
   RETL(v.l ? v.l : dvm_new_string(vm, "TLS"));
 }
+/* javax.net.ssl.SSLSessionContext of the host-backed SSLContext.  The host TLS keeps its own session cache, so
+ * this object holds the limits an app configures (conscrypt's defaults: 10 client / 20480 server sessions, 8 h)
+ * and enumerates no sessions. */
+static const struct rt_field rt_host_session_context_fields[] = {
+  { "cacheSize", "I" }, { "timeout", "I" }, F_END,
+};
+static const char *const rt_iface_ssl_session_context[] = { "Ljavax/net/ssl/SSLSessionContext;", NULL };
+static bool host_session_context_method(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                                        union dvm_value *out)
+{
+  (void)nargs;
+  const char *name = dvm__builtin_method()->name;
+  if (!strcmp(name, "getSessionCacheSize")) RETI(rt_get_int(vm, self, "cacheSize"));
+  if (!strcmp(name, "getSessionTimeout")) RETI(rt_get_int(vm, self, "timeout"));
+  if (!strcmp(name, "setSessionCacheSize") || !strcmp(name, "setSessionTimeout")) {
+    if (ARG(0).i < 0) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException", "%s", name[10] == 'C' ? "size < 0" : "seconds < 0");
+      return false;
+    }
+    rt_set_int(vm, self, name[10] == 'C' ? "cacheSize" : "timeout", ARG(0).i);
+    RETV();
+  }
+  if (!strcmp(name, "getSession")) RETL(0);                  /* no session is retained here */
+  return x_call_static(vm, "java/util/Collections", "emptyEnumeration", "()Ljava/util/Enumeration;", NULL, 0, out);
+}
+static const struct rt_method rt_host_session_context[] = {
+  M("getSessionCacheSize", "()I", host_session_context_method), M("setSessionCacheSize", "(I)V", host_session_context_method),
+  M("getSessionTimeout", "()I", host_session_context_method), M("setSessionTimeout", "(I)V", host_session_context_method),
+  M("getSession", "([B)Ljavax/net/ssl/SSLSession;", host_session_context_method),
+  M("getIds", "()Ljava/util/Enumeration;", host_session_context_method), M_END,
+};
+static dvm_ref host_session_context_new(struct dvm *vm, bool client)
+{
+  dvm_ref c = dvm_new_object(vm, dvm_find_class(vm, "lunaria/HostSSLSessionContext"));
+  if (!c) return 0;
+  rt_set_int(vm, c, "cacheSize", client ? 10 : 20480);
+  rt_set_int(vm, c, "timeout", 8 * 3600);
+  return c;
+}
+
 /* init / createSSLEngine / socket factories: the provider's engine*() methods. */
 static bool x_ssl_context_delegate(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                                    int nargs, union dvm_value *out)
@@ -535,6 +575,11 @@ static bool x_ssl_context_delegate(struct dvm *vm, dvm_ref self, const union dvm
     dvm_ref e = host_engine_new(vm, host, nargs >= 2 ? args[1].i : -1);
     if (!e) return false;
     RETL(e);
+  }
+  if (!spi && (!strcmp(m->name, "getClientSessionContext") || !strcmp(m->name, "getServerSessionContext"))) {
+    dvm_ref c = host_session_context_new(vm, !strcmp(m->name, "getClientSessionContext"));
+    if (!c) return false;
+    RETL(c);
   }
   if (!spi) {
     dvm__throw(vm, "java/lang/UnsupportedOperationException", "SSLContext.%s", m->name);
@@ -921,8 +966,6 @@ static bool x_intent_data_string(struct dvm *vm, dvm_ref self, const union dvm_v
 }
 static const struct rt_method rt_x_intent_more[] = {
   M("getDataString", "()Ljava/lang/String;", x_intent_data_string),
-  M("getClipData", "()Landroid/content/ClipData;", ret_null),   /* none is ever attached */
-  M("getSelector", "()Landroid/content/Intent;", ret_null),
   M_END,
 };
 static const struct rt_method rt_x_wifi_more[] = {

@@ -479,6 +479,22 @@ int dvm_binder_receive_fds(struct dvm *,const char *,const void *,size_t,const i
  * thread; return 0 for lifecycle commands and ServiceConnection callbacks. */
 int dvm_binder_receive_io(struct dvm *,const void *bytes,size_t size);
 int dvm_binder_remote_bind(struct dvm *,const char *package,uint32_t intent,uint32_t connection);
+/* ActivityThread operations, called by the component host on its main thread.
+ * State bits: 1=has Activities, 2=resumed, 4=launch pending, 8=hidden. */
+unsigned dvm_activity_state(struct dvm *);
+void dvm_activity_foreground(struct dvm *,bool);
+void dvm_activity_pause(struct dvm *);
+void dvm_activity_back(struct dvm *);
+int dvm_activity_accept(struct dvm *,uint32_t intent,uint32_t uid,
+                         uint32_t sender,uint32_t token);
+void dvm_activity_result(struct dvm *,uint32_t caller,int32_t request,
+                          int32_t code,uint32_t data);
+int dvm_binder_remote_activity(struct dvm *,const char *package,uint32_t intent,
+    const char *component,uint32_t caller,int32_t request,bool for_result);
+void dvm_binder_activity_finished(struct dvm *,uint32_t sender,uint32_t token,
+                                  int32_t code,uint32_t data);
+void dvm_binder_activity_tick(struct dvm *);
+void dvm_binder_activity_dispose(struct dvm *);
 
 /* ---- DEX / APK container readers (dex.c, apk_signers.c) ---- */
 /* Access flags (dex, class/field/method share the space). */

@@ -222,8 +222,9 @@ static const struct rt_method rt_x_activity_manager_more[] = {
 static const struct rt_method rt_x_traffic_stats_more[] = {
   SM("clearThreadStatsUid", "()V", nop_void),
   SM("setThreadStatsUid", "(I)V", nop_void),
-  SM("setThreadStatsTag", "(I)V", nop_void),
-  SM("clearThreadStatsTag", "()V", nop_void),
+  /* TrafficStats tags only label socket traffic for the platform's accounting; the host sockets are not accounted. */
+  SM("setThreadStatsTag", "(I)V", empty_void),
+  SM("clearThreadStatsTag", "()V", empty_void),
   M_END,
 };
 

@@ -840,3 +840,134 @@ int jcs_decoder_next(struct jcs_decoder *d, int (*next_byte)(void *ctx),
   }
   return dq_pop(d);
 }
+
+struct jcs_encoder {
+  struct jcs cs;
+  struct native_converter *native;
+  bool bom_written;
+};
+struct jcs_encoder *jcs_encoder_new(const struct jcs *cs)
+{
+  struct jcs_encoder *e=calloc(1,sizeof *e);
+  if(!e)return NULL;
+  e->cs=*cs;
+  if(cs->kind==JCS_NATIVE) {
+    e->native=native_open(cs->name,false);
+    if(!e->native) { free(e); return NULL; }
+  }
+  return e;
+}
+void jcs_encoder_free(struct jcs_encoder *e)
+{
+  if(!e)return;
+  native_close(e->native);
+  free(e);
+}
+void jcs_encoder_reset(struct jcs_encoder *e)
+{
+  e->bom_written=false;
+#ifndef _WIN32
+  if(e->native) (void)iconv(e->native->handle,NULL,NULL,NULL,NULL);
+#endif
+}
+struct jcs_coder_progress jcs_encoder_encode(struct jcs_encoder *e,
+    const uint16_t *input,size_t count,uint8_t *output,size_t capacity,bool end)
+{
+  struct jcs_coder_progress r={0};
+  if(e->cs.kind==JCS_UTF16 && count && !e->bom_written) {
+    if(capacity<2) { r.result=JCS_OVERFLOW; return r; }
+    output[r.produced++]=0xfe; output[r.produced++]=0xff;
+    e->bom_written=true;
+  }
+  while(r.consumed<count) {
+    uint32_t cp=input[r.consumed];
+    size_t width=1;
+    if(cp>=0xd800 && cp<=0xdbff) {
+      if(r.consumed+1==count && !end) return r;
+      if(r.consumed+1==count || input[r.consumed+1]<0xdc00 || input[r.consumed+1]>0xdfff) {
+        r.result=JCS_MALFORMED; r.error_length=1; return r;
+      }
+      cp=0x10000+((cp-0xd800)<<10)+(input[r.consumed+1]-0xdc00);
+      width=2;
+    } else if(cp>=0xdc00 && cp<=0xdfff) {
+      r.result=JCS_MALFORMED; r.error_length=1; return r;
+    }
+    uint8_t bytes[8]; size_t n=0;
+    switch(e->cs.kind) {
+    case JCS_ASCII: case JCS_LATIN1:
+      if(cp>(e->cs.kind==JCS_ASCII ? 0x7fU : 0xffU)) {
+        r.result=JCS_UNMAPPABLE; r.error_length=width; return r;
+      }
+      bytes[n++]=(uint8_t)cp;
+      break;
+    case JCS_UTF8:
+      n=jcs_utf16_to_wtf8(input+r.consumed,width,(char *)bytes);
+      break;
+    case JCS_UTF16: case JCS_UTF16BE: case JCS_UTF16LE:
+      for(size_t j=0; j<width; ++j) {
+        uint16_t unit=input[r.consumed+j];
+        bool le=e->cs.kind==JCS_UTF16LE;
+        bytes[n++]=(uint8_t)(unit>>(le ? 0 : 8));
+        bytes[n++]=(uint8_t)(unit>>(le ? 8 : 0));
+      }
+      break;
+    case JCS_NATIVE: {
+#ifdef _WIN32
+      WCHAR units[2];
+      for(size_t j=0; j<width; ++j) units[j]=(WCHAR)input[r.consumed+j];
+      BOOL substituted=FALSE;
+      DWORD flags=e->native->cp==54936 ? 0 : WC_NO_BEST_FIT_CHARS;
+      BOOL *used_default=e->native->cp==54936 ? NULL : &substituted;
+      int size=WideCharToMultiByte(e->native->cp,flags,units,(int)width,NULL,0,NULL,used_default);
+      if(!size || substituted) { r.result=JCS_UNMAPPABLE; r.error_length=width; return r; }
+      if((size_t)size>capacity-r.produced) { r.result=JCS_OVERFLOW; return r; }
+      if(!WideCharToMultiByte(e->native->cp,flags,units,(int)width,(char *)output+r.produced,size,NULL,used_default)) {
+        r.result=JCS_CODER_FAILURE; return r;
+      }
+      r.produced+=(size_t)size;
+#else
+      /* iconv sees explicit little-endian units, independent of host endian.
+       * It may emit a shift prefix before E2BIG without consuming the scalar;
+       * retain both its state and those produced bytes on OVERFLOW. */
+      char units[4],dummy;
+      for(size_t j=0; j<width; ++j) {
+        units[j*2]=(char)input[r.consumed+j];
+        units[j*2+1]=(char)(input[r.consumed+j]>>8);
+      }
+      char *src=units,*dest=capacity ? (char *)output+r.produced : &dummy;
+      size_t left=width*2,room=capacity-r.produced,initial=room;
+      size_t rc=iconv(e->native->handle,&src,&left,&dest,&room);
+      r.produced+=initial-room;
+      if(rc==(size_t)-1) {
+        r.result=errno==E2BIG ? JCS_OVERFLOW : errno==EILSEQ ? JCS_UNMAPPABLE : JCS_CODER_FAILURE;
+        if(r.result==JCS_UNMAPPABLE) r.error_length=width;
+        return r;
+      }
+      if(left) { r.result=JCS_CODER_FAILURE; return r; }
+#endif
+      r.consumed+=width;
+      continue;
+    }
+    }
+    if(n>capacity-r.produced) { r.result=JCS_OVERFLOW; return r; }
+    if(n)memcpy(output+r.produced,bytes,n);
+    r.produced+=n; r.consumed+=width;
+  }
+  return r;
+}
+struct jcs_coder_progress jcs_encoder_flush(struct jcs_encoder *e,uint8_t *output,size_t capacity)
+{
+  struct jcs_coder_progress r={0};
+#ifndef _WIN32
+  if(e->native) {
+    char dummy,*dest=capacity ? (char *)output : &dummy;
+    size_t left=capacity;
+    size_t rc=iconv(e->native->handle,NULL,NULL,&dest,&left);
+    r.produced=capacity-left;
+    if(rc==(size_t)-1) r.result=errno==E2BIG ? JCS_OVERFLOW : JCS_CODER_FAILURE;
+  }
+#else
+  (void)e; (void)output; (void)capacity;
+#endif
+  return r;
+}

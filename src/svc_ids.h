@@ -48,9 +48,9 @@
  * never saw the failure and ran on with a null SwappyDisplayManager class.
  * See jni_vtable_svc() for the slot→SVC mapping. */
 constexpr uint32_t JNI_VTABLE_COUNT = 233u; /* indices 0–232 */
-constexpr uint32_t SVC_MATH_F1_COUNT     = 27u;
+constexpr uint32_t SVC_MATH_F1_COUNT     = 31u;
 constexpr uint32_t SVC_MATH_F2_COUNT     = 9u;
-constexpr uint32_t SVC_MATH_D1_COUNT     = 25u;
+constexpr uint32_t SVC_MATH_D1_COUNT     = 29u;
 constexpr uint32_t SVC_MATH_D2_COUNT     = 7u;
 constexpr uint32_t NUM_DETOURS           = 20u;
 constexpr uint32_t NUM_ICALL_PROBES        = 16u;
@@ -2054,6 +2054,26 @@ enum SvcId : uint32_t {
   SVC_LOG_BUF_PRINT,
   SVC_LOG_BUF_WRITE,
   SVC_ASPRINTF,
+  SVC_LIBC_FUNOPEN,
+  SVC_LIBC_FUNOPEN64,
+  /* exec family: one handler, the variants differ only in how the argument
+   * vector, environment and PATH search are spelled. */
+  SVC_EXECL,
+  SVC_EXECLE,
+  SVC_EXECLP,
+  SVC_EXECV,
+  SVC_EXECVE,
+  SVC_EXECVP,
+  SVC_EXECVPE,
+  SVC_ISATTY,
+  SVC_POSIX_FADVISE,
+  SVC_POSIX_FADVISE64,
+  SVC_PTHREAD_GETCPUCLOCKID,
+  SVC_LLRINT,
+  SVC_GETPROGNAME,
+  SVC_GETRANDOM,
+  SVC_READV,
+  SVC_GETSERVBYNAME,
   SVC_TRAMP_TOTAL,
 };
 

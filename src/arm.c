@@ -14,6 +14,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 /* The lock is handed out in the order it was asked for.
@@ -335,4 +336,78 @@ bool arm_parallel_engines(void) {
 }
 void arm_set_parallel_engines(bool on) {
   g_parallel = on;
+}
+
+/* argc/argv/envp/auxv and their strings live in the new stack, not in the
+ * old image's heap. Size/width checks precede any writes. */
+static void stack_word(unsigned char *at,unsigned width,uint64_t value)
+{
+  for(unsigned i=0;i<width;++i) at[i]=(unsigned char)(value>>(8*i));
+}
+static int stack_string_size(const char *text,size_t *total)
+{
+  if(!text) { errno=EFAULT; return -1; }
+  size_t n=strnlen(text,131072);
+  if(n==131072 || *total>2097152-n-1) { errno=E2BIG; return -1; }
+  *total+=n+1;
+  return 0;
+}
+int guest_stack_build(void *memory,size_t capacity,uint64_t top,
+                       const struct guest_stack_spec *s,uint64_t *guest_sp)
+{
+  if(!memory || !s || !guest_sp || !s->random || !s->filename ||
+     (s->word_bytes!=4 && s->word_bytes!=8) ||
+     (s->argc && !s->argv) || (s->envc && !s->envp) || (s->auxc && !s->aux) ||
+     top<capacity || (s->word_bytes==4 && top>UINT64_C(0x100000000))) {
+    errno=EINVAL; return -1;
+  }
+  if(s->argc>131072 || s->envc>131072 || s->auxc>1024) { errno=E2BIG; return -1; }
+  size_t strings=16;
+  if(stack_string_size(s->filename,&strings)) return -1;
+  for(size_t i=0;i<s->argc;++i) if(stack_string_size(s->argv[i],&strings)) return -1;
+  for(size_t i=0;i<s->envc;++i) if(stack_string_size(s->envp[i],&strings)) return -1;
+  for(size_t i=0;i<s->auxc;++i) {
+    if(!s->aux[i].key || s->aux[i].key==25 || s->aux[i].key==31 ||
+       (s->word_bytes==4 && (s->aux[i].key>UINT32_MAX || s->aux[i].value>UINT32_MAX))) {
+      errno=EOVERFLOW; return -1;
+    }
+  }
+  size_t words=3+s->argc+s->envc+2*(s->auxc+3);
+  size_t table=words*s->word_bytes;
+  if(strings>capacity || table>capacity-strings || table+strings>top) { errno=E2BIG; return -1; }
+  uint64_t sp=(top-strings-table)&~UINT64_C(15),base=top-capacity;
+  if(sp<base) { errno=E2BIG; return -1; }
+  unsigned char *bytes=memory,*header=bytes+(size_t)(sp-base);
+  size_t cursor=capacity;
+  cursor-=16; memcpy(bytes+cursor,s->random,16);
+  uint64_t random=base+cursor;
+  size_t length=strlen(s->filename)+1;
+  cursor-=length; memcpy(bytes+cursor,s->filename,length);
+  uint64_t filename=base+cursor;
+  stack_word(header,s->word_bytes,s->argc);
+  size_t word=1;
+  for(size_t i=0;i<s->argc;++i) {
+    length=strlen(s->argv[i])+1; cursor-=length;
+    memcpy(bytes+cursor,s->argv[i],length);
+    stack_word(header+word++*s->word_bytes,s->word_bytes,base+cursor);
+  }
+  stack_word(header+word++*s->word_bytes,s->word_bytes,0);
+  for(size_t i=0;i<s->envc;++i) {
+    length=strlen(s->envp[i])+1; cursor-=length;
+    memcpy(bytes+cursor,s->envp[i],length);
+    stack_word(header+word++*s->word_bytes,s->word_bytes,base+cursor);
+  }
+  stack_word(header+word++*s->word_bytes,s->word_bytes,0);
+  for(size_t i=0;i<s->auxc;++i) {
+    stack_word(header+word++*s->word_bytes,s->word_bytes,s->aux[i].key);
+    stack_word(header+word++*s->word_bytes,s->word_bytes,s->aux[i].value);
+  }
+  stack_word(header+word++*s->word_bytes,s->word_bytes,25);
+  stack_word(header+word++*s->word_bytes,s->word_bytes,random);
+  stack_word(header+word++*s->word_bytes,s->word_bytes,31);
+  stack_word(header+word++*s->word_bytes,s->word_bytes,filename);
+  stack_word(header+word++*s->word_bytes,s->word_bytes,0);
+  stack_word(header+word++*s->word_bytes,s->word_bytes,0);
+  *guest_sp=sp;
+  return 0;
 }

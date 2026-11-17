@@ -1648,6 +1648,8 @@ struct canvas_state {
   struct canvas_clip *clip;
   size_t count, capacity, clips, clip_capacity;
   bool clip_cache_valid,clip_simple,clip_tail_intersect;
+  bool clip_single_mask;
+  size_t clip_mask_index;
   size_t clip_prefix;
   float clip_bounds[4];
   bool query_clip_valid;
@@ -1882,6 +1884,7 @@ static void canvas_prepare_clip(struct canvas_state *s)
 {
   if(!s || s->clip_cache_valid) return;
   s->clip_simple=true;
+  s->clip_single_mask=false;
   s->clip_prefix=0;
   s->clip_bounds[0]=s->clip_bounds[1]=-INFINITY;
   s->clip_bounds[2]=s->clip_bounds[3]=INFINITY;
@@ -1906,7 +1909,47 @@ static void canvas_prepare_clip(struct canvas_state *s)
       s->clip_tail_intersect=false;
       break;
     }
+  /* Intersections commute. A single device mask with any number of axis
+   * aligned rectangles needs only one alpha lookup per pixel; fold rectangles
+   * even when they were pushed after that mask. Other region operations keep
+   * their ordered evaluation below. */
+  if (!s->clip_simple && s->clip_tail_intersect) {
+    size_t complex_count=0,mask_index=0;
+    for (size_t i=0;i<s->clips;++i) {
+      const struct canvas_clip *c=&s->clip[i];
+      if (c->simple && !c->mask) {
+        s->clip_bounds[0]=fmaxf(s->clip_bounds[0],c->bounds[0]);
+        s->clip_bounds[1]=fmaxf(s->clip_bounds[1],c->bounds[1]);
+        s->clip_bounds[2]=fminf(s->clip_bounds[2],c->bounds[2]);
+        s->clip_bounds[3]=fminf(s->clip_bounds[3],c->bounds[3]);
+      } else {
+        ++complex_count;
+        mask_index=i;
+      }
+    }
+    const struct canvas_clip *c=&s->clip[mask_index];
+    if (complex_count==1 && c->mask && c->mask_x>=0 && c->mask_y>=0 &&
+        c->mask_width>0 && c->mask_height>0 && c->mask_x<=INT_MAX-c->mask_width && c->mask_y<=INT_MAX-c->mask_height) {
+      s->clip_single_mask=true;
+      s->clip_mask_index=mask_index;
+      s->clip_bounds[0]=fmaxf(s->clip_bounds[0],(float)c->mask_x);
+      s->clip_bounds[1]=fmaxf(s->clip_bounds[1],(float)c->mask_y);
+      s->clip_bounds[2]=fminf(s->clip_bounds[2],(float)(c->mask_x+c->mask_width));
+      s->clip_bounds[3]=fminf(s->clip_bounds[3],(float)(c->mask_y+c->mask_height));
+    }
+  }
   s->clip_cache_valid=true;
+}
+
+static inline bool canvas_clip_mask_contains(const struct canvas_state *s,float x,float y)
+{
+  if (!(x>=s->clip_bounds[0] && y>=s->clip_bounds[1] && x<s->clip_bounds[2] && y<s->clip_bounds[3])) return false;
+  const struct canvas_clip *c=&s->clip[s->clip_mask_index];
+  /* Bounds above make x/y finite, nonnegative and representable as int.
+   * Truncation then equals floor, including fractional pixel centres. */
+  unsigned px=(unsigned)((int)x-c->mask_x),py=(unsigned)((int)y-c->mask_y);
+  return px<(unsigned)c->mask_width && py<(unsigned)c->mask_height &&
+      c->mask[4*((size_t)py*c->mask_width+px)+3]!=0;
 }
 
 /* Whether the pixel centre (x, y) is inside one clip, ignoring how it combines. */
@@ -1930,6 +1973,7 @@ static bool canvas_clip_contains_general(struct canvas_state *s, float x, float 
   canvas_prepare_clip(s);
   if(s && s->clip_simple) return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
                                    x<s->clip_bounds[2] && y<s->clip_bounds[3];
+  if(s && s->clip_single_mask) return canvas_clip_mask_contains(s,x,y);
   /* Collapse the rectangular intersection prefix even when a later path
    * makes the clip complex. Later UNION/XOR/REPLACE still see this result. */
   bool result=!s || !s->clip_prefix ||
@@ -1978,6 +2022,7 @@ static inline bool canvas_clip_contains(struct canvas_state *s, float x, float y
     if(s->clip_simple)
       return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
              x<s->clip_bounds[2] && y<s->clip_bounds[3];
+    if(s->clip_single_mask) return canvas_clip_mask_contains(s,x,y);
     if(s->clip_tail_intersect) {
       if(!(x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
            x<s->clip_bounds[2] && y<s->clip_bounds[3])) return false;
@@ -2234,15 +2279,16 @@ static uint32_t canvas_src_over(uint32_t src,uint32_t dst,bool opaque)
    * divides out to itself: the result is the source, exactly. */
   if (!da) return src;
   if (da==255) {
-    /* Over an opaque pixel the divisor is sa*255+255*(255-sa) = 65025 whatever
-     * sa is, and the result alpha is 255: the same arithmetic as below with a
-     * constant the compiler turns into a multiply. */
-    uint32_t result=0xff000000u;
-    for(int shift=0; shift<=16; shift+=8) {
-      unsigned value=((src>>shift)&255)*sa*255+((dst>>shift)&255)*255*(255-sa);
-      result|=((value+32512)/65025)<<shift;
-    }
-    return result;
+    /* With an opaque destination the alpha denominator is 255 squared.
+     * Cancel one factor before rounding. Each packed 16-bit lane holds
+     * a channel's weighted sum (at most 65025), so red/blue cannot carry
+     * into one another. (n+128+((n+128)>>8))>>8 rounds n/255 exactly. */
+    const unsigned inv=255-sa;
+    uint32_t rb=(src&0x00ff00ffu)*sa+(dst&0x00ff00ffu)*inv+0x00800080u;
+    rb=((rb+((rb>>8)&0x00ff00ffu))>>8)&0x00ff00ffu;
+    unsigned green=((src>>8)&255)*sa+((dst>>8)&255)*inv+128;
+    green=(green+(green>>8))>>8;
+    return 0xff000000u|rb|(green<<8);
   }
   unsigned alpha=sa*255+da*(255-sa);
   uint32_t result=((alpha+127)/255)<<24;
@@ -3116,9 +3162,15 @@ static bool canvas_fill_color(struct dvm *vm,dvm_ref self,const float *rect,
       half_y=0.5f*hypotf(inverse[3],inverse[4]);
     }
   }
-  struct rt_bitmap *dst=canvas_bitmap(vm,self);
+  struct rt_bitmap *dst=canvas_bitmap_peek(vm,self);
   if (!dst) RETV();
   if (!bitmap_live(vm,dst)) return false;
+  /* Transparent source-over leaves an alpha-bearing bitmap untouched. Keep
+   * deferred capture clears pending as well: a later retained replay may be
+   * reusable, and an empty capture settles its clear at the end of drawing.
+   * Opaque storage still follows the normal alpha-normalising blend path. */
+  if (mode==3 && !(color>>24) && dst->has_alpha) RETV();
+  dst=canvas_bitmap(vm,self);
   struct canvas_state *state=canvas_state(vm,self);
   if (!state) return false;
   int limits[4];
@@ -4092,6 +4144,9 @@ static bool text_on_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args
   union dvm_value saved= {0},ignored= {0};
   if(!am_vcall(vm,canvas,"save","()I",NULL,0,&saved)) return false;
   int sx=ui_int(vm,self,"scrollX"),sy=ui_int(vm,self,"scrollY");
+  if(dvm__env("LUNARIA_TRACE_TEXT_CLIP"))
+    fprintf(stderr,"[text-clip] %s view=%u size=%dx%d pad=%d,%d,%d,%d layout_lines=%zu text_len=%zu\n",
+            dvm_class_name(dvm_object_class(vm,self)),(unsigned)self,width,height,pad[0],pad[1],pad[2],pad[3],layout->count,(size_t)layout->text.length);
   union dvm_value clip[]= {{.i=pad[0]+sx},{.i=pad[1]+sy},{.i=width-pad[2]+sx},{.i=height-pad[3]+sy}};
   bool good=am_vcall(vm,canvas,"clipRect","(IIII)Z",clip,4,&ignored);
   for(size_t i=0; good && i<layout->count; ++i) {
@@ -6356,6 +6411,11 @@ static const struct rt_method rt_bitmap[] = {
   M_END,
 };
 
+static const struct rt_field rt_path_op_sfields[]={
+  {"DIFFERENCE","Landroid/graphics/Path$Op;"},{"INTERSECT","Landroid/graphics/Path$Op;"},
+  {"UNION","Landroid/graphics/Path$Op;"},{"XOR","Landroid/graphics/Path$Op;"},
+  {"REVERSE_DIFFERENCE","Landroid/graphics/Path$Op;"},F_END
+};
 static const struct rt_field rt_path_fill_sfields[]= {
   {"WINDING","Landroid/graphics/Path$FillType;"},{"EVEN_ODD","Landroid/graphics/Path$FillType;"},
   {"INVERSE_WINDING","Landroid/graphics/Path$FillType;"},{"INVERSE_EVEN_ODD","Landroid/graphics/Path$FillType;"},F_END

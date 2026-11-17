@@ -61,6 +61,8 @@ static char *g_ime_html;       /* the input method's panel, above both */
 static char *g_ime_css;
 static char *g_toast_html;     /* a Toast: over the app, under the IME */
 static char *g_toast_css;
+static char *g_service_html;
+static unsigned g_service_failures;
 static char *g_menu_html;      /* the emulator's menu: over everything */
 static char *g_menu_css;
 static luna_overlay_menu_fn g_menu_fn;
@@ -1185,6 +1187,53 @@ void luna_overlay_set_toast(const char *html, const char *css)
   luna_overlay_wake();
 }
 
+static void overlay_google_dependency(const char *package, bool activity, bool connected)
+{
+  if (!package) return;
+  unsigned bit = !strcmp(package, "com.android.vending") ? 1u :
+                 !strcmp(package, "com.google.android.gms") ? 2u :
+                 !strcmp(package, "com.google.android.gsf") ? 4u : 0u;
+  if (!bit) return;
+  if (activity) bit <<= 3;
+  pthread_mutex_lock(&g_doc_lock);
+  unsigned previous = g_service_failures;
+  if (connected) g_service_failures &= ~bit;
+  else g_service_failures |= bit;
+  if (previous != g_service_failures) {
+    free(g_service_html);
+    const char *panel = "<div id='lunaria-google-help' style='position:fixed;left:16px;right:16px;bottom:24px;"
+                        "display:block;box-sizing:border-box;background:#18202c;color:#ffffff;padding:18px;border-radius:12px;font-size:16px;'>";
+    const char *message = (g_service_failures & 7u) ?
+      "<div id='lunaria-google-service-title' style='font-size:19px;margin-bottom:8px;min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>Googleサービスに接続できません</div>"
+      "<div id='lunaria-google-message' style='min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>このアプリが要求したGoogleサービスを利用できません。"
+      "右クリックの「Google services」から導入状況を確認してください。"
+      "必要なAPKを導入、またはGMS環境を選択した後、アプリを再起動してください。"
+      "導入済みの場合は、ログに記録された接続エラーを確認してください。</div></div>" :
+      "<div id='lunaria-google-activity-title' style='font-size:19px;margin-bottom:8px;min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>Googleの確認画面を開けません</div>"
+      "<div id='lunaria-google-message' style='min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>アプリが要求したGoogleの画面は見つかりましたが、Lunariaで起動できませんでした。"
+      "別アプリの画面へ移動する処理に、Lunaria側での対応が必要です。"
+      "Googleサービスの再インストールは不要です。</div></div>";
+    g_service_html = NULL;
+    if (g_service_failures) {
+      size_t length = strlen(panel) + strlen(message) + 1;
+      g_service_html = malloc(length);
+      if (g_service_html) snprintf(g_service_html,length,"%s%s",panel,message);
+    }
+    g_doc_dirty = true;
+  }
+  pthread_mutex_unlock(&g_doc_lock);
+  luna_overlay_wake();
+}
+
+void luna_overlay_google_service(const char *package, bool connected)
+{
+  overlay_google_dependency(package, false, connected);
+}
+void luna_overlay_google_activity(const char *package, bool started)
+{
+  overlay_google_dependency(package, true, started);
+}
+
 void luna_overlay_set_menu(const char *html, const char *css, bool modal)
 {
   pthread_mutex_lock(&g_doc_lock);
@@ -1532,12 +1581,24 @@ bool luna_overlay_guest_keys_captured(void)
   return captured && !g_failed;
 }
 
+/* Whether the overlay's own content can still change by itself.  Everything
+ * driven from outside (new document, text, bitmap, menu) calls
+ * luna_overlay_wake(); this covers what moves on its own clock.  True until a
+ * present has proved the page settled, so a frame that was never presented
+ * is retried. */
+static bool g_wants_frame = true;
+
+bool luna_overlay_wants_frame(void)
+{
+  return __atomic_load_n(&g_wants_frame, __ATOMIC_ACQUIRE);
+}
+
 bool luna_overlay_active(void)
 {
   overlay_maybe_test_card();
   pthread_mutex_lock(&g_doc_lock);
   bool up = g_html != NULL || g_status_html != NULL || g_ime_html != NULL ||
-            g_toast_html != NULL || g_menu_html != NULL;
+            g_toast_html != NULL || g_menu_html != NULL || g_service_html != NULL;
   pthread_mutex_unlock(&g_doc_lock);
   return up && !g_failed;
 }
@@ -1593,6 +1654,8 @@ static bool overlay_present_screen(int w, int h, int screen)
                       "this one (%lu)\n", skipped);
     return false;
   }
+  /* Stays true if this present bails out before luna-ui has stepped. */
+  __atomic_store_n(&g_wants_frame, true, __ATOMIC_RELEASE);
   overlay_present_locked(w, h);
   pthread_mutex_unlock(&g_present_lock);
   return true;
@@ -1724,6 +1787,7 @@ bound:
     const bool from_files = g_from_files;
     char *html = NULL, *css = NULL, *toast_html = NULL, *toast_css = NULL;
     char *ime_html = NULL, *ime_css = NULL, *menu_html = NULL, *menu_css = NULL;
+    char *service_html = NULL;
     if (reparsed) {
       const char *h = status_only ? g_status_html : g_html;
       const char *c = status_only ? g_status_css : g_css;
@@ -1737,6 +1801,7 @@ bound:
         ime_html = strdup(g_ime_html);
         ime_css = g_ime_css ? strdup(g_ime_css) : NULL;
       }
+      if (g_service_html) service_html = strdup(g_service_html);
       if (g_menu_html) {
         menu_html = strdup(g_menu_html);
         menu_css = g_menu_css ? strdup(g_menu_css) : NULL;
@@ -1796,6 +1861,7 @@ bound:
         if (ime_css) luna_parse_css(ime_css);
         luna_parse_html(ime_html);
       }
+      if (service_html) luna_parse_html(service_html);
       /* The emulator's menu is above every window, the card included. */
       if (menu_html) {
         if (menu_css) luna_parse_css(menu_css);
@@ -1844,6 +1910,7 @@ bound:
     }
     free(html);
     free(css);
+    free(service_html);
     free(toast_html);
     free(toast_css);
     free(ime_html);
@@ -1919,7 +1986,17 @@ bound:
     double dt = now - g_last_time;
     g_last_time = now;
     overlay_scripted_tap(now);
-    luna_update(now, dt);
+    {
+      /* One step of luna-ui's clock, and the answer to "is anything still
+       * moving?": a running transition/keyframe or a blinking caret needs
+       * another frame, a settled page does not. */
+      const int need = luna_needs_redraw(now, dt);
+      __atomic_store_n(&g_wants_frame,
+                       (need & (LUNA_REDRAW_ANIM | LUNA_REDRAW_PAINT)) != 0 ||
+                       luna_next_wake_seconds() > 0.0 ||
+                       getenv("LUNARIA_OVERLAY_TAP") != NULL,
+                       __ATOMIC_RELEASE);
+    }
     overlay_render_windows(w, h);
     overlay_maybe_dump_boot(w, h, status_only);
     overlay_report_gl_errors("render");
@@ -2023,6 +2100,9 @@ void luna_overlay_shutdown(void)
   free(g_ime_css);
   free(g_toast_html);
   free(g_toast_css);
+  free(g_service_html);
+  g_service_html = NULL;
+  g_service_failures = 0;
   free(g_menu_html);
   free(g_menu_css);
   overlay_source_remove_key(NULL);

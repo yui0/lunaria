@@ -1048,8 +1048,7 @@ static bool manifest_filter_matches(struct dvm *vm, dvm_ref intent,
   dvm_get_field(vm,intent,"categories","Ljava/util/Set;",&categories);
   dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
   dvm_get_field(vm,intent,"type","Ljava/lang/String;",&type);
-  const char *text=getenv(table);
-  char *copy=text ? strdup(text) : NULL;
+  char *copy=table ? strdup(table) : NULL;
   bool matched=false;
   for (char *p=copy, *row; p && (row=luna_strsep(&p,"\n"));) {
     char *name=luna_strsep(&row,"|"), *actions=luna_strsep(&row,"|"), *cats=luna_strsep(&row,"|");
@@ -1079,40 +1078,25 @@ static bool manifest_filter_matches(struct dvm *vm, dvm_ref intent,
   return matched;
 }
 
-static bool activity_filter_matches(struct dvm *vm,dvm_ref intent,const char *component,int flags,int *priority)
+/* Query the immutable tables belonging to one package without changing the
+ * process environment (other Java/Binder threads may be resolving too). */
+static bool pm_activity_candidates(struct dvm *vm, dvm_ref intent, int flags,
+    dvm_ref list, const char *package, const char *component_name,
+    const char *text, const char *filters, bool current)
 {
-  return manifest_filter_matches(vm,intent,component,flags,priority,"ANDROID_ACTIVITY_FILTERS");
-}
-
-static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
-                                     const union dvm_value *args, int nargs,
-                                     union dvm_value *out)
-{
-  (void)self;
-  dvm_ref list=coll_new_list(vm,"Ljava/util/ArrayList;");
-  if (!list || nargs<1 || !ARG(0).l) RETL(list);
-  const char *package=getenv("ANDROID_PACKAGE_NAME");
-  if (!package || !*package) RETL(list);
-  union dvm_value pkg= {0}, component= {0}, cp= {0}, cc= {0};
-  dvm_get_field(vm,ARG(0).l,"package","Ljava/lang/String;",&pkg);
-  if (pkg.l && strcmp(dvm_string_utf8(vm,pkg.l),package)) RETL(list);
-  dvm_get_field(vm,ARG(0).l,"component","Landroid/content/ComponentName;",&component);
-  if (component.l) {
-    dvm_get_field(vm,component.l,"pkg","Ljava/lang/String;",&cp);
-    dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cc);
-    if (!cp.l || !cc.l || strcmp(dvm_string_utf8(vm,cp.l),package)) RETL(list);
-  }
-  const char *text=getenv("ANDROID_ACTIVITIES");
   char *copy=text ? strdup(text) : NULL;
-  int flags=nargs>1 ? ARG(1).i : 0;
+  if (text && !copy) return false;
   for (char *p=copy,*row; p && (row=luna_strsep(&p,"\n"));) {
     char *name=luna_strsep(&row,"|"), *target=luna_strsep(&row,"|");
     if (!row || !target || !*name) continue;
-    bool enabled=atoi(row)!=0;
+    char *enabled_text=luna_strsep(&row,"|"), *exported_text=luna_strsep(&row,"|");
+    char *process=luna_strsep(&row,"|");
+    const char *permission=row ? row : "";
+    bool enabled=enabled_text && atoi(enabled_text)!=0;
     if (!enabled && !(flags & 0x200)) continue;
     int priority=0;
-    if (component.l ? strcmp(name,dvm_string_utf8(vm,cc.l))!=0
-        : !activity_filter_matches(vm,ARG(0).l,name,flags,&priority)) continue;
+    if (component_name ? strcmp(name,component_name)!=0
+        : !manifest_filter_matches(vm,intent,name,flags,&priority,filters)) continue;
     dvm_ref resolve=resolve_info_new(vm);
     dvm_ref info=pm_component_info(vm,"Landroid/content/pm/ActivityInfo;");
     if (!resolve || !info) {
@@ -1131,13 +1115,22 @@ static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
     dvm_set_field(vm,info,"enabled","Z",(union dvm_value) {
       .i=enabled
     });
+    dvm_set_field(vm,info,"exported","Z",(union dvm_value) {
+      .i=exported_text ? atoi(exported_text)!=0 : 0
+    });
+    dvm_set_field(vm,info,"processName","Ljava/lang/String;",(union dvm_value) {
+      .l=dvm_new_string(vm,process && *process ? process : package)
+    });
+    dvm_set_field(vm,info,"permission","Ljava/lang/String;",(union dvm_value) {
+      .l=*permission ? dvm_new_string(vm,permission) : 0
+    });
     struct lunaria_android_package installed;
     if (lunaria_android_package_find(package,&installed))
       dvm_set_field(vm,info,"applicationInfo","Landroid/content/pm/ApplicationInfo;",
       (union dvm_value) {
       .l=pm_application_info(vm,&installed)
     });
-    if (flags & PM_GET_META_DATA) {
+    if ((flags & PM_GET_META_DATA) && current) {
       union dvm_value bundle= {0};
       dvm_get_field(vm,info,"metaData","Landroid/os/Bundle;",&bundle);
       manifest_bundle_fill(vm,bundle.l,arm_exec_apk_component_meta_keys(name), name);
@@ -1163,7 +1156,51 @@ static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
     }
   }
   free(copy);
+  return true;
+}
+
+/* Activity launch resolution is a system operation and must not be limited
+ * by the caller's PackageManager query visibility. */
+static bool pm_query_activities(struct dvm *vm, dvm_ref intent, int flags,
+    bool system, union dvm_value *out)
+{
+  dvm_ref list=coll_new_list(vm,"Ljava/util/ArrayList;");
+  if (!list || !intent) RETL(list);
+  const char *self=getenv("ANDROID_PACKAGE_NAME");
+  union dvm_value pkg={0}, component={0}, cp={0}, cc={0};
+  dvm_get_field(vm,intent,"package","Ljava/lang/String;",&pkg);
+  dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
+  if (component.l) {
+    dvm_get_field(vm,component.l,"pkg","Ljava/lang/String;",&cp);
+    dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cc);
+    if (!cp.l || !cc.l) RETL(list);
+  }
+  const char *wanted=cp.l ? dvm_string_utf8(vm,cp.l) : pkg.l ? dvm_string_utf8(vm,pkg.l) : NULL;
+  const char *name=cc.l ? dvm_string_utf8(vm,cc.l) : NULL;
+  if (self && *self && (!wanted || !strcmp(wanted,self)) &&
+      !pm_activity_candidates(vm,intent,flags,list,self,name,
+        getenv("ANDROID_ACTIVITIES"),getenv("ANDROID_ACTIVITY_FILTERS"),true)) return false;
+  size_t count=lunaria_android_package_count();
+  for (size_t i=0;i<count;++i) {
+    struct lunaria_android_package record;
+    if (!lunaria_android_package_at(i,&record) || !record.name ||
+        (self && !strcmp(record.name,self)) ||
+        (wanted && strcmp(wanted,record.name)) ||
+        (!system && !lunaria_android_package_visible(&record))) continue;
+    char host[4096], *activities=NULL, *filters=NULL;
+    const char *archive=record.source_dir ? arm_exec_map_guest_path(record.source_dir,host,sizeof host) : NULL;
+    if (!archive || luna_apk_activity_manifest(archive,record.name,&activities,&filters)) continue;
+    bool ok=pm_activity_candidates(vm,intent,flags,list,record.name,name,activities,filters,false);
+    free(activities); free(filters);
+    if (!ok) return false;
+  }
   RETL(list);
+}
+static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,
+    const union dvm_value *args, int nargs, union dvm_value *out)
+{
+  (void)self;
+  return pm_query_activities(vm,nargs>0 ? ARG(0).l : 0,nargs>1 ? ARG(1).i : 0,false,out);
 }
 
 static bool pm_launch_intent(struct dvm *vm, dvm_ref self,

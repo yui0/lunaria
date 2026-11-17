@@ -301,9 +301,10 @@ static void borrowed_import_end(struct dvm *vm,JNIEnv *env,
   for(size_t i=scope->count; release && i>0; --i) {
     const struct borrowed_import *item=&scope->items[i-1];
     struct dvm_object *object=dvm__obj(vm,item->ref);
-    if(!object || object->pins!=1 ||
+    if(!object || object->pins!=1 || object->managed_retained ||
         object->host_handle!=(uint32_t)(uintptr_t)item->host)continue;
     object->host_handle=0;
+    object->host_binding_owned=false;
     forget_wrapper((uint32_t)(uintptr_t)item->host,item->ref);
     (*env)->DeleteGlobalRef(env,item->host);
     dvm_unpin(vm,item->ref);
@@ -333,6 +334,7 @@ bool dvm_jni_release_idle_wrapper(struct dvm *vm, dvm_ref ref, uint32_t host)
   if (jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) != 1)
     return false;
   object->host_handle = 0;
+  object->host_binding_owned=false;
   forget_wrapper(host, ref);
   (*env)->DeleteGlobalRef(env, (jobject)(uintptr_t)host);
   dvm_unpin(vm, ref);
@@ -453,6 +455,7 @@ static dvm_ref wrapper_for(struct dvm *vm, JNIEnv *env,
   dvm_ref r = dvm_wrap_external(vm, class_name, host);
   if (!r) return 0;
   dvm_pin(vm, r);
+  dvm__obj(vm,r)->host_binding_owned=true;
   remember_wrapper(host, r);
   borrowed_import_record(owned,r);
   return r;
@@ -469,6 +472,7 @@ static dvm_ref bind_payload(struct dvm *vm, JNIEnv *env, dvm_ref ref, jobject ho
   if (!owned) return 0;
   object->host_handle = (uint32_t)(uintptr_t)owned;
   dvm_pin(vm, ref);
+  object->host_binding_owned=true;
   remember_wrapper(object->host_handle, ref);
   borrowed_import_record(owned,ref);
   return ref;
@@ -573,7 +577,7 @@ static dvm_ref host_array_to_dvm(struct dvm *vm, JNIEnv *env, jobject o)
     for (jsize ei = 0; slots && ei < n; ++ei) {
       jobject el = (*env)->GetObjectArrayElement(env, (jobjectArray)o, ei);
       slots[ei] = from_jobject(vm, env, el);
-      if (slots[ei]) dvm_pin(vm, slots[ei]);
+      if (slots[ei]) dvm_keep_managed(vm, slots[ei]);
       if (el) (*env)->DeleteLocalRef(env, el);
     }
     struct dvm_object *ao = r ? dvm__obj(vm, r) : NULL;
@@ -1909,11 +1913,17 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
   g_bridge_frame = &frame;
 
   jvalue jargs[LUNARIA_JNI_MAX_ARGS];
+  jobject array_roots[LUNARIA_JNI_MAX_ARGS] = {0};
   memset(jargs, 0, sizeof jargs);
   for (int i = 0; i < nargs && i < LUNARIA_JNI_MAX_ARGS; ++i) {
     char one[256];
     if (!dvm__sig_param(sig, i, one, sizeof one)) break;
     jargs[i] = dvm_to_jvalue(vm, env, dvm__kind_of(one), args[i]);
+    /* Java retains the array independently of the argument's JNI local.
+     * Native code may delete that local before returning. Keep its backing
+     * object alive until native writes have reached the interpreter. */
+    if (one[0]=='[' && one[1]!='L' && one[1]!='[' && jargs[i].l)
+      array_roots[i] = (*env)->NewGlobalRef(env, jargs[i].l);
   }
 
   jvalue ret;
@@ -1943,6 +1953,8 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
                                jargs, nargs, &ret);
   dvm_gil_relock(vm, gil);
   if (!called) {
+    for (int i = 0; i < LUNARIA_JNI_MAX_ARGS; ++i)
+      if (array_roots[i]) (*env)->DeleteGlobalRef(env, array_roots[i]);
     bridge_end(vm, env, &frame);
     return false;
   }
@@ -1959,13 +1971,15 @@ static bool hook_call_native(void *user, struct dvm *vm, const char *class_name,
       dvm_direct_buffer_from_host(vm,args[i].l);
     } else if (parameter[0]=='[' && parameter[1]!='L' && parameter[1]!='[') {
       struct dvm_object *array=dvm__obj(vm,args[i].l);
-      if (jargs[i].l && array && array->kind==DVM_OBJ_ARRAY &&
+      if (array_roots[i] && array && array->kind==DVM_OBJ_ARRAY &&
           array->elem_kind!='L' && array->data && array->length)
-        ARRAY_REGION(env,Get,array->elem_kind,jargs[i].l,
+        ARRAY_REGION(env,Get,array->elem_kind,array_roots[i],
                      (jsize)array->length,array->data);
     }
   }
 
+  for (int i = 0; i < LUNARIA_JNI_MAX_ARGS; ++i)
+    if (array_roots[i]) (*env)->DeleteGlobalRef(env, array_roots[i]);
 
   ++g_native_calls;
   memset(out, 0, sizeof *out);
@@ -2239,6 +2253,136 @@ static void trace_jni_lifetime(const char *class_name,const char *method,
           g_nwrappers,g_nwrappers-before,handled,class_name,method,sig ? sig : "");
 }
 
+/* Reclaim JNI bindings according to managed reachability. The interpreter
+ * heap is non-moving; releasing an unreachable binding never invalidates a
+ * VM address. JNI local/global references, pinned runtime roots, class fields,
+ * Java frames (including parked threads) and native collections are roots.
+ * Native payload owners stay conservative roots until their resource closes. */
+struct binding_mark {
+  struct dvm *vm;
+  unsigned char *seen;
+  dvm_ref *work;
+  uint32_t count;
+  uint64_t *frames;
+  size_t frame_cap;
+};
+static bool binding_frame_live(const struct binding_mark *mark,uint64_t serial)
+{
+  size_t at=(size_t)serial & (mark->frame_cap-1);
+  while (mark->frames[at] && mark->frames[at]!=serial) at=(at+1)&(mark->frame_cap-1);
+  return mark->frames[at]!=0;
+}
+static void binding_visit(dvm_ref ref,void *context)
+{
+  struct binding_mark *mark=context;
+  if (!ref || ref>mark->vm->heap_size || mark->seen[ref] || !dvm__obj(mark->vm,ref)) return;
+  mark->seen[ref]=1;
+  mark->work[mark->count++]=ref;
+}
+static void binding_scan_words(struct binding_mark *mark,const void *data,size_t size)
+{
+  const unsigned char *bytes=data;
+  for (size_t i=0; i+sizeof(uint32_t)<=size; i+=sizeof(uint32_t)) {
+    uint32_t ref;
+    memcpy(&ref,bytes+i,sizeof ref);
+    binding_visit(ref,mark);
+  }
+}
+static void collect_managed_bindings(struct dvm *vm,JNIEnv *env)
+{
+  static uint64_t last_allocation;
+  struct jvm *jvm=jnienv_get_jvm(env);
+  uint64_t allocations=0;
+  if (jvm_live_objects(jvm,&allocations)<49152 || allocations-last_allocation<4096) return;
+  last_allocation=allocations;
+  struct binding_mark mark={.vm=vm,.frame_cap=16};
+  size_t frames=0;
+  for (const struct dvm_call_frame *f=vm->live_frames; f; f=f->live_next) ++frames;
+  while (mark.frame_cap<frames*2) mark.frame_cap*=2;
+  mark.frames=calloc(mark.frame_cap,sizeof *mark.frames);
+  if (!mark.frames) return;
+  for (const struct dvm_call_frame *f=vm->live_frames; f; f=f->live_next) {
+    size_t at=(size_t)f->serial & (mark.frame_cap-1);
+    while (mark.frames[at]) at=(at+1)&(mark.frame_cap-1);
+    mark.frames[at]=f->serial;
+  }
+  mark.seen=calloc((size_t)vm->heap_size+1,1);
+  mark.work=malloc(((size_t)vm->heap_size+1)*sizeof *mark.work);
+  if (!mark.seen || !mark.work) {free(mark.seen);free(mark.work);free(mark.frames);return;}
+  jvm_binding_collection_begin();
+  /* Conservatively include scalar runtime roots as well as explicit queues.
+   * Ambiguous integer words can retain an object, never discard a live one. */
+  binding_scan_words(&mark,vm,sizeof *vm);
+  for (int i=0; i<vm->npending; ++i) {
+    binding_visit(vm->pending_threads[i],&mark);
+    binding_visit(vm->pending_looper[i],&mark);
+    binding_visit(vm->pending_owner[i],&mark);
+    binding_visit(vm->pending_token[i],&mark);
+  }
+  for (size_t i=0; i<vm->shutdown_hook_count; ++i) binding_visit(vm->shutdown_hooks[i],&mark);
+  for (size_t i=0; i<vm->nlayout_observers; ++i) binding_visit(vm->layout_observers[i],&mark);
+  for (size_t i=0; i<vm->nactive_object_animators; ++i) binding_visit(vm->active_object_animators[i],&mark);
+  for (size_t i=0; i<vm->nnetwork_callbacks; ++i) {
+    binding_visit(vm->network_callbacks[i].callback,&mark);
+    binding_visit(vm->network_callbacks[i].network,&mark);
+  }
+  for (int i=0; i<vm->nclasses; ++i) {
+    const struct dvm_class *cls=vm->classes[i];
+    binding_visit(cls->class_object,&mark);
+    binding_visit(cls->defining_loader,&mark);
+    binding_visit(cls->type_parameters,&mark);
+    for (int k=0; cls->sslots && k<cls->nsslots; ++k) binding_visit(cls->sslots[k].l,&mark);
+  }
+  for (const struct dvm_call_frame *frame=vm->live_frames; frame; frame=frame->live_next) {
+    binding_visit(frame->self,&mark);
+    binding_scan_words(&mark,frame->arguments,(size_t)frame->argument_count*sizeof(uint32_t));
+    binding_scan_words(&mark,frame->registers,(size_t)frame->register_count*sizeof(uint32_t));
+    if (frame->result) binding_visit((dvm_ref)*frame->result,&mark);
+    for (const struct dvm_local_root *root=frame->locals; root; root=root->next) binding_visit(root->ref,&mark);
+  }
+  for (dvm_ref ref=1; ref<=vm->heap_size; ++ref) {
+    const struct dvm_object *object=dvm__obj(vm,ref);
+    if (!object) continue;
+    const unsigned owned=object->host_binding_owned ? 1u : 0u;
+    bool root=object->pins>owned || object->monitor_depth ||
+              (object->data && object->kind!=DVM_OBJ_ARRAY);
+    if (object->host_handle && wrapper_current(env,object->host_handle,ref) &&
+        jvm_bridge_ref_count(jvm,(jobject)(uintptr_t)object->host_handle)>(int)owned) root=true;
+    if (object->builtin_frame && binding_frame_live(&mark,object->builtin_frame)) root=true;
+    if (root) binding_visit(ref,&mark);
+  }
+  for (uint32_t cursor=0; cursor<mark.count; ++cursor) {
+    const struct dvm_object *object=dvm__obj(vm,mark.work[cursor]);
+    if (object->slots && object->cls)
+      for (int i=0; i<object->cls->islots; ++i) binding_visit(object->slots[i].l,&mark);
+    if (object->kind==DVM_OBJ_ARRAY && object->elem_kind=='L' && object->data) {
+      const dvm_ref *items=object->data;
+      for (uint32_t i=0; i<object->length; ++i) binding_visit(items[i],&mark);
+    }
+    dvm_runtime_visit_payload_refs(object,binding_visit,&mark);
+  }
+  unsigned released=0;
+  for (dvm_ref ref=1; ref<=vm->heap_size; ++ref) {
+    struct dvm_object *object=dvm__obj(vm,ref);
+    if (mark.seen[ref] || !object || !object->host_binding_owned || !object->host_handle) continue;
+    uint32_t handle=object->host_handle;
+    if (!wrapper_current(env,handle,ref) ||
+        !jvm_release_unreachable_binding(jvm,(jobject)(uintptr_t)handle,
+                                         object->cls && object->cls->dex)) continue;
+    object->host_handle=0;
+    object->host_binding_owned=false;
+    forget_wrapper(handle,ref);
+    dvm_unpin(vm,ref);
+    ++released;
+  }
+  jvm_binding_collection_end();
+  free(mark.work);
+  free(mark.seen);
+  free(mark.frames);
+  if (released) fprintf(stderr,"[dvm-jni] collected %u unreachable managed bindings (%zu JNI objects live)\n",
+                        released,jvm_live_objects(jvm,NULL));
+}
+
 static bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const char *method,
                                   const char *sig, jobject self, bool is_static,
                                   va_list *ap, const jvalue *jargs, jvalue *out, bool nonvirtual)
@@ -2249,6 +2393,7 @@ static bool dvm_jni_invoke_locked(JNIEnv *env, const char *class_name, const cha
   JNIEnv *saved = g_env;
   g_env = env;
   if (env) g_env_any = env;
+  collect_managed_bindings(vm,env);
   const size_t wrappers_before=g_nwrappers;
   struct dvm_method *m = find(vm, class_name, method, sig);
   struct borrowed_imports imports= {.previous=g_borrowed_imports};

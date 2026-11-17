@@ -586,7 +586,7 @@ static void *comp_main(void *arg)
     const bool boot = luna_boot_active() && !have_frame && !luna_overlay_guest_window_up();
     const bool ime = luna_ime_active();
     const bool image_sources = luna_overlay_has_image_sources();
-    const bool overlay = luna_overlay_active();
+    const bool overlay = luna_overlay_active() && luna_overlay_wants_frame();
     const uint64_t period = (boot || image_sources) ? 16000000ull : ime ? 33000000ull
                             : overlay ? 100000000ull
                             : 1000000000ull;

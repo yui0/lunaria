@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <errno.h>
 
 /* One bit per 4 KiB page in the 32-bit image window. Readers run inside
@@ -59,6 +60,21 @@ static inline int guest_rx_hits(const struct guest_rx_table *shared,
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Linux initial process stack. All pointers and words use the guest ABI,
+ * independent of the host. No output is modified on failure. */
+struct guest_stack_aux { uint64_t key,value; };
+struct guest_stack_spec {
+  unsigned word_bytes;
+  size_t argc,envc,auxc;
+  const char *const *argv;
+  const char *const *envp;
+  const struct guest_stack_aux *aux;
+  const char *filename;
+  const unsigned char *random; /* exactly 16 bytes */
+};
+int guest_stack_build(void *memory,size_t capacity,uint64_t guest_top,
+                       const struct guest_stack_spec *spec,uint64_t *guest_sp);
 
 /* The ARM execution lock.
  *

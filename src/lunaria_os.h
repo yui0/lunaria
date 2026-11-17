@@ -2384,6 +2384,8 @@ int luna_process_channel_send(struct luna_process_channel *,const void *,size_t)
  * channel/pool callback returns; duplicate any FD that must outlive it. */
 int luna_process_channel_send_fds(struct luna_process_channel *,const void *,size_t,const int *,size_t);
 const int *luna_process_message_fds(size_t *count);
+/* Origin of a pool callback, retained even after its process was reaped. */
+uint32_t luna_process_message_host_pid(void);
 /* Returns a message count or negative errno; -EPIPE means peer shutdown. */
 int luna_process_channel_tick(struct luna_process_channel *,luna_process_message_fn,void *);
 void luna_process_channel_close(struct luna_process_channel *);
@@ -2402,6 +2404,8 @@ struct luna_process_pool *luna_process_pool_open_host(const char *executable,con
 int luna_process_pool_set_profile(struct luna_process_pool *,const char *profile);
 /* Whether a host named `name` is alive in the pool (sending to it would not start one). */
 int luna_process_pool_running(struct luna_process_pool *,const char *name);
+/* Host routing identity, distinct from the guest-visible pid namespace. */
+uint32_t luna_process_pool_host_pid(struct luna_process_pool *,const char *name);
 /* Send to an existing host PID; never start a replacement process. */
 int luna_process_pool_send_to_host(struct luna_process_pool *,uint32_t host_pid,const void *data,size_t size);
 int luna_process_pool_send_to_host_fds(struct luna_process_pool *,uint32_t,const void *,size_t,const int *,size_t);
@@ -2420,6 +2424,8 @@ int luna_process_pool_tick(struct luna_process_pool *,luna_process_reply_fn,void
  * waitpid-encoded status, or -ECHILD when another reaper collected it. */
 int luna_process_pool_next_exit(struct luna_process_pool *,char *name,size_t capacity,
                                 uint32_t *guest_pid,int *status);
+int luna_process_pool_next_exit_host(struct luna_process_pool *,char *name,size_t capacity,
+                                     uint32_t *guest_pid,uint32_t *host_pid,int *status);
 /* Closes IPC, then reaps only this pool's own children. A bounded grace
  * period precedes termination of a child that does not close voluntarily. */
 void luna_process_pool_close(struct luna_process_pool *);
