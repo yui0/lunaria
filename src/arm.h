@@ -180,6 +180,8 @@ void arm_set_parallel_engines(bool on);
  * ------------------------------------------------------------------------ */
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <ctime>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -887,6 +889,24 @@ inline size_t a64_buf_len(uint64_t x) {
   return (x >> 32) ? (size_t)(uint32_t)x : (size_t)x;
 }
 
+/* The guest's main process id (its thread-group leader's tid).  A process on a device gets
+ * a different pid every time it is started, and software relies on it: a packer keeps a
+ * "who unpacked me" record in the app's private directory and treats a record naming the
+ * current pid as its own process's, so a pid fixed across launches makes the record a
+ * previous run left look current.  Chosen once per launch, in the range app processes get
+ * (zygote's children).  Libraries are loaded, and their mappings owned by this pid, before
+ * guest_process_identity_init runs; a child VM's identity (LUNARIA_GUEST_TID_BASE)
+ * overwrites it there. */
+inline uint32_t &guest_pid_base_ref()
+{
+  static uint32_t pid = [] {
+    uint64_t seed = (uint64_t)time(nullptr) * 2654435761u +
+                    (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
+    seed ^= seed >> 15;
+    return 5000u + (uint32_t)(seed % 25000u);
+  }();
+  return pid;
+}
 // Guest library regions, recorded by load_elf.
 /* One PT_LOAD of a mapped image, as /proc/<pid>/maps has to describe it.
  * `file_off` is the page-aligned file offset the region maps: a device's maps
@@ -903,7 +923,7 @@ struct LoadedRegion {
   uint64_t backing_inode = 0;
   /* Linux mappings belong to an mm/process.  The emulator has one backing
    * arena, but procfs must never expose an exec child image in its parent. */
-  uint32_t process_pid = 1000u; /* initial Android app process */
+  uint32_t process_pid = guest_pid_base_ref(); /* initial Android app process */
 };
 inline std::vector<LoadedRegion> g_loaded_regions;
 // Process-wide ABI selector used by synthetic /proc files.
@@ -915,7 +935,7 @@ struct ModulePhdr {
   GuestVA phdr_va;
   uint16_t phnum;
   bool is_64;
-  uint32_t process_pid = 1000u;
+  uint32_t process_pid = guest_pid_base_ref();
 };
 inline std::vector<ModulePhdr> g_module_phdrs;
 
@@ -1266,6 +1286,19 @@ inline uint32_t misc_optopt(void)     {
 inline uint32_t misc_stack_guard(void) {
   return MISC_DATA + 0x1C0u;
 }
+/* bionic's `__progname` is a `const char *` variable, and the libraries that
+ * import it read the pointer cell directly, so it has to be real data with its
+ * string beside it.  libc_init_common points it at argv[0]; AppRuntime::setArgv0
+ * then overwrites that very buffer with the app's process name, so in an app
+ * process __progname is the process name (the same text as /proc/self/cmdline),
+ * never "app_process".  The string area is the tail of the page. */
+inline uint32_t misc_progname(void)     {
+  return MISC_DATA + 0x1D0u;
+}
+inline uint32_t misc_progname_str(void) {
+  return MISC_DATA + 0xF00u;
+}
+inline constexpr uint32_t MISC_PROGNAME_MAX = 0x100u;
 /* The AThermalManager AThermal_acquireManager() hands out.  The object is
  * opaque to the guest — the thermal calls only pass the pointer back — but it
  * has to be an address in guest memory, not an arbitrary token, so a caller

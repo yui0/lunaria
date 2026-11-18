@@ -503,6 +503,7 @@ static void comp_take_shot(int w, int h)
   const bool ok = n > 4 && !strcmp(path + n - 4, ".png") && luna_png_write_rgba(path, w, h, px, true);
   fprintf(stderr, "[compositor] screenshot %s -> %s (%dx%d)\n", ok ? "saved" : "FAILED", path, w, h);
   free(px);
+  luna_overlay_screenshot_taken();
 }
 
 /* LUNARIA_COMP_SHOT_S=<seconds>: every that many seconds, write what the

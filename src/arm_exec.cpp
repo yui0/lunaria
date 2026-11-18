@@ -3135,6 +3135,7 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
   }
   if (strcmp(name, "__stack_chk_guard") == 0) return misc_stack_guard();
   if (strcmp(name, "tzname") == 0) return misc_tzname();
+  if (strcmp(name, "__progname") == 0) return misc_progname();
   if (strcmp(name, "timezone") == 0) return misc_tzvars();
   if (strcmp(name, "daylight") == 0)  return misc_daylight();
   // bionic FILE* table / aliases — must be real data, not SVC trampolines
@@ -5752,6 +5753,7 @@ static std::atomic<uint64_t> g_dvm_pending_signals[4096];
  * hole from ~0 up to the first high host==guest mmap and probed straight
  * through 0x200000000.  Body lives after g_threads. */
 static const char *synth_guest_maps(void);
+static const char *synth_guest_smaps(void);
 /* Host-driven JNI/audio callbacks also run on guest stacks. Keep mapped
  * windows visible after the callback releases its slot: the memory remains. */
 static std::atomic<uint32_t> g_cb_stack_mapped{0};
@@ -5765,7 +5767,9 @@ static std::atomic<uint32_t> g_cb_stack_mapped{0};
  * thread, so the process is GUEST_TID_BASE and thread n is GUEST_TID_BASE+n.
  * The base is what the fast gettid stub already writes into the guest's TLS
  * (TLS64_TID_OFF). */
-static uint32_t GUEST_TID_BASE = 1000u;
+/* The pid itself lives in arm.h (guest_pid_base_ref) so that mappings created before this
+ * file's initialisation runs are owned by the same value. */
+static uint32_t &GUEST_TID_BASE = guest_pid_base_ref();
 static uint32_t guest_pid(void);
 static inline uint32_t guest_tid_of(uint32_t tid)   {
   return GUEST_TID_BASE + tid;
@@ -6104,7 +6108,44 @@ static inline bool proc_is_host(const char *path) {
   return path && (!strncmp(path, "/proc/", 6) || !strcmp(path, "/proc"));
 }
 
-static const char *synthetic_proc_path(const char *path) {
+/* A /proc file the guest opens is served from a host file the emulator wrote, but the guest
+ * must still see what the kernel shows: readlink(/proc/self/fd/<n>) of an open /proc/self/maps
+ * is "/proc/<pid>/maps", never a temporary file.  Code that tests whether its maps is real
+ * does exactly that (anti-tamper's "API hook" check does), so every host backing file handed
+ * out for a /proc path is remembered under the name the kernel would give it. */
+static std::mutex g_synth_proc_names_mu;
+static std::map<std::string, std::string> g_synth_proc_names;
+static void synthetic_proc_name_note(const char *host, const char *guest_path)
+{
+  if (!host || !*host || strncmp(guest_path, "/proc/", 6)) return;
+  std::string canonical;
+  if (!strncmp(guest_path, "/proc/self", 10) && (!guest_path[10] || guest_path[10] == '/'))
+    canonical = "/proc/" + std::to_string(guest_pid()) + (guest_path + 10);
+  else
+    canonical = guest_path;
+  while (canonical.size() > 6 && canonical.back() == '/') canonical.pop_back();
+  char resolved[PATH_MAX];
+  std::lock_guard<std::mutex> lk(g_synth_proc_names_mu);
+  g_synth_proc_names[host] = canonical;
+  /* F_GETPATH reports the resolved spelling (/private/var/... for /var/...). */
+  if (realpath(host, resolved)) g_synth_proc_names[resolved] = canonical;
+}
+static const char *synthetic_proc_name(const char *host, char *out, size_t cap)
+{
+  std::lock_guard<std::mutex> lk(g_synth_proc_names_mu);
+  auto it = g_synth_proc_names.find(host);
+  if (it == g_synth_proc_names.end()) return nullptr;
+  snprintf(out, cap, "%s", it->second.c_str());
+  return out;
+}
+static const char *synthetic_proc_path_raw(const char *path);
+static const char *synthetic_proc_path(const char *path)
+{
+  const char *host = synthetic_proc_path_raw(path);
+  if (host && path) synthetic_proc_name_note(host, path);
+  return host;
+}
+static const char *synthetic_proc_path_raw(const char *path) {
   if (path) {
     if (lunaria_env("LUNARIA_TRACE_PROC") &&
         (!strncmp(path, "/proc/", 6) || !strncmp(path, "/sys/", 5))) {
@@ -6243,6 +6284,8 @@ static const char *synthetic_proc_path(const char *path) {
     // /proc/self/maps or /proc/<live-pid-or-tid>/maps.
     if (slash && proc_subject_live && !strcmp(slash, "/maps"))
       return synth_guest_maps();
+    if (slash && proc_subject_live && !strcmp(slash, "/smaps"))
+      return synth_guest_smaps();
     if (slash && proc_subject_live && !strcmp(slash, "/stat"))
       return synth_guest_stat();
     if (slash && proc_subject_live && !strcmp(slash, "/status"))
@@ -6989,7 +7032,7 @@ static int guest_process_identity_init(void)
 {
   const char *base = getenv("LUNARIA_GUEST_TID_BASE");
   const char *parent = getenv("LUNARIA_GUEST_PPID");
-  uint32_t values[2] = {1000u, 811u};
+  uint32_t values[2] = {GUEST_TID_BASE, 811u};
   if (base || parent) {
     if (!base || !parent) return -1;
     const char *texts[2] = {base, parent};
@@ -7583,6 +7626,37 @@ static const char *synth_guest_maps(void) {
     }
   }
 
+  /* The installed package's APKs.  ART and the AssetManager map each one read-only and shared
+   * (dex, resources.arsc and assets are read through that mapping), so on a device base.apk and
+   * every split show in maps with the file's own size.  Code that checks its package against
+   * what it finds mapped (anti-tamper records the size of the APK it sees in maps, and compares
+   * it with the file it is installed as) reads exactly these lines. */
+  if (g_guest_proc_arm64) {
+    struct apk_map { std::string guest, host; };
+    std::vector<apk_map> apks;
+    if (const char *base = lunaria_env("ANDROID_APK_FILE"))
+      apks.push_back({lunaria_android_apk_path(), base});
+    const char *list = lunaria_env("ANDROID_SPLIT_APKS");   /* "<name>|<host path>;..." */
+    for (const char *e = list; e && *e;) {
+      const char *bar = strchr(e, '|'), *sep = strchr(e, ';');
+      if (!sep) sep = e + strlen(e);
+      if (bar && bar < sep)
+        apks.push_back({std::string(lunaria_android_apk_dir()) + "/split_" + std::string(e, bar - e) + ".apk",
+                        std::string(bar + 1, sep - (bar + 1))});
+      e = *sep == ';' ? sep + 1 : sep;
+    }
+    GuestVA at = 0x700020000000ull;
+    for (const apk_map &a : apks) {
+      struct stat st;
+      if (luna_file_stat_follow(a.host.c_str(), &st) != 0 || st.st_size <= 0) continue;
+      unsigned maj, min;
+      unsigned long long ino;
+      maps_device_id(a.host.c_str(), a.guest.c_str(), 0, &maj, &min, &ino);
+      const GuestVA size = ((GuestVA)st.st_size + 0xfffull) & ~0xfffull;
+      emit_a64(at, at + size, "r--s", 0, maj, min, ino, a.guest.c_str());
+      at += (size + 0x1fffffull) & ~0x1fffffull;
+    }
+  }
   /* The shared arena above the heap limit belongs to mmap, not both. */
   const uint32_t heap_top = g_small_mmap_top ? g_small_mmap_top
                             : HEAP_BASE + g_heap_size;
@@ -7717,6 +7791,93 @@ static const char *synth_guest_maps(void) {
   for (const auto &l : lines) out += l.second;
   if (lunaria_env("LUNARIA_TRACE_MAPS"))
     fprintf(stderr, "[maps] tid=%u rendered:\n%s", g_current_tid, out.c_str());
+  if (luna_fd_write(fd, out.data(), out.size()) < 0) { /* best effort */ }
+  luna_fd_close(fd);
+  if (file[0]) luna_file_unlink(file);
+  strncpy(file, buf, sizeof file - 1);
+  file[sizeof file - 1] = '\0';
+  return file;
+}
+
+/* /proc/<pid>/smaps: the same mappings as maps, each followed by the accounting block a Linux
+ * 5.10 kernel (Android 12's) prints.  An app may read its own smaps, and code that checks
+ * whether its maps is genuine reads both and compares them, so the ranges here are exactly
+ * the ones synth_guest_maps() reports.  The residency figures are an estimate: the emulator
+ * does not track per-page state, so a file mapping counts as half resident and an anonymous
+ * one as a sixteenth, which is what a process that has touched part of its memory shows. */
+static const char *synth_guest_smaps(void)
+{
+  static thread_local char file[SYNTH_TMP_PATH] = "";
+  const char *maps = synth_guest_maps();
+  if (!maps) return nullptr;
+  std::string body;
+  if (FILE *f = luna_file_fopen(maps, "rb")) {
+    char chunk[4096];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof chunk, f)) > 0) body.append(chunk, n);
+    fclose(f);
+  } else {
+    return nullptr;
+  }
+  std::string out;
+  size_t at = 0;
+  while (at < body.size()) {
+    size_t eol = body.find('\n', at);
+    if (eol == std::string::npos) eol = body.size();
+    const std::string line = body.substr(at, eol - at);
+    at = eol + 1;
+    unsigned long long lo = 0, hi = 0;
+    char perm[8] = "";
+    if (sscanf(line.c_str(), "%llx-%llx %7s", &lo, &hi, perm) != 3) continue;
+    const bool file_backed = line.find('/') != std::string::npos;
+    const unsigned long long size_kb = (hi - lo) / 1024u;
+    const bool readable = perm[0] == 'r', writable = perm[1] == 'w', executable = perm[2] == 'x';
+    const bool inaccessible = !readable && !writable && !executable;
+    unsigned long long rss = inaccessible ? 0 : file_backed ? size_kb / 2 : size_kb / 16;
+    if (rss && rss < 4) rss = 4;
+    if (rss > size_kb) rss = size_kb;
+    rss &= ~3ull;   /* whole 4 kB pages */
+    const unsigned long long dirty = writable ? rss : 0;
+    const unsigned long long anon = file_backed ? 0 : rss;
+    /* rd/wr/ex follow the protection; mr/mw/me ("may ...") hold for any private mapping, and a
+     * private writable one is accounted ("ac"). */
+    char flags[96];
+    snprintf(flags, sizeof flags, "%s%s%smr mw me%s",
+             readable ? "rd " : "", writable ? "wr " : "", executable ? "ex " : "",
+             writable ? " ac" : "");
+    out += line;
+    out += '\n';
+    char block[1400];
+    snprintf(block, sizeof block,
+      "Size:               %8llu kB\n"
+      "KernelPageSize:        4 kB\n"
+      "MMUPageSize:           4 kB\n"
+      "Rss:                %8llu kB\n"
+      "Pss:                %8llu kB\n"
+      "Shared_Clean:          0 kB\n"
+      "Shared_Dirty:          0 kB\n"
+      "Private_Clean:      %8llu kB\n"
+      "Private_Dirty:      %8llu kB\n"
+      "Referenced:         %8llu kB\n"
+      "Anonymous:          %8llu kB\n"
+      "LazyFree:              0 kB\n"
+      "AnonHugePages:         0 kB\n"
+      "ShmemPmdMapped:        0 kB\n"
+      "FilePmdMapped:         0 kB\n"
+      "Shared_Hugetlb:        0 kB\n"
+      "Private_Hugetlb:       0 kB\n"
+      "Swap:                  0 kB\n"
+      "SwapPss:               0 kB\n"
+      "Locked:                0 kB\n"
+      "THPeligible:           0\n"
+      "VmFlags: %s\n",
+      size_kb, rss, rss, rss - dirty, dirty, rss, anon, flags);
+    out += block;
+  }
+  char buf[SYNTH_TMP_PATH];
+  strcpy(buf, "/tmp/lunaria-smaps-XXXXXX");
+  int fd = luna_temp_mkstemp(buf, sizeof buf);
+  if (fd < 0) return file[0] ? file : nullptr;
   if (luna_fd_write(fd, out.data(), out.size()) < 0) { /* best effort */ }
   luna_fd_close(fd);
   if (file[0]) luna_file_unlink(file);
@@ -11750,6 +11911,10 @@ static int guest_kill_process(ArmExecCtx &ctx, int32_t selector, int sig)
           break;
         }
     }
+    if (lunaria_env("LUNARIA_TRACE_SIG"))
+      fprintf(stderr, "[sig] kill sig=%d -> pid=%u delivered to sched tid=%u (leader mask=0x%llx, target mask=0x%llx)\n",
+              sig, pid, target, (unsigned long long)signal_mask_load(leader ? leader->id : 0),
+              (unsigned long long)signal_mask_load(target));
     guest_raise_signal(ctx, target, sig);
   }
   if (found) return 0;
@@ -12825,8 +12990,10 @@ static void maybe_dump_screenshot(uint64_t swap_index, bool from_swap) {
     g_shot_pending_path[0] = '\0';
   }
 
-  if (want)
+  if (want) {
     dump_framebuffer_ppm(forced[0] ? forced : nullptr, nullptr, 0);
+    luna_overlay_screenshot_taken();
+  }
   if (from_swap)
     gl_dump_textures(swap_index);
 }
@@ -12964,12 +13131,22 @@ static EGLConfig resolve_egl_config(uint32_t handle) {
   return g_egl_cfg;
 }
 
-static uint32_t egl_register_guest_config(EGLConfig config) {
+/* A device's EGL lists RGB565 configs next to the 8888 ones; this host's (ANGLE over Metal) lists only
+ * 8888.  A guest config may therefore be the host's 8-bit-per-channel, alpha-less config presented as
+ * RGB565 -- the same drawing surface, a 5/6/5/0 description.  The flag is part of the guest handle's
+ * identity (g_egl_cfg_565 runs parallel to g_egl_cfg_tab). */
+static std::vector<bool> g_egl_cfg_565;
+static uint32_t egl_register_guest_config(EGLConfig config, bool rgb565 = false) {
   uint32_t index;
   for (index = 0; index < g_egl_cfg_tab.size(); ++index)
-    if (g_egl_cfg_tab[index] == config) return ARM_EGL_CFGTAB_BASE + index;
+    if (g_egl_cfg_tab[index] == config && g_egl_cfg_565[index] == rgb565) return ARM_EGL_CFGTAB_BASE + index;
   g_egl_cfg_tab.push_back(config);
+  g_egl_cfg_565.push_back(rgb565);
   return ARM_EGL_CFGTAB_BASE + index;
+}
+static bool egl_guest_config_is_565(uint32_t handle) {
+  return handle >= ARM_EGL_CFGTAB_BASE && handle - ARM_EGL_CFGTAB_BASE < g_egl_cfg_565.size() &&
+         g_egl_cfg_565[handle - ARM_EGL_CFGTAB_BASE];
 }
 
 // Guest EGL context handle -> host EGLContext.
@@ -15934,6 +16111,59 @@ static void gldraw_dump_state() {
 static GLuint g_recent_color_tex[8];
 static int g_recent_color_tex_n = 0;
 
+/* ES 2.0 lets a framebuffer take a depth renderbuffer and a separate stencil
+ * renderbuffer (Unity does, for DEPTH_COMPONENT16 + STENCIL_INDEX8).  The host
+ * context is ES 3.x, which requires both attachments to be the same image and
+ * otherwise reports FRAMEBUFFER_UNSUPPORTED, so nothing is ever drawn into such
+ * a target.  A framebuffer that holds two different depth and stencil
+ * renderbuffers is therefore given one host-owned DEPTH24_STENCIL8
+ * renderbuffer of the same size instead; the guest's own two stay untouched. */
+struct GlRbInfo { GLsizei w = 0, h = 0; };
+struct GlFboDS { GLuint depth = 0, stencil = 0, packed = 0; };
+static std::unordered_map<GLuint, GlRbInfo> g_gl_rb_info;
+static std::unordered_map<GLuint, GlFboDS> g_gl_fbo_ds;
+static GLuint g_gl_bound_rb = 0;
+
+static void gl_packed_ds_storage(const GlFboDS &d)
+{
+  GLint prev = 0;
+  pfn_glGetIntegerv(0x8CA7 /* RENDERBUFFER_BINDING */, &prev);
+  const GlRbInfo &di = g_gl_rb_info[d.depth];
+  pfn_glBindRenderbuffer(0x8D41, d.packed);
+  pfn_glRenderbufferStorage(0x8D41, 0x88F0 /* DEPTH24_STENCIL8 */, di.w, di.h);
+  pfn_glBindRenderbuffer(0x8D41, (GLuint)prev);
+}
+
+static void gl_fbo_depth_stencil_attached(GLenum target, GLenum att, GLuint rb)
+{
+  if (!pfn_glGetIntegerv || !pfn_glGenRenderbuffers || !pfn_glBindRenderbuffer ||
+      !pfn_glRenderbufferStorage || !pfn_glDeleteRenderbuffers)
+    return;
+  GLint fbo = 0;
+  pfn_glGetIntegerv(0x8CA6 /* FRAMEBUFFER_BINDING */, &fbo);
+  if (!fbo) return;
+  GlFboDS &d = g_gl_fbo_ds[(GLuint)fbo];
+  if (att == 0x8D00) d.depth = rb;
+  else if (att == 0x8D20) d.stencil = rb;
+  else d.depth = d.stencil = rb; /* DEPTH_STENCIL_ATTACHMENT: already one image */
+  if (d.depth && d.stencil && d.depth != d.stencil) {
+    if (!d.packed) pfn_glGenRenderbuffers(1, &d.packed);
+    gl_packed_ds_storage(d);
+    pfn_glFramebufferRenderbuffer(target, 0x8D00, 0x8D41, 0);
+    pfn_glFramebufferRenderbuffer(target, 0x8D20, 0x8D41, 0);
+    pfn_glFramebufferRenderbuffer(target, 0x821A, 0x8D41, d.packed);
+  } else if (d.packed) {
+    /* One of the pair was detached or replaced: give the guest's own back. */
+    pfn_glFramebufferRenderbuffer(target, 0x821A, 0x8D41, 0);
+    pfn_glDeleteRenderbuffers(1, &d.packed);
+    d.packed = 0;
+    if (d.depth && d.depth != d.stencil)
+      pfn_glFramebufferRenderbuffer(target, 0x8D00, 0x8D41, d.depth);
+    if (d.stencil && d.depth != d.stencil)
+      pfn_glFramebufferRenderbuffer(target, 0x8D20, 0x8D41, d.stencil);
+  }
+}
+
 static void lunaria_note_color_tex(GLuint t) {
   if (!t) return;
   if (g_recent_color_tex_n < 8)
@@ -18772,13 +19002,40 @@ static int egl_host_choose_config(const int32_t *attribs, uint32_t *out,
                         "unmatched on host — using relaxed fallback config\n");
     }
   }
+  /* RGB565 was asked for exactly (alpha not required): add the RGB565 presentation of each host
+   * 8-bit, alpha-less config after the real ones, as a device's list has them. */
+  std::vector<EGLConfig> as565;
+  if (ok == EGL_TRUE && n > 0 && attribs && g_egl_dpy != EGL_NO_DISPLAY) {
+    EGLint red = 0, green = 0, blue = 0, alpha = 0;
+    for (size_t i = 0; attribs[i] != EGL_NONE; i += 2) {
+      if (attribs[i] == EGL_RED_SIZE) red = attribs[i + 1];
+      else if (attribs[i] == EGL_GREEN_SIZE) green = attribs[i + 1];
+      else if (attribs[i] == EGL_BLUE_SIZE) blue = attribs[i + 1];
+      else if (attribs[i] == EGL_ALPHA_SIZE) alpha = attribs[i + 1];
+    }
+    if (red == 5 && green == 6 && blue == 5 && alpha == 0) {
+      std::vector<EGLConfig> all((size_t)n);
+      EGLint got = 0;
+      if (eglChooseConfig(g_egl_dpy, host_attribs, all.data(), n, &got) == EGL_TRUE)
+        for (EGLint i = 0; i < got; ++i) {
+          EGLint r = 0, g = 0, b = 0, a = 0;
+          eglGetConfigAttrib(g_egl_dpy, all[i], EGL_RED_SIZE, &r);
+          eglGetConfigAttrib(g_egl_dpy, all[i], EGL_GREEN_SIZE, &g);
+          eglGetConfigAttrib(g_egl_dpy, all[i], EGL_BLUE_SIZE, &b);
+          eglGetConfigAttrib(g_egl_dpy, all[i], EGL_ALPHA_SIZE, &a);
+          if (r == 8 && g == 8 && b == 8 && a == 0) as565.push_back(all[i]);
+        }
+    }
+  }
+  const EGLint host_count = n;
+  n += (EGLint)as565.size();
   fprintf(stderr, "[arm_exec] eglChooseConfig -> ok=%d num=%d (size=%d)\n",
           ok, n, max);
   if (out && n > 0) {
     int n_out = n < max ? n : max;
-    for (int i = 0; i < n_out; ++i) {
-      out[i] = egl_register_guest_config(host_cfgs[i]);
-    }
+    for (int i = 0; i < n_out; ++i)
+      out[i] = i < host_count ? egl_register_guest_config(host_cfgs[i])
+                              : egl_register_guest_config(as565[i - host_count], true);
     n = (EGLint)n_out;
   }
   if (num) *num = n;
@@ -19206,6 +19463,12 @@ extern "C" int arm_exec_egl_present_surface(uint32_t handle) {
   if (width <= 0 || height <= 0) return EGL_FALSE;
   ++g_guest_egl_swap_count;
   luna_boot_guest_presented();
+  /* Same screenshot triggers as the NativeActivity swap: the Java GLSurfaceView
+   * presents through here, and a frame it draws must be capturable too. */
+  maybe_dump_screenshot(g_guest_egl_swap_count - 1, true);
+  if (lunaria_env("LUNARIA_TRACE_PRESENT"))
+    fprintf(stderr, "[present] #%llu %dx%d t=%.3f\n", (unsigned long long)g_guest_egl_swap_count,
+            (int)width, (int)height, (double)host_mono_ns() / 1e9);
   if (luna_comp_active()) {
     if (version < 3) {
       /* ES1/2 have no core framebuffer blit. Transfer the actual pixels
@@ -19412,6 +19675,17 @@ extern "C" int arm_exec_egl_get_config_attrib(uint32_t cfg, int attr,
       v = 1; /* HAL_PIXEL_FORMAT_RGBA_8888 */
     else
       v = 2; /* HAL_PIXEL_FORMAT_RGBX_8888 */
+  }
+  if (ok == EGL_TRUE && egl_guest_config_is_565(cfg)) {
+    switch (attr) {
+    case EGL_RED_SIZE:    v = 5; break;
+    case EGL_GREEN_SIZE:  v = 6; break;
+    case EGL_BLUE_SIZE:   v = 5; break;
+    case EGL_ALPHA_SIZE:  v = 0; break;
+    case EGL_BUFFER_SIZE: v = 16; break;
+    case EGL_NATIVE_VISUAL_ID: v = 4; break;   /* HAL_PIXEL_FORMAT_RGB_565 */
+    default: break;
+    }
   }
   if (value) *value = v;
   return (int)ok;
@@ -22909,8 +23183,61 @@ extern "C" void arm_exec_note_destructive(const char *what, const char *host_pat
   }
 }
 
+/* The device name of a file the package installer put on disk: base.apk, each
+ * split and the app's own libraries.  The guest opens them under /data/app/...
+ * (map_guest_path), so what it reads back from /proc/self/fd/<n> or
+ * /proc/self/maps has to be that same name and not the host copy's.  An APK is
+ * hard-linked into the staged view, so it is matched by device and inode, not
+ * by spelling.  Returns nullptr when the file is none of these. */
+static const char *unmap_guest_package_file(const char *path,char *buf,size_t capacity)
+{
+  struct stat st;
+  if (stat(path,&st)) return nullptr;
+  auto same=[&st](const char *other) {
+    struct stat o;
+    return other && *other && !stat(other,&o) && o.st_dev==st.st_dev && o.st_ino==st.st_ino;
+  };
+  int n=-1;
+  if (same(lunaria_env("ANDROID_APK_FILE")))
+    n=snprintf(buf,capacity,"%s/base.apk",lunaria_android_apk_dir());
+  /* ANDROID_SPLIT_APKS is "<name>|<host path>;..." (see map_guest_path). */
+  const char *list=lunaria_env("ANDROID_SPLIT_APKS");
+  for (const char *e=list; n<0 && e && *e; ) {
+    const char *bar=strchr(e,'|');
+    const char *sep=strchr(e,';');
+    if (!sep) sep=e+strlen(e);
+    if (bar && bar<sep) {
+      char host[PATH_MAX];
+      const size_t plen=(size_t)(sep-(bar+1));
+      if (plen<sizeof host) {
+        memcpy(host,bar+1,plen);
+        host[plen]='\0';
+        if (same(host))
+          n=snprintf(buf,capacity,"%s/split_%.*s.apk",lunaria_android_apk_dir(),(int)(bar-e),e);
+      }
+    }
+    e=(*sep==';') ? sep+1 : sep;
+  }
+  const char *libdir=lunaria_env("ANDROID_NATIVE_LIB_DIR");
+  if (n<0 && libdir && *libdir) {
+    char canonical[PATH_MAX];
+    const char *root=libdir;
+    if (!path_under(path,root,strlen(root)) &&
+        host_root_canonical(libdir,canonical,sizeof canonical)) root=canonical;
+    if (path_under(path,root,strlen(root)))
+      n=snprintf(buf,capacity,"%s%s",lunaria_android_native_lib_path(),path+strlen(root));
+  }
+  if (n<0) return nullptr;
+  if ((size_t)n>=capacity) {
+    errno=ENAMETOOLONG;
+    return nullptr;
+  }
+  return buf;
+}
+
 static const char *unmap_guest_file(const char *path,char *buf,size_t capacity)
 {
+  if (const char *package=unmap_guest_package_file(path,buf,capacity)) return package;
   const char *pkg=lunaria_env("ANDROID_PACKAGE_NAME");
   if (!pkg || !*pkg) pkg="com.lunaria.app";
   const char *external=lunaria_env("ANDROID_EXTERNAL_FILES_DIR");
@@ -23013,6 +23340,8 @@ static ptrdiff_t synth_proc_readlink(const char *path, char *out, size_t cap)
       /* "socket:[ino]", "pipe:[ino]", "anon_inode:[eventfd]": the same
        * text on every Linux kernel, nothing about this machine. */
       snprintf(text, sizeof text, "%s", host);
+    } else if (char named[PATH_MAX]; synthetic_proc_name(host, named, sizeof named)) {
+      snprintf(text, sizeof text, "%s", named);
     } else {
       char buf[PATH_MAX];
       const char *guest = unmap_guest_file(host, buf, sizeof buf);
@@ -23731,6 +24060,17 @@ static int host_open_flags(int guest)
  * the guest's numbers.  A guest that reads back what it set has to see its own
  * ABI, and `fl & LUNA_FILE_NONBLOCK` in guest code tests bit 0x800 whatever the host
  * calls that flag. */
+/* An app cannot read the /dev directory: the SELinux policy gives untrusted_app search
+ * (so stat and open of a device node work) but not read on device:dir, and opening or listing
+ * /dev itself fails with EACCES.  `path` is the mapped path, which for /dev is the host's own
+ * directory -- 382 ttys and disks of this machine, nothing an Android device has. */
+static bool guest_dev_directory_denied(const char *path)
+{
+  if (!path || strncmp(path, "/dev", 4) || (path[4] && strcmp(path + 4, "/"))) return false;
+  errno = EACCES;
+  return true;
+}
+
 static int guest_open_flags(int host)
 {
   int guest = host & 0x3;
@@ -23892,6 +24232,7 @@ static int guest_open_path(const char *path, int flags, mode_t mode) {
     return -1;
   }
   if (!path) return -1; /* Preserve a namespace/search failure. */
+  if (guest_dev_directory_denied(path)) return -1;
   const int host_flags = host_open_flags(flags);
   int fd = luna_file_open(path, host_flags, mode);
   int open_error = fd < 0 ? errno : 0;
@@ -25427,38 +25768,48 @@ static std::string arm_vformat(ArmExecCtx &ctx, const char *fmt, ArmVarArgs &ap)
       }
       else while (*p >= '0' && *p <= '9') spec += *p++;
     }
-    int longs = 0;
-    while (*p == 'l' || *p == 'h' || *p == 'z' || *p == 'j' ||
-           *p == 't' || *p == 'L') {
+    /* The length modifier names a C type of the guest's ABI: `long`, `size_t` (z) and
+     * `ptrdiff_t` (t) are 8 bytes on LP64 Android and 4 on LP32; `long long` and
+     * `intmax_t` (j) are 8 on both; `short`/`char` (h/hh) are the int argument cut
+     * down.  Reading 4 bytes for %zx on AArch64 drops the upper half of a pointer. */
+    int longs = 0, halfs = 0;
+    bool wide = false;
+    for (;; ++p) {
       if (*p == 'l') ++longs;
-      ++p;
+      else if (*p == 'h') ++halfs;
+      else if (*p == 'j') wide = true;
+      else if (*p == 'z' || *p == 't') { if (ctx.is_arm64) wide = true; }
+      else if (*p != 'L') break;
     }
+    if (longs >= 2 || (longs == 1 && ctx.is_arm64)) wide = true;
     char conv = *p;
     if (!conv) break;
     switch (conv) {
     case 'd':
     case 'i':
-      if (longs >= 2) {
+      if (wide) {
         spec += "lld";
         arm_append_format(out, spec.c_str(), (long long)(int64_t)ap.next64());
       }
       else            {
         spec += conv;
-        arm_append_format(out, spec.c_str(), (int)ap.next32());
+        int v = (int)ap.next32();
+        arm_append_format(out, spec.c_str(), halfs >= 2 ? (int)(signed char)v : halfs == 1 ? (int)(short)v : v);
       }
       break;
     case 'u':
     case 'x':
     case 'X':
     case 'o':
-      if (longs >= 2) {
+      if (wide) {
         spec += "ll";
         spec += conv;
         arm_append_format(out, spec.c_str(), (unsigned long long)ap.next64());
       }
       else            {
         spec += conv;
-        arm_append_format(out, spec.c_str(), (unsigned)ap.next32());
+        unsigned v = (unsigned)ap.next32();
+        arm_append_format(out, spec.c_str(), halfs >= 2 ? (unsigned)(unsigned char)v : halfs == 1 ? (unsigned)(unsigned short)v : v);
       }
       break;
     case 'p':
@@ -26002,7 +26353,26 @@ static bool write_guest_stat(ArmExecCtx &ctx, GuestVA va, const luna_file_info &
 }
 
 // guest struct tm: LP64 aligns long at 40 and the pointer at 48.
-static void write_guest_tm(ArmExecCtx &ctx, GuestVA va, const struct tm &t, int64_t offset) {
+/* bionic's struct tm always carries tm_zone, a pointer to the zone's abbreviation
+ * ("JST", "GMT"); callers strlen() it unconditionally.  Names are interned once in
+ * guest memory, so the pointer stays valid for the process's life as it does on a device. */
+static GuestVA guest_tm_zone(ArmExecCtx &ctx, const struct tm &t, bool local) {
+  static std::mutex lock;
+  static std::map<std::string, GuestVA> names;
+  std::string name = local ? "" : "GMT";
+#if !defined(_WIN32)
+  if (local && t.tm_zone) name = t.tm_zone;
+#endif
+  if (name.empty()) name = "UTC";
+  std::lock_guard<std::mutex> g(lock);
+  auto it = names.find(name);
+  if (it != names.end()) return it->second;
+  GuestVA va = arm_malloc(ctx, (uint32_t)name.size() + 1);
+  if (va) memcpy(ctx.mem.ptr(va), name.c_str(), name.size() + 1);
+  names[name] = va;
+  return va;
+}
+static void write_guest_tm(ArmExecCtx &ctx, GuestVA va, const struct tm &t, int64_t offset, bool local = true) {
   ctx.mem.write32(va +  0, (uint32_t)t.tm_sec);
   ctx.mem.write32(va +  4, (uint32_t)t.tm_min);
   ctx.mem.write32(va +  8, (uint32_t)t.tm_hour);
@@ -26015,10 +26385,11 @@ static void write_guest_tm(ArmExecCtx &ctx, GuestVA va, const struct tm &t, int6
   if (ctx.is_arm64) {
     uint64_t gmtoff = (uint64_t)offset;
     std::memcpy(ctx.mem.ptr(va + 40), &gmtoff, 8);
-    std::memset(ctx.mem.ptr(va + 48), 0, 8);
+    uint64_t zone = guest_tm_zone(ctx, t, local);
+    std::memcpy(ctx.mem.ptr(va + 48), &zone, 8);
   } else {
     ctx.mem.write32(va + 36, (uint32_t)offset);
-    ctx.mem.write32(va + 40, 0);
+    ctx.mem.write32(va + 40, (uint32_t)guest_tm_zone(ctx, t, local));
   }
 }
 static void read_guest_tm(ArmExecCtx &ctx, GuestVA va, struct tm &t) {
@@ -32125,7 +32496,11 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
   if ((svc_no >= SVC_EGL_GETDISPLAY && svc_no <= SVC_EGL_GETCURCTX) ||
       (svc_no >= SVC_GL_BASE && svc_no <= SVC_GL_VertexAttrib3fv)) {
     static uint64_t egl_gl_count = 0;
-    if (egl_gl_count < 200)
+    static const uint64_t egl_gl_limit = [] {
+      const char *e = lunaria_env("LUNARIA_TRACE_GL_MAX");
+      return e ? strtoull(e, nullptr, 0) : 200ull;
+    }();
+    if (egl_gl_count < egl_gl_limit)
       fprintf(stderr, "[svc-eglgl] svc=%u r0=0x%" PRIx64 " r1=0x%" PRIx64 " r2=0x%" PRIx64 " "
                       "lr=0x%08x tid=%u #%llu\n",
               svc_no, r0, r1, r2, lr, g_current_tid,
@@ -32282,6 +32657,34 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     }
     if (nr == (ctx.is_arm64 ? 90u : 184u)) {
       raw_via_libc(SVC_CAPGET);
+      break;
+    }
+    /* AArch64 getrlimit(163) / setrlimit(164) / prlimit64(261): the libc entry points'
+     * implementation, which keeps the guest's limits so a read-back sees what was set. */
+    if (ctx.is_arm64 && (nr == 163u || nr == 164u)) {
+      raw_via_libc(nr == 163u ? SVC_GETRLIMIT : SVC_SETRLIMIT);
+      break;
+    }
+    if (ctx.is_arm64 && nr == 261u) {
+      /* prlimit64(pid, resource, new_limit*, old_limit*): only the calling process. */
+      const uint64_t pid = g_svc_args64[0], res = g_svc_args64[1];
+      const uint64_t nl = g_svc_args64[2], ol = g_svc_args64[3];
+      if (pid && pid != guest_pid()) {
+        ret64((uint64_t)-(int64_t)ESRCH);
+        break;
+      }
+      ret64(0);
+      if (ol) {
+        g_svc_args64[0] = res;
+        g_svc_args64[1] = ol;
+        raw_via_libc(SVC_GETRLIMIT);
+        if (g_svc_jit64 && g_svc_jit64->GetRegister(0)) break;
+      }
+      if (nl) {
+        g_svc_args64[0] = res;
+        g_svc_args64[1] = nl;
+        raw_via_libc(SVC_SETRLIMIT);
+      }
       break;
     }
     if (!ctx.is_arm64 && nr == 65) {
@@ -36402,10 +36805,14 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
   }
 
   // 113: GetStaticMethodID
-  case 113:
-    ret32(jni_guest_method_id(jvm->native.GetStaticMethodID(env, AS_CLASS(r1),
-                                          ARM_STR(r2), ARM_STR(r3))));
+  case 113: {
+    jmethodID mid = jvm->native.GetStaticMethodID(env, AS_CLASS(r1), ARM_STR(r2), ARM_STR(r3));
+    if (lunaria_env("LUNARIA_TRACE_JNI"))
+      fprintf(stderr, "[arm_jni] GetStaticMethodID(%s %s) cls=0x%x -> 0x%x\n", ARM_STR(r2), ARM_STR(r3),
+              (unsigned)r1, (unsigned)(uintptr_t)mid);
+    ret32(jni_guest_method_id(mid));
     break;
+  }
 
   // 114-143: CallStatic* stubs
   // CallStaticObjectMethod/V/A — dispatch special-cased static calls that need argument marshaling.
@@ -36877,9 +37284,13 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
   }
 
   // 171: GetArrayLength
-  case 171:
-    ret32((uint32_t)jvm->native.GetArrayLength(env, AS_ARR(r1)));
+  case 171: {
+    const jsize length = jvm->native.GetArrayLength(env, AS_ARR(r1));
+    if (lunaria_env("LUNARIA_TRACE_JNI"))
+      fprintf(stderr, "[arm_jni] GetArrayLength: handle=0x%x -> %d\n", (unsigned)r1, (int)length);
+    ret32((uint32_t)length);
     break;
+  }
 
   // 172-174: ObjectArray ops
   case 172: {
@@ -41403,6 +41814,10 @@ aaudio_write_retry:
         if (bound_tex)
           g_gl_tex_size[bound_tex] = {(GLsizei)r3, h};
       }
+      if (lunaria_env("LUNARIA_TRACE_TEX"))
+        fprintf(stderr, "[gl] TexImage2D tgt=0x%" PRIx64 " lv=%" PRIu64 " ifmt=0x%" PRIx64
+                        " %" PRIu64 "x%d fmt=0x%x type=0x%x data=%s\n",
+                r0, r1, r2, r3, (int)h, (unsigned)fmt, (unsigned)typ, pva ? "yes" : "null");
       const void *data = gl_unpack_ptr(ctx, pva);
       gl_trace_upload("Image", r0, r1, (int)r3, (int)h, 0, 0, fmt, typ,
                       data, (size_t)r3 * (size_t)h);
@@ -41548,7 +41963,17 @@ aaudio_write_retry:
     }
     break;
   case SVC_GL_DeleteFramebuffers:
-    if (pfn_glDeleteFramebuffers && r1) pfn_glDeleteFramebuffers((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1));
+    if (pfn_glDeleteFramebuffers && r1) {
+      const GLuint *names = (const GLuint*)ctx.mem.ptr(r1);
+      for (GLsizei i = 0; i < (GLsizei)r0; ++i) {
+        auto it = g_gl_fbo_ds.find(names[i]);
+        if (it == g_gl_fbo_ds.end()) continue;
+        if (it->second.packed && pfn_glDeleteRenderbuffers)
+          pfn_glDeleteRenderbuffers(1, &it->second.packed);
+        g_gl_fbo_ds.erase(it);
+      }
+      pfn_glDeleteFramebuffers((GLsizei)r0,names);
+    }
     break;
   case SVC_GL_CheckFramebufferStatus: {
     GLenum st = pfn_glCheckFramebufferStatus
@@ -41599,7 +42024,11 @@ aaudio_write_retry:
     }
     break;
   case SVC_GL_FramebufferRenderbuffer:
-    if (pfn_glFramebufferRenderbuffer) pfn_glFramebufferRenderbuffer((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLuint)r3);
+    if (pfn_glFramebufferRenderbuffer) {
+      pfn_glFramebufferRenderbuffer((GLenum)r0,(GLenum)r1,(GLenum)r2,(GLuint)r3);
+      if (r1 == 0x8D00u || r1 == 0x8D20u || r1 == 0x821Au)
+        gl_fbo_depth_stencil_attached((GLenum)r0, (GLenum)r1, (GLuint)r3);
+    }
     break;
   case SVC_GL_GetFramebufferAttachmentParameteriv:
     if (pfn_glGetFramebufferAttachmentParameteriv && r3)
@@ -41612,14 +42041,28 @@ aaudio_write_retry:
     break;
   case SVC_GL_BindRenderbuffer:
     if (pfn_glBindRenderbuffer) pfn_glBindRenderbuffer((GLenum)r0,(GLuint)r1);
+    g_gl_bound_rb = (GLuint)r1;
     break;
   case SVC_GL_DeleteRenderbuffers:
-    if (pfn_glDeleteRenderbuffers && r1) pfn_glDeleteRenderbuffers((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1));
+    if (pfn_glDeleteRenderbuffers && r1) {
+      const GLuint *names = (const GLuint*)ctx.mem.ptr(r1);
+      for (GLsizei i = 0; i < (GLsizei)r0; ++i) g_gl_rb_info.erase(names[i]);
+      pfn_glDeleteRenderbuffers((GLsizei)r0,names);
+    }
     break;
   case SVC_GL_RenderbufferStorage:
     if (pfn_glRenderbufferStorage) {
-      ArmLockDropped gl_unlocked;
-      pfn_glRenderbufferStorage((GLenum)r0,(GLenum)r1,(GLsizei)r2,(GLsizei)r3);
+      {
+        ArmLockDropped gl_unlocked;
+        pfn_glRenderbufferStorage((GLenum)r0,(GLenum)r1,(GLsizei)r2,(GLsizei)r3);
+      }
+      if (g_gl_bound_rb) {
+        g_gl_rb_info[g_gl_bound_rb] = { (GLsizei)r2, (GLsizei)r3 };
+        /* A packed pair follows the size of the depth renderbuffer it replaces. */
+        for (const auto &e : g_gl_fbo_ds)
+          if (e.second.packed && e.second.depth == g_gl_bound_rb)
+            gl_packed_ds_storage(e.second);
+      }
     }
     break;
 
@@ -42242,6 +42685,20 @@ aaudio_write_retry:
                             "mode=0x%" PRIx64 " count=%d type=0x%" PRIx64 " ibo=%u tid=%u\n",
                     e, r0, (int)r1, r2, g_gl_bound_elem_buf,
                     g_current_tid);
+          if (e == 0x506u && pfn_glCheckFramebufferStatus) {
+            GLint fbo = 0, t = 0, n = 0;
+            pfn_glGetIntegerv(0x8CA6, &fbo);
+            pfn_glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD0, &t);
+            pfn_glGetFramebufferAttachmentParameteriv(0x8D40, 0x8CE0, 0x8CD1, &n);
+            fprintf(stderr, "[gl]   fbo=%d status=0x%x color0 type=0x%x name=%d\n",
+                    fbo, pfn_glCheckFramebufferStatus(0x8D40), t, n);
+            for (GLenum at : {0x8D00u, 0x8D20u, 0x821Au}) {
+              GLint ty = 0, nm = 0;
+              pfn_glGetFramebufferAttachmentParameteriv(0x8D40, at, 0x8CD0, &ty);
+              pfn_glGetFramebufferAttachmentParameteriv(0x8D40, at, 0x8CD1, &nm);
+              fprintf(stderr, "[gl]   attach 0x%x type=0x%x name=%d\n", (unsigned)at, ty, nm);
+            }
+          }
         }
       }
       gl_trace_fb0_draw_after();
@@ -47003,8 +47460,26 @@ aaudio_write_retry:
         break;
       }
     }
+    if (advice == 4 /* MADV_DONTNEED */ && !ctx.is_arm64) {
+      /* A32: the same guarantee for a 4 KiB guest on 16 KiB host pages.  The
+       * range is zeroed in place (anonymous memory); private file mappings
+       * are then re-read from their file, as Linux does on the next touch. */
+      const uint32_t lo = (uint32_t)a & ~4095u;
+      const uint64_t hi = std::min<uint64_t>(((uint64_t)a + len + 4095u) & ~4095ull, 0xfffff000u);
+      if (luna_os_memory_zero(guest_mem_range(lo, (size_t)(hi - lo)), (size_t)(hi - lo)) != 0) {
+        arm_set_errno(ctx, errno);
+        ret32(~0u);
+      } else {
+        a32_dontneed_refill(lo, (uint32_t)hi, ctx);
+        ret32(0);
+      }
+      break;
+    }
 #endif
     if (luna_os_memory_advise(p, len, advice) != 0) {
+      if (lunaria_env("LUNARIA_TRACE_MMAP"))
+        fprintf(stderr, "[madvise] FAILED 0x%08llx+%zu advice=%d errno=%d\n",
+                (unsigned long long)a, len, advice, errno);
       arm_set_errno(ctx, errno);
       ret32(~0u);
     } else {
@@ -47416,11 +47891,20 @@ sigmask_done:
      *   0 dlpi_addr, 8 dlpi_name, 16 dlpi_phdr, 24 dlpi_phnum(+pad),
      *   32 dlpi_adds, 40 dlpi_subs, 48 dlpi_tls_modid, 56 dlpi_tls_data
      * = 64 bytes, and 40 on ILP32 (the two counters are 8-byte aligned). */
+    const uint64_t phdr_t0 = host_mono_ns();
     const uint32_t info_size = ctx.is_arm64 ? 64u : 40u;
-    uint64_t adds = 0;
-    for (const auto &m : g_module_phdrs)
-      if (m.process_pid == guest_pid() && m.is_64 == ctx.is_arm64)
-        ++adds;
+    /* bionic holds its dl lock for the whole walk, so the callback sees one consistent
+     * list and dlpi_adds is that list's length.  Another guest thread can dlopen() while
+     * a callback runs here (the execution lock is dropped around guest code); iterating
+     * the live vector then skips or repeats modules and dlpi_adds disagrees with what the
+     * walk delivered -- which an integrity check reads as injected code.  Walk a snapshot. */
+    const std::vector<ModulePhdr> modules = [&] {
+      std::vector<ModulePhdr> v;
+      for (const auto &m : g_module_phdrs)
+        if (m.process_pid == guest_pid() && m.is_64 == ctx.is_arm64) v.push_back(m);
+      return v;
+    }();
+    const uint64_t adds = modules.size();
     /* dl_iterate_phdr is how a C++ unwinder finds .eh_frame_hdr: it adds
      * dlpi_addr to the PT_GNU_EH_FRAME segment's p_vaddr and expects the table's
      * version byte (1) there. If the loader placed the segment anywhere else,
@@ -47455,6 +47939,13 @@ sigmask_done:
         }
       }
     }
+    if (lunaria_env("LUNARIA_TRACE_PHDR")) {
+      fprintf(stderr, "[phdr] tid=%u iterating %zu modules (adds=%llu):\n", g_current_tid, g_module_phdrs.size(),
+              (unsigned long long)adds);
+      for (const auto &m : g_module_phdrs)
+        if (m.process_pid == guest_pid() && m.is_64 == ctx.is_arm64)
+          fprintf(stderr, "[phdr]   bias=0x%llx %s\n", (unsigned long long)m.load_bias, ctx.mem.cstr(m.name_va) ?: "?");
+    }
     /* One record serves every module: the callback gets it by pointer for the
      * duration of its call, and each pass rewrites every field. */
     const uint32_t info_backing = arm_malloc(ctx, info_size);
@@ -47464,9 +47955,7 @@ sigmask_done:
     }
     const GuestVA info = ctx.is_arm64 ? a64_guest_va(info_backing)
                          : (GuestVA)info_backing;
-    for (const auto &m : g_module_phdrs) {
-      if (m.process_pid != guest_pid()) continue;
-      if (m.is_64 != ctx.is_arm64) continue;
+    for (const auto &m : modules) {
       memset(ctx.mem.ptr(info), 0, info_size);
       if (ctx.is_arm64) {
         ctx.mem.write64(info + 0u, m.load_bias);
@@ -47500,6 +47989,8 @@ sigmask_done:
       if (callback_rc != 0) break; /* POSIX/bionic early-stop contract */
     }
     arm_free(ctx, info_backing);
+    if (lunaria_env("LUNARIA_TRACE_PHDR"))
+      fprintf(stderr, "[phdr] tid=%u walk took %.3f ms\n", g_current_tid, (double)(host_mono_ns() - phdr_t0) / 1e6);
     ret32((uint32_t)callback_rc);
     break;
   }
@@ -52455,6 +52946,8 @@ fputws_done:
     GuestVA handle = sysprop_exists(ctx, name)
                      ? sysprop_find_or_create(ctx, name)
                      : 0;
+    if (lunaria_env("LUNARIA_TRACE_PROP"))
+      fprintf(stderr, "[prop] find %s -> %s\n", name ? name : "(null)", handle ? "found" : "absent");
     if (ctx.is_arm64) ret64(handle);
     else ret32((uint32_t)handle);
     break;
@@ -53761,7 +54254,7 @@ fputws_done:
     const char *path = ctx.mem.cstr(r0);
     char od_mapped[PATH_MAX];
     path = map_guest_path(path, od_mapped, sizeof od_mapped);
-    if (!path) {
+    if (!path || guest_dev_directory_denied(path)) {
       arm_set_errno(ctx,errno);
       retptr(0);
       break;
@@ -55651,6 +56144,10 @@ fputws_done:
         break;
       }
       const ptrdiff_t answered = synth_proc_readlink(path, buffer, capacity);
+      if (lunaria_env("LUNARIA_TRACE_PROC"))
+        fprintf(stderr, "[proc] readlink %s -> %.*s%s (%td, errno=%d)\n", path,
+                answered > 0 ? (int)answered : 0, answered > 0 ? buffer : "",
+                answered < 0 ? "<error>" : "", answered, answered < 0 ? errno : 0);
       RET_SSIZE_ERRNO(answered);
       break;
     }
@@ -55741,7 +56238,7 @@ fputws_done:
       ret32(0);
       break;
     }
-    if (out) write_guest_tm(ctx, out, tmv, offset);
+    if (out) write_guest_tm(ctx, out, tmv, offset, svc_no == SVC_LOCALTIME_R);
     ret32(out);
     break;
   }
@@ -55766,7 +56263,7 @@ fputws_done:
       ret32(0);
       break;
     }
-    if (tm_static) write_guest_tm(ctx, tm_static, tmv, offset);
+    if (tm_static) write_guest_tm(ctx, tm_static, tmv, offset, svc_no == SVC_LOCALTIME);
     retptr(tm_static);
     /* Spin detection: LR, r0 (the time_t address) and the broken-down time, the
      * first few times and then periodically. Name which of the two calls this
@@ -56155,7 +56652,7 @@ fputws_done:
         ctx.mem.write32(eva, (uint32_t)err);
       ret32((uint32_t)-1);
     };
-    if (!path) {
+    if (!path || guest_dev_directory_denied(path)) {
       sd_fail(errno);
       break;
     }
@@ -56787,7 +57284,16 @@ pv_done:
     int rc;
     {
       ArmLockDropped unlocked;
+#ifdef __APPLE__
+      /* Darwin has no posix_fadvise; the call is a pure hint, so keep its
+       * error contract (EBADF / EINVAL, returned not via errno) and succeed. */
+      if (fcntl(fd, F_GETFD) < 0) rc = EBADF;
+      else if (advice < 0 || advice > 5) rc = EINVAL;
+      else rc = 0;
+      (void)offset; (void)length;
+#else
       rc = posix_fadvise(fd, (off_t)offset, (off_t)length, advice);
+#endif
     }
     ret32((uint32_t)rc);
     break;
@@ -58468,21 +58974,10 @@ mbsrtowcs_done:
     ret64((uint64_t)llrint(d));
     break;
   }
-  case SVC_GETPROGNAME: {
-    /* bionic's __progname is argv[0]'s basename, and every app process is a
-     * fork of the zygote, whose argv[0] is app_process. */
-    static GuestVA name_va[2];
-    GuestVA &va = name_va[ctx.is_arm64 ? 1 : 0];
-    if (!va) {
-      static const char kName32[] = "app_process32", kName64[] = "app_process64";
-      const char *text = ctx.is_arm64 ? kName64 : kName32;
-      const size_t n = (ctx.is_arm64 ? sizeof kName64 : sizeof kName32);
-      va = arm_malloc(ctx, n);
-      if (va) memcpy(ctx.mem.ptr(va), text, n);
-    }
-    retptr((uint32_t)va);
+  case SVC_GETPROGNAME:
+    /* The string __progname points at: the process name (see the data setup). */
+    retptr(misc_progname_str());
     break;
-  }
   case SVC_GETRANDOM: {
     /* getrandom(buf, len, flags): the entropy pool is always ready here, so
      * neither GRND_NONBLOCK (1) nor GRND_RANDOM (2) changes the answer. */
@@ -64006,6 +64501,13 @@ static void build_misc_data_page(ArmExecCtx &ctx) {
    * internals); publish the small process environment an Android zygote
    * child normally inherits. */
   guest_env_publish(ctx);
+  {
+    char name[MISC_PROGNAME_MAX];
+    snprintf(name, sizeof name, "%s", guest_process_name());
+    memcpy(ctx.mem.ptr(misc_progname_str()), name, strlen(name) + 1);
+    if (ctx.is_arm64) ctx.mem.write64(misc_progname(), a64_guest_va(misc_progname_str()));
+    else              ctx.mem.write32(misc_progname(), misc_progname_str());
+  }
   /* The stack-protector cookie.  bionic randomises it once per process and
    * mirrors it into every thread's TLS_SLOT_STACK_GUARD; do the same. */
   stack_chk_guard_publish(ctx);
@@ -70175,11 +70677,58 @@ a64_hooks_done:
     }
     const A64SoftFpAbi *softfp = svc_attr.softfp;
 
+    /* LUNARIA_DUMP_EXEC=<dir>: write every range the guest makes executable with a raw
+     * mprotect (a packer's second stage, a JIT region) to <dir>/exec_<addr>.bin, and the
+     * same range again the first time code inside it makes a syscall
+     * (exec_<addr>_run.bin: by then a self-decrypting stage has unpacked itself). */
+    if (!svc_no) {
+      static const char *dump_dir = lunaria_env("LUNARIA_DUMP_EXEC");
+      struct ExecRange { uint64_t lo, len; bool ran; };
+      static std::vector<ExecRange> exec_ranges;
+      auto dump = [&](const ExecRange &r, const char *tag) {
+        const void *src = ctx->mem.ptr((GuestVA)r.lo);
+        char name[PATH_MAX];
+        snprintf(name, sizeof name, "%s/exec_%llx%s.bin", dump_dir, (unsigned long long)r.lo, tag);
+        if (FILE *f = src ? fopen(name, "wb") : nullptr) {
+          fwrite(src, 1, (size_t)r.len, f);
+          fclose(f);
+          fprintf(stderr, "[dump-exec] 0x%llx+0x%llx -> %s\n", (unsigned long long)r.lo,
+                  (unsigned long long)r.len, name);
+        }
+      };
+      if (dump_dir) {
+        if (jit64->GetRegister(8) == 226 && (x2 & 4) && x1 && x1 <= (64u << 20)) {
+          exec_ranges.push_back({ x0, x1, false });
+          dump(exec_ranges.back(), "");
+        }
+        for (auto &r : exec_ranges)
+          if (!r.ran && x30 >= r.lo && x30 < r.lo + r.len) {
+            r.ran = true;
+            dump(r, "_run");
+          }
+      }
+    }
     static const bool trace_svc64 = lunaria_env("LUNARIA_TRACE_SVC") != nullptr;
     if (trace_svc64) {
-      fprintf(stderr, "[svc64] %u x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx lr=0x%llx\n",
-              svc_no, (unsigned long long)x0, (unsigned long long)x1,
+      /* A raw `svc #0` carries the kernel syscall number in x8. */
+      fprintf(stderr, "[svc64] %u(%s) x8=%llu x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx lr=0x%llx\n",
+              svc_no, svc_symbol_name(svc_no),
+              (unsigned long long)(svc_no ? 0u : jit64->GetRegister(8)),
+              (unsigned long long)x0, (unsigned long long)x1,
               (unsigned long long)x2, (unsigned long long)x3, (unsigned long long)x30);
+      if (svc_no && !strcmp(svc_symbol_name(svc_no), "vsnprintf"))
+        fprintf(stderr, "[svc64]   vsnprintf fmt=\"%.100s\"\n", ctx->mem.cstr((GuestVA)x2));
+      if (svc_no && !strcmp(svc_symbol_name(svc_no), "dlsym"))
+        fprintf(stderr, "[svc64]   dlsym(0x%llx, \"%.100s\")\n", (unsigned long long)x0,
+                ctx->mem.cstr((GuestVA)x1));
+      if (svc_no && !strcmp(svc_symbol_name(svc_no), "getenv"))
+        fprintf(stderr, "[svc64]   getenv(\"%.100s\")\n", ctx->mem.cstr((GuestVA)x0));
+      /* Raw path-taking syscalls: openat, faccessat, readlinkat, newfstatat. */
+      if (!svc_no) {
+        const uint64_t nr = jit64->GetRegister(8);
+        if (nr == 56 || nr == 48 || nr == 78 || nr == 79)
+          fprintf(stderr, "[svc64]   path=\"%.200s\"\n", ctx->mem.cstr((GuestVA)x1));
+      }
     }
     /* x8 is the AArch64 kernel syscall number, read before the adapter
      * normalises it into the A32 numbering the dispatcher switches on. */
@@ -75672,6 +76221,10 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
     if (first)
       fprintf(stderr, "[dvm] native %s.%s%s -> 0x%llx (%d args)\n",
               klass, method, sig, (unsigned long long)fn, ng - 2);
+    /* LUNARIA_TRACE_NATIVE=<substring>: every call of the natives whose name contains it. */
+    static const char *const watch = lunaria_env("LUNARIA_TRACE_NATIVE");
+    if (watch && *watch && key.find(watch) != std::string::npos)
+      fprintf(stderr, "[native-call] %s.%s tid=%u\n", klass, method, g_current_tid);
   }
 
   /* A Runnable delivered by the host pump is a Java/ART thread too, but it
@@ -75785,6 +76338,9 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
             jvm_bridge_ref_count(native_jvm,native_result),
             (unsigned long long)arm_exec_jni_thread_token());
   if (ret == 'L') rv.u = (uintptr_t)native_result;
+  if (ret == 'L' && !native_result && lunaria_env("LUNARIA_TRACE_NATIVE_NULL"))
+    fprintf(stderr, "[native-null] %s.%s%s tid=%u args=%d,%d,%d\n", klass, method, sig, g_current_tid,
+            nargs > 0 ? args[0].i : 0, nargs > 1 ? args[1].i : 0, nargs > 2 ? args[2].i : 0);
   if (trace_download) {
     const auto elapsed = std::chrono::steady_clock::now() - download_start;
     fprintf(stderr, "[download-cb] return value=%llu elapsed_ms=%lld tid=%u\n",
@@ -76755,8 +77311,85 @@ extern "C" int  arm64_exec_glfw_should_close(void)       {
   return arm_exec_glfw_should_close();
 }
 
+/* LUNARIA_WATCH_GUEST=<hex address>[,<hex address>...]: a diagnostic that reports when a guest
+ * 32-bit word changes, and the SVCs the guest had just made.  Guest memory is host memory at the
+ * same address, so a poller can read it; an address nothing has mapped yet is skipped (a write()
+ * of it to a pipe fails with EFAULT instead of faulting this process).  It answers "when was this
+ * flag set" for code that cannot be read, such as a packed security module; the PC that wrote it
+ * is not known, only what the guest was doing around it. */
+static void guest_watch_run(std::vector<uintptr_t> addrs) {
+  int fds[2];
+  if (pipe(fds)) return;
+  std::vector<uint32_t> last(addrs.size(), 0);
+  std::vector<bool> seen(addrs.size(), false);
+  const uint64_t t0 = host_mono_ns();
+  for (;;) {
+    for (size_t i = 0; i < addrs.size(); ++i) {
+      uint32_t value;
+      if (write(fds[1], (const void *)addrs[i], sizeof value) != (ssize_t)sizeof value) continue;
+      if (read(fds[0], &value, sizeof value) != (ssize_t)sizeof value) continue;
+      if (seen[i] && value == last[i]) continue;
+      const bool quiet = !seen[i];   /* a range's first sighting of every word is noise */
+      if (!quiet || addrs.size() <= 16)
+        fprintf(stderr, "[watch] +%.3fs %#lx: %s0x%x -> 0x%x\n", (double)(host_mono_ns() - t0) / 1e9,
+                (unsigned long)addrs[i], seen[i] ? "" : "(first seen) ", last[i], value);
+      seen[i] = true;
+      last[i] = value;
+      if (quiet) continue;
+      /* LUNARIA_WATCH_DUMP=<hex address>:<bytes>[,...]: guest memory to show with every change. */
+      if (const char *dump = lunaria_env("LUNARIA_WATCH_DUMP")) {
+        for (const char *d = dump; *d;) {
+          char *e1;
+          const unsigned long long a = strtoull(d, &e1, 16);
+          if (*e1 != ':') break;
+          char *e2;
+          const unsigned long n = strtoul(e1 + 1, &e2, 10);
+          fprintf(stderr, "[watch]   dump %#llx:", a);
+          for (unsigned long k = 0; k < n && k < 4096; ++k) {
+            uint8_t byte;
+            if (write(fds[1], (const void *)(uintptr_t)(a + k), 1) != 1 || read(fds[0], &byte, 1) != 1) { fprintf(stderr, " ??"); break; }
+            fprintf(stderr, " %02x", byte);
+          }
+          fprintf(stderr, "\n");
+          d = *e2 == ',' ? e2 + 1 : e2;
+        }
+      }
+      /* LUNARIA_WATCH_CONTEXT=<n>: how many of the guest's latest SVCs to print per change. */
+      static const uint32_t depth = [&addrs] {
+        const char *e = lunaria_env("LUNARIA_WATCH_CONTEXT");
+        const unsigned long n = e ? strtoul(e, nullptr, 10) : 0;
+        return n ? (uint32_t)std::min<unsigned long>(n, 1000) : (addrs.size() > 16 ? 2u : 8u);
+      }();
+      const uint32_t end = g_svc_ring_pos;
+      for (uint32_t k = end > depth ? end - depth : 0; k < end; ++k) {
+        const SvcTraceEnt &e = g_svc_ring[k & 1023];
+        fprintf(stderr, "[watch]     svc=%u(%s) tid=%u lr=0x%x\n", e.svc, svc_symbol_name(e.svc), e.tid, e.lr);
+      }
+    }
+    usleep(100);
+  }
+}
+static void guest_watch_start(void) {
+  const char *list = lunaria_env("LUNARIA_WATCH_GUEST");
+  if (!list || !*list) return;
+  std::vector<uintptr_t> addrs;
+  for (const char *p = list; *p;) {
+    char *end;
+    const unsigned long long a = strtoull(p, &end, 16);
+    if (end == p) break;
+    addrs.push_back((uintptr_t)a);
+    if (*end == '-') {   /* <first>-<last>: every word in the range */
+      const unsigned long long b = strtoull(end + 1, &end, 16);
+      for (unsigned long long w = a + 4; w < b && addrs.size() < 65536; w += 4) addrs.push_back((uintptr_t)w);
+    }
+    p = *end == ',' ? end + 1 : end;
+  }
+  if (!addrs.empty()) std::thread(guest_watch_run, std::move(addrs)).detach();
+}
+
 // The loader declares which of the two shapes above applies before it starts the engine; see g_a64_worker_engine.
 extern "C" void arm64_exec_threads_run_engine(int on) {
+  guest_watch_start();
   g_a64_worker_engine = on != 0;
   fprintf(stderr, "[sched64] engine runs on guest threads: %s\n",
           on ? "yes (adaptive slice)" : "no (flat slice)");

@@ -517,10 +517,32 @@ static bool x_os_sysconf(struct dvm *vm, dvm_ref self, const union dvm_value *ar
 {
   (void)self;
   (void)nargs;
-  /* The bionic _SC_ values apps ask for. */
+  /* bionic bits/sysconf.h numbering, answered from the guest's own profile
+   * (same values as the libc sysconf thunk), never from the host. */
   const int name = ARG(0).i;
-  long v = sysconf(name == 0x27 ? _SC_PAGESIZE : name == 0x60 ? _SC_NPROCESSORS_CONF : name == 0x61 ? _SC_NPROCESSORS_ONLN
-                   : name == 0x02 ? _SC_CLK_TCK : name == 0x28 ? _SC_PHYS_PAGES : name == 0x29 ? _SC_AVPHYS_PAGES : -1);
+  long v;
+  switch (name) {
+  case 39: /* _SC_PAGESIZE */
+  case 40: /* _SC_PAGE_SIZE */
+    v = 4096;
+    break;
+  case 96: /* _SC_NPROCESSORS_CONF */
+  case 97: /* _SC_NPROCESSORS_ONLN */
+    v = (long)lunaria_cpu_count();
+    break;
+  case 6: /* _SC_CLK_TCK */
+    v = 100;
+    break;
+  case 98: /* _SC_PHYS_PAGES */
+    v = (long)(lunaria_mem_total_bytes() / 4096ull);
+    break;
+  case 99: /* _SC_AVPHYS_PAGES */
+    v = (long)(lunaria_mem_avail_bytes() / 4096ull);
+    break;
+  default:
+    v = -1;
+    break;
+  }
   if (v < 0) {
     dvm__throw(vm, "android/system/ErrnoException", "sysconf failed: EINVAL (Invalid argument)");
     return false;

@@ -10244,6 +10244,235 @@ void dvm__activity_visible(struct dvm *vm, dvm_ref activity)
   act_reconcile_visibility(vm);
 }
 
+/* android:launchMode of one of this app's activities (0 standard, 1 singleTop, 2 singleTask,
+ * 3 singleInstance), from the manifest rows. */
+static int act_launch_mode(const char *dotted_class)
+{
+  const char *table = getenv("ANDROID_ACTIVITIES");
+  char want[512];
+  snprintf(want, sizeof want, "%s|", dotted_class);
+  for (const char *row = table; row && *row; ) {
+    const char *eol = strchr(row, '\n');
+    if (!strncmp(row, want, strlen(want))) {
+      const char *f = row;
+      for (int i = 0; i < 5 && f && (!eol || f < eol); ++i) { f = strchr(f, '|'); if (f) ++f; }
+      return f && (!eol || f < eol) ? atoi(f) : 0;
+    }
+    row = eol ? eol + 1 : NULL;
+  }
+  return 0;
+}
+
+/* ---- The system browser ---------------------------------------------------
+ *
+ * Android hands ACTION_VIEW on an http(s) URL to the device's browser (Chrome, or a Custom
+ * Tab on top of it).  This device has none installed, so the page is shown in a WebView
+ * window of the emulator's own, and its navigations are the browser's to follow the way
+ * Chrome does: a link or redirect to a scheme the browser cannot show (`intent:` URIs and
+ * app schemes such as lineauth://) is an Intent for the app that declares it -- LINE
+ * Login's redirect returns to the game that way.  One page at a time, like a Custom Tab. */
+static dvm_ref g_browser_dialog, g_browser_view, g_browser_caller;
+
+static bool browser_is_web_url(const char *u)
+{
+  return u && (!strncasecmp(u, "http://", 7) || !strncasecmp(u, "https://", 8) ||
+               !strncasecmp(u, "about:", 6) || !strncasecmp(u, "data:", 5) ||
+               !strncasecmp(u, "blob:", 5) || !strncasecmp(u, "javascript:", 11));
+}
+
+static void browser_close(struct dvm *vm)
+{
+  union dvm_value ignored = { 0 };
+  if (g_browser_dialog) {
+    (void)am_vcall(vm, g_browser_dialog, "dismiss", "()V", NULL, 0, &ignored);
+    dvm_unpin(vm, g_browser_dialog);
+  }
+  if (g_browser_view) dvm_unpin(vm, g_browser_view);
+  if (g_browser_caller) dvm_unpin(vm, g_browser_caller);
+  g_browser_dialog = g_browser_view = g_browser_caller = 0;
+}
+
+/* The Intent a non-web URL stands for.  "intent://host/path#Intent;scheme=s;package=p;S.k=v;end"
+ * is Chrome's own encoding (Intent.toUri(URI_INTENT_SCHEME)); any other scheme is a plain VIEW. */
+static dvm_ref browser_intent_for(struct dvm *vm, const char *url)
+{
+  dvm_ref intent = dvm_new_object(vm, dvm__class_by_desc(vm, "Landroid/content/Intent;"));
+  if (!intent) return 0;
+  union dvm_value action = { .l = dvm_new_string(vm, "android.intent.action.VIEW") }, ignored = { 0 };
+  if (!intent_init(vm, intent, &action, 1, &ignored)) return 0;
+  char *data = strdup(url);
+  if (!data) return 0;
+  if (!strncasecmp(url, "intent:", 7)) {
+    char *frag = strstr(data, "#Intent;");
+    char scheme[64] = "", package[256] = "", act[256] = "", *extras[8] = { 0 };
+    int nextras = 0;
+    if (frag) {
+      *frag = '\0';
+      for (char *tok = strtok(frag + 8, ";"); tok; tok = strtok(NULL, ";")) {
+        if (!strncmp(tok, "scheme=", 7)) snprintf(scheme, sizeof scheme, "%s", tok + 7);
+        else if (!strncmp(tok, "package=", 8)) snprintf(package, sizeof package, "%s", tok + 8);
+        else if (!strncmp(tok, "action=", 7)) snprintf(act, sizeof act, "%s", tok + 7);
+        else if (!strncmp(tok, "S.", 2) && nextras < 8) extras[nextras++] = tok + 2;
+      }
+    }
+    /* data = scheme: + what follows "intent:" ("//host/path?query") */
+    char *rest = data + 7;
+    size_t n = strlen(scheme) + 1 + strlen(rest) + 1;
+    char *composed = malloc(n);
+    if (!composed) { free(data); return 0; }
+    snprintf(composed, n, "%s:%s", scheme[0] ? scheme : "intent", rest);
+    union dvm_value u = { 0 };
+    union dvm_value text = { .l = dvm_new_string(vm, composed) };
+    (void)uri_parse(vm, 0, &text, 1, &u);
+    free(composed);
+    union dvm_value ud = { .l = u.l };
+    (void)am_vcall(vm, intent, "setData", "(Landroid/net/Uri;)Landroid/content/Intent;", &ud, 1, &ignored);
+    if (act[0]) {
+      union dvm_value a = { .l = dvm_new_string(vm, act) };
+      (void)am_vcall(vm, intent, "setAction", "(Ljava/lang/String;)Landroid/content/Intent;", &a, 1, &ignored);
+    }
+    if (package[0]) {
+      union dvm_value a = { .l = dvm_new_string(vm, package) };
+      (void)am_vcall(vm, intent, "setPackage", "(Ljava/lang/String;)Landroid/content/Intent;", &a, 1, &ignored);
+    }
+    for (int i = 0; i < nextras; ++i) {
+      char *eq = strchr(extras[i], '=');
+      if (!eq) continue;
+      *eq = '\0';
+      union dvm_value kv[2] = { { .l = dvm_new_string(vm, extras[i]) }, { .l = dvm_new_string(vm, eq + 1) } };
+      (void)am_vcall(vm, intent, "putExtra", "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;", kv, 2, &ignored);
+    }
+  } else {
+    union dvm_value u = { 0 };
+    union dvm_value text = { .l = dvm_new_string(vm, url) };
+    (void)uri_parse(vm, 0, &text, 1, &u);
+    union dvm_value ud = { .l = u.l };
+    (void)am_vcall(vm, intent, "setData", "(Landroid/net/Uri;)Landroid/content/Intent;", &ud, 1, &ignored);
+  }
+  free(data);
+  return intent;
+}
+
+static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
+                             bool from_activity, bool for_result, int32_t request_code);
+
+/* WebViewClient.shouldOverrideUrlLoading of the browser window. */
+static bool browser_client_override(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                    int nargs, union dvm_value *out)
+{
+  (void)self;
+  const char *url = NULL;
+  union dvm_value text = { 0 };
+  if (nargs >= 2 && args[1].l) {
+    struct dvm_object *o = dvm__obj(vm, args[1].l);
+    if (o && o->cls && !strcmp(o->cls->name, "java/lang/String")) url = dvm_string_utf8(vm, args[1].l);
+    else {
+      union dvm_value uri = { 0 };
+      if (am_vcall(vm, args[1].l, "getUrl", "()Landroid/net/Uri;", NULL, 0, &uri) && uri.l &&
+          am_vcall(vm, uri.l, "toString", "()Ljava/lang/String;", NULL, 0, &text) && text.l)
+        url = dvm_string_utf8(vm, text.l);
+    }
+  }
+  if (!url || browser_is_web_url(url)) RETI(0);
+  dvm_ref intent = browser_intent_for(vm, url);
+  dvm_ref caller = g_browser_caller;
+  if (dvm__env("LUNARIA_WEB_TRACE")) fprintf(stderr, "[browser] %s -> an Intent for the app\n", url);
+  if (intent && caller) {
+    dvm_pin(vm, caller);
+    browser_close(vm);
+    if (!act_start_common(vm, caller, intent, true, false, 0) && dvm_exception(vm)) {
+      char how[256];
+      dvm_describe_exception(vm, dvm_exception(vm), how, sizeof how);
+      fprintf(stderr, "[browser] %s: %s\n", url, how);
+      dvm_clear_exception(vm);
+    }
+    dvm_unpin(vm, caller);
+  }
+  RETI(1);
+}
+
+static const struct rt_method rt_browser_client[] = {
+  M("shouldOverrideUrlLoading", "(Landroid/webkit/WebView;Ljava/lang/String;)Z", browser_client_override),
+  M("shouldOverrideUrlLoading", "(Landroid/webkit/WebView;Landroid/webkit/WebResourceRequest;)Z", browser_client_override),
+  M_END,
+};
+
+/* ACTION_VIEW on a web URL that no installed app handles: show it. */
+static bool browser_show(struct dvm *vm, dvm_ref caller, dvm_ref intent)
+{
+  union dvm_value uri = { 0 }, text = { 0 }, ignored = { 0 };
+  if (!intent || !dvm_get_field(vm, intent, "data", "Landroid/net/Uri;", &uri) || !uri.l ||
+      !am_vcall(vm, uri.l, "toString", "()Ljava/lang/String;", NULL, 0, &text) || !text.l)
+    return false;
+  const char *url = dvm_string_utf8(vm, text.l);
+  if (!browser_is_web_url(url) || !caller) return false;
+  browser_close(vm);
+
+  struct dvm_class *wc = dvm__class_by_desc(vm, "Landroid/webkit/WebView;");
+  struct dvm_class *dc = dvm__class_by_desc(vm, "Landroid/app/Dialog;");
+  struct dvm_class *cc = dvm__class_by_desc(vm, "Llunaria/BrowserClient;");
+  struct dvm_class *lc = dvm__class_by_desc(vm, "Landroid/view/ViewGroup$LayoutParams;");
+  dvm_ref view = wc ? dvm_new_object(vm, wc) : 0, dialog = dc ? dvm_new_object(vm, dc) : 0;
+  dvm_ref client = cc ? dvm_new_object(vm, cc) : 0, params = lc ? dvm_new_object(vm, lc) : 0;
+  if (!view || !dialog || !client || !params) return false;
+  union dvm_value ctx = { .l = caller };
+  struct dvm_method *init = dvm_find_method(vm, wc, "<init>", "(Landroid/content/Context;)V");
+  if (!init || !dvm_call(vm, init, view, &ctx, 1, &ignored)) return false;
+  init = dvm_find_method(vm, dc, "<init>", "(Landroid/content/Context;)V");
+  if (!init || !dvm_call(vm, init, dialog, &ctx, 1, &ignored)) return false;
+  union dvm_value wh[2] = { { .i = -1 }, { .i = -1 } };
+  init = dvm_find_method(vm, lc, "<init>", "(II)V");
+  if (init) (void)dvm_call(vm, init, params, wh, 2, &ignored);
+  dvm_pin(vm, view);
+  dvm_pin(vm, dialog);
+  dvm_pin(vm, caller);
+  g_browser_view = view;
+  g_browser_dialog = dialog;
+  g_browser_caller = caller;
+  union dvm_value settings = { 0 }, on = { .i = 1 };
+  if (am_vcall(vm, view, "getSettings", "()Landroid/webkit/WebSettings;", NULL, 0, &settings) && settings.l) {
+    (void)am_vcall(vm, settings.l, "setJavaScriptEnabled", "(Z)V", &on, 1, &ignored);
+    (void)am_vcall(vm, settings.l, "setDomStorageEnabled", "(Z)V", &on, 1, &ignored);
+  }
+  union dvm_value cl = { .l = client };
+  (void)am_vcall(vm, view, "setWebViewClient", "(Landroid/webkit/WebViewClient;)V", &cl, 1, &ignored);
+  union dvm_value cv[2] = { { .l = view }, { .l = params } };
+  (void)am_vcall(vm, dialog, "setContentView", "(Landroid/view/View;Landroid/view/ViewGroup$LayoutParams;)V", cv, 2, &ignored);
+  (void)am_vcall(vm, dialog, "show", "()V", NULL, 0, &ignored);
+  union dvm_value u = { .l = text.l };
+  (void)am_vcall(vm, view, "loadUrl", "(Ljava/lang/String;)V", &u, 1, &ignored);
+  fprintf(stderr, "[browser] showing %s\n", url);
+  return true;
+}
+
+/* Like any activity start, the browser appears once the requesting activity has finished its
+ * own lifecycle step: an activity that starts one from onResume() is made visible after that
+ * returns, and a window opened before then would end up beneath it. */
+static dvm_ref g_browser_pending_intent, g_browser_pending_caller;
+static bool browser_open(struct dvm *vm, dvm_ref caller, dvm_ref intent)
+{
+  union dvm_value uri = { 0 }, text = { 0 };
+  if (!intent || !caller || !dvm_get_field(vm, intent, "data", "Landroid/net/Uri;", &uri) || !uri.l ||
+      !am_vcall(vm, uri.l, "toString", "()Ljava/lang/String;", NULL, 0, &text) || !text.l ||
+      !browser_is_web_url(dvm_string_utf8(vm, text.l)))
+    return false;
+  if (g_browser_pending_intent) { dvm_unpin(vm, g_browser_pending_intent); dvm_unpin(vm, g_browser_pending_caller); }
+  dvm_pin(vm, intent);
+  dvm_pin(vm, caller);
+  g_browser_pending_intent = intent;
+  g_browser_pending_caller = caller;
+  return true;
+}
+static void browser_flush(struct dvm *vm)
+{
+  if (!g_browser_pending_intent) return;
+  dvm_ref intent = g_browser_pending_intent, caller = g_browser_pending_caller;
+  g_browser_pending_intent = g_browser_pending_caller = 0;
+  if (!browser_show(vm, caller, intent) && dvm_exception(vm)) dvm_clear_exception(vm);
+  dvm_unpin(vm, intent);
+  dvm_unpin(vm, caller);
+}
+
 static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
                              bool from_activity, bool for_result,
                              int32_t request_code)
@@ -10293,6 +10522,11 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
     const char *running=getenv("ANDROID_PROCESS_NAME");
     if (owner && ((!current || strcmp(owner,current)) ||
         (running && destination && strcmp(running,destination)))) remote_owner=owner;
+    if (remote_owner && !strcmp(remote_owner,LUNA_BROWSER_PACKAGE)) {
+      if (browser_open(vm,from_activity ? self : 0,intent)) return true;
+      dvm__throw(vm,"android/content/ActivityNotFoundException","No Activity found to handle Intent");
+      return false;
+    }
     if (remote_owner) {
       union dvm_value exported={0}, permission={0}, app_info={0}, uid={0};
       dvm_get_field(vm,info.l,"exported","Z",&exported);
@@ -10349,6 +10583,8 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
       fprintf(stderr, "[activity]   %s=%u %s\n", *f, (unsigned)v.l, text.l ? dvm_string_utf8(vm, text.l) : "");
     }
   }
+  if ((!cls || !cls->dex) && !remote_owner && !resolved.l && from_activity && browser_open(vm, self, intent))
+    return true;
   if (!cls || !cls->dex) {
     if (remote_owner) luna_overlay_google_activity(remote_owner,false);
     union dvm_value act = { 0 };
@@ -10359,6 +10595,34 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
                a ? "act=" : "", a ? a : "");
     return false;
   }
+  /* An instance that is already running takes the Intent in onNewIntent() instead of a new
+   * one being made: singleTop at the top of the stack or FLAG_ACTIVITY_SINGLE_TOP, and
+   * singleTask / CLEAR_TOP, which first finishes what is above it. */
+  {
+    char dotted[512];
+    snprintf(dotted, sizeof dotted, "%s", cls->name);
+    for (char *q = dotted; *q; ++q) if (*q == '/') *q = '.';
+    const int mode = act_launch_mode(dotted);
+    const bool single_top = mode == 1 || (fl.i & 0x20000000);
+    const bool clear_top = (fl.i & 0x04000000) || mode >= 2;
+    int at = -1;
+    for (int i = g_nacts - 1; i >= 0 && at < 0; --i) {
+      struct dvm_class *ac = dvm_object_class(vm, g_acts[i].activity);
+      if (ac == cls) at = i;
+    }
+    if (at >= 0 && ((at == g_nacts - 1 && single_top) || clear_top)) {
+      union dvm_value ignored = { 0 };
+      for (int i = g_nacts - 1; i > at; --i)
+        (void)am_vcall(vm, g_acts[i].activity, "finish", "()V", NULL, 0, &ignored);
+      if (at < g_nacts - 1 && !single_top && mode == 0) goto launch_new; /* CLEAR_TOP alone recreates */
+      union dvm_value ni = { .l = intent };
+      fprintf(stderr, "[activity] onNewIntent %s\n", cls->name);
+      (void)am_vcall(vm, g_acts[at].activity, "onNewIntent", "(Landroid/content/Intent;)V", &ni, 1, &ignored);
+      if (dvm_exception(vm)) dvm_clear_exception(vm);
+      return true;
+    }
+  }
+launch_new:
   if (g_nact_launches >= (int)(sizeof g_act_launches / sizeof g_act_launches[0])) {
     fprintf(stderr, "[activity] launch queue full; %s dropped\n", cls->name);
     return true;
@@ -10678,6 +10942,8 @@ static void act_do_finish(struct dvm *vm, dvm_ref activity)
     (void)dvm_get_field(vm, activity, "resultCode", "I", &code);
     (void)dvm_get_field(vm, activity, "resultData", "Landroid/content/Intent;", &data);
     union dvm_value a[3] = { { .i = rec.request_code }, { .i = code.i }, { .l = data.l } };
+    fprintf(stderr, "[activity] result for request %d: code %d%s\n", rec.request_code, code.i,
+            data.l ? " with data" : "");
     act_call(vm, rec.caller, "onActivityResult", "(IILandroid/content/Intent;)V", a, 3);
     dvm_unpin(vm, rec.caller);
   }
@@ -10784,6 +11050,7 @@ static void act_tick(struct dvm *vm)
     if (l.component) dvm_unpin(vm, l.component);
     if (l.caller) dvm_unpin(vm, l.caller);
   }
+  browser_flush(vm);
 }
 
 unsigned dvm_activity_state(struct dvm *vm)

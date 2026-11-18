@@ -788,6 +788,27 @@ ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
   }
 }
 
+/* eventfd write(): an 8-byte counter added to the descriptor's.  The stand-in pipe's
+ * descriptor is its read end, so a plain write() would fail with EBADF -- and the
+ * libraries that wake a worker this way abort on the failure.  Anything else is
+ * an ordinary write. */
+ptrdiff_t luna_fd_write(int fd, const void *buffer, size_t length)
+{
+  if (luna_event_slot(fd) < 0) return write(fd, buffer, length);
+  uint64_t count;
+  if (length < sizeof count) {
+    errno = EINVAL;
+    return -1;
+  }
+  memcpy(&count, buffer, sizeof count);
+  if (count == UINT64_MAX) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (luna_os_event_signal(fd, count) < 0) return -1;
+  return (ptrdiff_t)sizeof count;
+}
+
 /* ---- timerfd -------------------------------------------------------------
  *
  * Darwin has none.  A timer is an event descriptor whose counter a single

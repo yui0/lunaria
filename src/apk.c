@@ -44,6 +44,7 @@ extern char **environ;
 #define APK_META 65536
 #define APK_MAX_MANIFEST (16u*1024u*1024u)
 static int android_system_fonts(const char *root);
+static int android_system_bin(const char *root);
 static int apk_error(const char *format, ...)
 {
   va_list ap;
@@ -850,7 +851,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
   bool main = false, launcher = false, activity_launch = false;
   int activity_enabled = 1, activity_exported = -1, filter_data = 0, filter_priority = 0;
   bool activity_filter = false;
-  char activity_permission[512] = "";
+  char activity_permission[512] = "", activity_launch_mode[16] = "";
   int receiver_depth = -1, enabled = 1, app_enabled = 1, exported = -1, boot = 0, app_boot = 0;
   bool receiver_filter = false;
   int service_depth = -1, service_enabled = 1, service_exported = -1, application_depth=-1;
@@ -997,6 +998,7 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
         activity_enabled = app_enabled && (!av || attr_boolean(av));
         av = attribute(a, count, "exported");
         activity_exported = av ? attr_boolean(av) : -1;
+        if (attr_number(activity_launch_mode, sizeof activity_launch_mode, a, count, "launchMode")) goto done;
         av = attribute(a, count, "permission");
         if (copy_text(activity_permission, sizeof activity_permission,
                       av ? av->text : !strcmp(tag,"activity-alias") ? "" : app_permission)) goto done;
@@ -1149,8 +1151,9 @@ static int parse_manifest_events(const unsigned char *data, size_t size, struct 
           free(rows);
           if (!found) goto done;
         }
-        if (text_add_row(&m->activities, "\n", "%s|%s|%d|%d|%s|%s", component, target_class, activity_enabled,
-                         activity_exported < 0 ? activity_filter : activity_exported, activity_process, activity_permission))
+        if (text_add_row(&m->activities, "\n", "%s|%s|%d|%d|%s|%s|%s", component, target_class, activity_enabled,
+                         activity_exported < 0 ? activity_filter : activity_exported, activity_process,
+                         *activity_launch_mode ? activity_launch_mode : "0", activity_permission))
           goto done;
         if (activity_launch && activity_enabled && !*m->activity) {
           if (copy_text(m->config_changes, sizeof m->config_changes, changes) ||
@@ -2027,21 +2030,135 @@ static int android_system_fonts(const char *root)
  * apps read them (the machine type in libc's header is the usual ABI probe).
  * Alias the real bionic images the runtime loads using the portable .sym.
  * representation, so the file the guest opens is the library it runs. */
+/* /system/bin: the zygote's own executables.  A device always has them -- /proc/self/exe
+ * names one -- and a process that opens its executable to look at it must find a file, so the
+ * image carries app_process64 and app_process32 as well-formed ELF files (an executable
+ * with its interpreter, the shape of the real thing) and app_process as the link Android
+ * 12 makes to the 64-bit one.  Nothing executes them. */
+static int write_elf_stub(const char *path, bool is64, bool library)
+{
+  unsigned char b[0x4000];
+  memset(b, 0, sizeof b);
+  const char *interp = is64 ? "/system/bin/linker64" : "/system/bin/linker";
+  const size_t interp_len = strlen(interp) + 1;
+  if (is64) {
+    /* ELF64 header (64 bytes), then PT_PHDR, PT_INTERP, PT_LOAD of 56 bytes each. */
+    memcpy(b, "\177ELF\2\1\1", 7);
+    b[16] = 3; b[18] = 183;                 /* ET_DYN, EM_AARCH64 */
+    b[20] = 1;                              /* EV_CURRENT */
+    b[32] = 64;                             /* e_phoff */
+    const unsigned nph = library ? 2 : 3;   /* a shared object has no interpreter */
+    b[52] = 64; b[54] = 56; b[56] = (unsigned char)nph;  /* e_ehsize, e_phentsize, e_phnum */
+    const unsigned off = 64 + nph * 56;
+    unsigned char *ph = b + 64;
+    ph[0] = 6; ph[4] = 4; ph[8] = 64; ph[16] = 64; ph[32] = nph * 56; ph[40] = nph * 56; ph[48] = 8;
+    ph += 56;
+    if (!library) {
+      ph[0] = 3; ph[4] = 4; ph[8] = off & 0xff; ph[9] = off >> 8; ph[16] = off & 0xff; ph[17] = off >> 8;
+      ph[32] = interp_len; ph[40] = interp_len; ph[48] = 1;
+      ph += 56;
+    }
+    ph[0] = 1; ph[4] = 5; ph[32] = 0; ph[33] = 0x40; ph[40] = 0; ph[41] = 0x40; ph[49] = 0x40;  /* R+X, 0x4000 */
+    if (!library) memcpy(b + off, interp, interp_len);
+  } else {
+    /* ELF32 header (52 bytes), then three 32-byte program headers. */
+    memcpy(b, "\177ELF\1\1\1", 7);
+    b[16] = 3; b[18] = 40;                  /* ET_DYN, EM_ARM */
+    b[20] = 1;
+    b[28] = 52;                             /* e_phoff */
+    b[36] = 0; b[37] = 0; b[38] = 0; b[39] = 5;   /* EF_ARM_EABI_VER5 */
+    const unsigned nph = library ? 2 : 3;
+    b[40] = 52; b[42] = 32; b[44] = (unsigned char)nph;  /* e_ehsize, e_phentsize, e_phnum */
+    const unsigned off = 52 + nph * 32;
+    unsigned char *ph = b + 52;
+    ph[0] = 6; ph[4] = 52; ph[8] = 52; ph[16] = nph * 32; ph[20] = nph * 32; ph[24] = 4; ph[28] = 4;
+    ph += 32;
+    if (!library) {
+      ph[0] = 3; ph[4] = off & 0xff; ph[5] = off >> 8; ph[8] = off & 0xff; ph[9] = off >> 8;
+      ph[16] = interp_len; ph[20] = interp_len; ph[24] = 4; ph[28] = 1;
+      ph += 32;
+    }
+    ph[0] = 1; ph[16] = 0; ph[17] = 0x40; ph[20] = 0; ph[21] = 0x40; ph[24] = 5; ph[29] = 0x10;
+    if (!library) memcpy(b + off, interp, interp_len);
+  }
+  /* An existing file stays: it may be a newer image, and the guest never writes /system. */
+  luna_file_info info;
+  if (!luna_file_infoat(LUNA_AT_FDCWD, path, &info, LUNA_AT_NOFOLLOW)) return 0;
+  FILE *f = luna_file_fopen(path, "wb");
+  if (!f) return apk_error("cannot create %s: %s", path, strerror(errno));
+  const bool ok = fwrite(b, 1, sizeof b, f) == sizeof b;
+  if (fclose(f) || !ok) return apk_error("cannot write %s: %s", path, strerror(errno));
+  return 0;
+}
+static int android_system_bin(const char *root)
+{
+  char dir[PATH_MAX], file[PATH_MAX], usr[PATH_MAX];
+  if (path_join(dir, sizeof dir, root, "system/bin") || mkdirs(dir) ||
+      path_join(usr, sizeof usr, root, "system/usr/share") || mkdirs(usr))
+    return -1;
+  if (path_join(file, sizeof file, dir, "app_process64") || write_elf_stub(file, true, false)) return -1;
+  if (path_join(file, sizeof file, dir, "app_process32") || write_elf_stub(file, false, false)) return -1;
+  /* /system/bin/app_process is the link to the 64-bit zygote binary on a 64-bit device. */
+  if (path_join(file, sizeof file, dir, "app_process")) return -1;
+  luna_file_info info;
+  if (luna_file_infoat(LUNA_AT_FDCWD, file, &info, LUNA_AT_NOFOLLOW) &&
+      luna_symlink_create("app_process64", file))
+    return apk_error("cannot link %s: %s", file, strerror(errno));
+  return 0;
+}
+/* The platform libraries every NDK app may link against.  A device always has
+ * all of them in /system/lib64 (and /system/lib), and a process that checks its
+ * environment looks for each by name.  Where the runtime has a real image of one
+ * (bionic's libc text, libm) the file is that image; the others are served by the
+ * host, so the file is a well-formed shared object with nothing in it. */
+/* Make dst a regular file with src's bytes.  A guest that resolves /system/lib64/libc.so
+ * (realpath, readlink) must not be shown a host path, and the path /proc/self/maps names for
+ * the library has to be the file it just opened, so the image is copied, not linked.
+ * An identical copy already in place is left alone. */
+static int copy_system_image(const char *src, const char *dst)
+{
+  luna_file_info a, b;
+  if (luna_file_infoat(LUNA_AT_FDCWD, src, &a, 0)) return -1;
+  if (!luna_file_infoat(LUNA_AT_FDCWD, dst, &b, LUNA_AT_NOFOLLOW)) {
+    if ((b.mode & 0170000) == 0100000 && b.size == a.size && b.modified.seconds >= a.modified.seconds) return 0;
+    if (luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0)) return -1;
+  }
+  FILE *in = luna_file_fopen(src, "rb"), *out = in ? luna_file_fopen(dst, "wb") : NULL;
+  bool ok = in && out;
+  char buf[65536];
+  size_t n;
+  while (ok && (n = fread(buf, 1, sizeof buf, in)) > 0) ok = fwrite(buf, 1, n, out) == n;
+  if (in) fclose(in);
+  if (out && fclose(out)) ok = false;
+  if (!ok) luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0);
+  return ok ? 0 : -1;
+}
 static int android_system_libs(const char *root)
 {
+  static const struct { const char *name, *backing; } libs[] = {
+    {"libc.so", "libc-pure.so"}, {"libm.so", "libm.so"}, {"libdl.so", NULL},
+    {"liblog.so", NULL}, {"libz.so", "libz.so"}, {"libstdc++.so", NULL},
+  };
   const char *sys = getenv("LUNARIA_SYSLIB_DIR");
-  if (!sys || !*sys) return 0;
-  char dir[PATH_MAX], src[PATH_MAX], dst[PATH_MAX];
-  if (path_join(dir, sizeof dir, root, "system/lib64") || mkdirs(dir)) return -1;
-  static const char *const libs[] = {"libc.so", "libm.so", "libz.so"};
-  for (unsigned i = 0; i < sizeof libs / sizeof libs[0]; ++i) {
-    luna_file_info info;
-    if (path_join(src, sizeof src, sys, libs[i]) || path_join(dst, sizeof dst, dir, libs[i])) return -1;
-    if (luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) continue;
-    if (!luna_file_infoat(LUNA_AT_FDCWD, dst, &info, LUNA_AT_NOFOLLOW) &&
-        luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0)) return -1;
-    if (luna_symlink_create(src, dst))
-      return apk_error("cannot install system library %s: %s", dst, strerror(errno));
+  static const char *const dirs[] = {"system/lib64", "system/lib"};
+  for (unsigned d = 0; d < 2; ++d) {
+    char dir[PATH_MAX], src[PATH_MAX], dst[PATH_MAX];
+    if (path_join(dir, sizeof dir, root, dirs[d]) || mkdirs(dir)) return -1;
+    for (unsigned i = 0; i < sizeof libs / sizeof libs[0]; ++i) {
+      luna_file_info info;
+      if (path_join(dst, sizeof dst, dir, libs[i].name)) return -1;
+      /* The 64-bit images are the ones the runtime has. */
+      if (d == 0 && sys && *sys && libs[i].backing && !path_join(src, sizeof src, sys, libs[i].backing) &&
+          !luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) {
+        /* A link from an earlier launch has to go before the copy is written. */
+        if (!luna_file_infoat(LUNA_AT_FDCWD, dst, &info, LUNA_AT_NOFOLLOW) && (info.mode & 0170000) == 0120000 &&
+            luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0)) return -1;
+        if (copy_system_image(src, dst))
+          return apk_error("cannot install system library %s: %s", dst, strerror(errno));
+        continue;
+      }
+      if (write_elf_stub(dst, d == 0, true)) return -1;
+    }
   }
   return 0;
 }
@@ -2440,9 +2557,21 @@ static int profile_storage(const char *root, const char *package, const char *pr
       return -1;
   if (path_join(path, sizeof path, common, "obb") || mkdirs(path) || env_set("ANDROID_EXTERNAL_OBB_DIR", path, true))
     return -1;
+  /* vold creates the app's directories on shared storage when the package is installed:
+   * Android/data/<pkg> (holding files and cache), Android/obb and Android/media.  Those two
+   * subdirectories resolve to external/files and external/cache; these entries make the
+   * package directory itself, and the Android/ tree around it, exist and list as on a device. */
+  static const char *const shared[] = {"Android/data/%s/files", "Android/data/%s/cache",
+                                       "Android/obb", "Android/media"};
+  for (size_t i = 0; i < sizeof shared / sizeof shared[0]; ++i) {
+    char sub[PATH_MAX], tail[PATH_MAX];
+    snprintf(tail, sizeof tail, shared[i], package);
+    if (path_join(sub, sizeof sub, common, "external/storage") || path_join(path, sizeof path, sub, tail) || mkdirs(path))
+      return -1;
+  }
   /* Like the app directories above, the device filesystem belongs to the
    * selected profile. exec retains the previous launch's environment. */
-  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path) || android_system_fonts(path) || android_system_libs(path))
+  if (path_join(path, sizeof path, private_dir, "device-root") || env_set("LUNARIA_GUEST_ROOT", path, true) || mkdirs(path) || luna_android_fs_prepare(path) || android_system_bin(path) || android_system_fonts(path) || android_system_libs(path))
     return -1;
   return env_set("LUNARIA_PROFILE", profile, true);
 }

@@ -63,6 +63,9 @@ static char *g_toast_html;     /* a Toast: over the app, under the IME */
 static char *g_toast_css;
 static char *g_service_html;
 static unsigned g_service_failures;
+static struct { float x, y, w, h; bool valid; } g_service_close;   /* g_ptr_lock; set where the layout is known */
+static uint64_t g_service_until_ns;   /* the panel is guidance: it goes away on its own */
+#define SERVICE_PANEL_NS 12000000000ull
 static char *g_menu_html;      /* the emulator's menu: over everything */
 static char *g_menu_css;
 static luna_overlay_menu_fn g_menu_fn;
@@ -1187,6 +1190,23 @@ void luna_overlay_set_toast(const char *html, const char *css)
   luna_overlay_wake();
 }
 
+/* The guidance panel is dismissed by its close button or when its time is up.  The failure
+ * state is kept, so only a new failure raises it again. */
+static void overlay_service_dismiss(bool only_if_expired)
+{
+  pthread_mutex_lock(&g_doc_lock);
+  if (g_service_html && (!only_if_expired || overlay_ns() >= g_service_until_ns)) {
+    free(g_service_html);
+    g_service_html = NULL;
+    g_doc_dirty = true;
+    pthread_mutex_unlock(&g_doc_lock);
+    fprintf(stderr, "[overlay] Google guidance panel dismissed (%s)\n", only_if_expired ? "time is up" : "close button");
+    luna_overlay_wake();
+    return;
+  }
+  pthread_mutex_unlock(&g_doc_lock);
+}
+
 static void overlay_google_dependency(const char *package, bool activity, bool connected)
 {
   if (!package) return;
@@ -1203,21 +1223,25 @@ static void overlay_google_dependency(const char *package, bool activity, bool c
     free(g_service_html);
     const char *panel = "<div id='lunaria-google-help' style='position:fixed;left:16px;right:16px;bottom:24px;"
                         "display:block;box-sizing:border-box;background:#18202c;color:#ffffff;padding:18px;border-radius:12px;font-size:16px;'>";
+    /* Last child, so it is painted -- and hit -- above the full-width title. */
+    const char *close_button = "<div id='lunaria-google-close' style='position:absolute;right:6px;top:4px;width:36px;height:36px;"
+                               "text-align:center;line-height:36px;font-size:24px;color:#c8d0dc;'>&#xd7;</div></div>";
     const char *message = (g_service_failures & 7u) ?
       "<div id='lunaria-google-service-title' style='font-size:19px;margin-bottom:8px;min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>Googleサービスに接続できません</div>"
       "<div id='lunaria-google-message' style='min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>このアプリが要求したGoogleサービスを利用できません。"
       "右クリックの「Google services」から導入状況を確認してください。"
       "必要なAPKを導入、またはGMS環境を選択した後、アプリを再起動してください。"
-      "導入済みの場合は、ログに記録された接続エラーを確認してください。</div></div>" :
+      "導入済みの場合は、ログに記録された接続エラーを確認してください。</div>" :
       "<div id='lunaria-google-activity-title' style='font-size:19px;margin-bottom:8px;min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>Googleの確認画面を開けません</div>"
       "<div id='lunaria-google-message' style='min-width:0;max-width:100%;white-space:normal;overflow-wrap:anywhere;'>アプリが要求したGoogleの画面は見つかりましたが、Lunariaで起動できませんでした。"
       "別アプリの画面へ移動する処理に、Lunaria側での対応が必要です。"
-      "Googleサービスの再インストールは不要です。</div></div>";
+      "Googleサービスの再インストールは不要です。</div>";
     g_service_html = NULL;
     if (g_service_failures) {
-      size_t length = strlen(panel) + strlen(message) + 1;
+      size_t length = strlen(panel) + strlen(message) + strlen(close_button) + 1;
       g_service_html = malloc(length);
-      if (g_service_html) snprintf(g_service_html,length,"%s%s",panel,message);
+      if (g_service_html) snprintf(g_service_html,length,"%s%s%s",panel,message,close_button);
+      g_service_until_ns = overlay_ns() + SERVICE_PANEL_NS;
     }
     g_doc_dirty = true;
   }
@@ -1359,6 +1383,11 @@ void luna_overlay_set_frame_handler(luna_overlay_frame_fn fn)
 static void overlay_element_clicked(LunaElement *e)
 {
   if (!e || !e->id[0]) return;
+  if (getenv("LUNARIA_TRACE_TOUCH")) fprintf(stderr, "[ovl-click] %s\n", e->id);
+  if (!strcmp(e->id, "lunaria-google-close")) {
+    overlay_service_dismiss(false);
+    return;
+  }
   if (!strncmp(e->id, "luna-menu", 9)) {
     if (g_menu_fn) g_menu_fn(e->id);
     return;
@@ -1676,41 +1705,67 @@ bool luna_overlay_present_checked(int w,int h,bool boot)
   return overlay_present_screen(w,h,boot ? OV_BOOT : OV_APP);
 }
 
-/* LUNARIA_OVERLAY_TAP="x,y@seconds[;x,y@seconds...]": taps the overlay at those
- * points, that long after start-up (press, then release a frame later).  A way
- * to drive a screen without a hand on the mouse: for tests and diagnosis. */
+/* LUNARIA_OVERLAY_TAP="x,y@seconds[;x,y>x2,y2@seconds...]": touches the overlay at those
+ * points, that long after start-up (press, then release a frame later).  "x,y>x2,y2" is a
+ * drag: press at the first point, move in steps to the second, release there.  A way to
+ * drive a screen without a hand on the mouse: for tests and diagnosis. */
 static void overlay_scripted_tap(double now)
 {
-  static double start = -1, release_at = -1, rx, ry;
+  enum { DRAG_STEPS = 8 };
+  static double start = -1, next_at = -1, rx, ry, dx, dy;
+  static int step = -1;           /* -1 idle, 0 pressed, 1..DRAG_STEPS moving */
   static const char *cursor;
   static bool init;
   if (!init) {
     init = true;
     cursor = getenv("LUNARIA_OVERLAY_TAP");
   }
-  if (!cursor || !*cursor) return;
+  if (step < 0 && (!cursor || !*cursor)) return;   /* nothing left to start; a gesture under way is finished first */
   if (start < 0) start = now;
-  if (release_at >= 0) {
-    if (now >= release_at) {
-      release_at = -1;
-      (void)luna_overlay_pointer(rx, ry, 0);
+  if (step >= 0) {
+    if (now < next_at) {
+      luna_overlay_wake();   /* an idle overlay draws no frame: the gesture's next step needs one */
+      return;
     }
+    if (step < DRAG_STEPS && (dx != rx || dy != ry)) {
+      ++step;
+      (void)luna_overlay_pointer(rx + (dx - rx) * step / DRAG_STEPS,
+                                 ry + (dy - ry) * step / DRAG_STEPS, -1);
+      next_at = now + 0.03;
+      luna_overlay_wake();
+      return;
+    }
+    step = -1;
+    if (getenv("LUNARIA_TRACE_TOUCH")) fprintf(stderr, "[overlay] scripted release %.0f,%.0f\n", dx, dy);
+    (void)luna_overlay_pointer(dx, dy, 0);
+    luna_overlay_wake();
     return;
   }
-  double x, y, at;
+  double x, y, at, x2, y2;
   int used = 0;
-  if (sscanf(cursor, "%lf,%lf@%lf%n", &x, &y, &at, &used) < 3) {
-    cursor = NULL;
-    return;
+  if (sscanf(cursor, "%lf,%lf>%lf,%lf@%lf%n", &x, &y, &x2, &y2, &at, &used) < 5) {
+    used = 0;
+    x2 = y2 = -1;
+    if (sscanf(cursor, "%lf,%lf@%lf%n", &x, &y, &at, &used) < 3) {
+      cursor = NULL;
+      return;
+    }
+    x2 = x;
+    y2 = y;
   }
   if (now - start < at) return;
-  fprintf(stderr, "[overlay] scripted tap %.0f,%.0f\n", x, y);
+  fprintf(stderr, "[overlay] scripted %s %.0f,%.0f -> %.0f,%.0f\n",
+          x2 == x && y2 == y ? "tap" : "drag", x, y, x2, y2);
   cursor += used;
   if (*cursor == ';') ++cursor;
   rx = x;
   ry = y;
-  release_at = now + 0.05;
+  dx = x2;
+  dy = y2;
+  step = 0;
+  next_at = now + 0.05;
   (void)luna_overlay_pointer(x, y, 1);
+  luna_overlay_wake();
 }
 
 static void overlay_present_locked(int w, int h)
@@ -1933,6 +1988,21 @@ bound:
       t_mark = n;
     }
 
+    {
+      /* Where the guidance panel's close button is, so a touch on it can be taken before the
+       * guest sees it (the panel is no guest window: the check cannot ask the widget layer). */
+      const int close_idx = luna_get_element_by_id("lunaria-google-close");
+      const LunaElement *close = close_idx >= 0 ? luna_element_at(close_idx) : NULL;
+      pthread_mutex_lock(&g_ptr_lock);
+      g_service_close.valid = close != NULL;
+      if (close) {
+        g_service_close.x = close->x;
+        g_service_close.y = close->y;
+        g_service_close.w = close->w;
+        g_service_close.h = close->h;
+      }
+      pthread_mutex_unlock(&g_ptr_lock);
+    }
     overlay_drain_pointer();
     /* Keystrokes go in and the field's contents come back out here: the
      * document is parsed and luna-ui is live, which is the only state its
@@ -2037,6 +2107,17 @@ bool luna_overlay_pointer(double x, double y, int action)
   bool menu = g_menu_html != NULL && g_menu_modal;
   pthread_mutex_unlock(&g_doc_lock);
   if (g_failed) return false;
+  bool service_close = false;
+  pthread_mutex_lock(&g_ptr_lock);
+  if (g_service_close.valid) {
+    /* A finger is bigger than a 36px glyph box: the touch target is at least 48px square. */
+    const float pad_x = g_service_close.w < 48.f ? (48.f - g_service_close.w) / 2.f : 0.f;
+    const float pad_y = g_service_close.h < 48.f ? (48.f - g_service_close.h) / 2.f : 0.f;
+    service_close = x >= g_service_close.x - pad_x && x < g_service_close.x + g_service_close.w + pad_x &&
+                    y >= g_service_close.y - pad_y && y < g_service_close.y + g_service_close.h + pad_y;
+  }
+  pthread_mutex_unlock(&g_ptr_lock);
+  if (service_close) goto consume;   /* the guidance panel's close button */
   if (menu) goto consume;    /* the emulator's menu is modal */
   if (luna_guest_paused()) return true;
   if (guest) goto consume;   /* a dialog is modal: it takes every touch */
@@ -2056,7 +2137,8 @@ consume:
     if (taken == 0 || (taken % 64) == 0)
       fprintf(stderr, "[overlay] took pointer %.0f,%.0f action=%d "
                       "(%s) — the guest does not see this touch\n", x, y, action,
-              menu ? "the emulator menu is up"
+              service_close ? "the Google guidance panel's close button"
+              : menu ? "the emulator menu is up"
               : guest ? "a guest dialog is up and is modal"
               : "inside the input method's band");
     ++taken;
@@ -3238,6 +3320,21 @@ static void menu_notice_locked(const char *msg)
   g_menu_notice_until = menu_now() + 2.5;
 }
 
+/* The "Screenshot saved" notice names the file, so it is raised once the picture is
+ * taken: up before, it would be in the picture.  Guarded by g_menu_lock. */
+static char g_shot_notice[256];
+
+void luna_overlay_screenshot_taken(void)
+{
+  pthread_mutex_lock(&g_menu_lock);
+  if (g_shot_notice[0]) {
+    menu_notice_locked(g_shot_notice);
+    g_shot_notice[0] = '\0';
+    menu_publish_locked();
+  }
+  pthread_mutex_unlock(&g_menu_lock);
+}
+
 /* The clipboard, typed into whatever has the text focus: the emulator's
  * input method, or a WebView page. */
 static int menu_paste_clipboard(void)
@@ -3661,11 +3758,11 @@ static void menu_clicked(const char *id)
   } else if (!strcmp(id, "shot")) {
     char path[600];
     menu_screenshot_path(path, sizeof path);
-    arm_exec_request_screenshot(path);
+    /* The notice names the file, so it is raised once the picture is taken
+     * (luna_overlay_screenshot_taken): up now, it would be in the picture. */
     const char *base = strrchr(path, '/');
-    char msg[256];
-    snprintf(msg, sizeof msg, "Screenshot saved: %s", base ? base + 1 : path);
-    menu_notice_locked(msg);
+    snprintf(g_shot_notice, sizeof g_shot_notice, "Screenshot saved: %s", base ? base + 1 : path);
+    arm_exec_request_screenshot(path);
   } else if (!strcmp(id, "paste")) {
     pthread_mutex_unlock(&g_menu_lock);
     const int typed = menu_paste_clipboard();
@@ -3896,6 +3993,7 @@ void luna_menu_close(void)
 
 void luna_menu_tick(void)
 {
+  overlay_service_dismiss(true);
   pthread_mutex_lock(&g_menu_lock);
   if (g_menu_notice[0] && menu_now() >= g_menu_notice_until) {
     g_menu_notice[0] = '\0';

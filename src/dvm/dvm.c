@@ -6070,6 +6070,16 @@ bool dvm_process_exited(struct dvm *vm, int *status)
 void dvm_exit_process(struct dvm *vm, int status)
 {
   if (!vm) return;
+  /* LUNARIA_DVM_EXIT_STACK=1: who ended the process -- the Java frames of the caller. */
+  static const char *exit_stack = (const char *)-1;
+  if (exit_stack == (const char *)-1) exit_stack = getenv("LUNARIA_DVM_EXIT_STACK");
+  if (exit_stack && *exit_stack && strcmp(exit_stack, "0")) {
+    fprintf(stderr, "[dvm] process exit status %d requested; Java call chain, innermost first:\n", status);
+    for (int i = vm->ncallstack - 1, shown = 0; i >= 0 && shown < 24; --i, ++shown) {
+      const struct dvm_method *f = vm->callstack[i];
+      if (f) fprintf(stderr, "[dvm]     #%d %s.%s%s\n", shown, f->cls ? f->cls->name : "?", f->name, f->sig ? f->sig : "");
+    }
+  }
   int live=0;
   if (!atomic_compare_exchange_strong_explicit(&vm->process_exit_phase,&live,1,
       memory_order_relaxed,memory_order_relaxed)) return;

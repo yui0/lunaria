@@ -1055,7 +1055,32 @@ JNIEnv_ThrowNew(JNIEnv* p0, jclass p1, const char* p2)
 {
   assert(p0 && p1);
   struct jvm *jvm = jnienv_get_jvm(p0);
-  jobject e = p0[0]->AllocObject(p0, p1);
+  /* JNI: ThrowNew constructs the exception with the class's (String) constructor.
+   * That is what gives it its detail message and, through Throwable's constructor, the
+   * stack trace of the Java frames the calling thread is in -- code that throws on purpose
+   * to look at its own call chain (anti-tamper does) reads exactly that.  An exception
+   * that was only allocated has neither.  A class with no (String) constructor gets the
+   * no-argument one; only if it has neither is the object left allocated. */
+  jobject e = NULL;
+  {
+    jmethodID ctor = p0[0]->GetMethodID(p0, p1, "<init>", "(Ljava/lang/String;)V");
+    if (ctor) {
+      jstring text = p2 ? p0[0]->NewStringUTF(p0, p2) : NULL;
+      jvalue arg = { .l = text };
+      e = p0[0]->NewObjectA(p0, p1, ctor, &arg);
+      if (text) p0[0]->DeleteLocalRef(p0, text);
+    } else {
+      p0[0]->ExceptionClear(p0);
+      ctor = p0[0]->GetMethodID(p0, p1, "<init>", "()V");
+      if (ctor) e = p0[0]->NewObjectA(p0, p1, ctor, NULL);
+      else p0[0]->ExceptionClear(p0);
+    }
+    if (p0[0]->ExceptionCheck(p0)) {
+      p0[0]->ExceptionClear(p0);
+      e = NULL;
+    }
+  }
+  if (!e) e = p0[0]->AllocObject(p0, p1);
   /* AllocObject can only fail if the class handle is bad; the exception
    * still has to become pending, so fall back to the class object itself. */
   jobject root=jvm_ref_object(jvm,e ? e : (jthrowable)p1);
@@ -3903,7 +3928,9 @@ static int application_start_transaction(struct jvm *jvm,const char *manifest_cl
     return -1;
   }
   jvalue arg= {.l=base};
+  dvm_platform_stack("application.attach");
   jvm->native.CallVoidMethodA(&jvm->env,application,attach,&arg);
+  dvm_platform_stack(NULL);
   if(jvm->native.ExceptionCheck(&jvm->env)) {
     fprintf(stderr,"[application] %s: start failed at step 10\n",name);
     jvm->native.ExceptionDescribe(&jvm->env);
@@ -3914,7 +3941,10 @@ static int application_start_transaction(struct jvm *jvm,const char *manifest_cl
     jvm->native.ExceptionDescribe(&jvm->env);
     return -1;
   }
-  if(providers(jvm,application)<0 || jvm->native.ExceptionCheck(&jvm->env)) {
+  dvm_platform_stack("provider.attach");
+  const int providers_started=providers(jvm,application);
+  dvm_platform_stack(NULL);
+  if(providers_started<0 || jvm->native.ExceptionCheck(&jvm->env)) {
     fprintf(stderr,"[application] %s: start failed at step 12\n",name);
     jvm->native.ExceptionDescribe(&jvm->env);
     return -1;
@@ -3925,7 +3955,9 @@ static int application_start_transaction(struct jvm *jvm,const char *manifest_cl
     jvm->native.ExceptionDescribe(&jvm->env);
     return -1;
   }
+  dvm_platform_stack("application.onCreate");
   jvm->native.CallVoidMethodA(&jvm->env,application,create,NULL);
+  dvm_platform_stack(NULL);
   if(jvm->native.ExceptionCheck(&jvm->env)) {
     fprintf(stderr,"[application] %s: start failed at step 14\n",name);
     jvm->native.ExceptionDescribe(&jvm->env);

@@ -59,11 +59,11 @@ INST(v8_SHA256SU1,          "SHA256SU1",                "111100110D10nnnndddd110
 // Three registers of different lengths
 INST(asimd_VADDL,           "VADDL/VADDW",              "1111001U1Dzznnnndddd000oN0M0mmmm") // ASIMD
 INST(asimd_VSUBL,           "VSUBL/VSUBW",              "1111001U1Dzznnnndddd001oN0M0mmmm") // ASIMD
-//INST(asimd_VADDHN,          "VADDHN",                   "111100101-----------0100-0-0----") // ASIMD
-//INST(asimd_VRADDHN,         "VRADDHN",                  "111100111-----------0100-0-0----") // ASIMD
+INST(asimd_VADDHN,          "VADDHN",                   "111100101Dzznnnndddd0100N0M0mmmm") // ASIMD
+INST(asimd_VRADDHN,         "VRADDHN",                  "111100111Dzznnnndddd0100N0M0mmmm") // ASIMD
 INST(asimd_VABAL,           "VABAL",                    "1111001U1Dzznnnndddd0101N0M0mmmm") // ASIMD
-//INST(asimd_VSUBHN,          "VSUBHN",                   "111100101-----------0110-0-0----") // ASIMD
-//INST(asimd_VRSUBHN,         "VRSUBHN",                  "111100111-----------0110-0-0----") // ASIMD
+INST(asimd_VSUBHN,          "VSUBHN",                   "111100101Dzznnnndddd0110N0M0mmmm") // ASIMD
+INST(asimd_VRSUBHN,         "VRSUBHN",                  "111100111Dzznnnndddd0110N0M0mmmm") // ASIMD
 INST(asimd_VABDL,           "VABDL",                    "1111001U1Dzznnnndddd0111N0M0mmmm") // ASIMD
 INST(asimd_VMLAL,           "VMLAL/VMLSL",              "1111001U1Dzznnnndddd10o0N0M0mmmm") // ASIMD
 //INST(asimd_VQDMLAL,         "VQDMLAL",                  "111100101-----------10-1-0-0----") // ASIMD

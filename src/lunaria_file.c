@@ -1314,6 +1314,15 @@ static const struct {
   {"data/user_de/0",0771,1000,1000},{"data/app",0771,1000,1000},
   {"data/local",0751,0,0},{"data/local/tmp",0771,2000,2000},
   {"data/misc",01771,1000,9998},{"data/system",0775,1000,1000},
+  /* The read-only platform: root's, with /system/bin in the shell group. */
+  {"system",0755,0,0},{"system/bin",0755,0,2000},{"system/usr",0755,0,0},
+};
+/* Files the platform image carries (see android_system_bin() in apk.c): same owner as bin. */
+static const struct {
+  const char *name;
+  unsigned mode,uid,gid;
+} android_fs_files[]= {
+  {"system/bin/app_process64",0755,0,2000},{"system/bin/app_process32",0755,0,2000},
 };
 int luna_android_fs_inode(const char *path,luna_file_info *info)
 {
@@ -1323,6 +1332,13 @@ int luna_android_fs_inode(const char *path,luna_file_info *info)
     info->uid=android_fs_dirs[i].uid;
     info->gid=android_fs_dirs[i].gid;
     info->mode=(info->mode&~07777u)|android_fs_dirs[i].mode;
+    return 1;
+  }
+  for (unsigned i=0; i<sizeof android_fs_files/sizeof android_fs_files[0]; ++i) {
+    if (strcmp(path+1,android_fs_files[i].name)) continue;
+    info->uid=android_fs_files[i].uid;
+    info->gid=android_fs_files[i].gid;
+    info->mode=(info->mode&~07777u)|android_fs_files[i].mode;
     return 1;
   }
   return 0;

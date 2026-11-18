@@ -312,6 +312,8 @@ void luna_overlay_set_menu_handler(luna_overlay_menu_fn fn);
  * w/h is the surface, to keep the menu on it. */
 void luna_menu_open(double x, double y, int w, int h);
 int luna_overlay_screenshot(const char *path);
+/* A screenshot the menu asked for has been taken: only now may its notice appear. */
+void luna_overlay_screenshot_taken(void);
 void luna_menu_close(void);
 /* Session-only execution control. The host compositor keeps running. */
 bool luna_guest_paused(void);

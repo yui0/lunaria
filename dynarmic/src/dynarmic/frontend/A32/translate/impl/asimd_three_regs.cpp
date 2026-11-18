@@ -241,6 +241,37 @@ bool WideInstruction(TranslatorVisitor& v, bool U, bool D, size_t sz, size_t Vn,
     return true;
 }
 
+// VADDHN/VRADDHN/VSUBHN/VRSUBHN: Dd = high half of (Qn +/- Qm), narrowed; the
+// rounding forms add half of one narrow-element unit (1 << (esize - 1)) first.
+bool NarrowHighHalf(TranslatorVisitor& v, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm, bool subtract, bool round) {
+    if (sz == 0b11) {
+        return v.DecodeError();
+    }
+
+    if (mcl::bit::get_bit<0>(Vn) || mcl::bit::get_bit<0>(Vm)) {
+        return v.UndefinedInstruction();
+    }
+
+    const size_t esize = 8U << sz;
+    const size_t wide_esize = esize * 2;
+    const auto d = ToVector(false, Vd, D);
+    const auto n = ToVector(true, Vn, N);
+    const auto m = ToVector(true, Vm, M);
+
+    const auto reg_n = v.ir.GetVector(n);
+    const auto reg_m = v.ir.GetVector(m);
+    auto wide = subtract ? v.ir.VectorSub(wide_esize, reg_n, reg_m)
+                         : v.ir.VectorAdd(wide_esize, reg_n, reg_m);
+    if (round) {
+        const auto round_const = v.ir.VectorBroadcast(wide_esize, v.I(wide_esize, u64(1) << (esize - 1)));
+        wide = v.ir.VectorAdd(wide_esize, wide, round_const);
+    }
+    const auto high = v.ir.VectorLogicalShiftRight(wide_esize, wide, static_cast<u8>(esize));
+
+    v.ir.SetVector(d, v.ir.VectorNarrow(wide_esize, high));
+    return true;
+}
+
 }  // Anonymous namespace
 
 // ASIMD Three registers of the same length
@@ -909,6 +940,22 @@ bool TranslatorVisitor::asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t
     return WideInstruction(*this, U, D, sz, Vn, Vd, N, M, Vm, op ? WidenBehaviour::Second : WidenBehaviour::Both, [this](size_t esize, const auto&, const auto& reg_n, const auto& reg_m) {
         return ir.VectorSub(esize, reg_n, reg_m);
     });
+}
+
+bool TranslatorVisitor::asimd_VADDHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+    return NarrowHighHalf(*this, D, sz, Vn, Vd, N, M, Vm, false, false);
+}
+
+bool TranslatorVisitor::asimd_VRADDHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+    return NarrowHighHalf(*this, D, sz, Vn, Vd, N, M, Vm, false, true);
+}
+
+bool TranslatorVisitor::asimd_VSUBHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+    return NarrowHighHalf(*this, D, sz, Vn, Vd, N, M, Vm, true, false);
+}
+
+bool TranslatorVisitor::asimd_VRSUBHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
+    return NarrowHighHalf(*this, D, sz, Vn, Vd, N, M, Vm, true, true);
 }
 
 bool TranslatorVisitor::asimd_VABAL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {

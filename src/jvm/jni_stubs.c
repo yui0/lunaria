@@ -383,43 +383,6 @@ java_lang_Long_longValue(JNIEnv *env, jobject object)
   return (jlong)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
-/* Return empty array so Unity's STE construction loop runs 0 iterations */
-jobjectArray
-java_lang_Thread_getStackTrace(JNIEnv *env, jobject thread)
-{
-  assert(env);
-  return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/StackTraceElement"), NULL);
-}
-
-jobjectArray
-java_lang_Throwable_getStackTrace(JNIEnv *env, jobject throwable)
-{
-  assert(env);
-  return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/lang/StackTraceElement"), NULL);
-}
-
-/* no-op: suppress stack-trace capture on exception construction */
-jobject
-java_lang_Throwable_fillInStackTrace(JNIEnv *env, jobject throwable)
-{
-  assert(env && throwable);
-  return throwable;
-}
-
-void
-java_lang_Throwable_printStackTrace(JNIEnv *env, jobject throwable)
-{
-  assert(env && throwable);
-  (void)throwable;
-}
-
-jstring
-java_lang_Throwable_getMessage(JNIEnv *env, jobject throwable)
-{
-  assert(env && throwable);
-  return NULL;
-}
-
 /* Scanner.useDelimiter(pattern) → the Scanner itself (fluent API).  Unity reads
  * small text resources via `new Scanner(stream).useDelimiter("\\A").next()`.
  * Returning NULL left the guest calling next() on a null Scanner → vtable load
@@ -1035,7 +998,10 @@ const char *lunaria_android_data_path(void)
   static char path[PATH_MAX];
   const char *pkg = getenv("ANDROID_PACKAGE_NAME");
   if (!path[0])
-    snprintf(path, sizeof path, "/data/data/%s",
+    /* The primary user's data directory as PackageManager reports it.  /data/user/0 is
+     * a link to /data/data, so files there resolve to the same place (the path mapper
+     * binds both), but this is the spelling an app is told: dataDir, getFilesDir(). */
+    snprintf(path, sizeof path, "/data/user/0/%s",
              (pkg && *pkg) ? pkg : "com.lunaria.app");
   return path;
 }
@@ -1138,9 +1104,9 @@ android_property_entry(const char *name, size_t index)
      * are identical in 32-bit applications and 64-bit system services. */
     { "ro.product.cpu.abi",       "arm64-v8a" },
     { "ro.product.cpu.abi2",      "" },
-    { "ro.product.cpu.abilist",   "arm64-v8a,armeabi-v7a" },
+    { "ro.product.cpu.abilist",   "arm64-v8a,armeabi-v7a,armeabi" },
     { "ro.product.cpu.abilist64", "arm64-v8a" },
-    { "ro.product.cpu.abilist32", "armeabi-v7a" },
+    { "ro.product.cpu.abilist32", "armeabi-v7a,armeabi" },
     /* build */
     { "ro.build.type",            "user" },
     { "ro.build.tags",            "release-keys" },
@@ -1157,7 +1123,14 @@ android_property_entry(const char *name, size_t index)
     { "ro.adb.secure",            "1" },
     { "ro.boot.verifiedbootstate", "green" },
     { "ro.boot.flash.locked",     "1" },
-    { "ro.bootloader",            "unknown" },
+    /* The rest of what a locked, verified Pixel's bootloader and init leave readable. */
+    { "ro.boot.vbmeta.device_state", "locked" },
+    { "ro.boot.vbmeta.avb_version",  "1.1" },
+    { "ro.boot.vbmeta.hash_alg",     "sha256" },
+    { "ro.boot.veritymode",       "enforcing" },
+    { "apexd.status",             "ready" },
+    { "init.svc.adbd",            "stopped" },
+    { "ro.bootloader",            "slider-1.2-8326997" },
     /* Since Android 8 the serial is not readable by ordinary apps, and the
      * platform answers Build.UNKNOWN rather than a number. */
     { "ro.serialno",              "unknown" },
@@ -1587,16 +1560,6 @@ android_net_Uri_encode(JNIEnv *env, jobject object, va_list args)
   return str;
 }
 
-jstring
-android_os_Bundle_getString(JNIEnv *env, jobject object, va_list args)
-{
-  assert(env && object);
-  if (!JVM_VA_HAS_ARGS(args)) return NULL;
-  jstring str1 = va_arg(args, jstring);
-  (*env)->GetStringUTFChars(env, str1, NULL);
-  return NULL;
-}
-
 jintArray
 android_view_InputDevice_getDeviceIds(JNIEnv *env, jobject object, va_list args)
 {
@@ -1896,15 +1859,6 @@ android_app_Activity_getIntent(JNIEnv *env, jobject object, va_list args)
   assert(env && object);
   static jobject sv;
   return jvm_cached_object(env, &sv, "android/content/Intent");
-}
-
-/* Intent.getExtras() → null: this launch carries no extras, so the caller
- * skips the Bundle.containsKey/toString probing that triggered type errors. */
-jobject
-android_content_Intent_getExtras(JNIEnv *env, jobject object, va_list args)
-{
-  assert(env && object);
-  return NULL;
 }
 
 /* Context.getObbDir() → a File stub (no OBB, but a valid object). */
@@ -3355,6 +3309,10 @@ jboolean java_lang_Object_isFinishing(JNIEnv *e, jobject o, va_list a)
  * to register lifecycle callbacks (including DFU's pointer capture helper). */
 static jobject lunaria_application_context(JNIEnv *e)
 {
+  /* With a Dalvik VM the process Application is the one ActivityThread bound: the
+   * object whose base Context is attached.  A fresh android.app.Application has none. */
+  jobject bound = dvm_jni_process_application(e);
+  if (bound) return bound;
   static jobject application;
   return jvm_cached_object(e, &application, "android/app/Application");
 }

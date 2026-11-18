@@ -1818,12 +1818,17 @@ dex_call_lifecycle(struct jvm *jvm, jobject self, const char *cls,
   if (!m)
     return 0;
   fprintf(stderr, "[loader] dex startup: %s.%s%s\n", cls, method, sig);
+  /* The platform code a device would be running this callback from. */
+  char entry[64];
+  snprintf(entry, sizeof entry, "activity.%s", method);
+  dvm_platform_stack(entry);
   if (takes_null_arg) {
     jvalue arg = { .l = NULL }; /* a fresh launch has no savedInstanceState */
     jvm->native.CallVoidMethodA(&jvm->env, self, m, &arg);
   } else {
     jvm->native.CallVoidMethodA(&jvm->env, self, m, NULL);
   }
+  dvm_platform_stack(NULL);
   return 1;
 }
 
@@ -2027,11 +2032,9 @@ run_dex_activity(struct jvm *jvm, int is_a64)
     cls[n++] = (*p == '.') ? '/' : *p;
   cls[n] = '\0';
 
-  /* A component of the platform itself (Settings screens) is launched like one of the app's. */
-  if (!dvm_jni_class_in_dex(cls) && !jvm->native.FindClass(&jvm->env, cls)) {
-    fprintf(stderr, "[loader] dex startup: %s is not in any dex\n", cls);
-    return EXIT_FAILURE;
-  }
+  /* The launcher class is resolved only after the Application has run: an app may define it at
+   * run time from attachBaseContext (a packed or split-delivered dex), so a missing class here
+   * proves nothing.  A platform component (Settings screens) resolves through FindClass below. */
 
   if (!(is_a64 ? arm64_exec_host_egl_init() : arm_exec_host_egl_init()))
     fprintf(stderr, "[loader] host EGL init failed\n");
@@ -2897,6 +2900,24 @@ main(int argc, const char *argv[])
 
   int launch = luna_apk_prepare(&argc, &argv);
   if (launch) return launch < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+
+  /* An app's stdin is /dev/null whatever the launcher's was: a tty or a pipe
+   * that never closes would block the guest's first read(0) for ever.  Only
+   * a launched package is an app process; a bare test module keeps its input. */
+  if (getenv("ANDROID_PACKAGE_NAME")) {
+#ifdef _WIN32
+    const char *null_path = "NUL";
+#else
+    const char *null_path = "/dev/null";
+#endif
+    int nul = luna_file_open(null_path, O_RDONLY, 0);
+    if (nul >= 0) {
+      if (nul != 0) {
+        luna_fd_dup_to(nul, 0, 0);
+        luna_fd_close(nul);
+      }
+    }
+  }
 
   printf("loading module: %s\n", argv[1]);
 

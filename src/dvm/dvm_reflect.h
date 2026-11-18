@@ -25,6 +25,10 @@ static dvm_ref runtime_singleton(struct dvm *vm, const char *desc,
  * be told apart.  Same reason as reflect_param_sig() below: getMethod() is
  * given the parameter types and picking the first method of that name calls a
  * different one. */
+/* A parameter list's descriptor.  Nine fully-qualified parameter types already pass 512
+ * bytes (PromotionControllerImpl's constructor does), and a truncated list is not a
+ * different signature, it is no signature: the lookup threw NoSuchMethodException. */
+#define REFLECT_SIG_MAX 4096
 static bool reflect_param_sig(struct dvm *vm, dvm_ref types, char *buf,
                               size_t cap);
 
@@ -32,7 +36,7 @@ static struct dvm_method *reflect_find_overload(struct dvm *vm,
     struct dvm_class *cls,
     const char *name, dvm_ref types)
 {
-  char sig[512];
+  char sig[REFLECT_SIG_MAX];
   if (!cls || !name || !reflect_param_sig(vm, types, sig, sizeof sig))
     return NULL;
   const size_t plen = strcspn(sig, ")") + 1u;   /* "(...)" including the ')' */
@@ -2415,7 +2419,7 @@ static bool cl_getConstructor(struct dvm *vm, dvm_ref self,
 {
   struct dvm_object *co = dvm__obj(vm, self);
   if (!co || !co->klass) RETL(0);
-  char sig[512];
+  char sig[REFLECT_SIG_MAX];
   dvm_ref types = nargs > 0 ? ARG(0).l : 0;
   bool have_sig = reflect_param_sig(vm, types, sig, sizeof sig);
 
@@ -5316,6 +5320,10 @@ done:
 }
 
 static const struct rt_method rt_dex_path_list[] = {
+  /* makePathElements(List, File, List) is the pre-loader-argument spelling Android 12 still
+   * carries (@UnsupportedAppUsage): it is makeDexElements with a null defining loader.
+   * Dex installers that extend an existing loader (MultiDex, packers) look it up first. */
+  SM("makePathElements", "(Ljava/util/List;Ljava/io/File;Ljava/util/List;)[Ldalvik/system/DexPathList$Element;", dex_path_make_elements),
   SM("makeDexElements", "(Ljava/util/List;Ljava/io/File;Ljava/util/List;Ljava/lang/ClassLoader;)[Ldalvik/system/DexPathList$Element;", dex_path_make_elements),
   SM("makeDexElements", "(Ljava/util/List;Ljava/io/File;Ljava/util/List;Ljava/lang/ClassLoader;Z)[Ldalvik/system/DexPathList$Element;", dex_path_make_elements),
   M_END

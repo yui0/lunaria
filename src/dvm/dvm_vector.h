@@ -1091,6 +1091,7 @@ static bool pm_activity_candidates(struct dvm *vm, dvm_ref intent, int flags,
     if (!row || !target || !*name) continue;
     char *enabled_text=luna_strsep(&row,"|"), *exported_text=luna_strsep(&row,"|");
     char *process=luna_strsep(&row,"|");
+    (void)luna_strsep(&row,"|");   /* launchMode: act_start_common reads it from the table */
     const char *permission=row ? row : "";
     bool enabled=enabled_text && atoi(enabled_text)!=0;
     if (!enabled && !(flags & 0x200)) continue;
@@ -1159,6 +1160,38 @@ static bool pm_activity_candidates(struct dvm *vm, dvm_ref intent, int flags,
   return true;
 }
 
+/* The browser every Android device ships.  Lunaria has no browser package, but the platform
+ * contract is that a VIEW of an http(s) URL resolves to one (apps such as LINE Login query for
+ * it and refuse to continue without), so the emulator's own browser window is presented as an
+ * installed system browser; act_start_common() opens such a component in it. */
+#define LUNA_BROWSER_PACKAGE "com.android.browser"
+#define LUNA_BROWSER_ACTIVITY "com.android.browser.BrowserActivity"
+static bool pm_browser_candidate(struct dvm *vm, dvm_ref intent, dvm_ref list,
+    const char *wanted, const char *name)
+{
+  if ((wanted && strcmp(wanted,LUNA_BROWSER_PACKAGE)) || (name && strcmp(name,LUNA_BROWSER_ACTIVITY)))
+    return true;
+  union dvm_value action={0}, data={0}, text={0};
+  dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
+  dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
+  const char *a=action.l ? dvm_string_utf8(vm,action.l) : NULL;
+  if (data.l) dvm_get_field(vm,data.l,"uri","Ljava/lang/String;",&text);
+  const char *u=text.l ? dvm_string_utf8(vm,text.l) : NULL;
+  if (!a || strcmp(a,"android.intent.action.VIEW") || !u ||
+      (strncasecmp(u,"http://",7) && strncasecmp(u,"https://",8))) return true;
+  dvm_ref resolve=resolve_info_new(vm);
+  dvm_ref info=pm_component_info(vm,"Landroid/content/pm/ActivityInfo;");
+  if (!resolve || !info) return false;
+  dvm_set_field(vm,info,"packageName","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_PACKAGE)});
+  dvm_set_field(vm,info,"name","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_ACTIVITY)});
+  dvm_set_field(vm,info,"processName","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_PACKAGE)});
+  dvm_set_field(vm,info,"enabled","Z",(union dvm_value){.i=1});
+  dvm_set_field(vm,info,"exported","Z",(union dvm_value){.i=1});
+  dvm_set_field(vm,resolve,"activityInfo","Landroid/content/pm/ActivityInfo;",(union dvm_value){.l=info});
+  union dvm_value item={.l=resolve}, ignored={0};
+  return list_add(vm,list,&item,1,&ignored);
+}
+
 /* Activity launch resolution is a system operation and must not be limited
  * by the caller's PackageManager query visibility. */
 static bool pm_query_activities(struct dvm *vm, dvm_ref intent, int flags,
@@ -1194,6 +1227,7 @@ static bool pm_query_activities(struct dvm *vm, dvm_ref intent, int flags,
     free(activities); free(filters);
     if (!ok) return false;
   }
+  if (!pm_browser_candidate(vm,intent,list,wanted,name)) return false;
   RETL(list);
 }
 static bool pm_queryIntentActivities(struct dvm *vm, dvm_ref self,

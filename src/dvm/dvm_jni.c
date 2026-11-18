@@ -3174,6 +3174,17 @@ bool dvm_jni_bind_application(JNIEnv *env, jobject base, jobject application)
   return ok;
 }
 
+jobject dvm_jni_process_application(JNIEnv *env)
+{
+  struct dvm *vm = vm_get();
+  if (!vm || !env) return NULL;
+  unsigned cookie = dvm_gil_enter_from_guest(vm);
+  dvm_ref app = dvm_process_application(vm);
+  jobject result = app ? to_jobject(vm, env, app) : NULL;
+  dvm_gil_leave_to_guest(vm, cookie);
+  return result;
+}
+
 void dvm_jni_bind_unity_activity(JNIEnv *env, jobject activity)
 {
   struct dvm *vm = vm_get();

@@ -146,6 +146,7 @@ struct lm_sink *dvm_surface_acquire_sink(struct dvm *vm, dvm_ref surface);
 /* Bind ContextImpl/LoadedApk before app construction; publish Application
  * after attachBaseContext and before providers/onCreate. */
 bool dvm_bind_application(struct dvm *vm, dvm_ref base, dvm_ref application);
+dvm_ref dvm_process_application(struct dvm *vm);
 /* Process teardown: stop admission and wake platform waits, then join Java
  * host threads before releasing the JNI table or execution engines. */
 bool dvm_is_stopping(struct dvm *vm);
@@ -928,6 +929,10 @@ struct lm_sink;
 jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink);
 struct lm_sink *dvm_jni_surface_acquire_sink(JNIEnv *env, jobject surface);
 void dvm_jni_main_transaction(JNIEnv *env, bool begin);
+/* Names the platform code that is calling into Java on this thread -- "application.attach",
+ * "activity.onCreate", ... (see dvm_platform_stack.h) -- so the frames a device would show
+ * below the app's own appear in stack traces.  NULL returns to the thread's default. */
+void dvm_platform_stack(const char *entry);
 /* Enter the launcher Activity into the activity stack before its onCreate. */
 void dvm_jni_attach_activity(JNIEnv *env, jobject activity);
 void dvm_jni_activity_dispatch(JNIEnv *env, jobject activity, const char *step,
@@ -939,6 +944,8 @@ void dvm_jni_report(void);
 
 /* Publish the process framework graph into the VM before application code. */
 bool dvm_jni_bind_application(JNIEnv *env, jobject base, jobject application);
+/* The process Application ActivityThread published, as a JNI reference; NULL before one is bound. */
+jobject dvm_jni_process_application(JNIEnv *env);
 jobject dvm_jni_get_class_loader(JNIEnv *env, jobject object);
 /* Publish the process Activity into UnityPlayer.currentActivity (static field
  * in the APK dex).  Plugins such as IronSource read that field via sget. */

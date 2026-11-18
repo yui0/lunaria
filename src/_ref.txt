@@ -1,3 +1,0 @@
-git submodule add -f https://github.com/Berry-OS/luna-ui.git luna-ui
-
-git submodule update --remote luna-ui

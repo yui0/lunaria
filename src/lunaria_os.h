@@ -329,15 +329,18 @@ static inline ptrdiff_t luna_fd_writev(int fd, const struct iovec *vectors, int 
 /* eventfd/timerfd are emulated (lunaria_mac.c): their read() is the 8-byte
  * counter and close() releases the emulation slot. */
 ptrdiff_t luna_fd_read(int fd, void *p, size_t n);
+ptrdiff_t luna_fd_write(int fd, const void *p, size_t n);
 int luna_fd_close(int fd);
 #else
 static inline ptrdiff_t luna_fd_read(int fd, void *p, size_t n) {
   return read(fd,p,n);
 }
 #endif
+#ifndef __APPLE__
 static inline ptrdiff_t luna_fd_write(int fd, const void *p, size_t n) {
   return write(fd,p,n);
 }
+#endif
 #ifndef __APPLE__
 static inline int luna_fd_close(int fd) {
   return close(fd);
