@@ -3352,7 +3352,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
     return -1;
   if (((!list && !prepare && !install) || choose || google_setup) && !service_host) {
-    if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
+    if (launcher_display_metadata(archive, container, conf) || font_defaults(exedir)) return -1;
     launch_ui_ready = luna_launcher_begin(input) != 0;
   }
   if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root))
@@ -3428,7 +3428,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       apk_error("container has no base APK");
       goto done;
     }
-  } else if (copy_text(base, sizeof base, input))
+  } else if (copy_text(base, sizeof base, archive))
     goto done;
   if (zip_open(&apk, base) || manifest_zip(&apk, m))
     goto done;
@@ -3606,7 +3606,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   luna_launcher_progress("Preparing runtime files and OBB resources", NULL, 0, 0);
   fprintf(stderr, "[apk] Preparing runtime files and OBB resources\n");
   fflush(stderr);
-  if (managed_setup(inst) || obb_setup(archive, container ? pkgdir : NULL, inst, m->package) || font_defaults(exedir))
+  if (managed_setup(inst) || obb_setup(input, container ? pkgdir : NULL, inst, m->package) || font_defaults(exedir))
     goto done;
   if (env_default("LUNARIA_DEX_START", "1") || env_default("LUNARIA_JIT_UI", "1") || env_default("LUNARIA_A64_SELF_SCHED", "1"))
     goto done;
