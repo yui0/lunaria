@@ -2809,7 +2809,7 @@ static int obb_setup(const char *input, const char *container, const char *inst,
 }
 static void apk_help(void)
 {
-  puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.aab|APP.xapk|APP.apks\n"
+  puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.apkm|APP.aab|APP.xapk|APP.apks\n"
        "       lunaria [--list-profiles | --choose-profile | --prepare-profile | --install-only] APP.apk\n"
        "       lunaria --install-system APP.apk\n"
        "       lunaria --google-services [--data-root DIR]\n"
@@ -3148,7 +3148,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
     if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
     argument = (*argv)[at];
   }
-  bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
+  bool container = suffix(argument, ".xapk") || suffix(argument, ".apks") || suffix(argument, ".apkm");
   if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
     if (at != 1)
       return apk_error("APK options require an APK archive");
