@@ -16,7 +16,7 @@ It loads the app's own package, executes its ARM32 or ARM64 code with
 [dynarmic](https://github.com/merryhime/dynarmic), and bridges JNI, EGL, OpenGL ES, MediaCodec and other
 Android services to the host. A built-in Dalvik interpreter runs the app's `classes*.dex`.
 
-Open an `.apk`, `.xapk`, `.apks`, or `.aab` directly; extraction, split APKs, caching and per-account
+Open an `.apk`, `.apkm`, `.xapk`, `.apks`, or `.aab` directly; extraction, split APKs, caching and per-account
 profiles are handled for you. WebView content uses Chrome/Chromium or the bundled [luna-browser](luna-browser/).
 
 **Demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Where Winds Meet (NetEase Messiah engine),
@@ -149,7 +149,7 @@ make dist-mac    # Lunaria.app + .dmg (Darwin only)
 
 ```bash
 lunaria                        # graphical launcher (drop a package on the window)
-lunaria path/to/app.apk        # or .xapk / .apks / .aab
+lunaria path/to/app.apk        # or .apkm / .xapk / .apks / .aab
 LUNARIA_ARCH=arm64-v8a lunaria app.apk   # pick an ABI when a package has several
 ```
 
@@ -192,7 +192,7 @@ From a source build, use `./lunaria` in place of `lunaria`.
 
 | Feature | What it does |
 |---|---|
-| **No Android image** | Launches `.apk`, `.xapk`, `.apks`, `.aab` without a VM. |
+| **No Android image** | Launches `.apk`, `.apkm`, `.xapk`, `.apks`, `.aab` without a VM. |
 | **ARM32 + ARM64** | ARMv7 and AArch64 through dynarmic's JIT; optional parallel engines (`LUNARIA_A64_ENGINES`). |
 | **Host graphics** | EGL and OpenGL ES 3 on the host GPU; Vulkan when the bridge is available. |
 | **Android services** | JNI, AssetManager, OBB, pthread, OpenSL ES and compatible Android APIs. |
@@ -529,7 +529,7 @@ Frames are saved as `lunaria_0000.png`. Creating `$LUNARIA_SHOT_TRIGGER` (defaul
 ## How it works
 
 ```text
- APK / XAPK / APKS / AAB
+ APK / APKM / XAPK / APKS / AAB
      │  extract base modules, splits, native libraries, assets and OBB
      ▼
  Android ELF loader ─── relocations and dependency resolution

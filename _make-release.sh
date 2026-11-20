@@ -578,7 +578,7 @@ curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | ba
 ### Linux (manual)
 ```bash
 tar -xzf lunaria-*-linux-x86_64.tar.gz && cd lunaria-*-linux-x86_64   # or -aarch64
-./lunaria /path/to/app.apk      # or .xapk / .apks
+./lunaria /path/to/app.apk      # or .apkm / .xapk / .apks
 ```
 The archive carries its own shim libraries, host libraries and fonts; it uses
 the running system's C library.
