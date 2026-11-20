@@ -124,7 +124,8 @@ int luna_process_state_publish(const struct luna_process_info *info)
     size_t prefix=strlen(state_directory)+1;
     memcpy(published,state_path,prefix);
     strcpy(published+prefix,state_path+prefix+1);
-    if (renameat2(AT_FDCWD,state_path,AT_FDCWD,published,RENAME_NOREPLACE)) rc=-errno;
+    if (renameat2(AT_FDCWD,state_path,AT_FDCWD,published,RENAME_NOREPLACE) &&
+        ((errno!=ENOSYS && errno!=EINVAL) || link(state_path,published) || unlink(state_path))) rc=-errno;
     else strcpy(state_path,published);
   }
   if (rc && created) state_close();
