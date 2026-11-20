@@ -155,7 +155,7 @@ LUNARIA_ARCH=arm64-v8a lunaria app.apk   # 複数ABIを含む場合は明示指�
 - **ホストメニュー：** 実行中に右クリック。スクリーンショット（**F12**）、貼り付け、戻る、音量、キーマップ、WebView、入力の録画、プロファイル、再起動、フルスクリーン、終了。
 - **表示密度：** 右クリックの**Display → SCREEN DENSITY (DPI)**から変更できます。アプリごとに保存され、再起動後に反映されます。**Automatic**で端末の既定値に戻せます。
 - **アプリ検索：** ランチャーの*Find an app on APKPure*に名前を入力し、候補のパッケージ名を確認して選ぶと、XAPKをダウンロードして開きます。保存先はパッケージキャッシュ配下の`downloads`、なければデータフォルダの`cache/packages/downloads`、それもなければ`~/Downloads/Lunaria`です。
-- **パッケージ：** split APKは元のベースAPKを書き換えずに重ね合わせ、AABはベースモジュールとアセットパックを読み込み、OBBは可能な限りハードリンク／シンボリックリンクで共有します。展開結果は`cache/packages/`にキャッシュされます（移動は`LUNARIA_CACHE_DIR`、無効化は`LUNARIA_NO_CACHE=1`）。
+- **パッケージ：** split APKは元のベースAPKを書き換えずに重ね合わせ、AABはベースモジュールとアセットパックを読み込み、OBBは可能な限りハードリンク／シンボリックリンクで共有します。展開結果は`cache/packages/`にキャッシュされます（移動は`LUNARIA_CACHE_DIR`、無効化は`LUNARIA_NO_CACHE=1`）。旧形式の暗号化APKMはlibsodiumがインストールされていれば復号します（現行のAPKMは通常のZIPです）。
 - **設定：** 永続的な設定は`lunaria.conf`（例：`lunaria.conf.sample`）に保存します。環境変数はその起動に限り優先されます。設定ファイルとゲストデータの標準位置は起動ディレクトリです。
 
   ```bash

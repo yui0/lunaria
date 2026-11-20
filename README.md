@@ -158,7 +158,7 @@ From a source build, use `./lunaria` in place of `lunaria`.
 - **Host menu:** right-click in a running game for screenshots (also **F12**), paste, Back, audio, keyboard maps, WebView, input recording, profiles, restart, fullscreen, and quit.
 - **Display density:** right-click **Display → SCREEN DENSITY (DPI)** to choose a density. It is saved per app and applies after restart; **Automatic** restores the device default.
 - **Find apps:** in the launcher, type a name under *Find an app on APKPure*, pick a result (check the package ID), and Lunaria downloads and opens the XAPK. Downloads go to `downloads` under the package cache, else `cache/packages/downloads` in the data folder, else `~/Downloads/Lunaria`.
-- **Packages:** splits are layered over the base APK without modifying it; AABs load the base module and asset packs; OBBs are hard-linked or symlinked where possible. Extractions are cached under `cache/packages/` (`LUNARIA_CACHE_DIR` to move, `LUNARIA_NO_CACHE=1` to disable).
+- **Packages:** splits are layered over the base APK without modifying it; AABs load the base module and asset packs; OBBs are hard-linked or symlinked where possible. Extractions are cached under `cache/packages/` (`LUNARIA_CACHE_DIR` to move, `LUNARIA_NO_CACHE=1` to disable). Legacy encrypted APKMs are decrypted when libsodium is installed; current APKMs are plain ZIPs.
 - **Settings:** persistent options live in `lunaria.conf` (see `lunaria.conf.sample`); environment variables override it per run. The file and guest data default to the startup directory.
 
   ```bash
