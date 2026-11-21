@@ -141,7 +141,7 @@ jobs:
             ### Linux (x86_64 / aarch64)
             ```bash
             tar -xzf lunaria-*-linux-x86_64.tar.gz && cd lunaria-*-linux-x86_64   # or -aarch64
-            ./lunaria /path/to/app.apk      # or .xapk / .apks
+            ./lunaria /path/to/app.apk      # or .apkm / .xapk / .apks
             ```
 
             ### macOS (Apple silicon / Intel)

@@ -1293,7 +1293,7 @@ static void pick_open_dialog(int field)
     config.title = "Open an application";
     config.initial_path = start[0] ? start : NULL;
     config.filter_name = "Android packages";
-    config.filter_patterns = "*.apk *.xapk *.apks *.aab *.so";
+    config.filter_patterns = "*.apk *.apkm *.xapk *.apks *.aab *.so";
   }
   if (luna_file_dialog_show(&config, pick_dialog_done, NULL) < 0)
     luna_set_text(luna_get_element_by_id("error"),
@@ -1345,7 +1345,7 @@ static int pick_clean(const char *in, char *out, size_t capacity)
 
 static int pick_acceptable(const char *path)
 {
-  static const char *const kinds[] = { ".apk", ".xapk", ".apks", ".aab", ".so" };
+  static const char *const kinds[] = { ".apk", ".apkm", ".xapk", ".apks", ".aab", ".so" };
   const size_t len = strlen(path);
   luna_file_info info;
   if (luna_file_infoat(LUNA_AT_FDCWD, path, &info, 0)) return 0;
@@ -1610,7 +1610,7 @@ static int launcher_form(char *path, size_t capacity,
   luna_set_text(luna_get_element_by_id("launcher-title"), title ? title : package ? "Open a profile" : "Open an application");
   if (note) luna_set_text(luna_get_element_by_id("launcher-note"), note);
   if (title) luna_set_text(luna_get_element_by_id("continue"), "Install");
-  luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, XAPK, APKS or AAB package.");
+  luna_set_text(luna_get_element_by_id("launcher-sub"), package ? package : "Choose an APK, APKM, XAPK, APKS or AAB package.");
   if (!package) {
     luna_set_on_click(luna_get_element_by_id("drop"), pick_browse);
   }
@@ -1688,7 +1688,7 @@ static int launcher_form(char *path, size_t capacity,
       } else if (pick_clean(selected_path, cleaned, sizeof cleaned) ||
                  !pick_acceptable(cleaned) || strlen(cleaned) >= capacity) {
         luna_set_text(luna_get_element_by_id("error"),
-                      "That is not an existing .apk, .xapk, .apks or .aab file.");
+                      "That is not an existing .apk, .apkm, .xapk, .apks or .aab file.");
       } else if (!pick_read_fields()) {
         memcpy(path, cleaned, strlen(cleaned) + 1);
         result = 0;

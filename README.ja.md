@@ -15,7 +15,7 @@ Androidのシステムイメージは不要。ARM32／ARM64のコードを、元
 アプリ本体を直接読み込み、ARM32／ARM64のコードを[dynarmic](https://github.com/merryhime/dynarmic)で実行します。
 JNI、EGL、OpenGL ES、MediaCodecなどのAndroid機能はホスト側へ橋渡しし、APK内の`classes*.dex`は内蔵のDalvikインタプリタで処理します。
 
-`.apk`、`.xapk`、`.apks`、`.aab`をそのまま開けます。展開、split APKの統合、キャッシュ、アカウント別のデータ分離はLunariaが行います。
+`.apk`、`.apkm`、`.xapk`、`.apks`、`.aab`をそのまま開けます。展開、split APKの統合、キャッシュ、アカウント別のデータ分離はLunariaが行います。
 WebViewにはChrome／Chromium、または内蔵の[luna-browser](luna-browser/)を使います。
 
 **動作を確認したタイトル：** 原神、二ノ国：Cross Worlds、アルケミアストーリー、気球！エアロノート（2013年のARM32向けAPK）、
@@ -146,7 +146,7 @@ make dist-mac    # Lunaria.app + .dmg（Darwinのみ）
 
 ```bash
 lunaria                        # グラフィカルランチャー（ウィンドウへパッケージをドロップ）
-lunaria path/to/app.apk        # .xapk / .apks / .aab も同様
+lunaria path/to/app.apk        # .apkm / .xapk / .apks / .aab も同様
 LUNARIA_ARCH=arm64-v8a lunaria app.apk   # 複数ABIを含む場合は明示指定
 ```
 
@@ -155,7 +155,7 @@ LUNARIA_ARCH=arm64-v8a lunaria app.apk   # 複数ABIを含む場合は明示指�
 - **ホストメニュー：** 実行中に右クリック。スクリーンショット（**F12**）、貼り付け、戻る、音量、キーマップ、WebView、入力の録画、プロファイル、再起動、フルスクリーン、終了。
 - **表示密度：** 右クリックの**Display → SCREEN DENSITY (DPI)**から変更できます。アプリごとに保存され、再起動後に反映されます。**Automatic**で端末の既定値に戻せます。
 - **アプリ検索：** ランチャーの*Find an app on APKPure*に名前を入力し、候補のパッケージ名を確認して選ぶと、XAPKをダウンロードして開きます。保存先はパッケージキャッシュ配下の`downloads`、なければデータフォルダの`cache/packages/downloads`、それもなければ`~/Downloads/Lunaria`です。
-- **パッケージ：** split APKは元のベースAPKを書き換えずに重ね合わせ、AABはベースモジュールとアセットパックを読み込み、OBBは可能な限りハードリンク／シンボリックリンクで共有します。展開結果は`cache/packages/`にキャッシュされます（移動は`LUNARIA_CACHE_DIR`、無効化は`LUNARIA_NO_CACHE=1`）。
+- **パッケージ：** split APKは元のベースAPKを書き換えずに重ね合わせ、AABはベースモジュールとアセットパックを読み込み、OBBは可能な限りハードリンク／シンボリックリンクで共有します。展開結果は`cache/packages/`にキャッシュされます（移動は`LUNARIA_CACHE_DIR`、無効化は`LUNARIA_NO_CACHE=1`）。旧形式の暗号化APKMはlibsodiumがインストールされていれば復号します（現行のAPKMは通常のZIPです）。
 - **設定：** 永続的な設定は`lunaria.conf`（例：`lunaria.conf.sample`）に保存します。環境変数はその起動に限り優先されます。設定ファイルとゲストデータの標準位置は起動ディレクトリです。
 
   ```bash
@@ -185,7 +185,7 @@ LUNARIA_ARCH=arm64-v8a lunaria app.apk   # 複数ABIを含む場合は明示指�
 
 | 特徴 | できること |
 |---|---|
-| **Androidイメージ不要** | VMなしで`.apk`、`.xapk`、`.apks`、`.aab`を起動。 |
+| **Androidイメージ不要** | VMなしで`.apk`、`.apkm`、`.xapk`、`.apks`、`.aab`を起動。 |
 | **ARM32＋ARM64** | dynarmicのJITでARMv7／AArch64を実行。`LUNARIA_A64_ENGINES`で並列化も可能。 |
 | **ホストGPU描画** | EGL／OpenGL ES 3をホストGPUへ。利用可能ならVulkanも公開。 |
 | **Androidサービス** | JNI、AssetManager、OBB、pthread、OpenSL ES、各種Android APIの互換実装。 |
@@ -473,7 +473,7 @@ LUNARIA_DUMP_DIR=/tmp/lunaria-shots LUNARIA_SCREENSHOT_EVERY=60 ./lunaria game.x
 ## 仕組み
 
 ```text
- APK / XAPK / APKS / AAB
+ APK / APKM / XAPK / APKS / AAB
      │  ベース・分割APK、ネイティブライブラリ、アセット、OBBを展開
      ▼
  Android ELF loader ─── relocation と依存関係解決

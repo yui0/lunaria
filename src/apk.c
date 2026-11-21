@@ -2580,6 +2580,169 @@ static bool suffix(const char *s, const char *ext)
   size_t n = strlen(s), k = strlen(ext);
   return n >= k && !strcasecmp(s + n - k, ext);
 }
+/* APKMirror's older .apkm files are not ZIPs: a 66-byte header names an
+ * Argon2 password hash and an XChaCha20-Poly1305 secretstream.  UnApkm
+ * (souramoo, 2020) documents the layout; the chunks decrypt to the ordinary
+ * ZIP that current .apkm files already are.  libsodium is optional: load it
+ * only for this format so plain packages keep the usual dependencies. */
+#define APKM_HEADER_SIZE 66
+#define APKM_MAX_CHUNK   (64u * 1024u * 1024u)
+#define APKM_MAX_MEMORY  (512u * 1024u * 1024u)
+static const char apkm_password[] = "#$%@#dfas4d00fFSDF9GSD56$^53$%7WRGF3dzzqasD!@";
+typedef int (*apkm_pwhash_fn)(unsigned char *, unsigned long long, const char *,
+                              unsigned long long, const unsigned char *,
+                              unsigned long long, size_t, int);
+typedef int (*apkm_stream_init_fn)(unsigned char *, const unsigned char *,
+                                   const unsigned char *);
+typedef int (*apkm_stream_pull_fn)(unsigned char *, unsigned char *,
+                                   unsigned long long *, unsigned char *,
+                                   const unsigned char *, unsigned long long,
+                                   const unsigned char *, unsigned long long);
+struct apkm_crypto {
+  void *library;
+  apkm_pwhash_fn pwhash;
+  apkm_stream_init_fn init;
+  apkm_stream_pull_fn pull;
+};
+static bool zip_signature(const char *path)
+{
+  unsigned char sig[4];
+  FILE *f = open_file(path, "rb");
+  if (!f)
+    return false;
+  bool zip = fread(sig, 1, sizeof sig, f) == sizeof sig &&
+             (!memcmp(sig, "PK\003\004", 4) || !memcmp(sig, "PK\005\006", 4) ||
+              !memcmp(sig, "PK\007\010", 4));
+  fclose(f);
+  return zip;
+}
+static int apkm_crypto_load(struct apkm_crypto *crypto)
+{
+  static const char *const names[] = {
+#ifdef _WIN32
+    "libsodium.dll", "sodium.dll",
+#elif defined(__APPLE__)
+    "libsodium.23.dylib", "libsodium.dylib",
+#else
+    "libsodium.so.23", "libsodium.so.26", "libsodium.so",
+#endif
+  };
+  for (size_t i = 0; i < sizeof names / sizeof names[0] && !crypto->library; ++i)
+    crypto->library = luna_os_library_open_local(names[i]);
+  if (!crypto->library)
+    return apk_error("encrypted APKM needs libsodium");
+  void *symbol;
+#define APKM_BIND(field, name) \
+  do { \
+    symbol = luna_os_library_symbol(crypto->library, name); \
+    if (!symbol) { \
+      luna_os_library_close(crypto->library); \
+      crypto->library = NULL; \
+      return apk_error("libsodium is missing %s", name); \
+    } \
+    memcpy(&crypto->field, &symbol, sizeof symbol); \
+  } while (0)
+  APKM_BIND(pwhash, "crypto_pwhash");
+  APKM_BIND(init, "crypto_secretstream_xchacha20poly1305_init_pull");
+  APKM_BIND(pull, "crypto_secretstream_xchacha20poly1305_pull");
+#undef APKM_BIND
+  return 0;
+}
+static int apkm_decrypt(const char *source, char *target, size_t capacity)
+{
+  FILE *in = open_file(source, "rb"), *out = NULL;
+  unsigned char header[APKM_HEADER_SIZE], key[32], state[64];
+  unsigned char *cipher = NULL, *plain = NULL;
+  struct apkm_crypto crypto = {0};
+  unsigned char last_tag = 0;
+  char path[APK_PATH] = "apkm-XXXXXX";
+  bool temp_created = false;
+  int result = -1;
+  if (!in)
+    return apk_error("cannot open APKM %s: %s", source, strerror(errno));
+  if (fread(header, 1, sizeof header, in) != sizeof header) {
+    apk_error("encrypted APKM header is truncated");
+    goto done;
+  }
+  unsigned alg = header[1];
+  uint64_t ops = le64(header + 2), mem = le64(header + 10), chunk = le64(header + 18);
+  if ((alg != 1 && alg != 2) || !ops || ops > 16 || !mem || mem > APKM_MAX_MEMORY ||
+      !chunk || chunk > APKM_MAX_CHUNK || chunk > SIZE_MAX - 17) {
+    apk_error("encrypted APKM has an invalid Argon2 header");
+    goto done;
+  }
+  if (apkm_crypto_load(&crypto))
+    goto done;
+  if (crypto.pwhash(key, sizeof key, apkm_password, sizeof apkm_password - 1,
+                    header + 26, ops, (size_t)mem, (int)alg)) {
+    apk_error("cannot derive the APKM key");
+    goto done;
+  }
+  if (crypto.init(state, header + 42, key)) {
+    apk_error("cannot start APKM decryption");
+    goto done;
+  }
+  size_t cipher_size = (size_t)chunk + 17;
+  cipher = malloc(cipher_size);
+  plain = malloc((size_t)chunk);
+  if (!cipher || !plain) {
+    apk_error("out of memory decrypting APKM");
+    goto done;
+  }
+  int fd = luna_temp_mkstemp(path, sizeof path);
+  if (fd < 0) {
+    apk_error("cannot create an APKM temporary file: %s", strerror(errno));
+    goto done;
+  }
+  temp_created = true;
+  out = fdopen(fd, "wb");
+  if (!out) {
+    luna_fd_close(fd);
+    apk_error("cannot open the APKM temporary file: %s", strerror(errno));
+    goto done;
+  }
+  for (;;) {
+    size_t n = fread(cipher, 1, cipher_size, in);
+    if (!n)
+      break;
+    unsigned long long plain_length = 0;
+    if (crypto.pull(state, plain, &plain_length, &last_tag, cipher, n, NULL, 0) ||
+        plain_length > chunk) {
+      apk_error("encrypted APKM decryption failed");
+      goto done;
+    }
+    if (plain_length && fwrite(plain, 1, (size_t)plain_length, out) != plain_length) {
+      apk_error("cannot write the decrypted APKM: %s", strerror(errno));
+      goto done;
+    }
+  }
+  if (ferror(in) || last_tag != 3) {
+    apk_error("encrypted APKM stream is truncated");
+    goto done;
+  }
+  if (fclose(out)) {
+    out = NULL;
+    apk_error("cannot finish the decrypted APKM: %s", strerror(errno));
+    goto done;
+  }
+  out = NULL;
+  if (snprintf(target, capacity, "%s", path) >= (int)capacity) {
+    apk_error("decrypted APKM path is too long");
+    goto done;
+  }
+  result = 0;
+done:
+  if (out)
+    fclose(out);
+  fclose(in);
+  free(cipher);
+  free(plain);
+  if (crypto.library)
+    luna_os_library_close(crypto.library);
+  if (result && temp_created)
+    luna_file_unlinkat(LUNA_AT_FDCWD, path, 0);
+  return result;
+}
 /* Driver discovery is host runtime state, shared by APKs and direct modules.
  * Keep explicit driver selection intact and resolve bundled Resources too. */
 static int host_driver_defaults(void)
@@ -2809,7 +2972,7 @@ static int obb_setup(const char *input, const char *container, const char *inst,
 }
 static void apk_help(void)
 {
-  puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.aab|APP.xapk|APP.apks\n"
+  puts("Usage: lunaria [--config FILE] [--data-root DIR] [--profile NAME] APP.apk|APP.apkm|APP.aab|APP.xapk|APP.apks\n"
        "       lunaria [--list-profiles | --choose-profile | --prepare-profile | --install-only] APP.apk\n"
        "       lunaria --install-system APP.apk\n"
        "       lunaria --google-services [--data-root DIR]\n"
@@ -3148,26 +3311,38 @@ static int apk_prepare_inner(int *argc, const char ***argv)
     if (at >= *argc || *argc - at != 1) return apk_error("specify one APK or module");
     argument = (*argv)[at];
   }
-  bool container = suffix(argument, ".xapk") || suffix(argument, ".apks");
+  bool container = suffix(argument, ".xapk") || suffix(argument, ".apks") || suffix(argument, ".apkm");
   if (!container && !suffix(argument, ".apk") && !suffix(argument, ".aab")) {
     if (at != 1)
       return apk_error("APK options require an APK archive");
     return 0;
   }
-  char input[APK_PATH], cwd[APK_PATH], exedir[APK_PATH], conf[APK_PATH], root[APK_PATH], cache_root[APK_PATH], cache[APK_PATH], pkgdir[APK_PATH], inst[APK_PATH], base[APK_PATH], ready[APK_PATH];
+  char input[APK_PATH], decrypted[APK_PATH] = "", cwd[APK_PATH], exedir[APK_PATH], conf[APK_PATH], root[APK_PATH], cache_root[APK_PATH], cache[APK_PATH], pkgdir[APK_PATH], inst[APK_PATH], base[APK_PATH], ready[APK_PATH];
   if (!luna_file_realpath(argument, input, sizeof input) || !apk_getcwd(cwd, sizeof cwd) || luna_os_executable_path(exedir, sizeof exedir))
     return apk_error("cannot resolve APK or executable path");
   /* APKPure's XAPK endpoint also serves ordinary APKs. The extension is a
    * download label, not the archive structure: inspect the central directory
    * before both launcher metadata and installation choose a parsing path. */
+  const char *archive = input;
+  bool decrypted_input = false;
+  if (suffix(argument, ".apkm") && !zip_signature(input)) {
+    if (apkm_decrypt(input, decrypted, sizeof decrypted)) return -1;
+    archive = decrypted;
+    decrypted_input = true;
+  }
   struct zip format = {0};
-  if (zip_open(&format, input)) return -1;
+  if (zip_open(&format, archive)) {
+    if (decrypted_input) luna_file_unlinkat(LUNA_AT_FDCWD, decrypted, 0);
+    return -1;
+  }
   container = !zip_find(&format, "AndroidManifest.xml") &&
               !zip_find(&format, "base/manifest/AndroidManifest.xml");
   zip_close(&format);
   char *slash = strrchr(exedir, '/');
-  if (!slash)
+  if (!slash) {
+    if (decrypted_input) luna_file_unlinkat(LUNA_AT_FDCWD, decrypted, 0);
     return -1;
+  }
   *slash = 0;
 #ifdef __APPLE__
   /* A .app uses its Resources directory as the distribution root. */
@@ -3177,7 +3352,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   if (conf_default_path(conf, sizeof conf) || env_set("LUNARIA_CONF", conf, true) || config_load(conf, NULL))
     return -1;
   if (((!list && !prepare && !install) || choose || google_setup) && !service_host) {
-    if (launcher_display_metadata(input, container, conf) || font_defaults(exedir)) return -1;
+    if (launcher_display_metadata(archive, container, conf) || font_defaults(exedir)) return -1;
     launch_ui_ready = luna_launcher_begin(input) != 0;
   }
   if (absolute_path(env_value("LUNARIA_DATA_ROOT", cwd), root, sizeof root) || mkdirs(root))
@@ -3210,7 +3385,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
   if (!m || !split)
     goto done;
   if (container) {
-    if (zip_open(&outer, input))
+    if (zip_open(&outer, archive))
       goto done;
     /* Keep contained APKs and expansion archives intact. */
     if (zip_extract(&outer, pkgdir, !hit))
@@ -3253,7 +3428,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
       apk_error("container has no base APK");
       goto done;
     }
-  } else if (copy_text(base, sizeof base, input))
+  } else if (copy_text(base, sizeof base, archive))
     goto done;
   if (zip_open(&apk, base) || manifest_zip(&apk, m))
     goto done;
@@ -3452,7 +3627,7 @@ static int apk_prepare_inner(int *argc, const char ***argv)
     goto done;
   }
   fprintf(stderr, "[apk] %s: %s, %s, profile=%s\n[apk] installed view: %s\n", m->package, arch, hit ? "cache hit" : "installed", profile, inst);
-  if (system_install && google_package_install(root, m->package, input, base, container)) goto done;
+  if (system_install && google_package_install(root, m->package, archive, base, container)) goto done;
   if (install) {
     printf("package=%s\nactivity=%s\narch=%s\ninstalled=%s\nmodule=%s\nconfigChanges=%s\n", m->package, m->activity, arch, inst, main_module, *m->config_changes ? m->config_changes : "0");
     result = 1;
@@ -3473,6 +3648,8 @@ static int apk_prepare_inner(int *argc, const char ***argv)
 done:
   zip_close(&outer);
   zip_close(&apk);
+  if (decrypted_input)
+    luna_file_unlinkat(LUNA_AT_FDCWD, decrypted, 0);
   for (size_t i = 0; i < apk_count; i++)
     free(apks[i]);
   free(apks);
