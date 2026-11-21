@@ -9899,6 +9899,7 @@ static bool exec_pool_await(struct dvm *vm, dvm_ref self, const union dvm_value 
   RETI(1);
 }
 
+static bool at_execute_runnable(struct dvm *vm, dvm_ref task, union dvm_value *out);
 static bool exec_execute(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                          int nargs, union dvm_value *out)
 {
@@ -9920,7 +9921,9 @@ static bool exec_execute(struct dvm *vm, dvm_ref self, const union dvm_value *ar
     }
   }
   if(!task) { dvm__throw(vm,"java/lang/NullPointerException","task"); return false; }
-  if(!self) return exec_run_task(vm,task,"run","()V");
+  /* The static AsyncTask.execute(Runnable) has no executor object; it is the platform's
+   * serial executor, whose thread runs the Runnable. */
+  if(!self) return at_execute_runnable(vm,task,out);
   union dvm_value active={0},maximum={0};
   dvm_get_field(vm,self,"workers","I",&active);
   dvm_get_field(vm,self,"maxWorkers","I",&maximum);
@@ -56605,8 +56608,18 @@ static bool at_run(struct dvm *vm, dvm_ref self, const union dvm_value *args,
  * ErrorMD5Mismatch.  So keep a queue and one worker that drains it. */
 #define AT_QUEUE_MAX 256
 static dvm_ref g_at_queue[AT_QUEUE_MAX];
+static bool g_at_runnable[AT_QUEUE_MAX];   /* entry is a Runnable, not an AsyncTask instance */
 static int g_at_head, g_at_tail;
 static bool g_at_worker;
+
+/* AsyncTask.execute(Runnable): the Runnable's run(), as the executor's thread does. */
+static bool at_run_runnable(struct dvm *vm, dvm_ref task)
+{
+  struct dvm_class *c = dvm_object_class(vm, task);
+  struct dvm_method *m = c ? dvm_find_method(vm, c, "run", "()V") : NULL;
+  union dvm_value ignored = { 0 };
+  return !m || dvm_call(vm, m, task, NULL, 0, &ignored);
+}
 
 static bool at_serial_run(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs,
@@ -56617,6 +56630,7 @@ static bool at_serial_run(struct dvm *vm, dvm_ref self,
   (void)nargs;
   while (g_at_head != g_at_tail) {
     dvm_ref task = g_at_queue[g_at_head];
+    const bool is_runnable = g_at_runnable[g_at_head];
     g_at_head = (g_at_head + 1) % AT_QUEUE_MAX;
     union dvm_value ignored = { 0 };
     const bool trace = dvm__env("LUNARIA_TRACE_ASYNC") != NULL;
@@ -56625,7 +56639,8 @@ static bool at_serial_run(struct dvm *vm, dvm_ref self,
                        (g_at_tail - g_at_head + AT_QUEUE_MAX) % AT_QUEUE_MAX);
     /* One task's uncaught exception is its own; the queue behind it still
      * has to run, exactly as it would on the platform's executor. */
-    const bool ran = at_run(vm, task, NULL, 0, &ignored);
+    const bool ran = is_runnable ? at_run_runnable(vm, task)
+                     : at_run(vm, task, NULL, 0, &ignored);
     if (trace) fprintf(stderr, "[AsyncTask] done  %s\n", task_name);
     if (!ran) {
       char error[512];
@@ -56640,6 +56655,52 @@ static bool at_serial_run(struct dvm *vm, dvm_ref self,
     dvm_unpin(vm, task);
   }
   g_at_worker = false;
+  RETV();
+}
+
+/* Hands `task` to the serial worker.  1: queued (or already run, when no worker
+ * thread could be started); 0: the queue is full, the caller runs it itself;
+ * -1: an exception is pending. */
+static int at_enqueue(struct dvm *vm, dvm_ref task, bool runnable)
+{
+  /* Queue it for the serial worker rather than draining it here.  The
+   * pending-runnable queue is drained by whoever reaches a call boundary
+   * next, which for this title is the frame pump — so the patch download
+   * (13.7 GB in one doInBackground) ran *on* the pump and the engine stopped
+   * for the whole transfer: no frames, no input, a frozen window.  On a
+   * device the work runs off the main thread. */
+  int next = (g_at_tail + 1) % AT_QUEUE_MAX;
+  if (next == g_at_head) return 0;
+  dvm_pin(vm, task);
+  g_at_queue[g_at_tail] = task;
+  g_at_runnable[g_at_tail] = runnable;
+  g_at_tail = next;
+  if (g_at_worker) return 1;      /* the worker will get to it */
+  struct dvm_class *tc = dvm__class_by_desc(vm, "Ljava/lang/Thread;");
+  struct dvm_class *ec =
+    dvm__class_by_desc(vm, "Landroid/os/AsyncTask$SerialExecutor;");
+  dvm_ref worker = tc ? dvm_new_object(vm, tc) : 0;
+  dvm_ref exec = ec ? dvm_new_object(vm, ec) : 0;
+  if (worker && exec) {
+    union dvm_value t = { .l = exec }, initialized = { 0 };
+    if (!t_init_runnable(vm, worker, &t, 1, &initialized)) return -1;
+    g_at_worker = true;
+    union dvm_value started = { 0 };
+    if (t_start(vm, worker, NULL, 0, &started)) return 1;
+    g_at_worker = false;
+  }
+  /* No worker could be started: run the queue here, in order. */
+  union dvm_value ig2 = { 0 };
+  (void)at_serial_run(vm, 0, NULL, 0, &ig2);
+  return 1;
+}
+
+/* The static AsyncTask.execute(Runnable) shortcut: the same serial executor. */
+static bool at_execute_runnable(struct dvm *vm, dvm_ref task, union dvm_value *out)
+{
+  const int queued = at_enqueue(vm, task, true);
+  if (queued < 0) return false;
+  if (queued == 0) return at_run_runnable(vm, task);
   RETV();
 }
 
@@ -56674,39 +56735,9 @@ static bool at_execute(struct dvm *vm, dvm_ref self,
   union dvm_value ignored = { 0 };
   if (m && !dvm_call(vm, m, self, NULL, 0, &ignored)) return false;
 
-  /* Queue it for the serial worker rather than draining it here.  The
-   * pending-runnable queue is drained by whoever reaches a call boundary
-   * next, which for this title is the frame pump — so the patch download
-   * (13.7 GB in one doInBackground) ran *on* the pump and the engine stopped
-   * for the whole transfer: no frames, no input, a frozen window.  On a
-   * device the work runs off the main thread. */
-  int next = (g_at_tail + 1) % AT_QUEUE_MAX;
-  if (next != g_at_head) {
-    dvm_pin(vm, self);
-    g_at_queue[g_at_tail] = self;
-    g_at_tail = next;
-    if (!g_at_worker) {
-      struct dvm_class *tc = dvm__class_by_desc(vm, "Ljava/lang/Thread;");
-      struct dvm_class *ec =
-        dvm__class_by_desc(vm, "Landroid/os/AsyncTask$SerialExecutor;");
-      dvm_ref worker = tc ? dvm_new_object(vm, tc) : 0;
-      dvm_ref exec = ec ? dvm_new_object(vm, ec) : 0;
-      if (worker && exec) {
-        union dvm_value t = { .l = exec }, initialized= {0};
-        if(!t_init_runnable(vm,worker,&t,1,&initialized)) return false;
-        g_at_worker = true;
-        union dvm_value started = { 0 };
-        if (t_start(vm, worker, NULL, 0, &started)) RETL(self);
-        g_at_worker = false;
-      }
-    } else {
-      RETL(self);       /* the worker will get to it */
-    }
-    /* No worker could be started: run the queue here, in order. */
-    union dvm_value ig2 = { 0 };
-    (void)at_serial_run(vm, 0, NULL, 0, &ig2);
-    RETL(self);
-  }
+  const int queued = at_enqueue(vm, self, false);
+  if (queued < 0) return false;
+  if (queued > 0) RETL(self);
   return at_run(vm, self, NULL, 0, &ignored) ? (out->l = self, true)
          : false;
 }

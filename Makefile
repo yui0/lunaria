@@ -2200,6 +2200,9 @@ abi-test: lunaria test/libabitest64.so test/libabitest32.so test/abi_pkg/classes
 	done; exit $$rc
 
 # Build dynarmic A32 JIT library (Release, A32 frontend only)
+# Bundled externals are forced: the link line below uses externals/{fmt,mcl,zydis}
+# archives, which CMake does not build when a system fmt/mcl/zydis is installed
+# (e.g. libfmt-dev on Debian/Ubuntu).
 DYNARMIC_DIR     = dynarmic
 DYNARMIC_BUILD  ?= $(DYNARMIC_DIR)/build
 DYNARMIC_LIB     = $(DYNARMIC_BUILD)/src/dynarmic/libdynarmic.a
@@ -2254,6 +2257,7 @@ $(DYNARMIC_LIB): $(DYNARMIC_SOURCES) $(DYNARMIC_DIR)/CMakeLists.txt
 	    -DDYNARMIC_TESTS=OFF \
 	    -DCMAKE_BUILD_TYPE=Release \
 	    -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=$(DYNARMIC_IPO) \
+	    -DDYNARMIC_USE_BUNDLED_EXTERNALS=ON \
 	    $(DYNARMIC_CMAKE_FLAGS) \
 	    -DDYNARMIC_FRONTENDS="A32;A64" \
 	    -DCMAKE_POLICY_VERSION_MINIMUM=3.5

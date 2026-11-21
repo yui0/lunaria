@@ -18641,20 +18641,27 @@ static bool init_host_egl() {
  * Must take a full GuestVA: on A64 the list often lives in a tokenised
  * high address, and callers must not pass a truncated rN. */
 static std::vector<EGLint> read_egl_attribs(ArmExecCtx &ctx, GuestVA va) {
+  /* An EGL attribute list is (key, value) pairs ended by a *key* of EGL_NONE.
+   * A value may itself be EGL_NONE (EGL_CONFIG_CAVEAT, EGL_NONE), so the list
+   * must be walked pair-wise: stopping at the first EGL_NONE word truncates
+   * the request and leaves an odd-length list that pair-wise consumers run
+   * past the end of.  The result always ends with a key EGL_NONE at an even
+   * index. */
   std::vector<EGLint> out;
-  if (!va) {
-    out.push_back(EGL_NONE);
-    return out;
+  for (int i = 0; va && i < 64; ++i) {
+    auto *kp = ctx.mem.ptr(va + (GuestVA)(i * 8));
+    if (!kp) break;
+    EGLint key;
+    memcpy(&key, kp, 4);
+    if (key == EGL_NONE) break;
+    auto *vp = ctx.mem.ptr(va + (GuestVA)(i * 8 + 4));
+    if (!vp) break;
+    EGLint val;
+    memcpy(&val, vp, 4);
+    out.push_back(key);
+    out.push_back(val);
   }
-  for (int i = 0; i < 64; ++i) {
-    auto *p = ctx.mem.ptr(va + (GuestVA)(i * 4));
-    if (!p) break;
-    EGLint v;
-    memcpy(&v, p, 4);
-    out.push_back(v);
-    if (v == EGL_NONE) break;
-  }
-  if (out.empty() || out.back() != EGL_NONE) out.push_back(EGL_NONE);
+  out.push_back(EGL_NONE);
   return out;
 }
 
@@ -37214,8 +37221,8 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
         lunaria_env("LUNARIA_TRACE_HTTP")) {
       const uint64_t lr = g_svc_jit64 ? g_svc_jit64->GetRegister(30) : 0;
       const uint64_t fp = g_svc_jit64 ? g_svc_jit64->GetRegister(29) : 0;
-      fprintf(stderr, "[http] JSON constructed at lr=0x%llx tid=%u\n",
-              (unsigned long long)lr, g_current_tid);
+      fprintf(stderr, "[http] JSON constructed at lr=0x%llx tid=%u: %s\n",
+              (unsigned long long)lr, g_current_tid, ns);
       if (ctx.is_arm64) a64_dump_guest_backtrace("HTTP JSON", g_current_tid, fp);
     }
     ++ns_count;
@@ -53620,29 +53627,43 @@ fputws_done:
     break;
   }
   case SVC_STRTOK_R: {
-
-    uint32_t s_va = r0 ? r0 : (r2 ? ctx.mem.read32(r2) : 0u);
-    const char *delim = ctx.mem.cstr(r1);
-    if (!s_va || !delim) {
-      ret32(0);
+    /* strtok_r(s, delim, saveptr): the saved position is a pointer-sized slot in guest memory
+     * and the token comes back as a guest pointer, both at the guest's own pointer width.
+     * The slot used to be read and written as 32 bits and the token returned as an
+     * image-window offset, so an AArch64 guest kept half of a stale pointer in its slot and was
+     * handed an address in unmapped low memory: what it then read was the shared scratch page
+     * unmapped accesses are absorbed into, and whether a parse worked depended on what other
+     * threads had last left there. */
+    const GuestVA slot = argp(2);
+    const GuestVA first = argp(0);
+    GuestVA cur = first ? first
+                  : (slot ? (ctx.is_arm64 ? (GuestVA)ctx.mem.read64(slot)
+                             : (GuestVA)ctx.mem.read32(slot)) : 0);
+    const char *delim = ctx.mem.cstr(argp(1));
+    char *text = cur ? (char *)ctx.mem.ptr(cur) : nullptr;
+    if (!text || !delim) {
+      retptr(0);
       break;
     }
-    char *base = (char*)ctx.mem.ptr(0u);
-    char *s = base + s_va;
-    s += strspn(s, delim);
-    if (!*s) {
-      if (r2) ctx.mem.write32(r2, (uint32_t)(s - base));
-      ret32(0);
-      break;
+    const char *const origin = text;
+    text += strspn(text, delim);
+    GuestVA at = cur + (GuestVA)(text - origin);
+    GuestVA token = 0;
+    if (*text) {
+      token = at;
+      const size_t length = strcspn(text, delim);
+      text += length;
+      at += length;
+      if (*text) {
+        *text = '\0';
+        ++at;
+      }
     }
-    char *tok = s;
-    s += strcspn(s, delim);
-    if (*s) {
-      *s = '\0';
-      ++s;
+    if (slot) {
+      if (ctx.is_arm64) ctx.mem.write64(slot, at);
+      else ctx.mem.write32(slot, (uint32_t)at);
     }
-    if (r2) ctx.mem.write32(r2, (uint32_t)(s - base));
-    ret32((uint32_t)(tok - base));
+    retptr(token);
     break;
   }
   case SVC_BASENAME:
@@ -55942,27 +55963,33 @@ fputws_done:
     break;
   }
   case SVC_STRSEP: {
-    // strsep(char** stringp, const char* delim): *stringp is a guest ptr.
-    if (!r0) {
-      ret32(0);
+    /* strsep(char **stringp, const char *delim): *stringp is a guest pointer, at the guest's
+     * pointer width (see strtok_r). */
+    const GuestVA slot = argp(0);
+    if (!slot) {
+      retptr(0);
       break;
     }
-    uint32_t cur = ctx.mem.read32(r0);
+    const GuestVA cur = ctx.is_arm64 ? (GuestVA)ctx.mem.read64(slot) : (GuestVA)ctx.mem.read32(slot);
     if (!cur) {
-      ret32(0);
+      retptr(0);
       break;
     }
-    const char *delim = ctx.mem.cstr(r1);
-    char *base = (char*)ctx.mem.ptr(cur);
-    size_t span = delim ? strcspn(base, delim) : strlen(base);
-    uint32_t tok = cur;
-    if (base[span]) {
-      base[span] = '\0';
-      ctx.mem.write32(r0, cur + (uint32_t)span + 1u);
-    } else {
-      ctx.mem.write32(r0, 0u); /* last token */
+    const char *delim = ctx.mem.cstr(argp(1));
+    char *text = (char *)ctx.mem.ptr(cur);
+    if (!text) {
+      retptr(0);
+      break;
     }
-    ret32(tok);
+    const size_t span = delim ? strcspn(text, delim) : strlen(text);
+    GuestVA next = 0;                       /* the last token leaves *stringp NULL */
+    if (text[span]) {
+      text[span] = '\0';
+      next = cur + (GuestVA)span + 1u;
+    }
+    if (ctx.is_arm64) ctx.mem.write64(slot, next);
+    else ctx.mem.write32(slot, (uint32_t)next);
+    retptr(cur);
     break;
   }
   case SVC_ISALPHA:
@@ -70711,8 +70738,8 @@ a64_hooks_done:
     static const bool trace_svc64 = lunaria_env("LUNARIA_TRACE_SVC") != nullptr;
     if (trace_svc64) {
       /* A raw `svc #0` carries the kernel syscall number in x8. */
-      fprintf(stderr, "[svc64] %u(%s) x8=%llu x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx lr=0x%llx\n",
-              svc_no, svc_symbol_name(svc_no),
+      fprintf(stderr, "[svc64] t%u %u(%s) x8=%llu x0=0x%llx x1=0x%llx x2=0x%llx x3=0x%llx lr=0x%llx\n",
+              g_current_tid, svc_no, svc_symbol_name(svc_no),
               (unsigned long long)(svc_no ? 0u : jit64->GetRegister(8)),
               (unsigned long long)x0, (unsigned long long)x1,
               (unsigned long long)x2, (unsigned long long)x3, (unsigned long long)x30);
@@ -76278,6 +76305,23 @@ static bool dvm_call_guest_native(const char *klass, const char *method,
       if (config)
         jvm->native.ReleaseStringUTFChars(env, str, config);
     }
+  }
+  if (!strcmp(klass, "nmss/app/NmssSa") &&
+      !strcmp(method, "nmssSetId") && nargs >= 2) {
+    /* The identifiers the security module keys its stored state with: Android ID and
+     * advertising ID.  They arrive asynchronously (the advertising ID from GMS), so the
+     * moment they arrive relative to the module reading its state is part of what it sees. */
+    struct jvm *jvm = g_ctx->jvm;
+    JNIEnv *env = jvm ? &jvm->env : nullptr;
+    fprintf(stderr, "[detect] nmssSetId");
+    for (unsigned i = 0; i < 2u; ++i) {
+      const jstring str = (jstring)args[i].l;
+      const char *sv = (env && str)
+                       ? jvm->native.GetStringUTFChars(env, str, nullptr) : nullptr;
+      fprintf(stderr, " arg%u=\"%s\"", i, sv ? sv : (str ? "<invalid>" : "<null>"));
+      if (sv) jvm->native.ReleaseStringUTFChars(env, str, sv);
+    }
+    fprintf(stderr, " tid=%u\n", g_current_tid);
   }
   if (!strcmp(klass, "nmss/app/NmssSa") &&
       !strcmp(method, "nmssNativeInit") && nargs >= 8) {
