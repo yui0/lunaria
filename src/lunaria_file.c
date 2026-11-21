@@ -734,7 +734,7 @@ static int sym_publish(const char *from,const char *to)
   return -1;
 #elif defined(__linux__) && defined(SYS_renameat2)
   if (!syscall(SYS_renameat2,AT_FDCWD,from,AT_FDCWD,to,1)) return 0;
-  if (errno!=ENOSYS) return -1;
+  if (errno!=ENOSYS && errno!=EINVAL) return -1;
   if (luna_file_link(from,to)) return -1;
   return luna_file_unlink(from);
 #elif defined(__APPLE__)
