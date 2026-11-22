@@ -2133,20 +2133,71 @@ static int copy_system_image(const char *src, const char *dst)
   if (!ok) luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0);
   return ok ? 0 : -1;
 }
+/* Copy <sys>/android/apex/<module>/<subdir>/ (and its bionic/ directory) into the device's
+ * /apex/<module>/<subdir>/.  Returns 0 when copied, 1 when there is no such image, -1 on error. */
+static int install_android_apex_dir(const char *from, const char *to)
+{
+  luna_directory *dir = luna_directory_open(from);
+  if (!dir) return 1;
+  int result = 0;
+  if (mkdirs(to)) result = -1;
+  for (luna_directory_entry *e; result == 0 && (e = luna_directory_read(dir));) {
+    char src[PATH_MAX], dst[PATH_MAX];
+    luna_file_info info;
+    if (e->d_name[0] == '.' || path_join(src, sizeof src, from, e->d_name) ||
+        path_join(dst, sizeof dst, to, e->d_name)) continue;
+    if (luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) continue;
+    if ((info.mode & 0170000) == 0040000) {
+      if (install_android_apex_dir(src, dst) == -1) result = -1;
+    } else if ((info.mode & 0170000) == 0100000 && copy_system_image(src, dst)) {
+      result = apk_error("cannot install %s: %s", dst, strerror(errno));
+    }
+  }
+  luna_directory_close(dir);
+  return result;
+}
+static int install_android_apex(const char *root, const char *sys, const char *module, const char *subdir)
+{
+  char from[PATH_MAX], to[PATH_MAX], rel[PATH_MAX];
+  if (snprintf(rel, sizeof rel, "android/apex/%s/%s", module, subdir) >= (int)sizeof rel ||
+      path_join(from, sizeof from, sys, rel)) return -1;
+  if (snprintf(rel, sizeof rel, "apex/%s/%s", module, subdir) >= (int)sizeof rel ||
+      path_join(to, sizeof to, root, rel)) return -1;
+  return install_android_apex_dir(from, to) == -1 ? -1 : 0;
+}
+static bool have_android_apex(const char *sys, const char *module)
+{
+  char probe[PATH_MAX], rel[PATH_MAX];
+  luna_file_info info;
+  if (!sys || !*sys || snprintf(rel, sizeof rel, "android/apex/%s/lib64", module) >= (int)sizeof rel ||
+      path_join(probe, sizeof probe, sys, rel)) return false;
+  return !luna_file_infoat(LUNA_AT_FDCWD, probe, &info, 0);
+}
 static int android_system_libs(const char *root)
 {
-  static const struct { const char *name, *backing; } libs[] = {
-    {"libc.so", "libc-pure.so"}, {"libm.so", "libm.so"}, {"libdl.so", NULL},
-    {"liblog.so", NULL}, {"libz.so", "libz.so"}, {"libstdc++.so", NULL},
+  static const struct { const char *name, *backing; bool bionic; } libs[] = {
+    {"libc.so", "libc-pure.so", true}, {"libm.so", "libm.so", true},
+    {"libdl.so", "libdl.so", true}, {"liblog.so", "liblog.so", false},
+    {"libz.so", "libz.so", false}, {"libstdc++.so", "libstdc++.so", false},
   };
   const char *sys = getenv("LUNARIA_SYSLIB_DIR");
-  static const char *const dirs[] = {"system/lib64", "system/lib"};
+  const bool runtime_apex = lunaria_sdk_int() >= 29;
+  static const char *const dirs[] = {"lib64", "lib"};
   for (unsigned d = 0; d < 2; ++d) {
-    char dir[PATH_MAX], src[PATH_MAX], dst[PATH_MAX];
-    if (path_join(dir, sizeof dir, root, dirs[d]) || mkdirs(dir)) return -1;
+    char dir[PATH_MAX], apex[PATH_MAX], src[PATH_MAX], dst[PATH_MAX];
+    if (snprintf(dir, sizeof dir, "%s/system/%s", root, dirs[d]) >= (int)sizeof dir ||
+        mkdirs(dir)) return -1;
+    if (runtime_apex &&
+        (snprintf(apex, sizeof apex, "%s/apex/com.android.runtime/%s/bionic", root, dirs[d])
+           >= (int)sizeof apex || mkdirs(apex))) return -1;
     for (unsigned i = 0; i < sizeof libs / sizeof libs[0]; ++i) {
       luna_file_info info;
-      if (path_join(dst, sizeof dst, dir, libs[i].name)) return -1;
+      const bool in_apex = runtime_apex && libs[i].bionic;
+      if (path_join(dst, sizeof dst, in_apex ? apex : dir, libs[i].name)) return -1;
+      /* The platform's own libc/libm/libdl are installed below from the real image. */
+      if (in_apex && d == 0 && have_android_apex(sys, "com.android.runtime")) {
+        /* fall through to the /system link only */
+      } else
       /* The 64-bit images are the ones the runtime has. */
       if (d == 0 && sys && *sys && libs[i].backing && !path_join(src, sizeof src, sys, libs[i].backing) &&
           !luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) {
@@ -2155,9 +2206,46 @@ static int android_system_libs(const char *root)
             luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0)) return -1;
         if (copy_system_image(src, dst))
           return apk_error("cannot install system library %s: %s", dst, strerror(errno));
-        continue;
+      } else if (write_elf_stub(dst, d == 0, true)) {
+        return -1;
       }
-      if (write_elf_stub(dst, d == 0, true)) return -1;
+      if (in_apex) {
+        char link[PATH_MAX], target[128], existing[128];
+        if (path_join(link, sizeof link, dir, libs[i].name)) return -1;
+        snprintf(target, sizeof target, "/apex/com.android.runtime/%s/bionic/%s",
+                 dirs[d], libs[i].name);
+        const ptrdiff_t n = luna_symlink_readlink(link, existing, sizeof existing);
+        if (n == (ptrdiff_t)strlen(target) && !memcmp(target, existing, (size_t)n)) continue;
+        if ((n >= 0 || !luna_file_infoat(LUNA_AT_FDCWD, link, &info, LUNA_AT_NOFOLLOW)) &&
+            luna_symlink_unlink(link)) return -1;
+        if (luna_symlink_create(target, link)) return -1;
+      }
+    }
+  }
+  /* A real platform image, when one was extracted beside the runtime
+ * (scripts/extract-android-apex.sh): every APEX library a device has is installed as it
+ * shipped, so a process that reads /apex/<module>/lib64 sees the files of the platform it is told
+ * it runs on, not placeholders. */
+  if (sys && *sys && install_android_apex(root, sys, "com.android.runtime", "lib64") == -1) return -1;
+  if (sys && *sys && install_android_apex(root, sys, "com.android.art", "lib64") == -1) return -1;
+  if (sys && *sys && lunaria_sdk_int() >= 31 && !have_android_apex(sys, "com.android.art")) {
+    static const char *const art[] = {
+      "libart.so", "libartbase.so", "libdexfile.so", "libnativeloader.so",
+    };
+    char dir[PATH_MAX];
+    if (path_join(dir, sizeof dir, root, "apex/com.android.art/lib64") ||
+        mkdirs(dir)) return -1;
+    for (size_t i = 0; i < sizeof art / sizeof art[0]; ++i) {
+      char src[PATH_MAX], dst[PATH_MAX];
+      luna_file_info info;
+      if (path_join(src, sizeof src, sys, art[i]) ||
+          path_join(dst, sizeof dst, dir, art[i])) return -1;
+      if (luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) {
+        if (errno == ENOENT) continue;
+        return -1;
+      }
+      if (copy_system_image(src, dst))
+        return apk_error("cannot install ART library %s: %s", dst, strerror(errno));
     }
   }
   return 0;

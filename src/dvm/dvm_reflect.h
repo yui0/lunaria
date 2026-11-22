@@ -2066,6 +2066,19 @@ static bool unsafe_put_object(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+/* Runtime methods run under the DVM GIL. Keep the read and write in the
+ * same dispatch so no other Java thread can observe a partial exchange. */
+static bool unsafe_get_and_set_object(struct dvm *vm, dvm_ref self,
+                                     const union dvm_value *args, int nargs,
+                                     union dvm_value *out)
+{
+  union dvm_value previous = { 0 };
+  if (!unsafe_get_object(vm, self, args, nargs, &previous) ||
+      !unsafe_put_object(vm, self, args, nargs, NULL))
+    return false;
+  RETL(previous.l);
+}
+
 #define UNSAFE_M(jname, name, tychar)                                         \
    M("get" jname, "(Ljava/lang/Object;J)" tychar, unsafe_get_##name),         \
    M("get" jname "Volatile", "(Ljava/lang/Object;J)" tychar,                  \
@@ -2103,6 +2116,8 @@ static const struct rt_method rt_unsafe[] = {
   M("getObjectVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;",
   unsafe_get_object),
   M("getObject", "(Ljava/lang/Object;J)Ljava/lang/Object;", unsafe_get_object),
+  M("getAndSetObject", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;",
+    unsafe_get_and_set_object),
   M("putObjectVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V",
   unsafe_put_object),
   M("putObject", "(Ljava/lang/Object;JLjava/lang/Object;)V", unsafe_put_object),

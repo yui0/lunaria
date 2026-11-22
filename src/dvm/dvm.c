@@ -6796,9 +6796,9 @@ static void prof_report(void)
   for (unsigned i = 0; i < DVM_PROF_SLOTS && i < 15u; ++i) {
     if (!g_prof[i].m || !g_prof[i].n) break;
     const struct dvm_method *m = g_prof[i].m;
-    fprintf(stderr, "[dvmprof]   %5.1f%%  %s.%s\n",
+    fprintf(stderr, "[dvmprof]   %5.1f%%  %s.%s%s\n",
             100.0 * (double)g_prof[i].n / (double)total,
-            m->cls && m->cls->name ? m->cls->name : "?", m->name);
+            m->cls && m->cls->name ? m->cls->name : "?", m->name, m->sig ? m->sig : "");
   }
   memset(g_prof, 0, sizeof g_prof);
   g_prof_busy = g_prof_idle = 0;

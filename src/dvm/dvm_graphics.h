@@ -1650,6 +1650,12 @@ struct canvas_state {
   bool clip_cache_valid,clip_simple,clip_tail_intersect;
   bool clip_single_mask;
   size_t clip_mask_index;
+  /* Several intersected masks (rounded corners nested in rounded corners) folded into one
+   * byte-per-pixel coverage buffer, rebuilt when the clip stack changes. */
+  bool clip_merged_on;
+  unsigned char *clip_merged;
+  size_t clip_merged_capacity;
+  int clip_merged_x,clip_merged_y,clip_merged_w,clip_merged_h;
   size_t clip_prefix;
   float clip_bounds[4];
   bool query_clip_valid;
@@ -1699,6 +1705,7 @@ static void canvas_destroy(void *data)
   for(size_t i=0; i<s->count; ++i) if(s->saved[i].layer) canvas_layer_free(s->saved[i].layer);
   free(s->saved);
   free(s->clip);
+  free(s->clip_merged);
   free(s);
 }
 
@@ -1885,6 +1892,7 @@ static void canvas_prepare_clip(struct canvas_state *s)
   if(!s || s->clip_cache_valid) return;
   s->clip_simple=true;
   s->clip_single_mask=false;
+  s->clip_merged_on=false;
   s->clip_prefix=0;
   s->clip_bounds[0]=s->clip_bounds[1]=-INFINITY;
   s->clip_bounds[2]=s->clip_bounds[3]=INFINITY;
@@ -1938,12 +1946,60 @@ static void canvas_prepare_clip(struct canvas_state *s)
       s->clip_bounds[3]=fminf(s->clip_bounds[3],(float)(c->mask_y+c->mask_height));
     }
   }
+  /* Two or more masks: every member is an intersection, so fold them all into one
+   * coverage buffer over the common area.  One lookup per pixel then replaces a walk
+   * over every mask for every pixel of every fill. */
+  if (!s->clip_simple && s->clip_tail_intersect && !s->clip_single_mask) {
+    bool ok=true;
+    float b[4]={s->clip_bounds[0],s->clip_bounds[1],s->clip_bounds[2],s->clip_bounds[3]};
+    for (size_t i=0;i<s->clips && ok;++i) {
+      const struct canvas_clip *c=&s->clip[i];
+      if (c->simple && !c->mask) continue;
+      if (!c->mask || c->mask_width<=0 || c->mask_height<=0 || c->mask_x<0 || c->mask_y<0 ||
+          c->mask_x>INT_MAX-c->mask_width || c->mask_y>INT_MAX-c->mask_height) { ok=false; break; }
+      b[0]=fmaxf(b[0],(float)c->mask_x);
+      b[1]=fmaxf(b[1],(float)c->mask_y);
+      b[2]=fminf(b[2],(float)(c->mask_x+c->mask_width));
+      b[3]=fminf(b[3],(float)(c->mask_y+c->mask_height));
+    }
+    if (ok && b[0]<b[2] && b[1]<b[3] && b[2]-b[0]<=16384.f && b[3]-b[1]<=16384.f) {
+      int x0=(int)floorf(b[0]),y0=(int)floorf(b[1]),x1=(int)ceilf(b[2]),y1=(int)ceilf(b[3]);
+      size_t w=(size_t)(x1-x0),h=(size_t)(y1-y0);
+      if (w*h>s->clip_merged_capacity) {
+        unsigned char *grown=realloc(s->clip_merged,w*h);
+        if (grown) { s->clip_merged=grown; s->clip_merged_capacity=w*h; }
+      }
+      if (w*h<=s->clip_merged_capacity) {
+        unsigned char *dst=s->clip_merged;
+        memset(dst,1,w*h);
+        for (size_t i=0;i<s->clips;++i) {
+          const struct canvas_clip *c=&s->clip[i];
+          if (!c->mask) continue;
+          for (size_t y=0;y<h;++y) {
+            const unsigned char *src=c->mask+4*((size_t)(y0+(int)y-c->mask_y)*c->mask_width+(size_t)(x0-c->mask_x))+3;
+            unsigned char *row=dst+y*w;
+            for (size_t x=0;x<w;++x) row[x]&=src[4*x]!=0;
+          }
+        }
+        s->clip_bounds[0]=b[0]; s->clip_bounds[1]=b[1];
+        s->clip_bounds[2]=b[2]; s->clip_bounds[3]=b[3];
+        s->clip_merged_x=x0; s->clip_merged_y=y0;
+        s->clip_merged_w=(int)w; s->clip_merged_h=(int)h;
+        s->clip_merged_on=true;
+      }
+    }
+  }
   s->clip_cache_valid=true;
 }
 
 static inline bool canvas_clip_mask_contains(const struct canvas_state *s,float x,float y)
 {
   if (!(x>=s->clip_bounds[0] && y>=s->clip_bounds[1] && x<s->clip_bounds[2] && y<s->clip_bounds[3])) return false;
+  if (s->clip_merged_on) {
+    unsigned mx=(unsigned)((int)x-s->clip_merged_x),my=(unsigned)((int)y-s->clip_merged_y);
+    return mx<(unsigned)s->clip_merged_w && my<(unsigned)s->clip_merged_h &&
+           s->clip_merged[(size_t)my*(unsigned)s->clip_merged_w+mx];
+  }
   const struct canvas_clip *c=&s->clip[s->clip_mask_index];
   /* Bounds above make x/y finite, nonnegative and representable as int.
    * Truncation then equals floor, including fractional pixel centres. */
@@ -1973,7 +2029,7 @@ static bool canvas_clip_contains_general(struct canvas_state *s, float x, float 
   canvas_prepare_clip(s);
   if(s && s->clip_simple) return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
                                    x<s->clip_bounds[2] && y<s->clip_bounds[3];
-  if(s && s->clip_single_mask) return canvas_clip_mask_contains(s,x,y);
+  if(s && (s->clip_single_mask || s->clip_merged_on)) return canvas_clip_mask_contains(s,x,y);
   /* Collapse the rectangular intersection prefix even when a later path
    * makes the clip complex. Later UNION/XOR/REPLACE still see this result. */
   bool result=!s || !s->clip_prefix ||
@@ -2022,7 +2078,7 @@ static inline bool canvas_clip_contains(struct canvas_state *s, float x, float y
     if(s->clip_simple)
       return x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
              x<s->clip_bounds[2] && y<s->clip_bounds[3];
-    if(s->clip_single_mask) return canvas_clip_mask_contains(s,x,y);
+    if(s->clip_single_mask || s->clip_merged_on) return canvas_clip_mask_contains(s,x,y);
     if(s->clip_tail_intersect) {
       if(!(x>=s->clip_bounds[0] && y>=s->clip_bounds[1] &&
            x<s->clip_bounds[2] && y<s->clip_bounds[3])) return false;
@@ -2203,16 +2259,14 @@ static bool canvas_clip_operation(struct dvm *vm,const union dvm_value *args,int
   return true;
 }
 
-static bool canvas_clip_rect(struct dvm *vm, dvm_ref self,
-                             const union dvm_value *args, int nargs,
-                             union dvm_value *out)
+/* Pushes `rect` (in the canvas's current coordinates) as a clip; returns false only on failure. */
+static bool canvas_clip_push_rect(struct dvm *vm, dvm_ref self, struct canvas_state *s,
+                                  int operation, const float rect[4], union dvm_value *out)
 {
-  struct canvas_state *s=canvas_state(vm,self);
-  if (!s) return false;
   struct canvas_clip clip= {0};
   float matrix[9];
-  if(!canvas_clip_operation(vm,args,nargs,&clip.operation)) return false;
-  if (!canvas_rect_args(vm,args,nargs,clip.rect)) return false;
+  clip.operation=operation;
+  memcpy(clip.rect,rect,sizeof clip.rect);
   canvas_read_matrix(vm,self,matrix);
   clip.singular=!mat_invert(matrix,clip.inverse);
   if (clip.singular || !(clip.rect[0] < clip.rect[2] && clip.rect[1] < clip.rect[3])) {
@@ -2268,6 +2322,19 @@ static bool canvas_clip_rect(struct dvm *vm, dvm_ref self,
         if (canvas_clip_contains(s,x+0.5f,y+0.5f)) RETI(1);
   }
   RETI(0);
+}
+
+static bool canvas_clip_rect(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs,
+                             union dvm_value *out)
+{
+  struct canvas_state *s=canvas_state(vm,self);
+  if (!s) return false;
+  int operation;
+  float rect[4];
+  if(!canvas_clip_operation(vm,args,nargs,&operation)) return false;
+  if (!canvas_rect_args(vm,args,nargs,rect)) return false;
+  return canvas_clip_push_rect(vm,self,s,operation,rect,out);
 }
 
 static uint32_t canvas_src_over(uint32_t src,uint32_t dst,bool opaque)
@@ -2763,6 +2830,8 @@ static inline unsigned canvas_mask_sample(const unsigned char *mask,int width,in
   float fx=x-ix,fy=y-iy;
   unsigned a=0,b=0,c=0,d=0;
   if (ix>=0 && ix<width && iy>=0 && iy<height) a=mask[4*((size_t)iy*width+ix)+3];
+  /* On a texel centre (integer translation at unit scale) the neighbours weigh nothing. */
+  if (fx==0.0f && fy==0.0f) return a;
   if (ix+1>=0 && ix+1<width && iy>=0 && iy<height) b=mask[4*((size_t)iy*width+ix+1)+3];
   if (ix>=0 && ix<width && iy+1>=0 && iy+1<height) c=mask[4*((size_t)(iy+1)*width+ix)+3];
   if (ix+1>=0 && ix+1<width && iy+1>=0 && iy+1<height) d=mask[4*((size_t)(iy+1)*width+ix+1)+3];
@@ -2815,8 +2884,15 @@ static void canvas_path_rows_draw(void *context, int begin, int end)
       if(!isfinite(row_v) || row_v<0 || row_v>=height) continue;
       row_mask=mask+4*(size_t)(int)row_v*width;
     }
-    for(int x=limits[0]; x<limits[2]; ++x) {
-      if(simple_clip ? !(x+.5f>=cb[0] && x+.5f<cb[2]) : !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
+    /* A rectangular clip bounds the row once: pixels x with cb[0] <= x+.5 < cb[2]. */
+    int x_begin=limits[0],x_end=limits[2];
+    if(simple_clip) {
+      const float lo=ceilf(cb[0]-.5f),hi=ceilf(cb[2]-.5f);
+      if(lo>(float)x_begin) x_begin=lo>=(float)x_end ? x_end : (int)lo;
+      if(hi<(float)x_end) x_end=hi<=(float)x_begin ? x_begin : (int)hi;
+    }
+    for(int x=x_begin; x<x_end; ++x) {
+      if(!simple_clip && !canvas_clip_contains(state,x+.5f,y+.5f)) continue;
       float lx,ly;
       unsigned coverage;
       if(axis) {
@@ -3046,6 +3122,11 @@ static bool canvas_clip_path(struct dvm *vm,dvm_ref self,const union dvm_value *
   struct rt_bitmap viewport= {.w=state->viewport_width,.h=state->viewport_height};
   if(!bitmap && state->recording) bitmap=&viewport;
   if(!bitmap || bitmap->w<=0 || bitmap->h<=0) RETI(0);
+  /* A path that is one rectangle clips as a rectangle (Skia's isRect): no mask to rasterise,
+   * copy and look up for every pixel of every draw under it. */
+  float rect_path[4];
+  if(luna_path_as_rect(path,rect_path))
+    return canvas_clip_push_rect(vm,self,state,operation,rect_path,out);
   float matrix[9];
   canvas_read_matrix(vm,self,matrix);
   struct canvas_clip clip= {.mask_width=bitmap->w,.mask_height=bitmap->h,

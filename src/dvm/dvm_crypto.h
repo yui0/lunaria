@@ -1303,7 +1303,7 @@ static bool skf_generateSecret(struct dvm *vm,dvm_ref self,const union dvm_value
     return false;
   }
   size_t length=0;
-  const bool eight_bit=name && strcasestr(name,"And8BIT");
+  const bool eight_bit=name && luna_strcasestr(name,"And8BIT");
   for(uint32_t i=0; i<n; ++i) {
     uint32_t cp=chars[i];
     if(eight_bit) {

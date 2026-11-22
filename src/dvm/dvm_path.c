@@ -156,6 +156,37 @@ bool luna_path_close(luna_path *p)
   }
   return true;
 }
+/* A single closed contour of four axis-aligned lines (Path.addRect, or moveTo + three lineTo + close)
+ * is a rectangle: Skia's SkPath::isRect, which turns clipPath(rect) into clipRect. */
+bool luna_path_as_rect(const luna_path *p,float rect[4])
+{
+  const NSVGpath *n=p ? p->first : NULL;
+  if(!n || n->next || !n->closed || (p->fill&2)) return false;
+  if(n->npts!=10 && n->npts!=13) return false;
+  if(n->npts==13 && (n->pts[24]!=n->pts[0] || n->pts[25]!=n->pts[1])) return false;
+  float ax[4],ay[4];
+  for(int i=0; i<4; ++i) {
+    ax[i]=n->pts[6*i];
+    ay[i]=n->pts[6*i+1];
+  }
+  float x0=fminf(fminf(ax[0],ax[1]),fminf(ax[2],ax[3])),x1=fmaxf(fmaxf(ax[0],ax[1]),fmaxf(ax[2],ax[3]));
+  float y0=fminf(fminf(ay[0],ay[1]),fminf(ay[2],ay[3])),y1=fmaxf(fmaxf(ay[0],ay[1]),fmaxf(ay[2],ay[3]));
+  if(!(x0<x1 && y0<y1) || !isfinite(x0) || !isfinite(x1) || !isfinite(y0) || !isfinite(y1)) return false;
+  for(int i=0; i<4; ++i) {
+    if((ax[i]!=x0 && ax[i]!=x1) || (ay[i]!=y0 && ay[i]!=y1)) return false;
+    for(int j=i+1; j<4; ++j) if(ax[i]==ax[j] && ay[i]==ay[j]) return false;
+    const int k=(i+1)&3;
+    if((ax[i]==ax[k])==(ay[i]==ay[k])) return false;
+    /* An explicit edge's control points lie on the edge. */
+    if(i<3 || n->npts==13) {
+      const float *c=n->pts+6*i+2;
+      for(int q=0; q<2; ++q)
+        if((ax[i]==ax[k] && c[2*q]!=ax[i]) || (ay[i]==ay[k] && c[2*q+1]!=ay[i])) return false;
+    }
+  }
+  rect[0]=x0; rect[1]=y0; rect[2]=x1; rect[3]=y1;
+  return true;
+}
 bool luna_path_append(luna_path *p,const luna_path *other,const float *matrix)
 {
   /* Capture the old tail so addPath(this) cannot loop through appended data. */

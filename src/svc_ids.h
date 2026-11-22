@@ -1877,6 +1877,7 @@ enum SvcId : uint32_t {
   SVC_GL_Uniform3i,
   SVC_GL_Uniform4i,
   SVC_ANA_SET_WINDOW_FLAGS,
+  SVC_ANA_FINISH,
   SVC_LOG_ASSERT,
   SVC_POSIX_TIMER_CREATE,
   SVC_POSIX_TIMER_SETTIME,
@@ -2074,6 +2075,12 @@ enum SvcId : uint32_t {
   SVC_GETRANDOM,
   SVC_READV,
   SVC_GETSERVBYNAME,
+  /* The dynamic linker's interface to libc.so.  Android's libc imports these from the
+   * linker (ld-android.so / linker64) rather than defining them: the shared-globals block
+   * both share, the thread-local-destructor registry, and the exported-namespace lookup. */
+  SVC_LOADER_SHARED_GLOBALS,
+  SVC_LOADER_THREAD_LOCAL_DTOR,
+  SVC_LOADER_EXPORTED_NAMESPACE,
   SVC_TRAMP_TOTAL,
 };
 

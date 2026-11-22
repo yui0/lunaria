@@ -1137,6 +1137,7 @@ android_property_entry(const char *name, size_t index)
     { "gsm.version.baseband",     "unknown" },
     { "ro.build.version.sdk", sdk },
     { "ro.build.version.release", lunaria_android_release() },
+    { "ro.build.version.release_or_codename", lunaria_android_release() },
     { "ro.build.id", build_id },
     { "ro.build.display.id", display },
     { "ro.build.fingerprint", fingerprint },

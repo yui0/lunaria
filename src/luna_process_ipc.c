@@ -28,12 +28,121 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <stddef.h>
 #include <time.h>
 #include <unistd.h>
 extern char **environ;
+
+static int snapshot_copy_range(int source, int snapshot,
+                               const struct luna_process_memory_range *range)
+{
+  const uintptr_t start = (uintptr_t)range->address;
+  const size_t size = range->size;
+  int error = 0;
+  unsigned char bytes[65536];
+  for (size_t offset = 0; !error && offset < size;) {
+    size_t length = size - offset;
+    if (length > sizeof bytes) length = sizeof bytes;
+    ssize_t received = pread64(source, bytes, length, (off64_t)(start + offset));
+    if (received < 0 && errno == EINTR) continue;
+    if (received <= 0) {
+      error = received < 0 ? errno : EIO;
+      break;
+    }
+    for (size_t written = 0; written < (size_t)received;) {
+      ssize_t count = pwrite64(snapshot, bytes + written, (size_t)received - written,
+                               (off64_t)(range->file_offset + offset + written));
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) {
+        error = count < 0 ? errno : EIO;
+        break;
+      }
+      written += (size_t)count;
+    }
+    offset += (size_t)received;
+  }
+  return error;
+}
+
+int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
+                                 size_t count)
+{
+  if (!ranges || !count) return -EINVAL;
+  uint64_t end = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const struct luna_process_memory_range *range = &ranges[i];
+    const uintptr_t start = (uintptr_t)range->address;
+    if (!start || !range->size || start > INT64_MAX ||
+        range->size > (uint64_t)INT64_MAX - start ||
+        range->file_offset > INT64_MAX ||
+        range->size > (uint64_t)INT64_MAX - range->file_offset ||
+        range->file_offset < end) return -EINVAL;
+    end = range->file_offset + range->size;
+  }
+
+  /* Reading our own memory this way also covers guest VMAs whose native
+   * protection is PROT_NONE. No host memory descriptor leaves the process. */
+  int source = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+  if (source < 0) return -errno;
+  int snapshot = memfd_create("lunaria-private-memory", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  int error = snapshot < 0 ? errno : 0;
+  for (size_t i = 0; !error && i < count; ++i)
+    error = snapshot_copy_range(source, snapshot, &ranges[i]);
+  if (!error && fcntl(snapshot, F_ADD_SEALS,
+                       F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) < 0)
+    error = errno;
+  close(source);
+  if (!error) return snapshot;
+  if (snapshot >= 0) close(snapshot);
+  return -error;
+}
+
+int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
+                                size_t count, const int *fds, size_t fd_count)
+{
+  if (!maps || !count || !fds || !fd_count) return -EINVAL;
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) return -ENOSYS;
+  uint64_t end = 0;
+  for (size_t i = 0; i < count; ++i) {
+    const struct luna_process_memory_mapping *map = &maps[i];
+    if (!map->address || !map->size || map->address < end ||
+        map->address > UINTPTR_MAX || map->size > UINTPTR_MAX - map->address ||
+        map->file_offset > INT64_MAX ||
+        ((map->address | map->size | map->file_offset) % (uint64_t)page_size) ||
+        (map->protection & ~(LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC)) ||
+        map->descriptor_index >= fd_count) return -EINVAL;
+    end = map->address + map->size;
+  }
+
+  size_t restored = 0;
+  int error = 0;
+  for (; restored < count; ++restored) {
+    const struct luna_process_memory_mapping *map = &maps[restored];
+    int protection = 0;
+    if (map->protection & LUNA_PROT_READ) protection |= PROT_READ;
+    if (map->protection & LUNA_PROT_WRITE) protection |= PROT_WRITE;
+    if (map->protection & LUNA_PROT_EXEC) protection |= PROT_EXEC;
+    const int flags = (map->shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED_NOREPLACE;
+    void *wanted = (void *)(uintptr_t)map->address;
+    void *mapped = mmap64(wanted, (size_t)map->size, protection, flags,
+                          fds[map->descriptor_index], (off64_t)map->file_offset);
+    if (mapped == wanted) continue;
+    error = mapped == MAP_FAILED ? errno : EEXIST;
+    if (mapped != MAP_FAILED) munmap(mapped, (size_t)map->size);
+    break;
+  }
+  if (restored == count) return 0;
+  while (restored) {
+    const struct luna_process_memory_mapping *map = &maps[--restored];
+    munmap((void *)(uintptr_t)map->address, (size_t)map->size);
+  }
+  return -error;
+}
+
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
 static char state_directory[4096], state_path[4096];
 static int state_fd = -1;
@@ -1026,6 +1135,22 @@ void luna_process_pool_close(struct luna_process_pool *pool)
 #include <unistd.h>
 #define ipc_close close
 #endif
+int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
+                                 size_t count)
+{
+  (void)ranges;
+  (void)count;
+  return -ENOSYS;
+}
+int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
+                                size_t count, const int *fds, size_t fd_count)
+{
+  (void)maps;
+  (void)count;
+  (void)fds;
+  (void)fd_count;
+  return -ENOSYS;
+}
 struct luna_process_channel *luna_process_channel_open(int fd)
 {
   if(fd>=0)ipc_close(fd);

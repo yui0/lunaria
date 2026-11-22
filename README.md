@@ -20,9 +20,9 @@ Open an `.apk`, `.apkm`, `.xapk`, `.apks`, or `.aab` directly; extraction, split
 profiles are handled for you. WebView content uses Chrome/Chromium or the bundled [luna-browser](luna-browser/).
 
 **Demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Where Winds Meet (NetEase Messiah engine),
-Gakuen Idolmaster, Alchemia Story, Kikyu! Aeronaut (a 2013 ARM32 APK), Layton Brothers: Mystery Room,
-Black Clover: Asta Fight, Kingdoms & Lords, other Unity and Unreal titles, and Java apps such as
-TVer (full-episode playback), LINE and APKPure.
+Gakuen Idolmaster, Alchemia Story, Shironeko Project, Kikyu! Aeronaut (a 2013 ARM32 APK), Layton Brothers:
+Mystery Room, Black Clover: Asta Fight, Kingdoms & Lords, other Unity and Unreal titles,
+and Java apps such as TVer (full-episode playback), WhatsApp, LINE, TumuTumu and APKPure.
 See [Compatibility](#compatibility) for exact stages and limits.
 
 > [!IMPORTANT]
@@ -34,14 +34,16 @@ See [Compatibility](#compatibility) for exact stages and limits.
 </p>
 
 <p align="center">
-  <img src="shots/genshin-glide-coast.png" width="32%" alt="Genshin Impact: Lumine gliding over turquoise water toward a green coast at sunset">
+  <img src="shots/genshin-glide-coast.png" width="23%" alt="Genshin Impact: Lumine gliding over turquoise water toward a green coast at sunset">
   &nbsp;
-  <img src="shots/cross-worlds-portal.png" width="32%" alt="Ni no Kuni: Cross Worlds, a glowing blue portal in a golden hall with characters and a familiar">
+  <img src="shots/cross-worlds-portal.png" width="23%" alt="Ni no Kuni: Cross Worlds, a glowing blue portal in a golden hall with characters and a familiar">
   &nbsp;
-  <img src="shots/genshin-lisa.png" width="32%" alt="Genshin Impact: Lisa recounting the Four Winds in Japanese dialogue">
+  <img src="shots/shironeko-first-stage.png" width="23%" alt="Shironeko Project: the portrait first stage, with its in-game HUD and tutorial dialog">
+  &nbsp;
+  <img src="shots/tumutumu-title.png" width="23%" alt="TumuTumu title screen with TAP TO START over Disney artwork">
 </p>
 
-<p align="center"><sub>Genshin Impact 7.2.0 (Unity IL2CPP, arm64-v8a) · Ni no Kuni: Cross Worlds (Unreal Engine 4, arm64-v8a)</sub></p>
+<p align="center"><sub>Genshin Impact 7.2.0 · Ni no Kuni: Cross Worlds · Shironeko Project · TumuTumu 12.11.0</sub></p>
 
 ## Install
 
@@ -197,7 +199,7 @@ From a source build, use `./lunaria` in place of `lunaria`.
 | **Host graphics** | EGL and OpenGL ES 3 on the host GPU; Vulkan when the bridge is available. |
 | **Android services** | JNI, AssetManager, OBB, pthread, OpenSL ES and compatible Android APIs. |
 | **Java and UI** | Dalvik interpreter for `classes*.dex`; Android views, text and layouts rendered by the host. |
-| **Media and WebView** | H.264 via OpenH264, AAC via libavcodec; WebView through Chrome/Chromium or luna-browser. |
+| **Media and WebView** | H.264 via OpenH264, AAC via libavcodec; WebView through Chrome/Chromium or luna-browser. `ACTION_VIEW https://` intents open a WebView-backed system browser whose `intent:` redirects return to the app. |
 | **Input** | Keyboard/mouse mapped to touch, with macros and record/replay. |
 | **Profiles and identity** | Per-account data via `--profile`; device profile in `lunaria.conf` (default Pixel 6). |
 | **Google services (GMS)** | Optional Google Play services, Play Store and Services Framework run from your own genuine packages; reusable sign-in environments. |
@@ -234,8 +236,28 @@ Lunaria runs app dex bytecode and implements Android views, layouts, text, resou
 <p align="center"><sub>TVer 6.40.0 · landscape playback · episode details · portrait playback · welcome screen</sub></p>
 
 APKPure renders its store, app details and download manager (download progress observed; completed install not yet verified).
+
+### Social apps: WhatsApp, LINE and TumuTumu
+
 **LINE 15.15.1** goes from the welcome screen into phone-number registration and the country-selection list
-(CollapsingToolbar + RecyclerView); scrolling, Back and edge-swipe gestures all work.
+(CollapsingToolbar + RecyclerView); scrolling, Back and edge-swipe gestures work. The news feed and official-account
+messages render as well. **WhatsApp 2.26.39.74** loads its merged native libraries and reaches the EULA and
+phone-number registration screens (+81 / 日本); indexing the APK once brought startup from 70 s to 1.4 s.
+No number or SMS was submitted in either app.
+
+**TumuTumu 12.11.0** (LINE's ツムツム, LIAPP v5 + Cocos2dx) reaches its title screen. The first-run terms WebView
+and the LINE login page now open: `ACTION_VIEW https://` intents get a WebView-backed system browser, and
+`intent:` redirects return to the app. The game is not playable yet.
+
+<p align="center">
+  <img src="shots/tumutumu-title.png" width="30%" alt="TumuTumu title screen, TAP TO START over Disney artwork">
+  &nbsp;
+  <img src="shots/line-news-feed.png" width="30%" alt="LINE news feed with a Sony Xperia advertisement">
+  &nbsp;
+  <img src="shots/line-auto-reply.png" width="30%" alt="LINEMO official-account automatic-reply message in LINE">
+</p>
+
+<p align="center"><sub>TumuTumu title · LINE news feed · LINEMO official-account auto-reply</sub></p>
 
 ### Genshin Impact 7.2.0
 
@@ -346,6 +368,21 @@ NDK MediaFormat and the AAC encoder.
 
 <p align="center"><sub>Character creation · the engine's own renderer draws on the host GPU</sub></p>
 
+### Shironeko Project
+
+白猫プロジェクト 5.62.0 (`jp.colopl.wcat`), Unity 2022.3 IL2CPP, `armeabi-v7a`, portrait `576 × 1024`.
+The title, data-download dialog, START, prologue cutscene and first 3D stage render, and taps reach the game.
+Google Play services are absent, so Firebase reports unavailable; this drove fixes for A32
+`madvise(MADV_DONTNEED)`, separate depth/stencil renderbuffers and missing NEON `VADDHN` instructions.
+
+<p align="center">
+  <img src="shots/shironeko-prologue.png" width="26%" alt="Shironeko Project prologue cutscene, with a SKIP button and speech bubbles">
+  &nbsp;
+  <img src="shots/shironeko-first-stage.png" width="26%" alt="Shironeko Project first stage, the portrait 3D scene with its in-game HUD">
+</p>
+
+<p align="center"><sub>Prologue cutscene · first stage and tutorial dialog</sub></p>
+
 ### More titles
 
 <p align="center">
@@ -385,6 +422,12 @@ NDK MediaFormat and the AAC encoder.
 </p>
 
 <p align="center"><sub><a href="https://www.level5.co.jp/">Layton Brothers: Mystery Room</a>: a 2013 LEVEL-5 title whose Java UI is drawn entirely through the Android view layer</sub></p>
+
+<p align="center">
+  <img src="shots/another-eden-dialogue.png" width="48%" alt="Another Eden Japanese dialogue scene, with AUTO and a download indicator">
+</p>
+
+<p align="center"><sub>Another Eden: in-game dialogue renders; loading the game still aborts</sub></p>
 
 <p align="center">
   <img src="shots/bedrock-addons.png" width="30%" alt="A Flutter-based Minecraft Bedrock add-on manager showing Villager Soldier, Dragon Bedrock, Zombie Bedrock and Simple Magnets Bedrock add-ons">
@@ -434,6 +477,9 @@ Results describe **what was actually observed** on particular builds and machine
 
 | Title | Engine / ABI | Current result |
 |---|---|---|
+| **Shironeko Project 5.62.0** | Unity 2022.3 IL2CPP · ARM32 XAPK | Title, data download, START, prologue and first 3D stage; taps work. No GMS, so Firebase is unavailable. |
+| **TumuTumu 12.11.0** | Cocos2dx + LIAPP v5 · AArch64 XAPK | Packed Application and native libraries start; title, terms WebView and LINE login page render. Idles after the first title tap; not playable. |
+| **WhatsApp 2.26.39.74** | Java / dex Android UI · AArch64 XAPK | EULA and phone-number registration (+81 / 日本) render; about 1.4 s startup after indexing the APK once. Account creation untested. |
 | **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux: login, server and character selection, village, dialogue, voiced cutscenes, field gameplay; SharedPreferences persist. Apple Silicon: 5.04.12 reached the opening movie, 3D intro and terms dialog; later stages unverified. |
 | **Where Winds Meet** | NetEase Messiah · AArch64 XAPK | Title with resource download, Japanese news, login choice (NetEase / Google / Guest), consent and guide screens, character creation. Gameplay not yet reached; startup videos need Main/High H.264. |
 | **Gakuen Idolmaster 3.5.3** | Unity 6000.0 IL2CPP (Vulkan, CRI) · AArch64 XAPK | Setup and consent screens render; the first asset download from the game CDN starts (~806 MB observed). Gameplay not yet reached. |
@@ -452,10 +498,10 @@ Results describe **what was actually observed** on particular builds and machine
 | **Disney Magic Kingdoms 12.1.1c** | Unity · ARMv7 XAPK | Content-verification screen draws; pauses asking its servers for an update. |
 | **Kingdoms & Lords** | Gameloft village builder | Island village, resource counters and dialogue render (2026-11-09); progression unverified. |
 | **TVer 6.40.0** | Java / dex Android UI | Welcome, home feed with playing tiles, episode details and main-feature playback. Heavy startup, some layout gaps. |
-| **LINE 15.15.1** | Java / dex Android UI | Welcome, phone-number registration and country selection (CollapsingToolbar + RecyclerView); scroll, Back and edge-swipe work. Authentication beyond registration not reached. |
+| **LINE 15.15.1** | Java / dex Android UI | Welcome, phone-number registration and country selection (CollapsingToolbar + RecyclerView); scroll, Back and edge-swipe work. News feed and official-account messages render. Authentication beyond registration not reached. |
 | **APKPure 3.20.8002** | Java / dex Android UI | Store, recommendations, details and download manager render; download progress observed, completed install unverified. |
 | **Minecraft Bedrock add-on manager** | Flutter (dex + Skia) · ARM32/ARM64 APK | Startup, START, add-on list and detail WebView; Back returns to the list. The detail CDN answers 404, so add-on content does not load. |
-| **Another Eden** | Native · ARMv7 XAPK | Existing-account load screen; loading the game aborts. |
+| **Another Eden** | Native · ARMv7 XAPK | Existing-account load and in-game dialogue screens render; loading the game aborts. |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Mono starts; rendering not yet working. |
 
 <details>
@@ -550,7 +596,7 @@ Frames are saved as `lunaria_0000.png`. Creating `$LUNARIA_SHOT_TRIGGER` (defaul
 - **Lifecycle:** the manifest `Application` and content providers start before the launcher `Activity`'s `onCreate`/`onStart`/`onResume`. Native-activity engines enter through `ANativeActivity_onCreate` with `APP_CMD_*` events. A `System.loadLibrary` root heads the lookup scope of its dependencies, as Android's linker does.
 - **Assets and media:** `AssetManager` reads DEFLATE/STORE entries from APKs and OBBs. `MediaCodec` decodes H.264 with openh264 and AAC with libavcodec (`LUNARIA_OPENH264` / `LUNARIA_LIBAVCODEC` set paths).
 - **Audio:** OpenSL ES, AAudio and `AudioTrack` share one mixer that outputs through ALSA; blocking writes do not stall the frame pump.
-- **WebView:** talks to a host browser over the DevTools pipe and shows the page as an image in the view. `LUNARIA_WEB_ENGINE` is `auto` (Chrome/Chromium, else luna-browser), `chrome`, `luna` or `off`; `LUNARIA_WEB_BROWSER` names a binary. Build the fallback with `make luna-browser`.
+- **WebView:** talks to a host browser over the DevTools pipe and shows the page as an image in the view. `LUNARIA_WEB_ENGINE` is `auto` (Chrome/Chromium, else luna-browser), `chrome`, `luna` or `off`; `LUNARIA_WEB_BROWSER` names a binary. Build the fallback with `make luna-browser`. An app's `ACTION_VIEW https://` intent opens a WebView-backed system browser, whose `intent:` navigations come back as app intents.
 - **Vulkan:** guest `vk*` calls reach the host loader, with Android surfaces and swapchains emulated. Games that don't use Vulkan keep using GLES, the path behind the demos above.
 
 ## Runtime controls

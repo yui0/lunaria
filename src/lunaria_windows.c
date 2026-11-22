@@ -379,8 +379,9 @@ void *luna_os_map_file(void *want, size_t len, int prot, int fd,
                                 LUNA_MAP_PRIVATE | (fixed ? LUNA_MAP_NOREPLACE : 0), fd, off);
 }
 
-void *luna_os_map_anon(void *want, size_t len, int replace)
+void *luna_os_map_anon(void *want, size_t len, int replace, int shared)
 {
+  (void)shared;
   if (replace && want) {
     MEMORY_BASIC_INFORMATION mi;
     if (VirtualQuery(want, &mi, sizeof mi) && mi.State == MEM_RESERVE)
@@ -474,12 +475,14 @@ void *luna_os_map_file_flags(void *want, size_t len, int prot, int policy,
   return p;
 }
 
-void *luna_os_remap(void *addr, size_t old_len, size_t new_len)
+void *luna_os_remap(void *addr, size_t old_len, size_t new_len, int may_move)
 {
   (void)addr;
   (void)old_len;
   (void)new_len;
-  return NULL;  /* no in-place resize on Windows; the caller copies */
+  (void)may_move;
+  errno = ENOTSUP;
+  return NULL;
 }
 
 size_t luna_os_page_size(void)

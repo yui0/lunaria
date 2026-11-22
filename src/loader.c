@@ -268,6 +268,21 @@ static void a64_preload_platform_libs(void)
     }
   }
 
+  /* The platform libraries a process reads out of /proc/self/maps and the ELF files on disk
+   * (the dynamic linker's front end libdl, liblog, libstdc++): present, with their real
+   * code, when the platform's own images were installed beside the runtime. */
+  {
+    static const char *const platform[] = {"libdl.so", "liblog.so", "libstdc++.so", NULL};
+    for (const char *const *lib = platform; *lib; ++lib) {
+      if ((size_t)snprintf(libpath, sizeof libpath, "%s/%s", sys, *lib) < sizeof libpath &&
+          stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+        printf("preloading arm64 platform image: %s\n", libpath);
+        if (arm64_exec_load_library(libpath, 0) < 0)
+          warnx("failed to load platform image %s", libpath);
+      }
+    }
+  }
+
   /* Guest-side malloc family as in-process code instead of traps. */
   {
     const char *off = getenv("LUNARIA_GUEST_LIBC");
@@ -287,6 +302,16 @@ static void a64_preload_platform_libs(void)
       "libart.so", "libartbase.so", "libdexfile.so", "libnativeloader.so", NULL
     };
     for (const char *const *img = art_images; *img; ++img) {
+      /* The platform's own image, when one was extracted (scripts/extract-android-apex.sh):
+       * mapped as the zygote has it, not run. */
+      if ((size_t)snprintf(libpath, sizeof libpath, "%s/android/apex/com.android.art/lib64/%s", sys, *img) <
+            sizeof libpath &&
+          stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+        printf("mapping arm64 runtime image: %s\n", libpath);
+        if (arm64_exec_map_image(libpath) < 0)
+          warnx("failed to map runtime image %s", libpath);
+        continue;
+      }
       if ((size_t)snprintf(libpath, sizeof libpath, "%s/%s", sys, *img) < sizeof libpath &&
           stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
         printf("preloading arm64 ART image: %s\n", libpath);
@@ -318,6 +343,9 @@ static bool elf_preload_needed(const char *path, const char *dir,
   char needed[64][LUNA_GUEST_NAME_MAX + 1];
   size_t n = elf_read_needed(path, needed, 64);
   for (size_t i = 0; i < n; ++i) {
+    /* A64 libc is already in the process namespace. Its native ABI goes
+     * through the runtime and its stateless exports use the preloaded image. */
+    if (elf64 && !strcmp(needed[i], "libc.so")) continue;
     char dep_path[PATH_MAX];
     struct stat st;
     if (elf_dep_seen(needed[i], seen, *seen_n)) continue;
@@ -337,28 +365,17 @@ static bool elf_preload_needed(const char *path, const char *dir,
       /* Not beside the APK's libraries.  Before handing it to the SVC
        * bridge, look for the real thing among the platform libraries. */
       const char *sys = elf64 ? a64_syslib_dir() : NULL;
-      int found = 0;
       if (sys) {
         char cand[PATH_MAX];
-        /* libc is process state, not merely a code DSO.  The copy in the
-         * syslib directory is loaded separately below as a deliberately
-         * filtered pure-code image.  Loading it here would run bionic's
-         * constructors and split pthread/allocator/errno ownership
-         * between bionic and Lunaria's Android ABI implementation. */
-        if (strcmp(needed[i], "libc.so") != 0 &&
-            (size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
+        if ((size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
             < sizeof cand &&
             stat(cand, &st) == 0 && elf_matches(cand, elf64)) {
           printf("preloading arm64 platform library: %s\n", cand);
           if (arm_exec_link_library(cand) < 0)
             warnx("failed to load platform library %s", cand);
-          else
-            found = 1;
         }
       }
-      if (!found)
-        continue; /* Android platform library: handled by the emulator. */
-      continue;    /* loaded from the platform directory, not from `dir` */
+      continue;
     }
     if (!elf_preload_needed(dep_path, dir, seen, seen_n, elf64)) return false;
     printf("loading ELF%u DT_NEEDED: %s\n", elf64 ? 64u : 32u, dep_path);
@@ -2231,7 +2248,7 @@ static bool service_process_ui(struct service_process *process)
   if(dir && *dir) {
     char path[4096];
     int n=snprintf(path,sizeof path,"%s/component-%d",dir,arm_exec_guest_pid());
-    if(n>0 && (size_t)n<sizeof path && (!luna_file_mkdir(path,0700) || errno==EEXIST))setenv("LUNARIA_DUMP_DIR",path,1);
+    if(n>0 && (size_t)n<sizeof path && (!luna_file_mkdir(path,0700) || errno==EEXIST))luna_os_setenv("LUNARIA_DUMP_DIR",path,1);
   }
   if(!arm_exec_host_activity_egl_init()) { process->fatal=1;return false; }
   luna_boot_finish("component Activity");

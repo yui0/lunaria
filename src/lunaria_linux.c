@@ -229,13 +229,13 @@ int luna_os_release(void *addr, size_t len)
   return munmap(addr, len);
 }
 
-void *luna_os_map_anon(void *want, size_t len, int replace)
+void *luna_os_map_anon(void *want, size_t len, int replace, int shared)
 {
   if (replace && !want) {
     errno = EINVAL;
     return NULL;
   }
-  int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+  int flags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_ANONYMOUS | MAP_NORESERVE;
   if (replace) flags |= MAP_FIXED;
   void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
   return p == MAP_FAILED ? NULL : p;
@@ -290,11 +290,9 @@ void *luna_os_map_file(void *want, size_t len, int prot, int fd,
   return p;
 }
 
-void *luna_os_remap(void *addr, size_t old_len, size_t new_len)
+void *luna_os_remap(void *addr, size_t old_len, size_t new_len, int may_move)
 {
-  /* No MREMAP_MAYMOVE: the guest's VA is the host's, so a mapping that moved
-   * would take every pointer into it with it. */
-  void *p = mremap(addr, old_len, new_len, 0);
+  void *p = mremap(addr, old_len, new_len, may_move ? MREMAP_MAYMOVE : 0);
   return p == MAP_FAILED ? NULL : p;
 }
 
@@ -1176,9 +1174,18 @@ int luna_os_audio_open(unsigned rate, unsigned channels)
       int c = -1;
       while (snd_card_next(&c) >= 0 && c >= 0) {
         char alt[32];
-        snprintf(alt, sizeof alt, "plughw:%d,0", c);
-        if (AUDIO_init(&g_audio, alt, rate, (int)channels, (int)period, 1,
-                       SND_PCM_FORMAT_S16_LE) == 0) {
+        /* Shared first: dmix mixes every lunaria (and any other dmix client)
+         * on the card, where plughw takes it exclusively and a second
+         * instance is left with the silent sink.  An exclusive hw PCM is the
+         * fallback for a card dmix cannot drive. */
+        int ok = 0;
+        for (int shared = 1; shared >= 0 && !ok; --shared) {
+          if (shared) snprintf(alt, sizeof alt, "plug:dmix:CARD=%d,DEV=0", c);
+          else snprintf(alt, sizeof alt, "plughw:%d,0", c);
+          ok = AUDIO_init(&g_audio, alt, rate, (int)channels, (int)period, 1,
+                          SND_PCM_FORMAT_S16_LE) == 0;
+        }
+        if (ok) {
           snprintf(devbuf, sizeof devbuf, "%s", alt);
           opened = 0;
           fprintf(stderr, "[audio] ALSA 'default' did not open; using '%s'\n",

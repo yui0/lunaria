@@ -18,6 +18,15 @@
 extern "C" {
 #endif
 
+/* Architectural state needed to resume one AArch64 thread. Guest addresses
+ * and register values are independent of the host JIT and scheduler slot. */
+struct luna_a64_resume_state {
+  uint64_t x[31];
+  uint64_t v[32][2];
+  uint64_t sp, pc, tpidr_el0;
+  uint32_t fpcr, fpsr, pstate;
+};
+
 int arm_exec_network_enabled(void);
 void arm_exec_set_network_enabled(int enabled);
 
@@ -966,6 +975,8 @@ int arm64_exec_context_init(struct jvm *jvm);
 /* Load an additional ARM64 ELF shared library into the current A64 context.
  * `base_addr` == 0 → auto-place after previously loaded libraries. */
 int arm64_exec_load_library(const char *path, uint64_t base_addr);
+/* Map a zygote-preloaded runtime image without running it (see arm_exec.cpp). */
+int arm64_exec_map_image(const char *path);
 
 /* The dynamic linker's DT_NEEDED walk for `path`, before `path` itself is
  * relocated: each dependency is loaded from beside `path` or, for a platform

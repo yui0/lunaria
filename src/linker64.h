@@ -115,6 +115,7 @@ const char *ln64_module_path(const struct ln64_module *m);
 const char *ln64_module_soname(const struct ln64_module *m);
 uint32_t    ln64_module_bias(const struct ln64_module *m);
 struct ln64_module *ln64_module_by_path(const char *path);
+struct ln64_module *ln64_module_by_soname(const char *soname);
 struct ln64_module *ln64_module_by_address(uint32_t address);
 bool ln64_lookup_next(struct ln64_module *caller, const char *name, struct ln64_sym *out);
 bool ln64_depends_on(struct ln64_module *module, const char *soname);

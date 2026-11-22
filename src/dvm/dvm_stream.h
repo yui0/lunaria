@@ -740,3 +740,9 @@ static const struct rt_field rt_collector_fields[] = {
   { "kind", "I" }, { "a", "Ljava/lang/Object;" }, { "b", "Ljava/lang/Object;" },
   { "c", "Ljava/lang/Object;" }, { "d", "Ljava/lang/Object;" }, F_END
 };
+
+/* Arrays.stream(T[]) is Stream.of(array): same items, same order. */
+static const struct rt_method rt_x_arrays_stream[] = {
+  SM("stream", "([Ljava/lang/Object;)Ljava/util/stream/Stream;", st_of),
+  M_END,
+};

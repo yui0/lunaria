@@ -661,6 +661,14 @@ struct ln64_module *ln64_module_by_path(const char *path)
   return NULL;
 }
 
+struct ln64_module *ln64_module_by_soname(const char *soname)
+{
+  if (!soname || !*soname) return NULL;
+  for (size_t i = 0; i < g_mods_n; ++i)
+    if (!strcmp(g_mods[i]->soname, soname)) return g_mods[i];
+  return NULL;
+}
+
 struct ln64_module *ln64_module_by_address(uint32_t address)
 {
   struct ln64_module *best = NULL;

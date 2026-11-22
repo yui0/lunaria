@@ -4,6 +4,25 @@
 set -eu
 fail() { echo "dist-cross-win: $*" >&2; exit 1; }
 cross=${WIN_CROSS_PREFIX:-x86_64-w64-mingw32-}
+# Ubuntu's apt MinGW targets msvcrt, not UCRT. When the compiler on PATH cannot
+# produce a UCRT binary, fall back to an llvm-mingw UCRT toolchain if one is
+# installed (override with LLVM_MINGW=/path/to/llvm-mingw).
+ucrt_ok() {
+    _d=$(mktemp -d)
+    printf 'int main(void) { return 0; }\n' >"$_d/t.c"
+    if "${cross}gcc" -mcrtdll=ucrt "$_d/t.c" -o "$_d/t.exe" >/dev/null 2>&1; then _r=0
+    elif "${cross}gcc" "$_d/t.c" -o "$_d/t.exe" >/dev/null 2>&1 &&
+         "${cross}objdump" -p "$_d/t.exe" 2>/dev/null | grep -Eiq 'ucrtbase|api-ms-win-crt-'; then _r=0
+    else _r=1; fi
+    rm -rf "$_d"; return $_r
+}
+if ! { command -v "${cross}gcc" >/dev/null && command -v "${cross}objdump" >/dev/null && ucrt_ok; }; then
+    for _t in "${LLVM_MINGW:-}" /opt/llvm-mingw /opt/llvm-mingw-*; do
+        [ -n "$_t" ] && [ -x "$_t/bin/${cross}gcc" ] || continue
+        PATH="$_t/bin:$PATH"; export PATH
+        ucrt_ok && break
+    done
+fi
 for tool in "${cross}gcc" "${cross}g++" "${cross}objdump" cmake ninja python3 zip curl bunzip2; do
     command -v "$tool" >/dev/null || fail "missing $tool"
 done

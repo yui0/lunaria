@@ -5422,7 +5422,171 @@ struct throwable_frame {
   const char *file;   /* platform frames only; the dex tracks no source files */
   bool native;
 };
-#include "dvm_platform_stack.h"
+/* ---- platform frames below an application's own (was dvm_platform_stack.h) ---- */
+/*
+ * Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+/* The platform frames below an application's own on a thread's stack.
+ *
+ * On a device the app is never the bottom of a stack.  Its onCreate() is called by
+ * Activity.performCreate(), which Instrumentation, ActivityThread, the transaction
+ * executor and the main Looper call in turn, down to ZygoteInit.main; a Thread's run() is
+ * called by java.lang.Thread.run.  Throwable.getStackTrace() and Thread.getStackTrace()
+ * report all of it, and code that inspects its own call chain (anti-tamper does, class by
+ * class) reads those frames.  The interpreter's stack holds only bytecode methods, so the
+ * frames that the host drives on the platform's behalf are listed here, per entry point, as
+ * Android 12 shows them (innermost first).  File names are the platform's; line numbers
+ * differ between builds and are not claimed.
+ *
+ * A host thread that enters Java names its entry with dvm_platform_stack() and clears it
+ * afterwards; with none named, the main thread is a Looper callback and any other bytecode
+ * thread is a plain Thread.
+ */
+
+struct platform_frame {
+  const char *cls, *method, *file;
+  bool native;
+};
+#define PF(c, m, f) { c, m, f, false }
+#define PF_NATIVE(c, m, f) { c, m, f, true }
+
+/* What the main Looper's callers look like from Handler.dispatchMessage down. */
+static const struct platform_frame pf_looper_tail[] = {
+  PF("android/os/Handler", "dispatchMessage", "Handler.java"),
+  PF("android/os/Looper", "loopOnce", "Looper.java"),
+  PF("android/os/Looper", "loop", "Looper.java"),
+  PF("android/app/ActivityThread", "main", "ActivityThread.java"),
+  PF_NATIVE("java/lang/reflect/Method", "invoke", "Method.java"),
+  PF("com/android/internal/os/RuntimeInit$MethodAndArgsCaller", "run", "RuntimeInit.java"),
+  PF("com/android/internal/os/ZygoteInit", "main", "ZygoteInit.java"),
+};
+
+#define PF_H PF("android/app/ActivityThread$H", "handleMessage", "ActivityThread.java")
+#define PF_BIND \
+  PF("android/app/ActivityThread", "handleBindApplication", "ActivityThread.java"), \
+  PF("android/app/ActivityThread", "access$1300", "ActivityThread.java"), \
+  PF_H
+#define PF_EXEC \
+  PF("android/app/servertransaction/TransactionExecutor", "execute", "TransactionExecutor.java")
+#define PF_CYCLE \
+  PF("android/app/servertransaction/TransactionExecutor", "performLifecycleSequence", "TransactionExecutor.java"), \
+  PF("android/app/servertransaction/TransactionExecutor", "cycleToPath", "TransactionExecutor.java"), \
+  PF("android/app/servertransaction/TransactionExecutor", "cycleToPath", "TransactionExecutor.java"), \
+  PF("android/app/servertransaction/TransactionExecutor", "executeLifecycleState", "TransactionExecutor.java"), \
+  PF_EXEC, PF_H
+#define PF_RESUME \
+  PF("android/app/ActivityThread", "performResumeActivity", "ActivityThread.java"), \
+  PF("android/app/ActivityThread", "handleResumeActivity", "ActivityThread.java"), \
+  PF("android/app/servertransaction/ResumeActivityItem", "execute", "ResumeActivityItem.java"), \
+  PF("android/app/servertransaction/TransactionExecutor", "executeLifecycleState", "TransactionExecutor.java"), \
+  PF_EXEC, PF_H
+
+static const struct platform_frame pf_application_attach[] = {
+  PF("android/app/Application", "attach", "Application.java"),
+  PF("android/app/Instrumentation", "newApplication", "Instrumentation.java"),
+  PF("android/app/Instrumentation", "newApplication", "Instrumentation.java"),
+  PF("android/app/LoadedApk", "makeApplication", "LoadedApk.java"),
+  PF_BIND,
+};
+static const struct platform_frame pf_application_create[] = {
+  PF("android/app/Instrumentation", "callApplicationOnCreate", "Instrumentation.java"),
+  PF_BIND,
+};
+static const struct platform_frame pf_provider_attach[] = {
+  PF("android/content/ContentProvider", "attachInfo", "ContentProvider.java"),
+  PF("android/content/ContentProvider", "attachInfo", "ContentProvider.java"),
+  PF("android/app/ActivityThread", "installProvider", "ActivityThread.java"),
+  PF("android/app/ActivityThread", "installContentProviders", "ActivityThread.java"),
+  PF_BIND,
+};
+static const struct platform_frame pf_activity_create[] = {
+  PF("android/app/Activity", "performCreate", "Activity.java"),
+  PF("android/app/Activity", "performCreate", "Activity.java"),
+  PF("android/app/Instrumentation", "callActivityOnCreate", "Instrumentation.java"),
+  PF("android/app/ActivityThread", "performLaunchActivity", "ActivityThread.java"),
+  PF("android/app/ActivityThread", "handleLaunchActivity", "ActivityThread.java"),
+  PF("android/app/servertransaction/LaunchActivityItem", "execute", "LaunchActivityItem.java"),
+  PF("android/app/servertransaction/TransactionExecutor", "executeCallbacks", "TransactionExecutor.java"),
+  PF_EXEC, PF_H,
+};
+static const struct platform_frame pf_activity_start[] = {
+  PF("android/app/Instrumentation", "callActivityOnStart", "Instrumentation.java"),
+  PF("android/app/Activity", "performStart", "Activity.java"),
+  PF("android/app/ActivityThread", "handleStartActivity", "ActivityThread.java"),
+  PF_CYCLE,
+};
+static const struct platform_frame pf_activity_post_create[] = {
+  PF("android/app/Instrumentation", "callActivityOnPostCreate", "Instrumentation.java"),
+  PF("android/app/ActivityThread", "handleStartActivity", "ActivityThread.java"),
+  PF_CYCLE,
+};
+static const struct platform_frame pf_activity_resume[] = {
+  PF("android/app/Instrumentation", "callActivityOnResume", "Instrumentation.java"),
+  PF("android/app/Activity", "performResume", "Activity.java"),
+  PF_RESUME,
+};
+static const struct platform_frame pf_activity_post_resume[] = {
+  PF("android/app/Activity", "performResume", "Activity.java"),
+  PF_RESUME,
+};
+static const struct platform_frame pf_looper_callback[] = {
+  PF("android/os/Handler", "handleCallback", "Handler.java"),
+};
+static const struct platform_frame pf_thread[] = {
+  PF("java/lang/Thread", "run", "Thread.java"),
+};
+
+struct platform_stack {
+  const char *name;
+  const struct platform_frame *head;
+  unsigned nhead;
+  bool looper;   /* the head is followed by the main Looper's callers */
+};
+#define PS(n, a, l) { n, a, sizeof a / sizeof a[0], l }
+static const struct platform_stack platform_stacks[] = {
+  PS("application.attach", pf_application_attach, true),
+  PS("application.onCreate", pf_application_create, true),
+  PS("provider.attach", pf_provider_attach, true),
+  PS("activity.onCreate", pf_activity_create, true),
+  PS("activity.onStart", pf_activity_start, true),
+  PS("activity.onPostCreate", pf_activity_post_create, true),
+  PS("activity.onResume", pf_activity_resume, true),
+  PS("activity.onPostResume", pf_activity_post_resume, true),
+  PS("looper.callback", pf_looper_callback, true),
+  PS("thread", pf_thread, false),
+};
+
+static _Thread_local const struct platform_stack *g_platform_stack;
+
+void dvm_platform_stack(const char *entry)
+{
+  g_platform_stack = NULL;
+  for (size_t i = 0; entry && i < sizeof platform_stacks / sizeof platform_stacks[0]; ++i)
+    if (!strcmp(platform_stacks[i].name, entry)) {
+      g_platform_stack = &platform_stacks[i];
+      return;
+    }
+}
+
+/* The frames below the interpreter's, innermost first.  `index` runs over head then tail. */
+static const struct platform_stack *platform_stack_current(void)
+{
+  if (g_platform_stack) return g_platform_stack;
+  return &platform_stacks[dvm_on_main_thread() ? 8 : 9];
+}
+static unsigned platform_frame_count(const struct platform_stack *s)
+{
+  return s->nhead + (s->looper ? (unsigned)(sizeof pf_looper_tail / sizeof pf_looper_tail[0]) : 0u);
+}
+static const struct platform_frame *platform_frame_at(const struct platform_stack *s, unsigned index)
+{
+  return index < s->nhead ? &s->head[index] : &pf_looper_tail[index - s->nhead];
+}
 struct throwable_trace {
   size_t count;
   struct throwable_frame frames[];
@@ -38683,8 +38847,175 @@ static bool chan_isOpen(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   RETI(v.i ? 1 : 0);
 }
 
-#include "dvm_nio_channel.h"
-#include "dvm_channel_output.h"
+
+/* ---- java.nio.channels contracts and Channels.newOutputStream (was dvm_nio_channel.h / dvm_channel_output.h) ---- */
+/* Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ * SPDX-License-Identifier: MPL-2.0
+ * Channel contracts needed by stream adapters. Selection/provider operations
+ * remain abstract; concrete channels must supply their actual behavior. */
+static bool nio_channel_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  dvm_ref lock=dvm_new_object(vm,dvm_find_class(vm,"java/lang/Object"));
+  if(!lock) { dvm__throw(vm,"java/lang/OutOfMemoryError","channel close lock"); return false; }
+  (void)dvm_set_field(vm,self,"closeLock","Ljava/lang/Object;",(union dvm_value){.l=lock});
+  (void)dvm_set_field(vm,self,"closed","Z",(union dvm_value){0});
+  RETV();
+}
+static bool nio_channel_open(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value closed={0};
+  (void)dvm_get_field(vm,self,"closed","Z",&closed);
+  RETI(!closed.i);
+}
+static bool nio_channel_close(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value lock={0},closed={0};
+  (void)dvm_get_field(vm,self,"closeLock","Ljava/lang/Object;",&lock);
+  if(!lock.l) {
+    union dvm_value ignored={0};
+    if(!nio_channel_init(vm,self,NULL,0,&ignored)) return false;
+    (void)dvm_get_field(vm,self,"closeLock","Ljava/lang/Object;",&lock);
+  }
+  if(!dvm__monitor_enter(vm,lock.l)) return false;
+  (void)dvm_get_field(vm,self,"closed","Z",&closed);
+  bool good=true;
+  if(!closed.i) {
+    (void)dvm_set_field(vm,self,"closed","Z",(union dvm_value){.i=1});
+    good=am_vcall(vm,self,"implCloseChannel","()V",NULL,0,out);
+  }
+  if(!dvm__monitor_exit(vm,lock.l)) good=false;
+  return good;
+}
+static bool nio_channel_register(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)nargs;
+  union dvm_value expanded[3]={ARG(0),ARG(1),{0}};
+  return am_vcall(vm,self,"register","(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",expanded,3,out);
+}
+#define NIO_ABSTRACT(name,sig) {name,sig,NULL,DEX_ACC_PUBLIC|DEX_ACC_ABSTRACT}
+static const struct rt_method rt_channel_contract[]={ NIO_ABSTRACT("close","()V"),NIO_ABSTRACT("isOpen","()Z"),M_END };
+static const char *const rt_channel_ifaces[]={"Ljava/io/Closeable;",NULL};
+static const char *const rt_interruptible_ifaces[]={"Ljava/nio/channels/Channel;",NULL};
+static const char *const rt_interruptible_base_ifaces[]={"Ljava/nio/channels/Channel;","Ljava/nio/channels/InterruptibleChannel;",NULL};
+static const struct rt_field rt_interruptible_channel_fields[]={ {"closed","Z"},{"closeLock","Ljava/lang/Object;"},F_END };
+static const struct rt_method rt_interruptible_channel[]={
+  {"<init>","()V",nio_channel_init,DEX_ACC_PROTECTED},
+  {"close","()V",nio_channel_close,DEX_ACC_PUBLIC|DEX_ACC_FINAL},
+  {"isOpen","()Z",nio_channel_open,DEX_ACC_PUBLIC|DEX_ACC_FINAL},
+  {"implCloseChannel","()V",NULL,DEX_ACC_PROTECTED|DEX_ACC_ABSTRACT},M_END
+};
+static const struct rt_method rt_selectable_channel[]={
+  {"<init>","()V",nio_channel_init,DEX_ACC_PROTECTED},
+  NIO_ABSTRACT("provider","()Ljava/nio/channels/spi/SelectorProvider;"),NIO_ABSTRACT("validOps","()I"),
+  NIO_ABSTRACT("isRegistered","()Z"),NIO_ABSTRACT("keyFor","(Ljava/nio/channels/Selector;)Ljava/nio/channels/SelectionKey;"),
+  NIO_ABSTRACT("register","(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;"),
+  {"register","(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",nio_channel_register,DEX_ACC_PUBLIC|DEX_ACC_FINAL},
+  NIO_ABSTRACT("configureBlocking","(Z)Ljava/nio/channels/SelectableChannel;"),
+  NIO_ABSTRACT("isBlocking","()Z"),NIO_ABSTRACT("blockingLock","()Ljava/lang/Object;"),M_END
+};
+#undef NIO_ABSTRACT
+
+/* Copyright © 2026 Yuichiro Nakada / Project Lunaria
+ * SPDX-License-Identifier: MPL-2.0 */
+static bool channels_new_output(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self; (void)nargs;
+  if(!ARG(0).l) { dvm__throw(vm,"java/lang/NullPointerException","\"ch\" is null!"); return false; }
+  dvm_ref stream=dvm_new_object(vm,dvm_find_class(vm,"java/nio/channels/Channels$1"));
+  if(!stream) { dvm__throw(vm,"java/lang/OutOfMemoryError","channel output stream"); return false; }
+  (void)dvm_set_field(vm,stream,"ch","Ljava/nio/channels/WritableByteChannel;",ARG(0));
+  RETL(stream);
+}
+static bool channel_output_fully(struct dvm *vm,dvm_ref channel,dvm_ref buffer)
+{
+  union dvm_value ignored={0},arg={.l=buffer};
+  for(;;) {
+    int32_t pos=0,limit=0;
+    (void)stream_field(vm,buffer,"pos",&pos);
+    (void)stream_field(vm,buffer,"count",&limit);
+    if(pos>=limit) return true;
+    if(!am_vcall(vm,channel,"write","(Ljava/nio/ByteBuffer;)I",&arg,1,&ignored)) return false;
+    if(ignored.i<=0) { dvm__throw(vm,"java/lang/RuntimeException","no bytes written"); return false; }
+  }
+  return true;
+}
+static bool channel_output_write(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  if(!dvm__monitor_enter(vm,self)) return false;
+  union dvm_value array={0},buffer={0},channel={0},old={0};
+  bool good=true;
+  int32_t offset=0,length=0;
+  if(!strcmp(builtin_sig(),"(I)V")) {
+    (void)dvm_get_field(vm,self,"b1","[B",&array);
+    if(!array.l) {
+      array.l=dvm_new_array(vm,'B',"B",1);
+      (void)dvm_set_field(vm,self,"b1","[B",array);
+    }
+    if(!array.l) { dvm__throw(vm,"java/lang/OutOfMemoryError","channel byte buffer"); good=false; }
+    else { ((uint8_t *)dvm_array_data(vm,array.l))[0]=(uint8_t)ARG(0).i; length=1; }
+  } else {
+    array=ARG(0);
+    if(!array.l) { dvm__throw(vm,"java/lang/NullPointerException","buffer"); good=false; }
+    else {
+      uint32_t count=dvm_array_length(vm,array.l);
+      offset=nargs==3 ? ARG(1).i : 0;
+      length=nargs==3 ? ARG(2).i : (int32_t)count;
+      if(offset<0 || length<0 || (uint32_t)offset>count || (uint32_t)length>count-(uint32_t)offset) {
+        dvm__throw(vm,"java/lang/IndexOutOfBoundsException",NULL); good=false;
+      }
+    }
+  }
+  if(good && length) {
+    (void)dvm_get_field(vm,self,"ch","Ljava/nio/channels/WritableByteChannel;",&channel);
+    (void)dvm_get_field(vm,self,"bs","[B",&old);
+    if(old.l==array.l) (void)dvm_get_field(vm,self,"bb","Ljava/nio/ByteBuffer;",&buffer);
+    else {
+      good=bb_wrap(vm,0,&array,1,&buffer);
+      if(good) {
+        (void)dvm_set_field(vm,self,"bs","[B",array);
+        (void)dvm_set_field(vm,self,"bb","Ljava/nio/ByteBuffer;",buffer);
+      }
+    }
+    if(good && !buffer.l) { dvm__throw(vm,"java/lang/OutOfMemoryError","channel ByteBuffer"); good=false; }
+    if(good) {
+      stream_set_field(vm,buffer.l,"count",offset+length);
+      stream_set_field(vm,buffer.l,"pos",offset);
+      struct dvm_class *selectable=dvm_find_class(vm,"java/nio/channels/SelectableChannel");
+      if(selectable && dvm__class_assignable(vm,dvm_object_class(vm,channel.l),selectable)) {
+        union dvm_value lock={0},blocking={0};
+        good=am_vcall(vm,channel.l,"blockingLock","()Ljava/lang/Object;",NULL,0,&lock);
+        if(good) good=dvm__monitor_enter(vm,lock.l);
+        if(good) {
+          good=am_vcall(vm,channel.l,"isBlocking","()Z",NULL,0,&blocking);
+          if(good && !blocking.i) { dvm__throw(vm,"java/nio/channels/IllegalBlockingModeException",NULL); good=false; }
+          if(good) good=channel_output_fully(vm,channel.l,buffer.l);
+          if(!dvm__monitor_exit(vm,lock.l)) good=false;
+        }
+      } else good=channel_output_fully(vm,channel.l,buffer.l);
+    }
+  }
+  if(!dvm__monitor_exit(vm,self)) good=false;
+  (void)out;
+  return good;
+}
+static bool channel_output_close(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value channel={0};
+  (void)dvm_get_field(vm,self,"ch","Ljava/nio/channels/WritableByteChannel;",&channel);
+  return am_vcall(vm,channel.l,"close","()V",NULL,0,out);
+}
+static const struct rt_field rt_channel_output_fields[]={
+  {"ch","Ljava/nio/channels/WritableByteChannel;"},{"bs","[B"},
+  {"bb","Ljava/nio/ByteBuffer;"},{"b1","[B"},F_END
+};
+static const struct rt_method rt_channel_output[]={
+  M("write","(I)V",channel_output_write),M("write","([B)V",channel_output_write),
+  M("write","([BII)V",channel_output_write),M("close","()V",channel_output_close),M_END
+};
 
 static const struct rt_method rt_channels[] = {
   SM("newOutputStream","(Ljava/nio/channels/WritableByteChannel;)Ljava/io/OutputStream;",channels_new_output),
@@ -45028,10 +45359,15 @@ static const int32_t *egl_attribs(struct dvm *vm, dvm_ref arr, int32_t off,
   uint32_t len = dvm_array_length(vm, arr);
   const int32_t *d = dvm_array_data(vm, arr);
   if (!d || (uint32_t)off >= len) return NULL;
+  /* (key, value) pairs ended by a *key* of EGL_NONE; a value may itself be
+   * EGL_NONE (EGL_CONFIG_CAVEAT, EGL_NONE), so walk pair-wise.  The result
+   * always ends with a key EGL_NONE at an even index. */
   int n = 0;
-  for (uint32_t i = (uint32_t)off; i < len && n < cap - 1; ++i) {
+  for (uint32_t i = (uint32_t)off; i < len && n + 2 < cap; i += 2) {
+    if (d[i] == 0x3038 /* EGL_NONE */) break;
+    if (i + 1 >= len) break;
     buf[n++] = d[i];
-    if (d[i] == 0x3038 /* EGL_NONE */) return buf;
+    buf[n++] = d[i + 1];
   }
   buf[n] = 0x3038;
   return buf;
@@ -47042,7 +47378,7 @@ static bool intent_toUri(struct dvm *vm, dvm_ref self, const union dvm_value *ar
           if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+')
             continue;
           if (c == ':' && i > 0) {
-            scheme_copy = strndup(rest, i);
+            scheme_copy = luna_strndup(rest, i);
             ts_put(&u, "intent:");
             memmove(rest, rest + i + 1, strlen(rest + i + 1) + 1);
           }
@@ -70360,7 +70696,6 @@ static const struct rt_method rt_restrictions_manager[] = {
   M_END,
 };
 
-#include "dvm_shortcut.h"
 
 /* ShortcutManager: the launcher is the emulator's own, so pinned and manifest
  * shortcuts are empty; dynamic shortcuts are kept so an app reads back what
@@ -72176,7 +72511,10 @@ static void ui_focus_tick(struct dvm *vm)
    * Its existence does not make it a modal input window. Resolve ownership
    * after surface traversal, even when the focused window has not changed. */
   bool native_focus = false;
-  if (focus && ui_is_a(vm, focus, "android/app/Activity")) {
+  /* A NativeActivity has taken its window's surface and input queue
+   * (Window.takeSurface / takeInputQueue): native code owns every touch. */
+  if (focus && ui_is_a(vm, focus, "android/app/NativeActivity")) native_focus = true;
+  else if (focus && ui_is_a(vm, focus, "android/app/Activity")) {
     dvm_ref root = ui_window_content(vm, focus);
     for (struct surface_view_state *s = surface_views; s; s = s->next) {
       if (s->vm != vm) continue;
@@ -96645,6 +96983,7 @@ struct rt_extra {
 
 static const struct rt_extra rt_extras[] = {
   { "Landroid/accounts/Account;", rt_account_parcel_more },
+  { "Ljava/util/Arrays;", rt_x_arrays_stream },
   { "Landroid/os/Binder;", rt_x_binder_identity },
   { "Ljavax/net/ssl/SSLSocket;", rt_empty_constructor },
   { "Ljava/security/MessageDigest;", rt_x_message_digest_more },

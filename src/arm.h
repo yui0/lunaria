@@ -478,13 +478,14 @@ inline int a64_access_fault(GuestVA va, size_t len, bool write, GuestVA *fault) 
 }
 
 inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned,
-                           bool file_backed = false) {
+                           bool file_backed = false, bool shared = false,
+                           unsigned backing_handle = 0, uint64_t backing_offset = 0) {
   std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
   auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
   [](const A64Mapping &m, GuestVA v) {
     return m.lo < v;
   });
-  g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned, file_backed});
+  g_a64_maps.insert(it, A64Mapping{lo, hi, prot, owned, file_backed, shared, backing_handle, backing_offset});
   a64_maps_bump();
 }
 
@@ -528,13 +529,15 @@ inline void a64_map_declare_backing(BackingOffset base, uint64_t len,
       continue;
     }
     GuestVA gap_hi = it == g_a64_maps.end() ? hi : std::min(hi, it->lo);
-    it = g_a64_maps.insert(it, A64Mapping{lo, gap_hi, prot, false});
+    it = g_a64_maps.insert(it, A64Mapping{lo, gap_hi, prot, false, false, false, 0, 0});
     lo = gap_hi;
   }
   for (size_t i = 1; i < g_a64_maps.size();) {
     A64Mapping &a = g_a64_maps[i - 1];
     const A64Mapping &b = g_a64_maps[i];
-    if (a.hi == b.lo && a.prot == b.prot && a.owned == b.owned) {
+    if (a.hi == b.lo && a.prot == b.prot && a.owned == b.owned &&
+        a.file_backed == b.file_backed && a.shared == b.shared &&
+        !a.backing_handle && !b.backing_handle) {
       a.hi = b.hi;
       g_a64_maps.erase(g_a64_maps.begin() + (long)i);
     } else {
@@ -550,8 +553,16 @@ inline void a64_map_declare_backing(BackingOffset base, uint64_t len,
  * Defined with g_loaded_regions. */
 inline void a64_loaded_regions_unmap(GuestVA lo, GuestVA hi);
 
+inline A64Mapping a64_mapping_slice(A64Mapping mapping, GuestVA lo, GuestVA hi) {
+  if (mapping.backing_handle) mapping.backing_offset += lo - mapping.lo;
+  mapping.lo = lo;
+  mapping.hi = hi;
+  return mapping;
+}
+
 // Drop [lo,hi) from the table, splitting/trimming entries as needed.
-inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
+inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release,
+                           bool keep_backing = false) {
   a64_loaded_regions_unmap(lo, hi);
   std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
   const GuestVA page = a64_host_page_size();
@@ -577,7 +588,7 @@ inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
     }
     bool head = m.lo < clo, tail = m.hi > chi;
     if (head && tail) {
-      A64Mapping right{chi, m.hi, m.prot, m.owned, m.file_backed};
+      A64Mapping right = a64_mapping_slice(m, chi, m.hi);
       m.hi = clo;
       g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, right);
       i += 2;
@@ -585,10 +596,17 @@ inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release) {
       m.hi = clo;
       ++i;
     } else if (tail) {
-      m.lo = chi;
+      m = a64_mapping_slice(m, chi, m.hi);
       ++i;
     } else {
+      const unsigned handle = m.backing_handle;
       g_a64_maps.erase(g_a64_maps.begin() + (long)i);
+      if (handle && !keep_backing &&
+          std::none_of(g_a64_maps.begin(), g_a64_maps.end(),
+                       [handle](const A64Mapping &entry) {
+                         return entry.backing_handle == handle;
+                       }))
+        luna_fd_close((int)(handle - 1));
     }
   }
   /* A host page cannot be released while any guest subpage still owns it.
@@ -631,10 +649,9 @@ inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
       m.prot = prot;
       continue;
     }
-    A64Mapping head{m.lo, clo, m.prot, m.owned, m.file_backed};
-    A64Mapping tail{chi, m.hi, m.prot, m.owned, m.file_backed};
-    m.lo = clo;
-    m.hi = chi;
+    const A64Mapping head = a64_mapping_slice(m, m.lo, clo);
+    const A64Mapping tail = a64_mapping_slice(m, chi, m.hi);
+    m = a64_mapping_slice(m, clo, chi);
     m.prot = prot;
     if (tail.hi > tail.lo) g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, tail);
     if (head.hi > head.lo) {
@@ -659,7 +676,7 @@ inline bool a64_va_usable(void *p, uint64_t len) {
 
 // Reserve `len` bytes of 64-bit guest VA backed by real host pages.
 inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
-                          bool fixed = false) {
+                          bool fixed = false, bool shared = false) {
   len = (len + 4095ull) & ~4095ull;
   if (!len) return 0;
   void *want = nullptr;
@@ -688,7 +705,7 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
   bool replaces_file_granule = false;
   if (fixed && a64_host_page_size() > 4096u) {
     std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
-    reuse_anon = luna_vm_anonymous_span(g_a64_maps.data(), g_a64_maps.size(),
+    reuse_anon = luna_vm_private_anonymous_span(g_a64_maps.data(), g_a64_maps.size(),
                                         (GuestVA)want, (GuestVA)want + len);
     const size_t page = a64_host_page_size();
     const GuestVA first = (GuestVA)want & ~(page - 1u);
@@ -696,13 +713,13 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
     for (const A64Mapping &m : g_a64_maps) {
       if (m.hi <= first) continue;
       if (m.lo >= end) break;
-      if (m.file_backed) {
+      if (m.file_backed || m.shared) {
         replaces_file_granule = true;
         break;
       }
     }
   }
-  if (reuse_anon) {
+  if (reuse_anon && !shared) {
     memset(want, 0, (size_t)len);
     a64_map_remove((GuestVA)want, (GuestVA)want + len, /*release=*/false);
     a64_map_insert((GuestVA)want, (GuestVA)want + len, prot, /*owned=*/true);
@@ -717,28 +734,49 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
     return 0;
   }
 #endif
-  void *p = luna_os_map_anon(want, (size_t)len, fixed);
+  int backing = -1;
+#ifdef __linux__
+  if (shared) {
+    /* A named descriptor lets a separately started emulator map the same
+     * shmem object. Keep its size fixed, as with Linux shared anonymous mmap. */
+    backing = luna_os_shm_create("lunaria-shared-anonymous", (size_t)len);
+    if (backing < 0) return 0;
+  }
+#endif
+  const auto map = [&](void *address, bool replace) {
+    if (backing < 0)
+      return luna_os_map_anon(address, (size_t)len, replace, shared);
+    return luna_os_map_file_flags(address, (size_t)len, LUNA_PROT_READ | LUNA_PROT_WRITE,
+                                 LUNA_MAP_SHARED | LUNA_MAP_NORESERVE |
+                                 (replace ? LUNA_MAP_FIXED : 0), backing, 0);
+  };
+  void *p = map(want, fixed);
   if (fixed && p != want) {
     if (p) luna_os_release(p, (size_t)len);
+    if (backing >= 0) luna_fd_close(backing);
     return 0;
   }
   if (!(image_fixed && p == want) && !a64_va_usable(p, len)) {
     if (fixed) {
       if (p) luna_os_release(p, (size_t)len);
+      if (backing >= 0) luna_fd_close(backing);
       return 0;
     }
     // Landed in the image window (or an unusable hint).
     void *bad = p;
-    p = (want || p) ? luna_os_map_anon(nullptr, (size_t)len, 0) : nullptr;
+    p = (want || p) ? map(nullptr, false) : nullptr;
     if (bad) luna_os_release(bad, (size_t)len);
     if (!a64_va_usable(p, len)) {
       if (p) luna_os_release(p, (size_t)len);
+      if (backing >= 0) luna_fd_close(backing);
       return 0;
     }
   }
   if (fixed)
     a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
-  a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true);
+  a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true,
+                 /*file_backed=*/false, shared,
+                 backing < 0 ? 0u : (unsigned)backing + 1u);
   return image_fixed ? hint : (GuestVA)p;
 }
 
@@ -782,8 +820,11 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
   }
   if (fixed && !(map_flags & LUNA_MAP_NOREPLACE))
     a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
+  const bool shared = (map_flags & LUNA_MAP_SHARED) != 0;
+  const int backing = shared ? luna_fd_dup(fd, 0, 1) : -1;
   a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true,
-                 /*file_backed=*/true);
+                 /*file_backed=*/true, shared,
+                 backing < 0 ? 0u : (unsigned)backing + 1u, (uint64_t)off);
   return (GuestVA)p;
 }
 

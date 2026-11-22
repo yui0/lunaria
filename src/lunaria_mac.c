@@ -315,13 +315,13 @@ int luna_os_release(void *addr, size_t len)
   return munmap(addr, len);
 }
 
-void *luna_os_map_anon(void *want, size_t len, int replace)
+void *luna_os_map_anon(void *want, size_t len, int replace, int shared)
 {
   if (replace && !want) {
     errno = EINVAL;
     return NULL;
   }
-  int flags = MAP_PRIVATE | MAP_ANON;
+  int flags = (shared ? MAP_SHARED : MAP_PRIVATE) | MAP_ANON;
   if (replace) flags |= MAP_FIXED;
   void *p = mmap(want, len, PROT_READ | PROT_WRITE, flags, -1, 0);
   return p == MAP_FAILED ? NULL : p;
@@ -365,12 +365,14 @@ void *luna_os_map_file(void *want, size_t len, int prot, int fd,
   return p;
 }
 
-void *luna_os_remap(void *addr, size_t old_len, size_t new_len)
+void *luna_os_remap(void *addr, size_t old_len, size_t new_len, int may_move)
 {
   (void)addr;
   (void)old_len;
   (void)new_len;
-  return NULL;  /* no in-place resize on macOS; the caller copies */
+  (void)may_move;
+  errno = ENOTSUP;
+  return NULL;
 }
 
 size_t luna_os_page_size(void)

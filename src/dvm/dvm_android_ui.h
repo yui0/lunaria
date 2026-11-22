@@ -10473,6 +10473,21 @@ static void browser_flush(struct dvm *vm)
   dvm_unpin(vm, caller);
 }
 
+static void act_trace_intent(struct dvm *vm, dvm_ref intent, struct dvm_class *cls, bool resolved)
+{
+  fprintf(stderr, "[activity] start request: resolved=%u class=%s\n", (unsigned)resolved, cls ? cls->name : "(none)");
+  for (const char *const *f = (const char *const[]) {
+    "action", "package", "type", "data", "categories", "component", NULL
+  }; *f; ++f) {
+    union dvm_value v = { 0 };
+    (void)dvm_get_field(vm, intent, *f, !strcmp(*f, "categories") ? "Ljava/util/Set;" : !strcmp(*f, "data") ? "Landroid/net/Uri;" :
+                        !strcmp(*f, "component") ? "Landroid/content/ComponentName;" : "Ljava/lang/String;", &v);
+    union dvm_value text = { 0 };
+    if (v.l && strcmp(*f, "categories") && strcmp(*f, "component")) (void)am_vcall(vm, v.l, "toString", "()Ljava/lang/String;", NULL, 0, &text);
+    fprintf(stderr, "[activity]   %s=%u %s\n", *f, (unsigned)v.l, text.l ? dvm_string_utf8(vm, text.l) : "");
+  }
+}
+
 static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
                              bool from_activity, bool for_result,
                              int32_t request_code)
@@ -10568,21 +10583,8 @@ static bool act_start_common(struct dvm *vm, dvm_ref self, dvm_ref intent,
       free(descriptor);
     }
   }
-  if (dvm__env("LUNARIA_TRACE_ACCOUNTS") && (!cls || !cls->dex))
-  {
-    fprintf(stderr, "[activity] cannot start: resolved=%u class=%s dex=%u\n", (unsigned)resolved.l,
-            cls ? cls->name : "(none)", cls ? (unsigned)(cls->dex != NULL) : 0u);
-    for (const char *const *f = (const char *const[]) {
-    "action", "package", "type", "data", "categories", "component", NULL
-  }; *f; ++f) {
-      union dvm_value v = { 0 };
-      (void)dvm_get_field(vm, intent, *f, !strcmp(*f, "categories") ? "Ljava/util/Set;" : !strcmp(*f, "data") ? "Landroid/net/Uri;" :
-                          !strcmp(*f, "component") ? "Landroid/content/ComponentName;" : "Ljava/lang/String;", &v);
-      union dvm_value text = { 0 };
-      if (v.l && strcmp(*f, "categories") && strcmp(*f, "component")) (void)am_vcall(vm, v.l, "toString", "()Ljava/lang/String;", NULL, 0, &text);
-      fprintf(stderr, "[activity]   %s=%u %s\n", *f, (unsigned)v.l, text.l ? dvm_string_utf8(vm, text.l) : "");
-    }
-  }
+  if (dvm__env("LUNARIA_TRACE_ACCOUNTS") && (!cls || !cls->dex || remote_owner))
+    act_trace_intent(vm, intent, cls, resolved.l != 0);
   if ((!cls || !cls->dex) && !remote_owner && !resolved.l && from_activity && browser_open(vm, self, intent))
     return true;
   if (!cls || !cls->dex) {
@@ -17999,9 +18001,14 @@ static void ui_emit_view_inner(struct dvm *vm, struct ui_buf *b, struct ui_buf *
 
   /* SurfaceView draws into a separate surface behind its window. Its View
    * paint point clears the window buffer before drawing its own background
-   * or children (SurfaceView.draw/dispatchDraw, PorterDuff.Mode.CLEAR). */
+   * or children (SurfaceView.draw/dispatchDraw, PorterDuff.Mode.CLEAR).
+   * NativeActivity's content view is the same thing: the activity takes the
+   * window's surface for native code (Window.takeSurface), so the app's frames
+   * are the window and its windowBackground is never visible. */
   ui_printf(b, "<div id=\"v%u\" class=\"w%s %s%s%s\">", (unsigned)view,
-            ui_is_a(vm, view, "android/view/SurfaceView") ? " lunaria-surface-hole" : "",
+            ui_is_a(vm, view, "android/view/SurfaceView") ||
+            ui_is_a(vm, view, "android/app/NativeActivity$NativeContentView")
+              ? " lunaria-surface-hole" : "",
             simple, is_webview ? " lunaria-webview lunaria-touchview" : " lunaria-touchview",
             ui_is_a(vm, view, "android/widget/NumberPicker") ? " lunaria-gestureview" : "");
   /* A custom child/foreground dispatcher owns painter order within the

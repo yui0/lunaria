@@ -930,7 +930,7 @@ jobject dvm_jni_surface_from_sink(JNIEnv *env, struct lm_sink *sink);
 struct lm_sink *dvm_jni_surface_acquire_sink(JNIEnv *env, jobject surface);
 void dvm_jni_main_transaction(JNIEnv *env, bool begin);
 /* Names the platform code that is calling into Java on this thread -- "application.attach",
- * "activity.onCreate", ... (see dvm_platform_stack.h) -- so the frames a device would show
+ * "activity.onCreate", ... (see the platform frames section of dvm_runtime.c) -- so the frames a device would show
  * below the app's own appear in stack traces.  NULL returns to the thread's default. */
 void dvm_platform_stack(const char *entry);
 /* Enter the launcher Activity into the activity stack before its onCreate. */

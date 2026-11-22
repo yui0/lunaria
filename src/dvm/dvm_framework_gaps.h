@@ -69,8 +69,8 @@ static bool x_dateutils_format(struct dvm *vm, dvm_ref self, const union dvm_val
     /* The year is left out of a date in the current year, unless asked for. */
     time_t when = (time_t)(millis / 1000), now = time(NULL);
     struct tm tw, tn;
-    localtime_r(&when, &tw);
-    localtime_r(&now, &tn);
+    luna_localtime(&when, &tw);
+    luna_localtime(&now, &tn);
     const bool show_year = (flags & DU_SHOW_YEAR) || (!(flags & DU_NO_YEAR) && tw.tm_year != tn.tm_year);
     const int style = (flags & DU_NUMERIC_DATE) ? 3 : abbrev_month ? 2 : 1;
     if (!du_pattern_of(vm, locale.l, style, -1, part, sizeof part)) return false;
@@ -115,8 +115,8 @@ static bool x_dateutils_is_today(struct dvm *vm, dvm_ref self, const union dvm_v
   clock_gettime(CLOCK_REALTIME, &ts);
   time_t a = (time_t)(ARG(0).j / 1000), b = ts.tv_sec;
   struct tm ta, tb;
-  localtime_r(&a, &ta);
-  localtime_r(&b, &tb);
+  luna_localtime(&a, &ta);
+  luna_localtime(&b, &tb);
   RETI(ta.tm_year == tb.tm_year && ta.tm_yday == tb.tm_yday);
 }
 
@@ -2634,7 +2634,7 @@ static bool x_ldt_parse(struct dvm *vm, dvm_ref self, const union dvm_value *arg
     }
     if (*p || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || s > 59) goto bad;
     struct tm tmv = { .tm_year = y - 1900, .tm_mon = mo - 1, .tm_mday = d, .tm_hour = h, .tm_min = mi, .tm_sec = s };
-    seconds = (int64_t)timegm(&tmv);
+    seconds = (int64_t)time_utc(&tmv);
   } else {
     /* a formatter pattern: parse it as a SimpleDateFormat pattern in UTC (java.time's u == y) */
     char fixed[160];
@@ -5120,7 +5120,7 @@ static bool xs_put_escaped(struct dvm *vm, dvm_ref self, const char *s, char quo
     const char *run = p;
     while (*p && *p != '&' && *p != '<' && *p != '>' && !(quote && *p == quote)) ++p;
     if (p > run) {
-      char *chunk = strndup(run, (size_t)(p - run));
+      char *chunk = luna_strndup(run, (size_t)(p - run));
       const bool ok = chunk && xs_put(vm, self, chunk);
       free(chunk);
       if (!ok) return false;

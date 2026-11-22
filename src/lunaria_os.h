@@ -1634,14 +1634,13 @@ void *luna_os_map_file(void *want, size_t len, int prot, int fd,
 /* Anonymous guest pages stay host-RW; guest protections live in the VMA
  * table. replace requires the requested address, replacing an old mapping
  * where supported. Neither function returns a MAP_FAILED sentinel. */
-void *luna_os_map_anon(void *want, size_t len, int replace);
+void *luna_os_map_anon(void *want, size_t len, int replace, int shared);
 void *luna_os_map_file_flags(void *want, size_t len, int prot, int flags,
                              int fd, uint64_t off);
 
-/* Grow or shrink an existing anonymous mapping in place where the host can,
- * and otherwise report that it cannot (returns NULL, leaving the old mapping
- * untouched) so the caller can copy.  Only Linux has the in-place form. */
-void *luna_os_remap(void *addr, size_t old_len, size_t new_len);
+/* Resize a native mapping without changing its backing. On failure return
+ * NULL and leave the original mapping intact. Moving requires may_move. */
+void *luna_os_remap(void *addr, size_t old_len, size_t new_len, int may_move);
 
 size_t luna_os_page_size(void);
 /* One low-bit residency result per host page in [addr, addr + len).
@@ -2076,7 +2075,9 @@ int luna_calendar_timezone(const char *zone, int64_t ms, int32_t *west,
 struct luna_guest_mapping {
   uint64_t lo, hi;
   uint32_t prot;
-  bool owned, file_backed;
+  bool owned, file_backed, shared;
+  unsigned backing_handle; /* retained host descriptor plus one, or zero */
+  uint64_t backing_offset;
 };
 typedef int (*luna_vm_host_operation)(void *, size_t, int);
 typedef int (*luna_vm_host_release)(void *, size_t);
@@ -2109,7 +2110,7 @@ static inline int luna_vm_access_fault(const struct luna_guest_mapping *maps,
 
 /* Anonymous MAP_FIXED may reuse backing only when every byte belongs to
  * anonymous memory. Zeroing a shared file mapping would alter the file. */
-static inline bool luna_vm_anonymous_span(const struct luna_guest_mapping *maps,
+static inline bool luna_vm_private_anonymous_span(const struct luna_guest_mapping *maps,
     size_t count, uint64_t lo, uint64_t hi)
 {
   size_t i;
@@ -2117,7 +2118,7 @@ static inline bool luna_vm_anonymous_span(const struct luna_guest_mapping *maps,
   for (i = 0; i < count && lo < hi; ++i) {
     const struct luna_guest_mapping *m = maps + i;
     if (m->hi <= lo) continue;
-    if (m->lo > lo || m->file_backed) return false;
+    if (m->lo > lo || m->file_backed || m->shared) return false;
     lo = m->hi < hi ? m->hi : hi;
   }
   return lo == hi;
@@ -2271,6 +2272,9 @@ static inline int luna_vma_map(struct luna_vma_table *t, uint64_t lo,
     piece[k].hi = hi;
     piece[k].prot = prot;
     piece[k].owned = true;
+    piece[k].shared = false;
+    piece[k].backing_handle = 0;
+    piece[k].backing_offset = 0;
     piece[k++].file_backed = file_backed;
   }
   if (first < last && t->v[last - 1].hi > hi) {
@@ -2365,6 +2369,25 @@ extern "C" {
 #define LUNA_PROCESS_FD_MAX 64u
 struct luna_process_channel;
 struct luna_process_pool;
+struct luna_process_memory_range {
+  const void *address;
+  size_t size;
+  uint64_t file_offset;
+};
+/* Copy stable host ranges into one immutable file. Ranges are ordered by
+ * file offset and must not overlap there. Gaps read as zero. The caller owns
+ * the returned CLOEXEC descriptor. An error is a negative errno. */
+int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
+                                 size_t count);
+struct luna_process_memory_mapping {
+  uint64_t address, size, file_offset;
+  uint32_t protection, descriptor_index;
+  bool shared;
+};
+/* Restore sorted, disjoint mappings into free native address ranges.
+ * Return 0 or a negative errno. The caller retains all descriptors. */
+int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
+                                size_t count, const int *fds, size_t fd_count);
 /* Device process inventory, published by the framework rather than inferred
  * from installed packages. The registry is private to the emulated image. */
 struct luna_process_info {

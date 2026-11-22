@@ -787,10 +787,16 @@ $(BUILD_DIR)/execute-fault32.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
 	$(ABI32_HFBARE_CC) -std=c11 -o $@ $<
 $(BUILD_DIR)/execute-fatal32.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
 	$(ABI32_HFBARE_CC) -std=c11 -DGUEST_EXECUTE_FATAL -Wno-unused-function -o $@ $<
+$(BUILD_DIR)/execute-fault64.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
+	$(ABI64_ANDROID_CC) -std=c11 -o $@ $<
+$(BUILD_DIR)/execute-fatal64.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
+	$(ABI64_ANDROID_CC) -std=c11 -DGUEST_EXECUTE_FATAL -Wno-unused-function -o $@ $<
 .PHONY: execute-fault-test
-execute-fault-test: lunaria $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fatal32.so
-	@python3 test/run_guest_results.py $(BUILD_DIR)/execute-fault32.so
-	@python3 -c 'import pathlib,subprocess,sys; p=subprocess.run(["./lunaria",sys.argv[1]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30); out=p.stdout.decode(errors="replace"); pathlib.Path(sys.argv[1]+".out").write_text(out); ok=p.returncode==139 and "Fatal signal 11 (SIGSEGV), code 1, fault addr 0x00000000" in out and "RESULT FAIL" not in out and "retired: NULL" not in out and "host-abort" not in out; print("Unhandled worker execute fault: "+("PASS" if ok else "FAIL")); sys.exit(0 if ok else 1)' $(BUILD_DIR)/execute-fatal32.so
+execute-fault-test: lunaria $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fatal32.so $(BUILD_DIR)/execute-fault64.so $(BUILD_DIR)/execute-fatal64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fault64.so
+	@for fixture in $(BUILD_DIR)/execute-fatal32.so $(BUILD_DIR)/execute-fatal64.so; do \
+	  python3 -c 'import pathlib,subprocess,sys; p=subprocess.run(["./lunaria",sys.argv[1]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30); out=p.stdout.decode(errors="replace"); pathlib.Path(sys.argv[1]+".out").write_text(out); ok=p.returncode==139 and "Fatal signal 11 (SIGSEGV), code 1, fault addr 0x00000000" in out and "RESULT FAIL" not in out and "retired: NULL" not in out and "host-abort" not in out; print("Unhandled worker execute fault: "+("PASS" if ok else "FAIL")); sys.exit(0 if ok else 1)' "$$fixture" || exit $$?; \
+	done
 
 $(eval $(call GUEST_ABI_TEST,guest-dac,test/guest_dac_test.c,$(ABI32_HFBARE_CC),-std=c11))
 
@@ -1922,6 +1928,13 @@ test/libthreadstart.so: test/thread_start_test.c
 test/libatforktest.so: test/atfork_test.c
 	$(ABI64_CC) -std=c11 \
 	    -Wl,-soname,libatforktest.so -o $@ $<
+
+$(BUILD_DIR)/fork-isolation64.so: test/guest_fork_isolation_test.c | $(BUILD_DIR)
+	$(ABI64_ANDROID_CC) -std=c11 -o $@ $<
+
+.PHONY: fork-isolation-test
+fork-isolation-test: lunaria $(BUILD_DIR)/fork-isolation64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/fork-isolation64.so
 
 atfork-test: lunaria test/libatforktest.so
 	@timeout -k 2s 12s env LUNARIA_A64_ENGINES=4 \

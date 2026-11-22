@@ -399,6 +399,8 @@ bool luna_path_line(luna_path *path,float x,float y);
 bool luna_path_cubic(luna_path *path,const float points[6]);
 bool luna_path_quad(luna_path *path,float x1,float y1,float x2,float y2);
 bool luna_path_close(luna_path *path);
+/* True (and the rectangle) for a path that is exactly one axis-aligned rectangle. */
+bool luna_path_as_rect(const luna_path *path,float rect[4]);
 bool luna_path_append(luna_path *path,const luna_path *other,const float *matrix);
 bool luna_path_transform(luna_path *path,const float matrix[9]);
 bool luna_path_arc(luna_path *path,const float rect[4],float start,float sweep,bool move);
