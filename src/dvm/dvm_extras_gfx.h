@@ -82,12 +82,12 @@ static bool x_canvas_shape(struct dvm *vm, dvm_ref self, const union dvm_value *
                          "Landroid/graphics/Paint$Style;", &style);
     stroke = style.l;
     union dvm_value saved = { 0 };
-    (void)dvm_get_field(vm, paint, "style", "Landroid/graphics/Paint$Style;", &saved);
-    (void)dvm_set_field(vm, paint, "style", "Landroid/graphics/Paint$Style;", (union dvm_value) {
+    (void)(dvm_get_field)(vm, paint, "style", "Landroid/graphics/Paint$Style;", &saved);
+    (void)(dvm_set_field)(vm, paint, "style", "Landroid/graphics/Paint$Style;", (union dvm_value) {
       .l = stroke
     });
     good = canvas_path_paint(vm, self, &path, paint, out);
-    (void)dvm_set_field(vm, paint, "style", "Landroid/graphics/Paint$Style;", saved);
+    (void)(dvm_set_field)(vm, paint, "style", "Landroid/graphics/Paint$Style;", saved);
   } else good = canvas_path_paint(vm, self, &path, paint, out);
   luna_path_clear(&path, true);
   return good;
@@ -182,11 +182,11 @@ static const struct rt_method rt_x_color[] = {
 static float *x_cm(struct dvm *vm, dvm_ref self)
 {
   union dvm_value arr = { 0 };
-  (void)dvm_get_field(vm, self, "array", "[F", &arr);
+  (void)(dvm_get_field)(vm, self, "array", "[F", &arr);
   if (!arr.l) {
     arr.l = dvm_new_array(vm, 'F', "F", 20);
     if (!arr.l) return NULL;
-    (void)dvm_set_field(vm, self, "array", "[F", arr);
+    (void)(dvm_set_field)(vm, self, "array", "[F", arr);
     float *f = dvm_array_data(vm, arr.l);
     memset(f, 0, 20 * sizeof *f);
     f[0] = f[6] = f[12] = f[18] = 1.f;
@@ -347,7 +347,7 @@ static bool x_cm_getArray(struct dvm *vm, dvm_ref self, const union dvm_value *a
   (void)args;
   (void)nargs;
   if (!x_cm(vm, self)) return false;
-  return dvm_get_field(vm, self, "array", "[F", out);
+  return (dvm_get_field)(vm, self, "array", "[F", out);
 }
 
 static const struct rt_method rt_x_color_matrix[] = {
@@ -391,7 +391,7 @@ static bool x_cmcf_init(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   dvm_ref copy = dvm_new_array(vm, 'F', "F", 20);
   if (!copy) return false;
   memcpy(dvm_array_data(vm, copy), src, 20 * sizeof(float));
-  (void)dvm_set_field(vm, self, "colorMatrix", "[F", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "colorMatrix", "[F", (union dvm_value) {
     .l = copy
   });
   RETV();
@@ -419,19 +419,19 @@ static bool x_outline_init(struct dvm *vm, dvm_ref self, const union dvm_value *
 {
   (void)args;
   (void)out;
-  (void)dvm_set_field(vm, self, "alpha", "F", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "alpha", "F", (union dvm_value) {
     .f = 0.f
   });
   if (nargs && ARG(0).l) {            /* Outline(Outline) */
     static const char *const ints[] = { "shape", "left", "top", "right", "bottom" };
     for (int i = 0; i < 5; ++i) rt_set_int(vm, self, ints[i], rt_get_int(vm, ARG(0).l, ints[i]));
     union dvm_value f = { 0 }, p = { 0 };
-    (void)dvm_get_field(vm, ARG(0).l, "radius", "F", &f);
-    (void)dvm_set_field(vm, self, "radius", "F", f);
-    (void)dvm_get_field(vm, ARG(0).l, "alpha", "F", &f);
-    (void)dvm_set_field(vm, self, "alpha", "F", f);
-    (void)dvm_get_field(vm, ARG(0).l, "path", "Landroid/graphics/Path;", &p);
-    (void)dvm_set_field(vm, self, "path", "Landroid/graphics/Path;", p);
+    (void)(dvm_get_field)(vm, ARG(0).l, "radius", "F", &f);
+    (void)(dvm_set_field)(vm, self, "radius", "F", f);
+    (void)(dvm_get_field)(vm, ARG(0).l, "alpha", "F", &f);
+    (void)(dvm_set_field)(vm, self, "alpha", "F", f);
+    (void)(dvm_get_field)(vm, ARG(0).l, "path", "Landroid/graphics/Path;", &p);
+    (void)(dvm_set_field)(vm, self, "path", "Landroid/graphics/Path;", p);
   }
   RETV();
 }
@@ -443,7 +443,7 @@ static bool x_outline_set(struct dvm *vm, dvm_ref self, const union dvm_value *a
   const char *name = builtin_name(), *sig = builtin_sig();
   if (!strcmp(name, "setEmpty")) {
     rt_set_int(vm, self, "shape", X_OUTLINE_EMPTY);
-    (void)dvm_set_field(vm, self, "path", "Landroid/graphics/Path;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "path", "Landroid/graphics/Path;", (union dvm_value) {
       0
     });
     RETV();
@@ -454,7 +454,7 @@ static bool x_outline_set(struct dvm *vm, dvm_ref self, const union dvm_value *a
       return false;
     }
     rt_set_int(vm, self, "shape", X_OUTLINE_PATH);
-    (void)dvm_set_field(vm, self, "path", "Landroid/graphics/Path;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "path", "Landroid/graphics/Path;", ARG(0));
     RETV();
   }
   int32_t b[4];
@@ -481,7 +481,7 @@ static bool x_outline_set(struct dvm *vm, dvm_ref self, const union dvm_value *a
   static const char *const f[] = { "left", "top", "right", "bottom" };
   for (int i = 0; i < 4; ++i) rt_set_int(vm, self, f[i], b[i]);
   rt_set_int(vm, self, "shape", oval ? X_OUTLINE_OVAL : round && radius > 0 ? X_OUTLINE_ROUND : X_OUTLINE_RECT);
-  (void)dvm_set_field(vm, self, "radius", "F", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "radius", "F", (union dvm_value) {
     .f = radius
   });
   RETV();
@@ -497,16 +497,16 @@ static bool x_outline_query(struct dvm *vm, dvm_ref self, const union dvm_value 
   if (!strcmp(name, "canClip")) RETI(shape == X_OUTLINE_RECT || shape == X_OUTLINE_ROUND || shape == X_OUTLINE_OVAL || shape == X_OUTLINE_PATH);
   if (!strcmp(name, "getRadius")) {
     union dvm_value f = { 0 };
-    (void)dvm_get_field(vm, self, "radius", "F", &f);
+    (void)(dvm_get_field)(vm, self, "radius", "F", &f);
     RETF(shape == X_OUTLINE_ROUND ? f.f : -1.0f);
   }
   if (!strcmp(name, "getAlpha")) {
     union dvm_value f = { 0 };
-    (void)dvm_get_field(vm, self, "alpha", "F", &f);
+    (void)(dvm_get_field)(vm, self, "alpha", "F", &f);
     RETF(f.f);
   }
   if (!strcmp(name, "setAlpha")) {
-    (void)dvm_set_field(vm, self, "alpha", "F", ARG(0));
+    (void)(dvm_set_field)(vm, self, "alpha", "F", ARG(0));
     RETV();
   }
   /* getRect(Rect): only a rectangle (or a round rect) is a rect. */
@@ -549,7 +549,7 @@ static bool x_outline_path(struct dvm *vm, dvm_ref outline, luna_path *path)
   if (shape == X_OUTLINE_EMPTY) return false;
   if (shape == X_OUTLINE_PATH) {
     union dvm_value p = { 0 };
-    (void)dvm_get_field(vm, outline, "path", "Landroid/graphics/Path;", &p);
+    (void)(dvm_get_field)(vm, outline, "path", "Landroid/graphics/Path;", &p);
     luna_path *src = p.l ? path_of(vm, p.l) : NULL;
     return src && luna_path_append(path, src, NULL);
   }
@@ -558,7 +558,7 @@ static bool x_outline_path(struct dvm *vm, dvm_ref outline, luna_path *path)
                         };
   if (shape == X_OUTLINE_OVAL) return luna_path_arc(path, rect, 0, 360, true) && luna_path_close(path);
   union dvm_value radius = { 0 };
-  (void)dvm_get_field(vm, outline, "radius", "F", &radius);
+  (void)(dvm_get_field)(vm, outline, "radius", "F", &radius);
   if (shape == X_OUTLINE_ROUND) {
     const float radii[8] = { radius.f, radius.f, radius.f, radius.f, radius.f, radius.f, radius.f, radius.f };
     return luna_path_round_rect(path, rect, radii, false);
@@ -613,7 +613,7 @@ static bool x_vop_bounds(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   }
   union dvm_value rect[4] = { { .i = box[0] }, { .i = box[1] }, { .i = box[2] }, { .i = box[3] } }, ignored = { 0 };
   if (!am_vcall(vm, ARG(1).l, "setRect", "(IIII)V", rect, 4, &ignored)) return false;
-  (void)dvm_set_field(vm, ARG(1).l, "alpha", "F", (union dvm_value) {
+  (void)(dvm_set_field)(vm, ARG(1).l, "alpha", "F", (union dvm_value) {
     .f = 1.f
   });
   RETV();
@@ -631,7 +631,7 @@ static bool x_vop_background(struct dvm *vm, dvm_ref self, const union dvm_value
   }
   if (ARG(1).l) {
     if (!x_vop_bounds(vm, self, args, nargs, out)) return false;
-    (void)dvm_set_field(vm, ARG(1).l, "alpha", "F", (union dvm_value) {
+    (void)(dvm_set_field)(vm, ARG(1).l, "alpha", "F", (union dvm_value) {
       .f = 0.f
     });
   }
@@ -672,14 +672,14 @@ static bool x_gradient_getOutline(struct dvm *vm, dvm_ref self, const union dvm_
   if (!ARG(0).l) RETV();
   union dvm_value bounds = { 0 }, ignored = { 0 }, radius = { 0 };
   if (!am_vcall(vm, self, "getBounds", "()Landroid/graphics/Rect;", NULL, 0, &bounds) || !bounds.l) return false;
-  (void)dvm_get_field(vm, self, "cornerRadius", "F", &radius);
+  (void)(dvm_get_field)(vm, self, "cornerRadius", "F", &radius);
   const int shape = rt_get_int(vm, self, "shape");
   union dvm_value a[2] = { bounds, { .f = radius.f } };
   bool good;
   if (shape == 1) good = am_vcall(vm, ARG(0).l, "setOval", "(Landroid/graphics/Rect;)V", a, 1, &ignored);
   else if (radius.f > 0) good = am_vcall(vm, ARG(0).l, "setRoundRect", "(Landroid/graphics/Rect;F)V", a, 2, &ignored);
   else good = am_vcall(vm, ARG(0).l, "setRect", "(Landroid/graphics/Rect;)V", a, 1, &ignored);
-  if (good) (void)dvm_set_field(vm, ARG(0).l, "alpha", "F", (union dvm_value) {
+  if (good) (void)(dvm_set_field)(vm, ARG(0).l, "alpha", "F", (union dvm_value) {
     .f = (float)(rt_get_int(vm, self, "alpha") ? rt_get_int(vm, self, "alpha") : 255) / 255.f
   });
   return good;
@@ -729,7 +729,7 @@ static bool x_rn_set(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   const char *field = !strcmp(name, "setOutline") ? "outline" : !strcmp(name, "setClipToOutline") ? "clipToOutline" :
                       !strcmp(name, "setHasOverlappingRendering") ? "hasOverlappingRendering" : "usesCompositingLayer";
   if (!strcmp(name, "setOutline")) {
-    (void)dvm_get_field(vm, self, "outline", "Landroid/graphics/Outline;", &old);
+    (void)(dvm_get_field)(vm, self, "outline", "Landroid/graphics/Outline;", &old);
     /* A copy: the caller reuses its Outline for the next frame. */
     dvm_ref copy = 0;
     if (ARG(0).l) {
@@ -737,13 +737,13 @@ static bool x_rn_set(struct dvm *vm, dvm_ref self, const union dvm_value *args,
       union dvm_value ignored = { 0 }, src = ARG(0);
       if (!copy || !am_vcall(vm, copy, "<init>", "(Landroid/graphics/Outline;)V", &src, 1, &ignored)) return false;
     }
-    (void)dvm_set_field(vm, self, "outline", "Landroid/graphics/Outline;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "outline", "Landroid/graphics/Outline;", (union dvm_value) {
       .l = copy
     });
     RETI(old.l != copy);
   }
-  (void)dvm_get_field(vm, self, field, "Z", &old);
-  (void)dvm_set_field(vm, self, field, "Z", (union dvm_value) {
+  (void)(dvm_get_field)(vm, self, field, "Z", &old);
+  (void)(dvm_set_field)(vm, self, field, "Z", (union dvm_value) {
     .i = ARG(0).i != 0
   });
   RETI((old.i != 0) != (ARG(0).i != 0));
@@ -1070,18 +1070,18 @@ static const struct rt_field rt_x_drawable_tint_fields[] = {
 static bool x_drawable_apply_tint(struct dvm *vm, dvm_ref self)
 {
   union dvm_value set = { 0 }, list = { 0 }, color = { 0 }, mode = { 0 };
-  (void)dvm_get_field(vm, self, "tintSet", "Z", &set);
+  (void)(dvm_get_field)(vm, self, "tintSet", "Z", &set);
   if (!set.i) return true;
-  (void)dvm_get_field(vm, self, "tintList", "Landroid/content/res/ColorStateList;", &list);
-  (void)dvm_get_field(vm, self, "tintMode", "Landroid/graphics/PorterDuff$Mode;", &mode);
+  (void)(dvm_get_field)(vm, self, "tintList", "Landroid/content/res/ColorStateList;", &list);
+  (void)(dvm_get_field)(vm, self, "tintMode", "Landroid/graphics/PorterDuff$Mode;", &mode);
   union dvm_value filter = { 0 }, ignored = { 0 };
   if (list.l) {
     union dvm_value def = { 0 };
-    (void)dvm_get_field(vm, list.l, "color", "I", &def);
+    (void)(dvm_get_field)(vm, list.l, "color", "I", &def);
     static const int32_t enabled[1] = { 0x0101009e /* state_enabled */ };
     color.i = color_state_lookup(vm, list.l, enabled, 1, def.i);
   } else {
-    (void)dvm_get_field(vm, self, "tintColor", "I", &color);
+    (void)(dvm_get_field)(vm, self, "tintColor", "I", &color);
   }
   if (!mode.l) (void)dvm_get_static(vm, dvm_find_class(vm, "android/graphics/PorterDuff$Mode"), "SRC_IN",
                                       "Landroid/graphics/PorterDuff$Mode;", &mode);
@@ -1099,21 +1099,21 @@ static bool x_drawable_tint(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)nargs;
   (void)out;
   const char *name = builtin_name();
-  (void)dvm_set_field(vm, self, "tintSet", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "tintSet", "Z", (union dvm_value) {
     .i = 1
   });
   if (!strcmp(name, "setTint")) {
-    (void)dvm_set_field(vm, self, "tintList", "Landroid/content/res/ColorStateList;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "tintList", "Landroid/content/res/ColorStateList;", (union dvm_value) {
       0
     });
-    (void)dvm_set_field(vm, self, "tintColor", "I", ARG(0));
+    (void)(dvm_set_field)(vm, self, "tintColor", "I", ARG(0));
   } else if (!strcmp(name, "setTintList")) {
-    (void)dvm_set_field(vm, self, "tintList", "Landroid/content/res/ColorStateList;", ARG(0));
-    if (!ARG(0).l) (void)dvm_set_field(vm, self, "tintColor", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "tintList", "Landroid/content/res/ColorStateList;", ARG(0));
+    if (!ARG(0).l) (void)(dvm_set_field)(vm, self, "tintColor", "I", (union dvm_value) {
       0
     });
   } else {
-    (void)dvm_set_field(vm, self, "tintMode", "Landroid/graphics/PorterDuff$Mode;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "tintMode", "Landroid/graphics/PorterDuff$Mode;", ARG(0));
   }
   if (!x_drawable_apply_tint(vm, self)) return false;
   return am_vcall(vm,self,"invalidateSelf","()V",NULL,0,out);

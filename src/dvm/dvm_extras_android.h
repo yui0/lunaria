@@ -163,8 +163,8 @@ static bool x_component_flattenShort(struct dvm *vm, dvm_ref self, const union d
   (void)args;
   (void)nargs;
   union dvm_value pkg = { 0 }, cls = { 0 };
-  (void)dvm_get_field(vm, self, "pkg", "Ljava/lang/String;", &pkg);
-  (void)dvm_get_field(vm, self, "cls", "Ljava/lang/String;", &cls);
+  (void)(dvm_get_field)(vm, self, "pkg", "Ljava/lang/String;", &pkg);
+  (void)(dvm_get_field)(vm, self, "cls", "Ljava/lang/String;", &cls);
   if (!pkg.l || !cls.l) {
     /* The long form is the only one this component has fields for. */
     return am_vcall(vm, self, "flattenToString", "()Ljava/lang/String;", NULL, 0, out);
@@ -191,10 +191,10 @@ static const struct rt_method rt_x_component[] = {
 static dvm_ref x_if_list(struct dvm *vm, dvm_ref self, const char *field, bool create)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, field, "Ljava/util/List;", &v);
+  (void)(dvm_get_field)(vm, self, field, "Ljava/util/List;", &v);
   if (!v.l && create) {
     v.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, field, "Ljava/util/List;", v);
+    (void)(dvm_set_field)(vm, self, field, "Ljava/util/List;", v);
   }
   return v.l;
 }
@@ -251,10 +251,10 @@ static bool x_if_add(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   }
   if (!strcmp(name, "addAction")) {
     union dvm_value first = { 0 };
-    (void)dvm_get_field(vm, self, "action", "Ljava/lang/String;", &first);
-    if (!first.l) (void)dvm_set_field(vm, self, "action", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_get_field)(vm, self, "action", "Ljava/lang/String;", &first);
+    if (!first.l) (void)(dvm_set_field)(vm, self, "action", "Ljava/lang/String;", ARG(0));
   } else if (!strcmp(name, "addDataScheme")) {
-    (void)dvm_set_field(vm, self, "scheme", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "scheme", "Ljava/lang/String;", ARG(0));
   }
   RETV();
 }
@@ -553,7 +553,7 @@ static bool x_if_copy(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   }
   for (const struct rt_field *field = rt_intent_filter_fields; field->name; ++field) {
     union dvm_value value = {0};
-    if (!dvm_get_field(vm, ARG(0).l, field->name, field->type, &value)) return false;
+    if (!(dvm_get_field)(vm, ARG(0).l, field->name, field->type, &value)) return false;
     if (value.l && !strcmp(field->type, "Ljava/util/List;")) {
       struct rt_list *source = list_of(vm, value.l);
       dvm_ref copy = coll_new_list(vm, "Ljava/util/ArrayList;");
@@ -564,7 +564,7 @@ static bool x_if_copy(struct dvm *vm, dvm_ref self, const union dvm_value *args,
       }
       value.l = copy;
     }
-    if (!dvm_set_field(vm, self, field->name, field->type, value)) return false;
+    if (!(dvm_set_field)(vm, self, field->name, field->type, value)) return false;
   }
   RETV();
 }
@@ -699,7 +699,7 @@ static dvm_ref x_link_properties(struct dvm *vm)
   if (!lp) return 0;
   char iface[32] = "eth0";
   (void)x_default_interface(iface, sizeof iface);
-  (void)dvm_set_field(vm, lp, "interfaceName", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, lp, "interfaceName", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, iface)
   });
   dvm_ref dns = coll_new_list(vm, "Ljava/util/ArrayList;");
@@ -714,7 +714,7 @@ static dvm_ref x_link_properties(struct dvm *vm)
     else dvm_clear_exception(vm);
   }
   if (f) fclose(f);
-  (void)dvm_set_field(vm, lp, "dnsServers", "Ljava/util/List;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, lp, "dnsServers", "Ljava/util/List;", (union dvm_value) {
     .l = dns
   });
   return lp;
@@ -736,8 +736,8 @@ static bool x_lp_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)args;
   (void)nargs;
   const char *name = builtin_name();
-  if (!strcmp(name, "getInterfaceName")) return dvm_get_field(vm, self, "interfaceName", "Ljava/lang/String;", out);
-  if (!strcmp(name, "getDnsServers")) return dvm_get_field(vm, self, "dnsServers", "Ljava/util/List;", out);
+  if (!strcmp(name, "getInterfaceName")) return (dvm_get_field)(vm, self, "interfaceName", "Ljava/lang/String;", out);
+  if (!strcmp(name, "getDnsServers")) return (dvm_get_field)(vm, self, "dnsServers", "Ljava/util/List;", out);
   if (!strcmp(name, "getHttpProxy") || !strcmp(name, "getPrivateDnsServerName") || !strcmp(name, "getDomains") ||
       !strcmp(name, "getTcpBufferSizes")) RETL(0);
   if (!strcmp(name, "isPrivateDnsActive")) RETI(0);
@@ -772,7 +772,7 @@ static bool x_looper_setMessageLogging(struct dvm *vm, dvm_ref self, const union
 {
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "messageLogging", "Landroid/util/Printer;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "messageLogging", "Landroid/util/Printer;", ARG(0));
   RETV();
 }
 
@@ -781,7 +781,7 @@ void dvm_runtime_looper_log(struct dvm *vm, dvm_ref looper, bool begin, dvm_ref 
 {
   dvm_ref l = looper ? looper : looper_main(vm);
   union dvm_value printer = { 0 };
-  if (!l || !dvm_get_field(vm, l, "messageLogging", "Landroid/util/Printer;", &printer) || !printer.l) return;
+  if (!l || !(dvm_get_field)(vm, l, "messageLogging", "Landroid/util/Printer;", &printer) || !printer.l) return;
   struct dvm_class *c = runnable ? dvm_object_class(vm, runnable) : NULL;
   char text[256];
   snprintf(text, sizeof text, "%s Handler (android.os.Handler) {%x} %s: 0",
@@ -915,8 +915,8 @@ static dvm_ref x_find_provider(struct dvm *vm, const char *wanted)
   const size_t wanted_len = strlen(wanted);
   for (dvm_ref p = vm->content_providers; p;) {
     union dvm_value info = { 0 }, names = { 0 }, next = { 0 };
-    (void)dvm_get_field(vm, p, "info", "Landroid/content/pm/ProviderInfo;", &info);
-    (void)dvm_get_field(vm, info.l, "authority", "Ljava/lang/String;", &names);
+    (void)(dvm_get_field)(vm, p, "info", "Landroid/content/pm/ProviderInfo;", &info);
+    (void)(dvm_get_field)(vm, info.l, "authority", "Ljava/lang/String;", &names);
     const char *entry = dvm_string_utf8(vm, names.l);
     while (entry && *entry) {
       const char *end = strchr(entry, ';');
@@ -924,7 +924,7 @@ static dvm_ref x_find_provider(struct dvm *vm, const char *wanted)
       if (len == wanted_len && !memcmp(entry, wanted, len)) return p;
       entry = end ? end + 1 : NULL;
     }
-    (void)dvm_get_field(vm, p, "resolverNext", "Landroid/content/ContentProvider;", &next);
+    (void)(dvm_get_field)(vm, p, "resolverNext", "Landroid/content/ContentProvider;", &next);
     p = next.l;
   }
   return 0;
@@ -1490,7 +1490,7 @@ static bool x_resolver_acquire(struct dvm *vm, dvm_ref self, const union dvm_val
   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/content/ContentProviderClient;");
   dvm_ref client = c ? dvm_new_object(vm, c) : 0;
   if (!client) return false;
-  (void)dvm_set_field(vm, client, "authority", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, client, "authority", "Ljava/lang/String;", (union dvm_value) {
     .l = authority
   });
   RETL(client);
@@ -1503,7 +1503,7 @@ static bool x_client_call(struct dvm *vm, dvm_ref self, const union dvm_value *a
 {
   union dvm_value authority = {0}, uri = {0};
   const bool with_authority = nargs == 4;
-  (void)dvm_get_field(vm, self, "authority", "Ljava/lang/String;", &authority);
+  (void)(dvm_get_field)(vm, self, "authority", "Ljava/lang/String;", &authority);
   struct dvm_class *uc = dvm__class_by_desc(vm, "Landroid/net/Uri;");
   struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
   char text[512];
@@ -1618,11 +1618,11 @@ static bool x_ws_setting(struct dvm *vm, dvm_ref self, const union dvm_value *ar
     return false;
   }
   union dvm_value map = { 0 };
-  (void)dvm_get_field(vm, self, "props", "Ljava/util/Map;", &map);
+  (void)(dvm_get_field)(vm, self, "props", "Ljava/util/Map;", &map);
   if (!map.l) {
     map.l = coll_new_map(vm);
     if (!map.l) return false;
-    (void)dvm_set_field(vm, self, "props", "Ljava/util/Map;", map);
+    (void)(dvm_set_field)(vm, self, "props", "Ljava/util/Map;", map);
   }
   union dvm_value k = { .l = dvm_new_string(vm, key) };
   if (!k.l) return false;
@@ -1706,10 +1706,10 @@ static bool x_webview_package(struct dvm *vm, dvm_ref self, const union dvm_valu
   (void)nargs;
   dvm_ref pi = dvm_new_object(vm, dvm_find_class(vm, "android/content/pm/PackageInfo"));
   if (!pi) return false;
-  (void)dvm_set_field(vm, pi, "packageName", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, pi, "packageName", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, "com.google.android.webview")
   });
-  (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, pi, "versionName", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, "120.0.0.0")
   });
   rt_set_int(vm, pi, "versionCode", 612000000);
@@ -1832,8 +1832,8 @@ static bool x_wm_addView(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   dvm_ref window = c ? dvm_new_object(vm, c) : 0;
   dvm_ref attributes = window ? wm_attributes(vm, ARG(1).l) : 0;
   if (!window || !attributes) return false;
-  (void)dvm_set_field(vm, window, "contentView", "Landroid/view/View;", ARG(0));
-  (void)dvm_set_field(vm, window, "attributes", "Landroid/view/WindowManager$LayoutParams;",
+  (void)(dvm_set_field)(vm, window, "contentView", "Landroid/view/View;", ARG(0));
+  (void)(dvm_set_field)(vm, window, "attributes", "Landroid/view/WindowManager$LayoutParams;",
   (union dvm_value) {
     .l = attributes
   });
@@ -1877,7 +1877,7 @@ static bool x_wm_updateViewLayout(struct dvm *vm, dvm_ref self, const union dvm_
   }
   dvm_ref attributes = wm_attributes(vm, ARG(1).l);
   if (!attributes) return false;
-  (void)dvm_set_field(vm, g_wm_added[i].window, "attributes", "Landroid/view/WindowManager$LayoutParams;",
+  (void)(dvm_set_field)(vm, g_wm_added[i].window, "attributes", "Landroid/view/WindowManager$LayoutParams;",
   (union dvm_value) {
     .l = attributes
   });
@@ -2063,7 +2063,7 @@ static bool atb_set(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 {
   (void)nargs;
   const char *n = builtin_name();
-  if (!strcmp(n, "setAudioFormat")) (void)dvm_set_field(vm, self, "format", "Landroid/media/AudioFormat;", args[0]);
+  if (!strcmp(n, "setAudioFormat")) (void)(dvm_set_field)(vm, self, "format", "Landroid/media/AudioFormat;", args[0]);
   else if (!strcmp(n, "setBufferSizeInBytes")) rt_set_int(vm, self, "size", args[0].i);
   else if (!strcmp(n, "setTransferMode")) rt_set_int(vm, self, "mode", args[0].i);
   else if (!strcmp(n, "setSessionId")) rt_set_int(vm, self, "session", args[0].i);
@@ -2076,7 +2076,7 @@ static bool atb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)args;
   (void)nargs;
   union dvm_value fmt = {0};
-  (void)dvm_get_field(vm, self, "format", "Landroid/media/AudioFormat;", &fmt);
+  (void)(dvm_get_field)(vm, self, "format", "Landroid/media/AudioFormat;", &fmt);
   if (!fmt.l) {
     dvm__throw(vm, "java/lang/UnsupportedOperationException", "Audio format must be set");
     return false;
@@ -2207,7 +2207,7 @@ static bool close_guard_open(struct dvm *vm, dvm_ref self, const union dvm_value
     dvm__throw(vm, "java/lang/NullPointerException", "closer == null");
     return false;
   }
-  (void)dvm_set_field(vm, self, "opener", "Ljava/lang/String;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "opener", "Ljava/lang/String;", ARG(0));
   RETV();
 }
 
@@ -2217,7 +2217,7 @@ static bool close_guard_close(struct dvm *vm, dvm_ref self, const union dvm_valu
   (void)args;
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "opener", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "opener", "Ljava/lang/String;", (union dvm_value) {
     .l = 0
   });
   RETV();
@@ -2230,7 +2230,7 @@ static bool close_guard_warn(struct dvm *vm, dvm_ref self, const union dvm_value
   (void)args;
   (void)nargs;
   (void)out;
-  (void)dvm_get_field(vm, self, "opener", "Ljava/lang/String;", &opener);
+  (void)(dvm_get_field)(vm, self, "opener", "Ljava/lang/String;", &opener);
   if (opener.l)
     fprintf(stderr, "[dvm] CloseGuard: A resource was acquired at attached stack trace "
                     "but never released (%s)\n", dvm_string_utf8(vm, opener.l));
@@ -2253,10 +2253,10 @@ static bool cfg_set_to_defaults(struct dvm *vm, dvm_ref self, const union dvm_va
   (void)args;
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "fontScale", "F", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "fontScale", "F", (union dvm_value) {
     .f = 1.0f
   });
-  (void)dvm_set_field(vm, self, "screenLayout", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "screenLayout", "I", (union dvm_value) {
     .i = 0
   });
   configuration_ensure_locale(vm, self);
@@ -2454,7 +2454,7 @@ static bool alarm_queue_listener(struct dvm *vm,dvm_ref listener,dvm_ref handler
   dvm_ref job=dvm_new_object(vm,dvm_find_class(vm,"lunaria/AlarmDelivery"));
   if(!job)return false;
   dvm_pin(vm,job);
-  dvm_set_field(vm,job,"listener","Landroid/app/AlarmManager$OnAlarmListener;",(union dvm_value) {
+  (dvm_set_field)(vm,job,"listener","Landroid/app/AlarmManager$OnAlarmListener;",(union dvm_value) {
     .l=listener
   });
   bool ok;
@@ -2631,7 +2631,7 @@ static const struct rt_method rt_alarm_manager[]= {
 /* SQLiteQueryBuilder composes SQL; execution and binding belong to SQLiteDatabase. */
 static bool qb_field(struct dvm *vm,dvm_ref self,const char *name,const char *type,union dvm_value *value)
 {
-  return dvm_get_field(vm,self,name,type,value);
+  return (dvm_get_field)(vm,self,name,type,value);
 }
 static bool qb_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -2642,7 +2642,7 @@ static bool qb_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   const char *type=!strcmp(name,"projection") ? "Ljava/util/Map;" :
                    !strcmp(name,"distinct") ? "Z" : "Ljava/lang/String;";
   if(!strncmp(method,"set",3)) {
-    dvm_set_field(vm,self,name,type,ARG(0));
+    (dvm_set_field)(vm,self,name,type,ARG(0));
     RETV();
   }
   return qb_field(vm,self,name,type,out);
@@ -2674,7 +2674,7 @@ static bool qb_append_where(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(standalone)good &= bytes_append(&b,")",1);
   if(good) {
     chunk.l=dvm_new_string_n(vm,(const char *)b.p,b.len);
-    good=chunk.l && dvm_set_field(vm,self,"where","Ljava/lang/String;",chunk);
+    good=chunk.l && (dvm_set_field)(vm,self,"where","Ljava/lang/String;",chunk);
   }
   free(b.p);
   if(!good)return false;
@@ -2913,13 +2913,13 @@ static const struct rt_field rt_notification_fields[] = {
 static dvm_ref notification_extras(struct dvm *vm, dvm_ref obj)
 {
   union dvm_value ex = { 0 }, ignored = { 0 };
-  (void)dvm_get_field(vm, obj, "extras", "Landroid/os/Bundle;", &ex);
+  (void)(dvm_get_field)(vm, obj, "extras", "Landroid/os/Bundle;", &ex);
   if (ex.l) return ex.l;
   struct dvm_class *bc = dvm__class_by_desc(vm, "Landroid/os/Bundle;");
   ex.l = bc ? dvm_new_object(vm, bc) : 0;
   if (!ex.l) return 0;
   (void)map_init(vm, ex.l, NULL, 0, &ignored);
-  (void)dvm_set_field(vm, obj, "extras", "Landroid/os/Bundle;", ex);
+  (void)(dvm_set_field)(vm, obj, "extras", "Landroid/os/Bundle;", ex);
   return ex.l;
 }
 
@@ -2956,7 +2956,7 @@ static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
 { \
    union dvm_value v = { 0 }; \
    (void)args; (void)nargs; \
-   (void)dvm_get_field(vm, self, field, desc, &v); \
+   (void)(dvm_get_field)(vm, self, field, desc, &v); \
    ret(v.l); \
 }
 NOTIFICATION_GETTER(notification_get_group, "group", "Ljava/lang/String;", RETL)
@@ -2970,7 +2970,7 @@ static bool notification_get_when(struct dvm *vm, dvm_ref self, const union dvm_
   union dvm_value v = { 0 };
   (void)args;
   (void)nargs;
-  (void)dvm_get_field(vm, self, "when", "J", &v);
+  (void)(dvm_get_field)(vm, self, "when", "J", &v);
   RETJ(v.j);
 }
 
@@ -2993,9 +2993,9 @@ static bool nb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)notification_extras(vm, self);
   /* Builder(Context, String channelId) */
   if (nargs > 1 && args[1].l)
-    (void)dvm_set_field(vm, self, "channelId", "Ljava/lang/String;", args[1]);
+    (void)(dvm_set_field)(vm, self, "channelId", "Ljava/lang/String;", args[1]);
   union dvm_value now = { .j = (int64_t)time(NULL) * 1000 };
-  (void)dvm_set_field(vm, self, "when", "J", now);
+  (void)(dvm_set_field)(vm, self, "when", "J", now);
   RETV();
 }
 
@@ -3005,7 +3005,7 @@ static bool nb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
                int nargs, union dvm_value *out) \
 { \
-   (void)dvm_set_field(vm, self, field, desc, ARG(0)); \
+   (void)(dvm_set_field)(vm, self, field, desc, ARG(0)); \
    RETL(self); \
 }
 #define NB_EXTRA(fn, key, call, sig) \
@@ -3035,9 +3035,9 @@ NB_EXTRA(nb_set_show_when, "android.showWhen", "putBoolean", "(Ljava/lang/String
 static bool nb_flag(struct dvm *vm, dvm_ref self, int32_t bit, bool on)
 {
   union dvm_value f = { 0 };
-  (void)dvm_get_field(vm, self, "flags", "I", &f);
+  (void)(dvm_get_field)(vm, self, "flags", "I", &f);
   f.i = on ? (f.i | bit) : (f.i & ~bit);
-  return dvm_set_field(vm, self, "flags", "I", f);
+  return (dvm_set_field)(vm, self, "flags", "I", f);
 }
 #define NB_FLAG(fn, bit) \
 static bool fn(struct dvm *vm, dvm_ref self, const union dvm_value *args, \
@@ -3067,7 +3067,7 @@ static bool nb_set_style(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   /* BigTextStyle.bigText() supplies the expanded text. */
   union dvm_value text = { 0 };
   if (ARG(0).l) {
-    (void)dvm_get_field(vm, ARG(0).l, "bigText", "Ljava/lang/CharSequence;", &text);
+    (void)(dvm_get_field)(vm, ARG(0).l, "bigText", "Ljava/lang/CharSequence;", &text);
     if (text.l && !notification_put_extra(vm, self, "android.bigText", "putCharSequence",
                                           "(Ljava/lang/String;Ljava/lang/CharSequence;)V", text))
       return false;
@@ -3108,7 +3108,7 @@ static bool nb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   }
   union dvm_value v = { 0 };
 #define X(name, desc) \
-   (void)dvm_get_field(vm, self, name, desc, &v); (void)dvm_set_field(vm, n, name, desc, v);
+   (void)(dvm_get_field)(vm, self, name, desc, &v); (void)(dvm_set_field)(vm, n, name, desc, v);
   NOTIFICATION_COPY_FIELDS(X)
 #undef X
   /* The notification owns a copy of the extras, not the builder's Bundle. */
@@ -3168,7 +3168,7 @@ static const struct rt_method rt_notification_builder[] = {
 static bool bts_big_text(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                          int nargs, union dvm_value *out)
 {
-  (void)dvm_set_field(vm, self, "bigText", "Ljava/lang/CharSequence;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "bigText", "Ljava/lang/CharSequence;", ARG(0));
   RETL(self);
 }
 static const struct rt_field rt_big_text_style_fields[] = {
@@ -3208,8 +3208,8 @@ static bool shortcut_init(struct dvm *vm,dvm_ref self,const union dvm_value *arg
   }
   union dvm_value package={0};
   if (!am_vcall(vm,ARG(0).l,"getPackageName","()Ljava/lang/String;",NULL,0,&package)) return false;
-  dvm_set_field(vm,self,"id","Ljava/lang/String;",ARG(1));
-  dvm_set_field(vm,self,"package","Ljava/lang/String;",package);
+  (dvm_set_field)(vm,self,"id","Ljava/lang/String;",ARG(1));
+  (dvm_set_field)(vm,self,"package","Ljava/lang/String;",package);
   RETV();
 }
 
@@ -3248,7 +3248,7 @@ static bool shortcut_set_intents(struct dvm *vm,dvm_ref self,const union dvm_val
   }
   dvm_ref copy=shortcut_intents_copy(vm,source,true);
   if (!copy) return false;
-  dvm_set_field(vm,self,"intents","[Landroid/content/Intent;",(union dvm_value){.l=copy});
+  (dvm_set_field)(vm,self,"intents","[Landroid/content/Intent;",(union dvm_value){.l=copy});
   RETL(self);
 }
 
@@ -3263,7 +3263,7 @@ static bool shortcut_property(struct dvm *vm,dvm_ref self,const union dvm_value 
   const struct rt_field *f=rt_shortcut_fields;
   for (;f->name && strcmp(f->name,field);++f) {}
   if (!f->name) return false;
-  if (name[0]=='g') return dvm_get_field(vm,self,f->name,f->type,out);
+  if (name[0]=='g') return (dvm_get_field)(vm,self,f->name,f->type,out);
   if (!strcmp(f->type,"Ljava/lang/CharSequence;")) {
     union dvm_value length={0};
     if (!ARG(0).l || !am_vcall(vm,ARG(0).l,"length","()I",NULL,0,&length) || !length.i) {
@@ -3274,7 +3274,7 @@ static bool shortcut_property(struct dvm *vm,dvm_ref self,const union dvm_value 
   if (!strcmp(field,"rank") && ARG(0).i<0) {
     dvm__throw(vm,"java/lang/IllegalArgumentException","rank must be nonnegative"); return false;
   }
-  if (!dvm_set_field(vm,self,f->name,f->type,ARG(0))) return false;
+  if (!(dvm_set_field)(vm,self,f->name,f->type,ARG(0))) return false;
   RETL(self);
 }
 
@@ -3286,7 +3286,7 @@ static bool shortcut_build(struct dvm *vm,dvm_ref self,const union dvm_value *ar
   if (!value) return false;
   for (const struct rt_field *f=rt_shortcut_fields;f->name;++f) {
     union dvm_value v={0};
-    if (!dvm_get_field(vm,self,f->name,f->type,&v)) return false;
+    if (!(dvm_get_field)(vm,self,f->name,f->type,&v)) return false;
     if (!strcmp(f->name,"intents") && v.l) {
       v.l=shortcut_intents_copy(vm,v.l,false);
       if (!v.l) return false;
@@ -3302,7 +3302,7 @@ static bool shortcut_build(struct dvm *vm,dvm_ref self,const union dvm_value *ar
       memcpy(dvm_array_data(vm,copy),source->data,(size_t)source->length*sizeof(dvm_ref));
       v.l=copy;
     }
-    if (!dvm_set_field(vm,value,f->name,f->type,v)) return false;
+    if (!(dvm_set_field)(vm,value,f->name,f->type,v)) return false;
   }
   RETL(value);
 }
@@ -3312,7 +3312,7 @@ static bool shortcut_get_intents(struct dvm *vm,dvm_ref self,const union dvm_val
 {
   (void)args; (void)nargs;
   union dvm_value v={0};
-  dvm_get_field(vm,self,"intents","[Landroid/content/Intent;",&v);
+  (dvm_get_field)(vm,self,"intents","[Landroid/content/Intent;",&v);
   if (!v.l) RETL(0);
   dvm_ref copy=shortcut_intents_copy(vm,v.l,false);
   if (!copy) return false;

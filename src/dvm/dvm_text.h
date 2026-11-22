@@ -73,16 +73,16 @@ static bool decsym_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if(!strcmp(language,"bn") || !strcmp(language,"as") || !strcmp(language,"hi") ||
       !strcmp(language,"mr") || !strcmp(language,"ne") ||
       ((!strcmp(language,"en") || !strcmp(language,"ta") || !strcmp(language,"te") || !strcmp(language,"kn") || !strcmp(language,"ml")) && !strcmp(country,"IN"))) secondary=2;
-  (void)dvm_set_field(vm,self,"zeroDigit","C",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"zeroDigit","C",(union dvm_value) {
     .i=zero
   });
-  (void)dvm_set_field(vm,self,"decimalSeparator","C",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"decimalSeparator","C",(union dvm_value) {
     .i=decimal
   });
-  (void)dvm_set_field(vm,self,"groupingSeparator","C",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"groupingSeparator","C",(union dvm_value) {
     .i=group
   });
-  (void)dvm_set_field(vm,self,"minusSign","C",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"minusSign","C",(union dvm_value) {
     .i='-'
   });
   rt_set_int(vm,self,"primaryGroup",3);
@@ -95,8 +95,8 @@ static dvm_ref decsym_copy(struct dvm *vm,dvm_ref source)
   if(!copy) return 0;
   for(const struct rt_field *f=rt_decimal_symbols_fields; f->name; ++f) {
     union dvm_value value= {0};
-    (void)dvm_get_field(vm,source,f->name,f->type,&value);
-    (void)dvm_set_field(vm,copy,f->name,f->type,value);
+    (void)(dvm_get_field)(vm,source,f->name,f->type,&value);
+    (void)(dvm_set_field)(vm,copy,f->name,f->type,value);
   }
   return copy;
 }
@@ -125,10 +125,10 @@ static bool decsym_char(struct dvm *vm,dvm_ref self,const union dvm_value *args,
                     strstr(name,"GroupingSeparator") ? "groupingSeparator" : "minusSign";
   union dvm_value value= {0};
   if(nargs) {
-    (void)dvm_set_field(vm,self,field,"C",args[0]);
+    (void)(dvm_set_field)(vm,self,field,"C",args[0]);
     RETV();
   }
-  (void)dvm_get_field(vm,self,field,"C",&value);
+  (void)(dvm_get_field)(vm,self,field,"C",&value);
   *out=value;
   return true;
 }
@@ -145,8 +145,8 @@ static const struct rt_method rt_decimal_symbols[]= {
 static int decfmt_symbol(struct dvm *vm,dvm_ref self,const char *name,int fallback)
 {
   union dvm_value symbols= {0},value= {0};
-  (void)dvm_get_field(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",&symbols);
-  if(!symbols.l || !dvm_get_field(vm,symbols.l,name,"C",&value)) return fallback;
+  (void)(dvm_get_field)(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",&symbols);
+  if(!symbols.l || !(dvm_get_field)(vm,symbols.l,name,"C",&value)) return fallback;
   return value.i;
 }
 
@@ -223,15 +223,15 @@ static void decfmt_apply_affixes(struct dvm *vm,dvm_ref self,const char *pattern
   if(semi) decfmt_subpattern(semi+1,end,np,ns,sizeof np,&ignored);
   union dvm_value v= {0};
   v.l=dvm_new_string(vm,pp);
-  (void)dvm_set_field(vm,self,"posPrefix","Ljava/lang/String;",v);
+  (void)(dvm_set_field)(vm,self,"posPrefix","Ljava/lang/String;",v);
   v.l=dvm_new_string(vm,ps);
-  (void)dvm_set_field(vm,self,"posSuffix","Ljava/lang/String;",v);
+  (void)(dvm_set_field)(vm,self,"posSuffix","Ljava/lang/String;",v);
   /* Without an explicit negative subpattern the negative form is the minus
    * sign in front of the positive prefix, and the same suffix. */
   v.l=semi ? dvm_new_string(vm,np) : 0;
-  (void)dvm_set_field(vm,self,"negPrefix","Ljava/lang/String;",v);
+  (void)(dvm_set_field)(vm,self,"negPrefix","Ljava/lang/String;",v);
   v.l=semi ? dvm_new_string(vm,ns) : 0;
-  (void)dvm_set_field(vm,self,"negSuffix","Ljava/lang/String;",v);
+  (void)(dvm_set_field)(vm,self,"negSuffix","Ljava/lang/String;",v);
   rt_set_int(vm,self,"multiplier",multiplier);
 }
 static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
@@ -265,7 +265,7 @@ static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
       }
     }
   }
-  (void)dvm_set_field(vm,self,"pattern","Ljava/lang/String;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"pattern","Ljava/lang/String;",(union dvm_value) {
     .l=dvm_new_string(vm,pattern ? pattern : "")
   });
   rt_set_int(vm,self,"minFrac",min);
@@ -274,7 +274,7 @@ static void decfmt_apply(struct dvm *vm,dvm_ref self,const char *pattern)
   rt_set_int(vm,self,"maxInt",309);
   rt_set_int(vm,self,"primaryGroup",last<0 ? 3 : digits-last);
   rt_set_int(vm,self,"secondaryGroup",previous<0 ? digits-last : last-previous);
-  (void)dvm_set_field(vm,self,"grouping","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"grouping","Z",(union dvm_value) {
     .i=last>=0
   });
   decfmt_apply_affixes(vm,self,pattern);
@@ -299,7 +299,7 @@ static bool decfmt_init(struct dvm *vm, dvm_ref self,
     symbols.l=decsym_copy(vm,args[1].l);
   } else if(!decsym_factory(vm,0,NULL,0,&symbols)) return false;
   if(!symbols.l) return false;
-  (void)dvm_set_field(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
+  (void)(dvm_set_field)(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
   rt_set_int(vm,self,"minInt",1);
   rt_set_int(vm,self,"maxInt",309);
   if(!nargs && rt_get_int(vm,symbols.l,"secondaryGroup")==2) pattern="#,##,##0.###";
@@ -307,6 +307,30 @@ static bool decfmt_init(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+/* DecimalFormat.getDecimalFormatSymbols() hands out a copy (a change to it does not touch the
+ * format); setDecimalFormatSymbols() takes a copy of the argument. */
+static bool decfmt_get_symbols(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  union dvm_value symbols= {0};
+  (void)(dvm_get_field)(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",&symbols);
+  if(!symbols.l) RETL(0);
+  RETL(decsym_copy(vm,symbols.l));
+}
+static bool decfmt_set_symbols(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+  (void)nargs;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","newSymbols");
+    return false;
+  }
+  union dvm_value copy= {.l=decsym_copy(vm,ARG(0).l)};
+  if(!copy.l) return false;
+  (void)(dvm_set_field)(vm,self,"symbols","Ljava/text/DecimalFormatSymbols;",copy);
+  RETV();
+}
 static bool decfmt_applyPattern(struct dvm *vm, dvm_ref self,
                                 const union dvm_value *args, int nargs,
                                 union dvm_value *out)
@@ -344,12 +368,12 @@ static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm
   size_t used=0;
   const bool negative=*ascii=='-';
   union dvm_value prefix= {0},suffix= {0};
-  (void)dvm_get_field(vm,self,"posPrefix","Ljava/lang/String;",&prefix);
-  (void)dvm_get_field(vm,self,"posSuffix","Ljava/lang/String;",&suffix);
+  (void)(dvm_get_field)(vm,self,"posPrefix","Ljava/lang/String;",&prefix);
+  (void)(dvm_get_field)(vm,self,"posSuffix","Ljava/lang/String;",&suffix);
   if(negative) {
     union dvm_value np= {0},ns= {0};
-    (void)dvm_get_field(vm,self,"negPrefix","Ljava/lang/String;",&np);
-    (void)dvm_get_field(vm,self,"negSuffix","Ljava/lang/String;",&ns);
+    (void)(dvm_get_field)(vm,self,"negPrefix","Ljava/lang/String;",&np);
+    (void)(dvm_get_field)(vm,self,"negSuffix","Ljava/lang/String;",&ns);
     if(np.l) {
       prefix=np;
       if(ns.l) suffix=ns;
@@ -377,7 +401,7 @@ static bool decfmt_ascii(struct dvm *vm,dvm_ref self,const char *ascii,union dvm
   size_t padding=(size_t)min>digits ? (size_t)min-digits : 0,total=padding+digits;
   if(!min && digits==1 && ascii[0]=='0' && dot && dot[1]) total=digits=0;
   union dvm_value grouping= {0};
-  (void)dvm_get_field(vm,self,"grouping","Z",&grouping);
+  (void)(dvm_get_field)(vm,self,"grouping","Z",&grouping);
   int primary=rt_get_int(vm,self,"primaryGroup"),secondary=rt_get_int(vm,self,"secondaryGroup");
   if(primary<1) primary=3;
   if(secondary<1) secondary=primary;
@@ -505,7 +529,7 @@ static bool decfmt_set_grouping(struct dvm *vm, dvm_ref self,
 {
   (void)out;
   union dvm_value v = { .i = ARG(0).i };
-  (void)dvm_set_field(vm, self, "grouping", "Z", v);
+  (void)(dvm_set_field)(vm, self, "grouping", "Z", v);
   RETV();
 }
 
@@ -516,7 +540,7 @@ static bool decfmt_toPattern(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "pattern", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, self, "pattern", "Ljava/lang/String;", &v);
   RETL(v.l ? v.l : dvm_new_string(vm, ""));
 }
 
@@ -528,7 +552,7 @@ static bool field_position_init(struct dvm *vm,dvm_ref self,const union dvm_valu
 {
   bool attribute=dvm__builtin_method()->sig[1]=='L';
   rt_set_int(vm,self,"field",attribute ? nargs>1 ? args[1].i : -1 : args[0].i);
-  dvm_set_field(vm,self,"attribute","Ljava/text/Format$Field;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"attribute","Ljava/text/Format$Field;",(union dvm_value) {
     .l=attribute ? args[0].l : 0
   });
   rt_set_int(vm,self,"beginIndex",0);
@@ -540,7 +564,7 @@ static bool field_position_access(struct dvm *vm,dvm_ref self,const union dvm_va
   const char *name=dvm__builtin_method()->name;
   if (!strcmp(name,"getFieldAttribute")) {
     union dvm_value value= {0};
-    dvm_get_field(vm,self,"attribute","Ljava/text/Format$Field;",&value);
+    (dvm_get_field)(vm,self,"attribute","Ljava/text/Format$Field;",&value);
     RETL(value.l);
   }
   const char *field=strstr(name,"Begin") ? "beginIndex" : strstr(name,"End") ? "endIndex" : "field";
@@ -556,8 +580,8 @@ static bool field_position_equals(struct dvm *vm,dvm_ref self,const union dvm_va
   struct dvm_class *other=dvm_object_class(vm,args[0].l);
   if (!other || !dvm__class_assignable(vm,other,dvm_find_class(vm,"java/text/FieldPosition"))) RETI(0);
   union dvm_value a= {0},b= {0},equal= {0};
-  dvm_get_field(vm,self,"attribute","Ljava/text/Format$Field;",&a);
-  dvm_get_field(vm,args[0].l,"attribute","Ljava/text/Format$Field;",&b);
+  (dvm_get_field)(vm,self,"attribute","Ljava/text/Format$Field;",&a);
+  (dvm_get_field)(vm,args[0].l,"attribute","Ljava/text/Format$Field;",&b);
   if (a.l!=b.l) {
     if (!a.l || !b.l) RETI(0);
     struct dvm_method *method=dvm_find_method(vm,dvm_object_class(vm,a.l),"equals","(Ljava/lang/Object;)Z");
@@ -681,14 +705,14 @@ static bool numfmt_factory(struct dvm *vm,dvm_ref self,const union dvm_value *ar
     return false;
   }
   dvm_pin(vm,format);
-  bool good=dvm_set_field(vm,format,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
+  bool good=(dvm_set_field)(vm,format,"symbols","Ljava/text/DecimalFormatSymbols;",symbols);
   if(good) {
     const char *name=builtin_name();
     const bool indian=rt_get_int(vm,symbols.l,"secondaryGroup")==2;
     const char *pattern=indian ? "#,##,##0.###" : "#,##0.###";
     if(!strcmp(name,"getIntegerInstance")) {
       pattern=indian ? "#,##,##0" : "#,##0";
-      (void)dvm_set_field(vm,format,"parseIntegerOnly","Z",(union dvm_value) {
+      (void)(dvm_set_field)(vm,format,"parseIntegerOnly","Z",(union dvm_value) {
         .i=1
       });
     } else if(!strcmp(name,"getPercentInstance")) {
@@ -716,6 +740,8 @@ static const struct rt_method rt_decimal_format[] = {
   M("<init>", "()V", decfmt_init),
   M("<init>", "(Ljava/lang/String;)V", decfmt_init),
   M("<init>", "(Ljava/lang/String;Ljava/text/DecimalFormatSymbols;)V", decfmt_init),
+  M("getDecimalFormatSymbols", "()Ljava/text/DecimalFormatSymbols;", decfmt_get_symbols),
+  M("setDecimalFormatSymbols", "(Ljava/text/DecimalFormatSymbols;)V", decfmt_set_symbols),
   M("applyPattern", "(Ljava/lang/String;)V", decfmt_applyPattern),
   M("toPattern", "()Ljava/lang/String;", decfmt_toPattern),
   M("format", "(D)Ljava/lang/String;", numfmt_primitive),
@@ -766,8 +792,8 @@ static bool choice_set(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   }
   union dvm_value limits= {0},formats= {0};
   if (!o_clone(vm,args[0].l,NULL,0,&limits) || !limits.l || !o_clone(vm,args[1].l,NULL,0,&formats) || !formats.l) return false;
-  dvm_set_field(vm,self,"choiceLimits","[D",limits);
-  dvm_set_field(vm,self,"choiceFormats","[Ljava/lang/String;",formats);
+  (dvm_set_field)(vm,self,"choiceLimits","[D",limits);
+  (dvm_set_field)(vm,self,"choiceFormats","[Ljava/lang/String;",formats);
   RETV();
 }
 static bool choice_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -776,7 +802,7 @@ static bool choice_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   (void)nargs;
   bool limits=!strcmp(dvm__builtin_method()->name,"getLimits");
   union dvm_value field= {0};
-  dvm_get_field(vm,self,limits ? "choiceLimits" : "choiceFormats",limits ? "[D" : "[Ljava/lang/String;",&field);
+  (dvm_get_field)(vm,self,limits ? "choiceLimits" : "choiceFormats",limits ? "[D" : "[Ljava/lang/String;",&field);
   if (limits) return o_clone(vm,field.l,NULL,0,out);
   uint32_t length=dvm_array_length(vm,field.l);
   dvm_ref copy=dvm_new_array(vm,'L',"Ljava/lang/Object;",length);
@@ -869,10 +895,10 @@ static bool choice_apply(struct dvm *vm,dvm_ref self,const union dvm_value *args
     ((double *)dvm_array_data(vm,limits))[i]=entries[i].limit;
     ((dvm_ref *)dvm_array_data(vm,formats))[i]=entries[i].format;
   }
-  dvm_set_field(vm,self,"choiceLimits","[D",(union dvm_value) {
+  (dvm_set_field)(vm,self,"choiceLimits","[D",(union dvm_value) {
     .l=limits
   });
-  dvm_set_field(vm,self,"choiceFormats","[Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"choiceFormats","[Ljava/lang/String;",(union dvm_value) {
     .l=formats
   });
   good=true;
@@ -893,8 +919,8 @@ static bool choice_format(struct dvm *vm,dvm_ref self,const union dvm_value *arg
 {
   double value=dvm__builtin_method()->sig[1]=='J' ? (double)args[0].j : args[0].d;
   union dvm_value limits= {0},formats= {0};
-  dvm_get_field(vm,self,"choiceLimits","[D",&limits);
-  dvm_get_field(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
+  (dvm_get_field)(vm,self,"choiceLimits","[D",&limits);
+  (dvm_get_field)(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
   uint32_t count=dvm_array_length(vm,limits.l),index=0;
   const double *values=dvm_array_data(vm,limits.l);
   while (index<count && value>=values[index]) ++index;
@@ -926,8 +952,8 @@ static bool choice_pattern(struct dvm *vm,dvm_ref self,const union dvm_value *ar
   (void)args;
   (void)nargs;
   union dvm_value limits= {0},formats= {0};
-  dvm_get_field(vm,self,"choiceLimits","[D",&limits);
-  dvm_get_field(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
+  (dvm_get_field)(vm,self,"choiceLimits","[D",&limits);
+  (dvm_get_field)(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
   struct rt_bytes buffer= {0};
   bool good=true;
   uint32_t count=dvm_array_length(vm,limits.l);
@@ -965,8 +991,8 @@ static bool choice_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args
 {
   union dvm_value clone= {0},fields[2]= {{0}},ignored= {0};
   if (!o_clone(vm,self,args,nargs,&clone) || !clone.l) return false;
-  dvm_get_field(vm,self,"choiceLimits","[D",fields);
-  dvm_get_field(vm,self,"choiceFormats","[Ljava/lang/String;",fields+1);
+  (dvm_get_field)(vm,self,"choiceLimits","[D",fields);
+  (dvm_get_field)(vm,self,"choiceFormats","[Ljava/lang/String;",fields+1);
   if (!choice_set(vm,clone.l,fields,2,&ignored)) return false;
   RETL(clone.l);
 }
@@ -1018,8 +1044,8 @@ static bool choice_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args
   int32_t start=rt_get_int(vm,position,"index"),furthest=start;
   double best=NAN;
   union dvm_value formats= {0},limits= {0};
-  dvm_get_field(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
-  dvm_get_field(vm,self,"choiceLimits","[D",&limits);
+  (dvm_get_field)(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
+  (dvm_get_field)(vm,self,"choiceLimits","[D",&limits);
   uint32_t count=dvm_array_length(vm,formats.l);
   struct dvm_object *source=dvm__obj(vm,args[0].l);
   if (count && !source) {
@@ -1066,8 +1092,8 @@ static bool choice_equals(struct dvm *vm,dvm_ref self,const union dvm_value *arg
   union dvm_value limits[2]= {{0}},formats[2]= {{0}};
   for (int k=0; k<2; ++k) {
     dvm_ref ref=k ? args[0].l : self;
-    dvm_get_field(vm,ref,"choiceLimits","[D",limits+k);
-    dvm_get_field(vm,ref,"choiceFormats","[Ljava/lang/String;",formats+k);
+    (dvm_get_field)(vm,ref,"choiceLimits","[D",limits+k);
+    (dvm_get_field)(vm,ref,"choiceFormats","[Ljava/lang/String;",formats+k);
   }
   uint32_t count=dvm_array_length(vm,limits[0].l);
   if (count!=dvm_array_length(vm,limits[1].l)) RETI(0);
@@ -1089,7 +1115,7 @@ static bool choice_hash(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   (void)args;
   (void)nargs;
   union dvm_value formats= {0};
-  dvm_get_field(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
+  (dvm_get_field)(vm,self,"choiceFormats","[Ljava/lang/String;",&formats);
   uint32_t count=dvm_array_length(vm,formats.l);
   union dvm_value hash= {0};
   if (count) {
@@ -1408,7 +1434,7 @@ static bool message_apply(struct dvm *vm,dvm_ref self,const union dvm_value *arg
     dvm__throw(vm,"java/lang/OutOfMemoryError","MessageFormat pattern");
     goto done;
   }
-  dvm_get_field(vm,self,"locale","Ljava/util/Locale;",&locale);
+  (dvm_get_field)(vm,self,"locale","Ljava/util/Locale;",&locale);
   dvm_ref literal=text_from_utf16(vm,pattern.literal,pattern.literal_length);
   dvm_ref offsets=dvm_new_array(vm,'I',"I",(uint32_t)pattern.count);
   dvm_ref arguments=dvm_new_array(vm,'I',"I",(uint32_t)pattern.count);
@@ -1421,16 +1447,16 @@ static bool message_apply(struct dvm *vm,dvm_ref self,const union dvm_value *arg
     ((int32_t *)dvm_array_data(vm,arguments))[i]=pattern.elements[i].argument;
     ((dvm_ref *)dvm_array_data(vm,formats))[i]=format.l;
   }
-  dvm_set_field(vm,self,"pattern","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"pattern","Ljava/lang/String;",(union dvm_value) {
     .l=literal
   });
-  dvm_set_field(vm,self,"offsets","[I",(union dvm_value) {
+  (dvm_set_field)(vm,self,"offsets","[I",(union dvm_value) {
     .l=offsets
   });
-  dvm_set_field(vm,self,"argumentNumbers","[I",(union dvm_value) {
+  (dvm_set_field)(vm,self,"argumentNumbers","[I",(union dvm_value) {
     .l=arguments
   });
-  dvm_set_field(vm,self,"formats","[Ljava/text/Format;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"formats","[Ljava/text/Format;",(union dvm_value) {
     .l=formats
   });
   good=true;
@@ -1443,17 +1469,17 @@ static bool message_init(struct dvm *vm,dvm_ref self,const union dvm_value *args
   union dvm_value locale= {0};
   if(nargs>1) locale=args[1];
   else if(!loc_getDefault(vm,0,NULL,0,&locale)) return false;
-  dvm_set_field(vm,self,"locale","Ljava/util/Locale;",locale);
+  (dvm_set_field)(vm,self,"locale","Ljava/util/Locale;",locale);
   return message_apply(vm,self,args,1,out);
 }
 static bool message_locale(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(nargs) {
-    dvm_set_field(vm,self,"locale","Ljava/util/Locale;",args[0]);
+    (dvm_set_field)(vm,self,"locale","Ljava/util/Locale;",args[0]);
     RETV();
   }
   union dvm_value locale= {0};
-  dvm_get_field(vm,self,"locale","Ljava/util/Locale;",&locale);
+  (dvm_get_field)(vm,self,"locale","Ljava/util/Locale;",&locale);
   RETL(locale.l);
 }
 static bool message_formats(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -1461,8 +1487,8 @@ static bool message_formats(struct dvm *vm,dvm_ref self,const union dvm_value *a
   const char *name=dvm__builtin_method()->name;
   bool by_argument=strstr(name,"ByArgumentIndex")!=NULL;
   union dvm_value formats= {0},indices= {0};
-  dvm_get_field(vm,self,"formats","[Ljava/text/Format;",&formats);
-  dvm_get_field(vm,self,"argumentNumbers","[I",&indices);
+  (dvm_get_field)(vm,self,"formats","[Ljava/text/Format;",&formats);
+  (dvm_get_field)(vm,self,"argumentNumbers","[I",&indices);
   uint32_t count=dvm_array_length(vm,formats.l);
   if(!nargs) {
     uint32_t length=count;
@@ -1519,7 +1545,7 @@ static bool message_buffer(struct dvm *vm,dvm_ref self,const union dvm_value *ar
   const char *const names[]= {"pattern","offsets","argumentNumbers","formats","locale"};
   const char *const types[]= {"Ljava/lang/String;","[I","[I","[Ljava/text/Format;","Ljava/util/Locale;"};
   for(int i=0; i<5; ++i) {
-    dvm_get_field(vm,self,names[i],types[i],fields+i);
+    (dvm_get_field)(vm,self,names[i],types[i],fields+i);
     dvm_pin(vm,fields[i].l);
   }
   size_t length=0;
@@ -1611,9 +1637,9 @@ static bool message_clone(struct dvm *vm,dvm_ref self,const union dvm_value *arg
   const char *const types[]= {"[I","[I","[Ljava/text/Format;"};
   for(int k=0; k<3; ++k) {
     union dvm_value source= {0},array= {0};
-    dvm_get_field(vm,self,fields[k],types[k],&source);
+    (dvm_get_field)(vm,self,fields[k],types[k],&source);
     if(!o_clone(vm,source.l,NULL,0,&array) || !array.l) return false;
-    dvm_set_field(vm,copy.l,fields[k],types[k],array);
+    (dvm_set_field)(vm,copy.l,fields[k],types[k],array);
     if(k==2) for(uint32_t i=0; i<dvm_array_length(vm,array.l); ++i) {
         dvm_ref item=((dvm_ref *)dvm_array_data(vm,array.l))[i];
         if(!item) continue;
@@ -1805,7 +1831,7 @@ static bool layout_desired_width(struct dvm *vm,dvm_ref self,
     return false;
   }
   union dvm_value scale= {0};
-  dvm_get_field(vm,paint,"textScaleX","F",&scale);
+  (dvm_get_field)(vm,paint,"textScaleX","F",&scale);
   struct textview_layout context= {.source=ARG(0).l,.direction=nargs>=5 ? ARG(4).l : 0};
   float widest=0,limit=nargs==6 ? ARG(5).f : INFINITY;
   size_t paragraph=(size_t)start;
@@ -1865,26 +1891,26 @@ static bool static_builder_obtain(struct dvm *vm,dvm_ref self,
   dvm_ref b=dvm_new_object(vm,dvm_find_class(vm,"android/text/StaticLayout$Builder"));
   if(!b) return false;
   dvm_pin(vm,b);
-  dvm_set_field(vm,b,"source","Ljava/lang/CharSequence;",ARG(0));
-  dvm_set_field(vm,b,"start","I",ARG(1));
-  dvm_set_field(vm,b,"end","I",ARG(2));
-  dvm_set_field(vm,b,"paint","Landroid/text/TextPaint;",ARG(3));
-  dvm_set_field(vm,b,"width","I",ARG(4));
-  dvm_set_field(vm,b,"ellipsizedWidth","I",ARG(4));
-  dvm_set_field(vm,b,"maxLines","I",(union dvm_value) {
+  (dvm_set_field)(vm,b,"source","Ljava/lang/CharSequence;",ARG(0));
+  (dvm_set_field)(vm,b,"start","I",ARG(1));
+  (dvm_set_field)(vm,b,"end","I",ARG(2));
+  (dvm_set_field)(vm,b,"paint","Landroid/text/TextPaint;",ARG(3));
+  (dvm_set_field)(vm,b,"width","I",ARG(4));
+  (dvm_set_field)(vm,b,"ellipsizedWidth","I",ARG(4));
+  (dvm_set_field)(vm,b,"maxLines","I",(union dvm_value) {
     .i=INT_MAX
   });
-  dvm_set_field(vm,b,"spacingMult","F",(union dvm_value) {
+  (dvm_set_field)(vm,b,"spacingMult","F",(union dvm_value) {
     .f=1
   });
-  dvm_set_field(vm,b,"includePad","Z",(union dvm_value) {
+  (dvm_set_field)(vm,b,"includePad","Z",(union dvm_value) {
     .i=1
   });
   union dvm_value v= {0};
   dvm_get_static(vm,dvm_find_class(vm,"android/text/TextDirectionHeuristics"),"FIRSTSTRONG_LTR","Landroid/text/TextDirectionHeuristic;",&v);
-  dvm_set_field(vm,b,"direction","Landroid/text/TextDirectionHeuristic;",v);
+  (dvm_set_field)(vm,b,"direction","Landroid/text/TextDirectionHeuristic;",v);
   dvm_get_static(vm,dvm_find_class(vm,"android/text/Layout$Alignment"),"ALIGN_NORMAL","Landroid/text/Layout$Alignment;",&v);
-  dvm_set_field(vm,b,"alignment","Landroid/text/Layout$Alignment;",v);
+  (dvm_set_field)(vm,b,"alignment","Landroid/text/Layout$Alignment;",v);
   dvm_unpin(vm,b);
   RETL(b);
 }
@@ -1905,20 +1931,20 @@ static bool static_builder_set(struct dvm *vm,dvm_ref self,
   };
   const char *name=builtin_name();
   for(size_t i=0; i<sizeof map/sizeof *map; ++i) if(!strcmp(name,map[i].method)) {
-      if(!dvm_set_field(vm,self,map[i].field,map[i].type,ARG(0))) return false;
+      if(!(dvm_set_field)(vm,self,map[i].field,map[i].type,ARG(0))) return false;
       if(!strcmp(name,"setWidth")) {
         union dvm_value ellipsis= {0};
-        dvm_get_field(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
-        if(!ellipsis.l) dvm_set_field(vm,self,"ellipsizedWidth","I",ARG(0));
+        (dvm_get_field)(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
+        if(!ellipsis.l) (dvm_set_field)(vm,self,"ellipsizedWidth","I",ARG(0));
       }
       RETL(self);
     }
   if(!strcmp(name,"setLineSpacing")) {
-    dvm_set_field(vm,self,"spacingAdd","F",ARG(0));
-    dvm_set_field(vm,self,"spacingMult","F",ARG(1));
+    (dvm_set_field)(vm,self,"spacingAdd","F",ARG(0));
+    (dvm_set_field)(vm,self,"spacingMult","F",ARG(1));
   } else {
-    dvm_set_field(vm,self,"leftIndents","[I",ARG(0));
-    dvm_set_field(vm,self,"rightIndents","[I",ARG(1));
+    (dvm_set_field)(vm,self,"leftIndents","[I",ARG(0));
+    (dvm_set_field)(vm,self,"rightIndents","[I",ARG(1));
   }
   RETL(self);
 }
@@ -2012,8 +2038,8 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
                                 dvm_ref result,union dvm_value *out)
 {
   union dvm_value source= {0},paint= {0},add= {0},mult= {0},ellipsis= {0},left= {0},right= {0},direction= {0},alignment= {0};
-  dvm_get_field(vm,self,"source","Ljava/lang/CharSequence;",&source);
-  dvm_get_field(vm,self,"paint","Landroid/text/TextPaint;",&paint);
+  (dvm_get_field)(vm,self,"source","Ljava/lang/CharSequence;",&source);
+  (dvm_get_field)(vm,self,"paint","Landroid/text/TextPaint;",&paint);
   if(!source.l || !paint.l) {
     dvm__throw(vm,"java/lang/NullPointerException","text or paint");
     return false;
@@ -2026,9 +2052,9 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
     dvm__throw(vm,"java/lang/IllegalArgumentException","layout range, width or line count");
     return false;
   }
-  dvm_get_field(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
-  dvm_get_field(vm,self,"leftIndents","[I",&left);
-  dvm_get_field(vm,self,"rightIndents","[I",&right);
+  (dvm_get_field)(vm,self,"ellipsize","Landroid/text/TextUtils$TruncateAt;",&ellipsis);
+  (dvm_get_field)(vm,self,"leftIndents","[I",&left);
+  (dvm_get_field)(vm,self,"rightIndents","[I",&right);
   /* breakStrategy and hyphenationFrequency only tune where a line may break;
    * the host has no hyphenation dictionaries, so greedy breaking is the
    * answer a device without them gives too.  Indents and justification change
@@ -2039,8 +2065,8 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
     dvm__throw(vm,"java/lang/UnsupportedOperationException","StaticLayout advanced line breaking is not implemented");
     return false;
   }
-  dvm_get_field(vm,self,"direction","Landroid/text/TextDirectionHeuristic;",&direction);
-  dvm_get_field(vm,self,"alignment","Landroid/text/Layout$Alignment;",&alignment);
+  (dvm_get_field)(vm,self,"direction","Landroid/text/TextDirectionHeuristic;",&direction);
+  (dvm_get_field)(vm,self,"alignment","Landroid/text/Layout$Alignment;",&alignment);
   if(!direction.l || !alignment.l) {
     free(units.owned);
     dvm__throw(vm,"java/lang/NullPointerException","direction or alignment");
@@ -2063,13 +2089,13 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
   if(count) memcpy(copy,units.data+start,count*sizeof *copy);
   copy[count]=0;
   free(units.owned);
-  dvm_get_field(vm,self,"spacingAdd","F",&add);
-  dvm_get_field(vm,self,"spacingMult","F",&mult);
+  (dvm_get_field)(vm,self,"spacingAdd","F",&add);
+  (dvm_get_field)(vm,self,"spacingMult","F",&mult);
   union dvm_value px= {0},scale= {0},face= {0},flags= {0};
-  dvm_get_field(vm,paint.l,"textSize","F",&px);
-  dvm_get_field(vm,paint.l,"textScaleX","F",&scale);
-  dvm_get_field(vm,paint.l,"typeface","Landroid/graphics/Typeface;",&face);
-  dvm_get_field(vm,paint.l,"flags","I",&flags);
+  (dvm_get_field)(vm,paint.l,"textSize","F",&px);
+  (dvm_get_field)(vm,paint.l,"textScaleX","F",&scale);
+  (dvm_get_field)(vm,paint.l,"typeface","Landroid/graphics/Typeface;",&face);
+  (dvm_get_field)(vm,paint.l,"flags","I",&flags);
   *layout=(struct textview_layout) {
     .text= {copy,copy,count},.source=source.l,.paint=paint.l,.face=face.l,
                                                              .direction=direction.l,.source_start=start,.source_end=end,
@@ -2084,7 +2110,7 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
   }
   if(ellipsis.l) {
     union dvm_value ename= {0};
-    const char *where=dvm_get_field(vm,ellipsis.l,"name","Ljava/lang/String;",&ename) && ename.l ? dvm_string_utf8(vm,ename.l) : "END";
+    const char *where=(dvm_get_field)(vm,ellipsis.l,"name","Ljava/lang/String;",&ename) && ename.l ? dvm_string_utf8(vm,ename.l) : "END";
     int eavail=rt_get_int(vm,self,"ellipsizedWidth");
     layout->ellipsized_width=eavail;
     if(!where || !static_layout_ellipsize(vm,layout,where,(float)eavail)) {
@@ -2108,10 +2134,10 @@ static bool static_layout_build(struct dvm *vm,dvm_ref self,
   if (o->data_destroy) o->data_destroy(o->data);
   o->data=layout;
   o->data_destroy=textview_layout_destroy;
-  dvm_set_field(vm,result,"source","Ljava/lang/CharSequence;",source);
-  dvm_set_field(vm,result,"paint","Landroid/text/TextPaint;",paint);
-  dvm_set_field(vm,result,"alignment","Landroid/text/Layout$Alignment;",alignment);
-  dvm_set_field(vm,result,"direction","Landroid/text/TextDirectionHeuristic;",direction);
+  (dvm_set_field)(vm,result,"source","Ljava/lang/CharSequence;",source);
+  (dvm_set_field)(vm,result,"paint","Landroid/text/TextPaint;",paint);
+  (dvm_set_field)(vm,result,"alignment","Landroid/text/Layout$Alignment;",alignment);
+  (dvm_set_field)(vm,result,"direction","Landroid/text/TextDirectionHeuristic;",direction);
   RETL(result);
 }
 static bool static_builder_build(struct dvm *vm,dvm_ref self,
@@ -2133,10 +2159,10 @@ static bool static_layout_init(struct dvm *vm,dvm_ref self,
   free(text.owned);
   if(!static_builder_obtain(vm,0,obtain,5,&builder)) return false;
   dvm_pin(vm,builder.l);
-  bool good=dvm_set_field(vm,builder.l,"alignment","Landroid/text/Layout$Alignment;",ARG(3)) &&
-            dvm_set_field(vm,builder.l,"spacingMult","F",ARG(4)) &&
-            dvm_set_field(vm,builder.l,"spacingAdd","F",ARG(5)) &&
-            dvm_set_field(vm,builder.l,"includePad","Z",ARG(6)) &&
+  bool good=(dvm_set_field)(vm,builder.l,"alignment","Landroid/text/Layout$Alignment;",ARG(3)) &&
+            (dvm_set_field)(vm,builder.l,"spacingMult","F",ARG(4)) &&
+            (dvm_set_field)(vm,builder.l,"spacingAdd","F",ARG(5)) &&
+            (dvm_set_field)(vm,builder.l,"includePad","Z",ARG(6)) &&
             static_layout_build(vm,builder.l,self,out);
   dvm_unpin(vm,builder.l);
   if(!good) return false;
@@ -2162,13 +2188,13 @@ static bool boring_layout_init(struct dvm *vm,dvm_ref self,
   dvm_pin(vm,result);
   union dvm_value direction={0};
   dvm_get_static(vm,dvm_find_class(vm,"android/text/TextDirectionHeuristics"),"LTR","Landroid/text/TextDirectionHeuristic;",&direction);
-  bool good=result && dvm_set_field(vm,builder.l,"alignment","Landroid/text/Layout$Alignment;",ARG(3)) &&
-      dvm_set_field(vm,builder.l,"includePad","Z",ARG(pi)) &&
-      dvm_set_field(vm,builder.l,"maxLines","I",(union dvm_value){.i=1});
-  if (good && direction.l) dvm_set_field(vm,builder.l,"direction","Landroid/text/TextDirectionHeuristic;",direction);
+  bool good=result && (dvm_set_field)(vm,builder.l,"alignment","Landroid/text/Layout$Alignment;",ARG(3)) &&
+      (dvm_set_field)(vm,builder.l,"includePad","Z",ARG(pi)) &&
+      (dvm_set_field)(vm,builder.l,"maxLines","I",(union dvm_value){.i=1});
+  if (good && direction.l) (dvm_set_field)(vm,builder.l,"direction","Landroid/text/TextDirectionHeuristic;",direction);
   if (good && nargs>ei) {
-    good=dvm_set_field(vm,builder.l,"ellipsize","Landroid/text/TextUtils$TruncateAt;",ARG(ei)) &&
-        dvm_set_field(vm,builder.l,"ellipsizedWidth","I",ARG(ei+1));
+    good=(dvm_set_field)(vm,builder.l,"ellipsize","Landroid/text/TextUtils$TruncateAt;",ARG(ei)) &&
+        (dvm_set_field)(vm,builder.l,"ellipsizedWidth","I",ARG(ei+1));
   }
   if (good) good=static_layout_build(vm,builder.l,result,out);
   if (good) {
@@ -2209,7 +2235,7 @@ static bool boring_layout_init(struct dvm *vm,dvm_ref self,
         good=text!=0;
         if (good) {
           layout->source=text;
-          dvm_set_field(vm,result,"source","Ljava/lang/CharSequence;",(union dvm_value){.l=text});
+          (dvm_set_field)(vm,result,"source","Ljava/lang/CharSequence;",(union dvm_value){.l=text});
         }
       }
     }

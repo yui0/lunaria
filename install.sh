@@ -124,7 +124,7 @@ resolve_asset_url() {
 
   case "$os" in
     linux) pattern="lunaria-.*-linux-${aarch}\\.tar\\.gz" ;;
-    macos) pattern="lunaria-.*-macos-${aarch}\\.dmg" ;;
+    macos) pattern="lunaria-.*-macos-${aarch}\\.tar\\.gz" ;;
     *) die "Unsupported OS for assets: $os" ;;
   esac
 
@@ -221,45 +221,19 @@ install_linux() {
 EOF
 }
 
-attach_dmg() {
-  local dmg="$1" line mp
-  # Prefer plist output so the mount point is unambiguous.
-  if hdiutil attach -nobrowse -readonly -plist "$dmg" >"$_TMP/attach.plist" 2>/dev/null \
-     && command -v python3 >/dev/null 2>&1; then
-    mp="$(ATTACH_PLIST="$_TMP/attach.plist" python3 - <<'PY'
-import os, plistlib, sys
-with open(os.environ["ATTACH_PLIST"], "rb") as f:
-    data = plistlib.load(f)
-for ent in data.get("system-entities") or []:
-    point = ent.get("mount-point")
-    if point:
-        print(point)
-        sys.exit(0)
-sys.exit(1)
-PY
-)" && [ -n "$mp" ] && [ -d "$mp" ] && { printf '%s\n' "$mp"; return; }
-  fi
-  line="$(hdiutil attach -nobrowse -readonly "$dmg" | tail -n1)" || die "Failed to mount DMG"
-  mp="$(printf '%s\n' "$line" | awk '{print $NF}')"
-  [ -n "$mp" ] && [ -d "$mp" ] || die "Could not determine DMG mount point"
-  printf '%s\n' "$mp"
-}
-
 install_macos() {
-  local prefix="$1" app_dir="$2" dmg="$3"
-  local mount app_src app_dst bin_dir bin_path
+  local prefix="$1" app_dir="$2" archive="$3"
+  local app_src app_dst bin_dir bin_path
 
-  require_cmd hdiutil
+  require_cmd tar
   ensure_writable "$app_dir"
-  mkdir -p "$app_dir" "$prefix/bin" "$_TMP"
+  mkdir -p "$app_dir" "$prefix/bin" "$_TMP/extract"
 
-  log "Mounting DMG..."
-  mount="$(attach_dmg "$dmg")"
-  # shellcheck disable=SC2064
-  trap 'hdiutil detach "'"$mount"'" -quiet 2>/dev/null || true; rm -rf "$_TMP"' EXIT
+  log "Extracting archive..."
+  tar -xzf "$archive" -C "$_TMP/extract"
 
-  app_src="$(find "$mount" -maxdepth 2 -type d -name 'Lunaria.app' | head -n1)"
-  [ -n "$app_src" ] || die "Lunaria.app not found inside the DMG"
+  app_src="$(find "$_TMP/extract" -maxdepth 3 -type d -name 'Lunaria.app' | head -n1)"
+  [ -n "$app_src" ] || die "Lunaria.app not found inside the archive"
   app_dst="${app_dir}/Lunaria.app"
 
   log "Installing app → ${app_dst}"
@@ -284,9 +258,6 @@ install_macos() {
   mkdir -p "$bin_dir"
   ln -sfn "$bin_path" "${bin_dir}/lunaria"
   log "Symlink: ${bin_dir}/lunaria → ${bin_path}"
-
-  hdiutil detach "$mount" -quiet 2>/dev/null || true
-  trap 'rm -rf "$_TMP"' EXIT
 
   case ":${PATH}:" in
     *":${bin_dir}:"*) ;;

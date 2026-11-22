@@ -60,7 +60,7 @@ curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | su
 curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash -s -- --uninstall
 ```
 
-手動で入れる場合は、`lunaria-*-linux-x86_64.tar.gz`／`…-aarch64.tar.gz`を展開して`./lunaria`を実行するか、macOSの`.dmg`から`Lunaria.app`を取り出してください。
+手動で入れる場合は、`lunaria-*-linux-x86_64.tar.gz`／`…-aarch64.tar.gz`を展開して`./lunaria`を実行するか、`lunaria-*-macos-*.tar.gz`を展開して`Lunaria.app`を開いてください。
 
 **Windows（x86_64）**
 
@@ -139,7 +139,7 @@ python3 scripts/install-framework.py /tmp/platform-31_r01.zip
 
 ```bash
 make dist        # lunaria-<version>-linux-x86_64.tar.gz
-make dist-mac    # Lunaria.app + .dmg（Darwinのみ）
+make dist-mac    # Lunaria.app + .tar.gz（Darwinのみ）
 ```
 
 ## 使い方

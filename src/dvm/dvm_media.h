@@ -282,12 +282,12 @@ void luna_at_advance(unsigned frames, unsigned rate, unsigned channels);
 static dvm_ref mr_obj(struct dvm *vm,dvm_ref o,const char *field,const char *type)
 {
   union dvm_value v= {0};
-  dvm_get_field(vm,o,field,type,&v);
+  (dvm_get_field)(vm,o,field,type,&v);
   return v.l;
 }
 static void mr_put(struct dvm *vm,dvm_ref o,const char *field,const char *type,dvm_ref value)
 {
-  dvm_set_field(vm,o,field,type,(union dvm_value) {
+  (dvm_set_field)(vm,o,field,type,(union dvm_value) {
     .l=value
   });
 }
@@ -867,7 +867,7 @@ static bool mr_route(struct dvm *vm,dvm_ref self,const union dvm_value *args,int
           if(v.i>max)v.i=max;
         }
         int old=rt_get_int(vm,self,"types");
-        dvm_set_field(vm,self,properties[i].field,properties[i].type,v);
+        (dvm_set_field)(vm,self,properties[i].field,properties[i].type,v);
         if(!strcmp(properties[i].field,"types") && old!=v.i) {
           if(!mr_changed(vm,router,self,old))return false;
         }
@@ -876,7 +876,7 @@ static bool mr_route(struct dvm *vm,dvm_ref self,const union dvm_value *args,int
         if(group && group!=self && !mr_group_refresh(vm,group))return false;
         RETV();
       }
-      dvm_get_field(vm,self,properties[i].field,properties[i].type,&v);
+      (dvm_get_field)(vm,self,properties[i].field,properties[i].type,&v);
       if(properties[i].type[0]=='I')RETI(v.i);
       RETL(v.l);
     }

@@ -714,7 +714,7 @@ static void watchdog_tick(void)
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   const double now = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-  if (!last) last = now;
+  if (!(last > 0.0)) last = now;
   if (now - last < 10.0) return;
   last = now;
   arm_exec_watchdog_tick();
@@ -1185,9 +1185,9 @@ static int binder_service_process(const char *package,const char *table,
   if(!result && operation!=3)result=-EPROTO;
   union dvm_value component= {0},cls= {0},action= {0};
   if(!result) {
-    dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
-    if(component.l)dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cls);
-    dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
+    (dvm_get_field)(vm,intent,"component","Landroid/content/ComponentName;",&component);
+    if(component.l)(dvm_get_field)(vm,component.l,"cls","Ljava/lang/String;",&cls);
+    (dvm_get_field)(vm,intent,"action","Ljava/lang/String;",&action);
     const char *name=cls.l ? dvm_string_utf8(vm,cls.l) : NULL;
     const char *act=action.l ? dvm_string_utf8(vm,action.l) : NULL;
     char full[512];

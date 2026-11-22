@@ -233,7 +233,7 @@ static bool parcel_fd_write(struct dvm *vm,dvm_ref self,const union dvm_value *a
     return false;
   }
   union dvm_value value= {.i=-1};
-  dvm_get_field(vm,self,"fd","I",&value);
+  (dvm_get_field)(vm,self,"fd","I",&value);
   struct dvm_object *o=dvm__obj(vm,self);
   struct parcel_fd_owner *owner=o && o->data_destroy==parcel_fd_destroy ? o->data : NULL;
   int comm=owner ? owner->comm_fd : -1;
@@ -1561,8 +1561,8 @@ static bool binder_proxy_identity(struct dvm *vm, dvm_ref obj, uint32_t *peer, i
   struct dvm_class *c = dvm_object_class(vm, obj);
   if (!c || !c->name || strcmp(c->name, "android/os/BinderProxy")) return false;
   union dvm_value p = {0}, h = {0};
-  (void)dvm_get_field(vm, obj, "peer", "I", &p);
-  (void)dvm_get_field(vm, obj, "handle", "I", &h);
+  (void)(dvm_get_field)(vm, obj, "peer", "I", &p);
+  (void)(dvm_get_field)(vm, obj, "handle", "I", &h);
   *peer = (uint32_t)p.i;
   *handle = h.i;
   return true;
@@ -1578,10 +1578,10 @@ static dvm_ref binder_proxy_get(struct dvm *vm, uint32_t peer, int32_t handle)
   dvm_ref proxy = c ? dvm_new_object(vm, c) : 0;
   if (!proxy) return 0;
   dvm_pin(vm, proxy);
-  (void)dvm_set_field(vm, proxy, "peer", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, proxy, "peer", "I", (union dvm_value) {
     .i = (int32_t)peer
   });
-  (void)dvm_set_field(vm, proxy, "handle", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, proxy, "handle", "I", (union dvm_value) {
     .i = handle
   });
   g_binder_proxies[g_nbinder_proxies++] = (struct binder_proxy_rec) {
@@ -2084,7 +2084,7 @@ static bool intent_write_body(struct dvm *vm, dvm_ref parcel, struct rt_parcel *
   bool ok=true;
   for(const struct rt_field *f=rt_intent_fields; ok && f->name; ++f) {
     value.l=0;
-    (void)dvm_get_field(vm,intent,f->name,f->type,&value);
+    (void)(dvm_get_field)(vm,intent,f->name,f->type,&value);
     if(!strcmp(f->name,"flags"))ok=parcel_put_i32(vm,p,value.i);
     else if(!strcmp(f->name,"data")) {
       union dvm_value text= {0};
@@ -2095,7 +2095,7 @@ static bool intent_write_body(struct dvm *vm, dvm_ref parcel, struct rt_parcel *
       const char *fields[]= {"pkg","cls"};
       for(unsigned i=0; ok && value.l && i<2; ++i) {
         union dvm_value text= {0};
-        (void)dvm_get_field(vm,value.l,fields[i],"Ljava/lang/String;",&text);
+        (void)(dvm_get_field)(vm,value.l,fields[i],"Ljava/lang/String;",&text);
         ok=parcel_put_string(vm,p,text.l);
       }
     } else if(!strcmp(f->name,"categories")) {
@@ -2169,7 +2169,7 @@ static bool intent_read_fields(struct dvm *vm,struct rt_parcel *p,dvm_ref result
         for(unsigned i=0; ok && i<2; ++i) {
           union dvm_value text= {0};
           ok=parcel_take_string(vm,p,&text.l) && text.l;
-          if(ok)ok=dvm_set_field(vm,value.l,fields[i],"Ljava/lang/String;",text);
+          if(ok)ok=(dvm_set_field)(vm,value.l,fields[i],"Ljava/lang/String;",text);
         }
         dvm_unpin(vm,value.l);
       }
@@ -2194,7 +2194,7 @@ static bool intent_read_fields(struct dvm *vm,struct rt_parcel *p,dvm_ref result
         dvm_unpin(vm,value.l);
       }
     } else ok=parcel_take_string(vm,p,&value.l);
-    if(ok)ok=!p->failed && dvm_set_field(vm,result,f->name,f->type,value);
+    if(ok)ok=!p->failed && (dvm_set_field)(vm,result,f->name,f->type,value);
   }
   return ok;
 }
@@ -2492,15 +2492,15 @@ static void binder_bind_connected(struct dvm *vm, struct binder_pending *e, cons
   dvm_ref name = cc ? dvm_new_object(vm, cc) : 0;
   if (!name || !e->connection) return;
   dvm_pin(vm, name);
-  (void)dvm_set_field(vm, name, "pkg", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, name, "pkg", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, e->package ? e->package : "")
   });
-  (void)dvm_set_field(vm, name, "cls", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, name, "cls", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, cls)
   });
   dvm_ref proxy = e->peer && e->status >= 0 && e->handle > 0 ? binder_proxy_get(vm, e->peer, e->handle) : 0;
   if (proxy) {
-    (void)dvm_set_field(vm, proxy, "descriptor", "Ljava/lang/String;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, proxy, "descriptor", "Ljava/lang/String;", (union dvm_value) {
       .l = dvm_new_string(vm, desc)
     });
     union dvm_value a[2] = { { .l = name }, { .l = proxy } };
@@ -2529,7 +2529,7 @@ static bool binder_connection_run(struct dvm *vm,dvm_ref self,const union dvm_va
   (void)args;
   (void)nargs;
   union dvm_value seq= {0};
-  dvm_get_field(vm,self,"seq","I",&seq);
+  (dvm_get_field)(vm,self,"seq","I",&seq);
   pthread_mutex_lock(&g_binder_lock);
   struct binder_pending *e=g_binder_pending;
   while(e && e->seq!=(uint32_t)seq.i)e=e->next;
@@ -2662,7 +2662,7 @@ static bool binder_job_run(struct dvm *vm, dvm_ref self, const union dvm_value *
   (void)args;
   (void)nargs;
   union dvm_value ptr = { 0 };
-  (void)dvm_get_field(vm, self, "job", "J", &ptr);
+  (void)(dvm_get_field)(vm, self, "job", "J", &ptr);
   struct binder_job *j = (struct binder_job *)(uintptr_t)ptr.j;
   if (j) {
     struct parcel_fds saved=binder_incoming_fds;
@@ -2710,10 +2710,10 @@ static void binder_dispatch_request(struct dvm *vm, uint32_t sender, uint32_t se
   memcpy(j->body, body, blen);
   atomic_fetch_add(&g_binder_load[worker], 1);
   union dvm_value ptr = { .j = (int64_t)(uintptr_t)j }, post = { .l = job }, posted = { 0 };
-  (void)dvm_set_field(vm, job, "job", "J", ptr);
+  (void)(dvm_set_field)(vm, job, "job", "J", ptr);
   if (!am_vcall(vm, handler, "post", "(Ljava/lang/Runnable;)Z", &post, 1, &posted) || !posted.i) {
     if (dvm_exception(vm)) dvm_clear_exception(vm);
-    (void)dvm_set_field(vm, job, "job", "J", (union dvm_value) {
+    (void)(dvm_set_field)(vm, job, "job", "J", (union dvm_value) {
       .j = 0
     });
     atomic_fetch_sub(&g_binder_load[worker], 1);
@@ -2865,7 +2865,7 @@ static int binder_receive(struct dvm *vm, const char *name, const void *bytes, s
                   dvm__class_by_desc(vm,"Llunaria/BinderConnection;")) : 0;
       if(n && e->payload)memcpy(e->payload,body+12,n);
       e->done=true;
-      bool queued=job && dvm_set_field(vm,job,"seq","I",(union dvm_value) {
+      bool queued=job && (dvm_set_field)(vm,job,"seq","I",(union dvm_value) {
         .i=(int32_t)e->seq
       })
       && dvm__queue_runnable_at(vm,job,false,0);
@@ -2910,8 +2910,8 @@ static int binder_receive(struct dvm *vm, const char *name, const void *bytes, s
         if (!status && operation==4) {
           dvm_pin(vm,intent);
           union dvm_value component={0},name={0};
-          dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
-          if(component.l)dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&name);
+          (dvm_get_field)(vm,intent,"component","Landroid/content/ComponentName;",&component);
+          if(component.l)(dvm_get_field)(vm,component.l,"cls","Ljava/lang/String;",&name);
           const char *actual=name.l ? dvm_string_utf8(vm,name.l) : NULL;
           status=actual && strlen(actual)==cn && !memcmp(actual,body+16,cn) ?
             dvm_activity_accept(vm,intent,caller_uid,sender,bget(body+4)) : -EINVAL;

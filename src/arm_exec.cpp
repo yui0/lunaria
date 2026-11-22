@@ -1501,6 +1501,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"getenv",                  SVC_GETENV},
   {"android_get_application_target_sdk_version", SVC_ANDROID_TARGET_SDK},
   {"android_get_device_api_level",              SVC_ANDROID_DEVICE_API_LEVEL},
+  {"getopt",                                    SVC_GETOPT},
   {"__loader_shared_globals",                   SVC_LOADER_SHARED_GLOBALS},
   {"__loader_add_thread_local_dtor",            SVC_LOADER_THREAD_LOCAL_DTOR},
   {"__loader_remove_thread_local_dtor",         SVC_LOADER_THREAD_LOCAL_DTOR},
@@ -2308,6 +2309,10 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"getc",           SVC_GETC},
   {"ungetc",         SVC_UNGETC},
   {"putc",           SVC_FPUTC},
+  /* bionic's stdio macro slow paths: putc(c, fp) / getc(fp) when the inline buffer is full or empty;
+   * binaries built for pre-L NDKs still import them. */
+  {"__swbuf",        SVC_FPUTC},
+  {"__srget",        SVC_GETC},
   {"putchar",        SVC_PUTCHAR},
   {"__fpclassifyf",  SVC_FPCLASSIFYF},
   {"__get_h_errno",  SVC_GET_H_ERRNO},
@@ -20167,6 +20172,8 @@ static uint32_t    g_apk_app_icon;
  * name (dotted, package-qualified). */
 static uint32_t    g_apk_app_theme;
 static std::map<std::string, uint32_t> g_apk_activity_theme;
+/* android:screenOrientation of each <activity>, by dotted class name (ActivityInfo.SCREEN_ORIENTATION_*). */
+static std::map<std::string, int32_t> g_apk_activity_orientation;
 static int32_t     g_apk_version_code = 0;
 
 /* One entry of a ResStringPool (resources.arsc, binary XML), as
@@ -21381,6 +21388,8 @@ static void apk_meta_ensure_loaded() {
           attr_size >= 20) {
         std::string name;
         uint32_t theme = 0;
+        bool have_orientation = false;
+        int32_t orientation = -1;
         size_t base = i + 16 + attr_start;
         for (uint16_t a = 0; a < attr_count; ++a) {
           size_t ao = base + (size_t)a * attr_size;
@@ -21394,13 +21403,18 @@ static void apk_meta_ensure_loaded() {
             name = strings[dval];
           else if (!strcmp(an, "theme") && typ == 0x01)
             theme = dval;
+          else if (!strcmp(an, "screenOrientation") && (typ == 0x10 || typ == 0x11)) {
+            orientation = (int32_t)dval;
+            have_orientation = true;
+          }
         }
-        if (!name.empty() && theme) {
+        if (!name.empty() && (theme || have_orientation)) {
           if (name[0] == '.') {
             const char *pkg = lunaria_env("ANDROID_PACKAGE_NAME");
             name = std::string(pkg ? pkg : "") + name;
           }
-          g_apk_activity_theme[name] = theme;
+          if (theme) g_apk_activity_theme[name] = theme;
+          if (have_orientation) g_apk_activity_orientation[name] = orientation;
         }
       }
       if (!strcmp(ename, "meta-data") && attr_size >= 20) {
@@ -21545,6 +21559,18 @@ extern "C" uint32_t arm_exec_activity_theme(const char *cls)
     if (it != g_apk_activity_theme.end()) return arsc_resolved_resource_id(it->second);
   }
   return arsc_resolved_resource_id(g_apk_app_theme);
+}
+
+/* The orientation an Activity asks for in its manifest, or -1 (unspecified) when it names none.
+ * `cls` may be dotted or slashed. */
+extern "C" int arm_exec_activity_orientation(const char *cls)
+{
+  apk_meta_ensure_loaded();
+  if (!cls) return -1;
+  std::string dotted(cls);
+  for (char &ch : dotted) if (ch == '/') ch = '.';
+  auto it = g_apk_activity_orientation.find(dotted);
+  return it == g_apk_activity_orientation.end() ? -1 : (int)it->second;
 }
 
 /* Whether a theme makes a floating window (android:windowIsFloating), from
@@ -59212,6 +59238,70 @@ mbsrtowcs_done:
     /* The string __progname points at: the process name (see the data setup). */
     retptr(misc_progname_str());
     break;
+  case SVC_GETOPT: {
+    /* BSD getopt(3), as in bionic: optind/optopt/opterr/optarg live in the process's data (the
+     * addresses libkeengame-style binaries import), `place` is the position inside the current
+     * argument between calls. */
+    static GuestVA place;
+    const int argc = (int)(int32_t)arg32(0);
+    const GuestVA argv = argp(1);
+    const char *ostr = ctx.mem.cstr(argp(2));
+    const unsigned psz = ctx.is_arm64 ? 8u : 4u;
+    auto rd_ptr = [&](GuestVA a) -> GuestVA { return ctx.is_arm64 ? ctx.mem.read64(a) : (GuestVA)ctx.mem.read32((uint32_t)a); };
+    auto get_optind = [&]() { return (int)(int32_t)ctx.mem.read32(misc_optind()); };
+    auto set_optind = [&](int v) { ctx.mem.write32(misc_optind(), (uint32_t)v); };
+    auto set_optarg = [&](GuestVA v) { if (ctx.is_arm64) ctx.mem.write64(misc_optarg(), v); else ctx.mem.write32(misc_optarg(), (uint32_t)v); };
+    auto chr = [&](GuestVA a) -> int { return a ? (int)(unsigned char)ctx.mem.cstr(a)[0] : 0; };
+    int result;
+    if (!ostr || !argv) { ret32((uint32_t)-1); break; }
+    int optind_v = get_optind();
+    if (optind_v < 1) { optind_v = 1; set_optind(1); place = 0; }
+    if (!place || !chr(place)) {
+      place = 0;
+      if (optind_v >= argc || !(place = rd_ptr(argv + (GuestVA)optind_v * psz)) || chr(place) != '-') {
+        place = 0;
+        ret32((uint32_t)-1);
+        break;
+      }
+      if (chr(place + 1) && chr(place + 1) == '-') {   /* "--" ends the options */
+        set_optind(optind_v + 1);
+        place = 0;
+        ret32((uint32_t)-1);
+        break;
+      }
+      if (chr(place + 1)) place += 1;                  /* skip the '-' ; a lone "-" is an operand */
+      else { place = 0; ret32((uint32_t)-1); break; }
+    }
+    const int optopt_v = chr(place++);
+    ctx.mem.write32(misc_optopt(), (uint32_t)optopt_v);
+    const char *oli = optopt_v == ':' ? nullptr : strchr(ostr, optopt_v);
+    const bool quiet = ostr[0] == ':';
+    if (!oli) {
+      if (!chr(place)) set_optind(get_optind() + 1);
+      result = '?';
+    } else if (oli[1] != ':') {
+      set_optarg(0);
+      if (!chr(place)) set_optind(get_optind() + 1);
+      result = optopt_v;
+    } else {
+      if (chr(place)) {
+        set_optarg(place);
+        set_optind(get_optind() + 1);
+        result = optopt_v;
+      } else if (argc <= get_optind() + 1) {
+        set_optind(get_optind() + 1);
+        result = quiet ? ':' : '?';
+      } else {
+        set_optind(get_optind() + 1);
+        set_optarg(rd_ptr(argv + (GuestVA)get_optind() * psz));
+        set_optind(get_optind() + 1);
+        result = optopt_v;
+      }
+      place = 0;
+    }
+    ret32((uint32_t)result);
+    break;
+  }
   case SVC_GETRANDOM: {
     /* getrandom(buf, len, flags): the entropy pool is always ready here, so
      * neither GRND_NONBLOCK (1) nor GRND_RANDOM (2) changes the answer. */
@@ -68328,6 +68418,15 @@ static void a64_install_code_hooks(ArmExecCtx &ctx) {
   }
 }
 
+/* LUNARIA_TRACE_ABORT_STACK: name the site that starts a JIT run at the abort() trampoline. */
+template <class J> static void a64_trace_abort_entry(const char *site, J &jit) {
+  if (jit.GetPC() != a64_guest_va(TRAMP_BASE + SVC_ABORT * TRAMP_STRIDE) || !lunaria_env("LUNARIA_TRACE_ABORT_STACK")) return;
+  fprintf(stderr, "[abort] JIT run starts at abort(): %s tid=%u\n", site, g_current_tid);
+#ifdef __GLIBC__
+  void *frames[48]; const int n = backtrace(frames, 48);
+  backtrace_symbols_fd(frames, n, 2);
+#endif
+}
 class Arm64Callbacks : public Dynarmic::A64::UserCallbacks {
 public:
   ArmExecCtx *ctx = nullptr;
@@ -72519,6 +72618,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
   ctx_push(false);  /* the SVCs below are this guest thread's, not a caller callback's */
   for (;;) {
     guest_pause_point();
+    a64_trace_abort_entry("line 72522", j64);
     const Dynarmic::HaltReason reason = j64.Run();
     if (reason != Dynarmic::HaltReason{} || !cb64.ticks_remaining) break;
     if (host_mono_ns() >= cb64.slice_deadline_ns) {
@@ -72579,6 +72679,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
       ++g_slice_depth;
       ctx_push(false);
       guest_pause_point();
+      a64_trace_abort_entry("line 72582", j64);
       j64.Run();
       ctx_pop();
       --g_slice_depth;
@@ -74133,10 +74234,12 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
     Dynarmic::HaltReason hr;
     if (g_cb64_keep_ael) {
       guest_pause_point();
+      a64_trace_abort_entry("line 74136", j);
       hr = j.Run();
     } else {
       const unsigned d_ = arm_lock_unlock_all();
       guest_pause_point();
+      a64_trace_abort_entry("line 74140", j);
       hr = j.Run();
       arm_lock_relock(d_);
     }
@@ -76285,6 +76388,7 @@ static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
     a64_drain_main_jit_inval(ctx);
     const uint64_t main_signal_returns_before = g_main_signal_returns;
     guest_pause_point();
+    a64_trace_abort_entry("line 76288", j);
     Dynarmic::HaltReason hr = j.Run();
     const bool wake_yield = Dynarmic::Has(hr, Dynarmic::HaltReason::UserDefined3);
     if (lunaria_env("LUNARIA_TRACE_A64_HALT") &&

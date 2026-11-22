@@ -749,10 +749,10 @@ static bool ssl_engine_init(struct dvm *vm, dvm_ref self, const union dvm_value 
 {
   (void)out;
   if (nargs >= 2) {
-    (void)dvm_set_field(vm, self, "peerHost", "Ljava/lang/String;", ARG(0));
-    (void)dvm_set_field(vm, self, "peerPort", "I", ARG(1));
+    (void)(dvm_set_field)(vm, self, "peerHost", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "peerPort", "I", ARG(1));
   } else {
-    (void)dvm_set_field(vm, self, "peerPort", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "peerPort", "I", (union dvm_value) {
       .i = -1
     });
   }
@@ -765,8 +765,8 @@ static bool ssl_engine_peer(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)args;
   (void)nargs;
   if (!strcmp(builtin_name(), "getPeerHost"))
-    return dvm_get_field(vm, self, "peerHost", "Ljava/lang/String;", out);
-  return dvm_get_field(vm, self, "peerPort", "I", out);
+    return (dvm_get_field)(vm, self, "peerHost", "Ljava/lang/String;", out);
+  return (dvm_get_field)(vm, self, "peerPort", "I", out);
 }
 
 /* A one-element ByteBuffer[] holding `buffer`. */
@@ -1340,17 +1340,17 @@ static bool x_hse_session(struct dvm *vm, dvm_ref self, const union dvm_value *a
   union dvm_value v = { 0 };
   /* Before the handshake: the null session (SSL_NULL_WITH_NULL_NULL / NONE). */
   v.l = dvm_new_string(vm, up ? dvm_tls_engine_cipher(h->tls) : "SSL_NULL_WITH_NULL_NULL");
-  (void)dvm_set_field(vm, sess, "cipherSuite", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, sess, "cipherSuite", "Ljava/lang/String;", v);
   v.l = dvm_new_string(vm, up ? dvm_tls_engine_protocol(h->tls) : "NONE");
-  (void)dvm_set_field(vm, sess, "protocol", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, sess, "protocol", "Ljava/lang/String;", v);
   v.l = dvm_new_string(vm, h->peer_host);
-  (void)dvm_set_field(vm, sess, "peerHost", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, sess, "peerHost", "Ljava/lang/String;", v);
   v.i = h->peer_port;
-  (void)dvm_set_field(vm, sess, "peerPort", "I", v);
+  (void)(dvm_set_field)(vm, sess, "peerPort", "I", v);
   v.j = (int64_t)time(NULL) * 1000;
-  (void)dvm_set_field(vm, sess, "creationTime", "J", v);
+  (void)(dvm_set_field)(vm, sess, "creationTime", "J", v);
   v.i = up;
-  (void)dvm_set_field(vm, sess, "valid", "Z", v);
+  (void)(dvm_set_field)(vm, sess, "valid", "Z", v);
   if (up) {
     uint8_t **der = NULL;
     int *len = NULL;
@@ -1366,7 +1366,7 @@ static bool x_hse_session(struct dvm *vm, dvm_ref self, const union dvm_value *a
     free(der);
     free(len);
     v.l = arr;
-    (void)dvm_set_field(vm, sess, "peerCertificates", "[Ljava/security/cert/Certificate;", v);
+    (void)(dvm_set_field)(vm, sess, "peerCertificates", "[Ljava/security/cert/Certificate;", v);
     if (arr) dvm_unpin(vm, arr);
   }
   dvm_unpin(vm, sess);
@@ -1387,18 +1387,18 @@ static bool x_hse_get_params(struct dvm *vm, dvm_ref self, const union dvm_value
   const char *const *all = dvm_tls_supported_ciphers();
   v.l = h->nciphers ? string_array_of(vm, (const char *const *)h->ciphers, h->nciphers)
         : string_array_of(vm, all, cipher_count(all));
-  (void)dvm_set_field(vm, p, "cipherSuites", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, p, "cipherSuites", "[Ljava/lang/String;", v);
   v.l = h->nprotocols ? string_array_of(vm, (const char *const *)h->protocols, h->nprotocols)
         : string_array_of(vm, g_ssl_default_protocols, 2);
-  (void)dvm_set_field(vm, p, "protocols", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, p, "protocols", "[Ljava/lang/String;", v);
   v.l = string_array_of(vm, (const char *const *)h->alpn, h->nalpn);
-  (void)dvm_set_field(vm, p, "applicationProtocols", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, p, "applicationProtocols", "[Ljava/lang/String;", v);
   v.l = h->verify_host ? dvm_new_string(vm, "HTTPS") : 0;
-  (void)dvm_set_field(vm, p, "endpointIdentificationAlgorithm", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, p, "endpointIdentificationAlgorithm", "Ljava/lang/String;", v);
   v.i = h->need_client_auth;
-  (void)dvm_set_field(vm, p, "needClientAuth", "Z", v);
+  (void)(dvm_set_field)(vm, p, "needClientAuth", "Z", v);
   v.i = h->want_client_auth;
-  (void)dvm_set_field(vm, p, "wantClientAuth", "Z", v);
+  (void)(dvm_set_field)(vm, p, "wantClientAuth", "Z", v);
   (void)en;
   dvm_unpin(vm, p);
   RETL(p);
@@ -1416,22 +1416,22 @@ static bool x_hse_set_params(struct dvm *vm, dvm_ref self, const union dvm_value
   union dvm_value v = { 0 };
   char **l = NULL;
   int n;
-  if (dvm_get_field(vm, p, "cipherSuites", "[Ljava/lang/String;", &v) && v.l) {
+  if ((dvm_get_field)(vm, p, "cipherSuites", "[Ljava/lang/String;", &v) && v.l) {
     n = string_array_take(vm, v.l, &l);
     host_engine_set_list(&h->ciphers, &h->nciphers, l, n);
   }
-  if (dvm_get_field(vm, p, "protocols", "[Ljava/lang/String;", &v) && v.l) {
+  if ((dvm_get_field)(vm, p, "protocols", "[Ljava/lang/String;", &v) && v.l) {
     n = string_array_take(vm, v.l, &l);
     host_engine_set_list(&h->protocols, &h->nprotocols, l, n);
   }
-  if (dvm_get_field(vm, p, "applicationProtocols", "[Ljava/lang/String;", &v) && v.l) {
+  if ((dvm_get_field)(vm, p, "applicationProtocols", "[Ljava/lang/String;", &v) && v.l) {
     n = string_array_take(vm, v.l, &l);
     host_engine_set_list(&h->alpn, &h->nalpn, l, n);
   }
-  if (dvm_get_field(vm, p, "endpointIdentificationAlgorithm", "Ljava/lang/String;", &v))
+  if ((dvm_get_field)(vm, p, "endpointIdentificationAlgorithm", "Ljava/lang/String;", &v))
     h->verify_host = v.l && !strcasecmp(dvm_string_utf8(vm, v.l), "HTTPS");
-  if (dvm_get_field(vm, p, "needClientAuth", "Z", &v)) h->need_client_auth = v.i != 0;
-  if (dvm_get_field(vm, p, "wantClientAuth", "Z", &v)) h->want_client_auth = v.i != 0;
+  if ((dvm_get_field)(vm, p, "needClientAuth", "Z", &v)) h->need_client_auth = v.i != 0;
+  if ((dvm_get_field)(vm, p, "wantClientAuth", "Z", &v)) h->want_client_auth = v.i != 0;
   RETV();
 }
 

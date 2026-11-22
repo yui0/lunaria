@@ -30,8 +30,11 @@ RUNTIMEDIR ?= /lunaria
 
 RM = rm -f
 
-WARNINGS = -Wall -Wextra -Wpedantic -Wformat=2 -Wstrict-aliasing=3 -Wstrict-overflow=3 -Wstack-usage=4096000 \
-	-Wfloat-equal -Wcast-align -Wpointer-arith -Wchar-subscripts -Warray-bounds=2 -Wno-unused-parameter
+WARNINGS = -Wall -Wextra -Wpedantic -Wformat=2 -Wstrict-aliasing=3 -Wno-strict-overflow -Wno-stack-usage \
+	-Wno-float-equal -Wno-format-nonliteral -Wcast-align -Wpointer-arith -Wchar-subscripts -Warray-bounds=2 -Wno-unused-parameter \
+	-Wno-stringop-overflow -Wno-maybe-uninitialized -Wno-override-init -Wno-unused-function -Wno-unused-const-variable \
+	-Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-result -Wno-sign-compare -Wno-type-limits \
+	-Wno-format-truncation -Wno-array-bounds -Wno-comment
 
 OPTFLAGS ?= -g -O2
 CFLAGS ?= $(OPTFLAGS) $(WARNINGS)
@@ -2265,7 +2268,8 @@ DYNARMIC_LIBS = \
 endif
 
 $(DYNARMIC_LIB): $(DYNARMIC_SOURCES) $(DYNARMIC_DIR)/CMakeLists.txt
-	$(CMAKE) -B $(DYNARMIC_BUILD) -S $(DYNARMIC_DIR) \
+	$(CMAKE) -Wno-dev -DCMAKE_WARN_DEPRECATED=OFF \
+	    -B $(DYNARMIC_BUILD) -S $(DYNARMIC_DIR) \
 	    -DDYNARMIC_WARNINGS_AS_ERRORS=OFF \
 	    -DDYNARMIC_TESTS=OFF \
 	    -DCMAKE_BUILD_TYPE=Release \
@@ -3496,7 +3500,7 @@ else
 DIST_OS      ?= linux
 endif
 # The archive is named for the day it was made, the system and the CPU:
-# lunaria-YYYY-MM-DD-linux-x86_64.tar.gz (macos .dmg, windows .zip).
+# lunaria-YYYY-MM-DD-linux-x86_64.tar.gz (macos .tar.gz, windows .zip).
 # What it was built from is in the app's Info.plist and in git.
 DIST_DATE    ?= $(shell date +%Y-%m-%d)
 DIST_NAME     = lunaria-$(DIST_DATE)-$(DIST_OS)-$(DIST_ARCH)
@@ -3576,8 +3580,8 @@ syslib-for-dist:
 	    $(MAKE) syslib-core; \
 	}
 
-# The archive, next to the sources, ready to upload.  On macOS that is the
-# disk image: the .app bundle inside it launches without arguments and asks
+# The archive, next to the sources, ready to upload.  On macOS that is a
+# tarball containing the .app bundle, which launches without arguments and asks
 # which application to open.
 ifeq ($(DIST_OS),macos)
 dist: dist-mac
@@ -3622,18 +3626,9 @@ dist-mac: dist-stage
 	# and Resources and macOS refuses it as damaged.
 	codesign --force --deep --sign - "$(MAC_APP)"
 	codesign --verify --deep --strict "$(MAC_APP)"
-	# A folder with the app and a link to /Applications: drag to install.
-	rm -rf "$(BUILD_DIR)/dist/dmg"
-	mkdir -p "$(BUILD_DIR)/dist/dmg"
-	cp -R "$(MAC_APP)" "$(BUILD_DIR)/dist/dmg/"
-	ln -s /Applications "$(BUILD_DIR)/dist/dmg/Applications"
-	# The disk image's own icon, the same moon.
-	cp "$(MAC_APP)/Contents/Resources/Lunaria.icns" "$(BUILD_DIR)/dist/dmg/.VolumeIcon.icns"
-	-SetFile -a C "$(BUILD_DIR)/dist/dmg"
-	rm -f "$(CURDIR)/$(DIST_NAME).dmg"
-	hdiutil create -volname Lunaria -srcfolder "$(BUILD_DIR)/dist/dmg" -ov -format UDZO \
-	    "$(CURDIR)/$(DIST_NAME).dmg"
-	@echo "$(DIST_NAME).dmg"
+	rm -f "$(CURDIR)/$(DIST_NAME).tar.gz"
+	cd "$(dir $(MAC_APP))" && COPYFILE_DISABLE=1 tar czf "$(CURDIR)/$(DIST_NAME).tar.gz" "$(notdir $(MAC_APP))"
+	@echo "$(DIST_NAME).tar.gz"
 
 dist-clean:
 	$(RM) -r "$(BUILD_DIR)/dist"

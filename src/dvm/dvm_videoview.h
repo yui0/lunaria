@@ -78,7 +78,7 @@ enum { VV_ERROR=-1, VV_IDLE, VV_PREPARING, VV_PREPARED, VV_PLAYING,
 static void vv_ref(struct dvm *vm,dvm_ref view,const char *field,
                    const char *type,dvm_ref value)
 {
-  (void)dvm_set_field(vm,view,field,type,(union dvm_value) {
+  (void)(dvm_set_field)(vm,view,field,type,(union dvm_value) {
     .l=value
   });
 }
@@ -445,13 +445,13 @@ static bool vv_callback(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     }
     if (!strcmp(name,"onPrepared")) {
       rt_set_int(vm,view,"mCurrentState",VV_PREPARED);
-      (void)dvm_set_field(vm,view,"mCanPause","Z",(union dvm_value) {
+      (void)(dvm_set_field)(vm,view,"mCanPause","Z",(union dvm_value) {
         .i=1
       });
-      (void)dvm_set_field(vm,view,"mCanSeekBack","Z",(union dvm_value) {
+      (void)(dvm_set_field)(vm,view,"mCanSeekBack","Z",(union dvm_value) {
         .i=1
       });
-      (void)dvm_set_field(vm,view,"mCanSeekForward","Z",(union dvm_value) {
+      (void)(dvm_set_field)(vm,view,"mCanSeekForward","Z",(union dvm_value) {
         .i=1
       });
       if (!vv_listener(vm,view,"mOnPreparedListener","Landroid/media/MediaPlayer$OnPreparedListener;",

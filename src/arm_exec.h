@@ -991,6 +991,10 @@ int arm_exec_link_library(const char *path);
 /* The theme an Activity class starts with (its manifest android:theme, else
  * the application's), and whether a theme makes a floating window. */
 uint32_t arm_exec_activity_theme(const char *cls);
+/* The orientation (ActivityInfo.SCREEN_ORIENTATION_*) an Activity's manifest entry asks for; -1 when none. */
+int arm_exec_activity_orientation(const char *cls);
+/* An Activity that starts with a fixed orientation turns the display, as the window manager does. */
+void lunaria_activity_apply_orientation(int orientation);
 int arm_exec_theme_is_floating(uint32_t theme);
 
 /* java.lang.System.load(filename): map the absolute path through the guest

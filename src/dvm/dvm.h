@@ -275,9 +275,9 @@ int dvm_android_bitmap_unlock(uint32_t host, const uint8_t *bytes, uint32_t n);
 
 /* --- fields (for the JNI bridge) ---------------------------------------- */
 
-bool dvm_get_field(struct dvm *vm, dvm_ref obj, const char *name,
+bool (dvm_get_field)(struct dvm *vm, dvm_ref obj, const char *name,
                    const char *type, union dvm_value *out);
-bool dvm_set_field(struct dvm *vm, dvm_ref obj, const char *name,
+bool (dvm_set_field)(struct dvm *vm, dvm_ref obj, const char *name,
                    const char *type, union dvm_value val);
 bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
                     const char *type, union dvm_value *out);

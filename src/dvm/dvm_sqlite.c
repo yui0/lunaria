@@ -373,7 +373,7 @@ dvm_ref dvm_sqlite_open(struct dvm *vm, const char *path, int flags)
     return 0;
   }
   host_data_set(vm, obj, d, db_destroy);
-  (void)dvm_set_field(vm, obj, "path", "Ljava/lang/String;",
+  (void)(dvm_set_field)(vm, obj, "path", "Ljava/lang/String;",
   (union dvm_value) {
     .l = dvm_new_string(vm, memory ? ":memory:" : guest)
   });
@@ -595,7 +595,7 @@ static dvm_ref cursor_wrap(struct dvm *vm, struct sq_cursor *data)
     return 0;
   }
   host_data_set(vm, obj, data, cursor_destroy);
-  (void)dvm_set_field(vm, obj, "position", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, obj, "position", "I", (union dvm_value) {
     .i = -1
   });
   return obj;
@@ -691,7 +691,7 @@ static struct sq_cell *cursor_cell(struct dvm *vm, dvm_ref self, int column)
 {
   struct sq_cursor *c = cursor_of(vm, self);
   union dvm_value pos = { 0 };
-  (void)dvm_get_field(vm, self, "position", "I", &pos);
+  (void)(dvm_get_field)(vm, self, "position", "I", &pos);
   const int rows = c ? c->nrows : 0;
   if (pos.i < 0 || pos.i >= rows) {
     dvm__throw(vm, "android/database/CursorIndexOutOfBoundsException",
@@ -801,7 +801,7 @@ static bool cur_move_to(struct dvm *vm, dvm_ref self, int position, union dvm_va
   const int rows = c ? c->nrows : 0;
   if (position < -1) position = -1;
   if (position > rows) position = rows;
-  (void)dvm_set_field(vm, self, "position", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "position", "I", (union dvm_value) {
     .i = position
   });
   RETI(position >= 0 && position < rows);
@@ -810,7 +810,7 @@ static bool cur_move_to(struct dvm *vm, dvm_ref self, int position, union dvm_va
 static int cur_pos(struct dvm *vm, dvm_ref self)
 {
   union dvm_value p = { 0 };
-  (void)dvm_get_field(vm, self, "position", "I", &p);
+  (void)(dvm_get_field)(vm, self, "position", "I", &p);
   return p.i;
 }
 
@@ -1073,10 +1073,10 @@ static bool cur_close(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)out;
   cursor_data_free(cursor_of(vm, self));
   host_data_set(vm, self, NULL, NULL);
-  (void)dvm_set_field(vm, self, "closed", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "closed", "Z", (union dvm_value) {
     .i = 1
   });
-  (void)dvm_set_field(vm, self, "position", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "position", "I", (union dvm_value) {
     .i = -1
   });
   RETV();
@@ -1088,7 +1088,7 @@ static bool cur_is_closed(struct dvm *vm, dvm_ref self, const union dvm_value *a
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "closed", "Z", &v);
+  (void)(dvm_get_field)(vm, self, "closed", "Z", &v);
   RETI(v.i);
 }
 
@@ -1431,7 +1431,7 @@ static bool matrix_init(struct dvm *vm, dvm_ref self, const union dvm_value *arg
     return false;
   }
   host_data_set(vm, self, c, cursor_destroy);
-  (void)dvm_set_field(vm, self, "position", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "position", "I", (union dvm_value) {
     .i = -1
   });
   RETV();
@@ -2000,10 +2000,10 @@ static bool db_raw_query(struct dvm *vm, dvm_ref self, const union dvm_value *ar
       RETL(0);
     }
     dvm_pin(vm, q);
-    (void)dvm_set_field(vm, q, "database", "Landroid/database/sqlite/SQLiteDatabase;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, q, "database", "Landroid/database/sqlite/SQLiteDatabase;", (union dvm_value) {
       .l = self
     });
-    (void)dvm_set_field(vm, q, "sql", "Ljava/lang/String;", ARG(1));
+    (void)(dvm_set_field)(vm, q, "sql", "Ljava/lang/String;", ARG(1));
     host_data_set(vm, q, b, binds_destroy);   /* the query owns its arguments now */
     struct dvm_class *fc = dvm_object_class(vm, ARG(0).l);
     struct dvm_method *nc = fc ? dvm_find_method(vm, fc, "newCursor",
@@ -2376,7 +2376,7 @@ static bool db_get_path(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   (void)args;
   (void)nargs;
   union dvm_value p = { 0 };
-  (void)dvm_get_field(vm, self, "path", "Ljava/lang/String;", &p);
+  (void)(dvm_get_field)(vm, self, "path", "Ljava/lang/String;", &p);
   RETL(p.l);
 }
 
@@ -2513,7 +2513,7 @@ static bool db_attached(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   dvm_ref pair = pc ? dvm_new_object(vm, pc) : 0;
   if (!list || !pair) RETL(list);
   union dvm_value ignored = { 0 }, path = { 0 };
-  (void)dvm_get_field(vm, self, "path", "Ljava/lang/String;", &path);
+  (void)(dvm_get_field)(vm, self, "path", "Ljava/lang/String;", &path);
   struct dvm_method *init = dvm_find_method(vm, lc, "<init>", "()V");
   if (init && !dvm_call(vm, init, list, NULL, 0, &ignored)) return false;
   union dvm_value kv[2] = { { .l = dvm_new_string(vm, "main") }, { .l = path.l } };
@@ -2536,11 +2536,11 @@ static bool db_compile(struct dvm *vm, dvm_ref self, const union dvm_value *args
   struct dvm_class *c = dvm__class_by_desc(vm, STMT_DESC);
   dvm_ref st = c ? dvm_new_object(vm, c) : 0;
   if (!st) RETL(0);
-  (void)dvm_set_field(vm, st, "database", "Landroid/database/sqlite/SQLiteDatabase;",
+  (void)(dvm_set_field)(vm, st, "database", "Landroid/database/sqlite/SQLiteDatabase;",
   (union dvm_value) {
     .l = self
   });
-  (void)dvm_set_field(vm, st, "sql", "Ljava/lang/String;", ARG(0));
+  (void)(dvm_set_field)(vm, st, "sql", "Ljava/lang/String;", ARG(0));
   /* Compile once now so a bad statement fails here, as it does on a device. */
   sqlite3_stmt *probe = NULL;
   const char *sql = dvm_string_utf8(vm, ARG(0).l);
@@ -2598,7 +2598,7 @@ static bool db_open_or_create(struct dvm *vm, dvm_ref self, const union dvm_valu
   struct dvm_object *o = path ? dvm__obj(vm, path) : NULL;
   if (o && o->kind != DVM_OBJ_STRING) {        /* a File: its path field */
     union dvm_value p = { 0 };
-    (void)dvm_get_field(vm, path, "path", "Ljava/lang/String;", &p);
+    (void)(dvm_get_field)(vm, path, "path", "Ljava/lang/String;", &p);
     path = p.l;
   }
   const char *text;
@@ -2627,7 +2627,7 @@ static bool db_delete_database(struct dvm *vm, dvm_ref self, const union dvm_val
 {
   (void)self;
   union dvm_value p = { 0 };
-  if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &p);
+  if (ARG(0).l) (void)(dvm_get_field)(vm, ARG(0).l, "path", "Ljava/lang/String;", &p);
   RETI(dvm_sqlite_delete_files(p.l ? dvm_string_utf8(vm, p.l) : NULL));
 }
 
@@ -2643,7 +2643,7 @@ static dvm_ref open_params_make(struct dvm *vm, const char *desc, int flags)
 {
   struct dvm_class *c = dvm__class_by_desc(vm, desc);
   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
-  if (o) (void)dvm_set_field(vm, o, "flags", "I", (union dvm_value) {
+  if (o) (void)(dvm_set_field)(vm, o, "flags", "I", (union dvm_value) {
     .i = flags
   });
   return o;
@@ -2652,7 +2652,7 @@ static dvm_ref open_params_make(struct dvm *vm, const char *desc, int flags)
 static int open_params_flags(struct dvm *vm, dvm_ref o)
 {
   union dvm_value v = { .i = OPEN_CREATE_IF_NECESSARY };
-  if (o) (void)dvm_get_field(vm, o, "flags", "I", &v);
+  if (o) (void)(dvm_get_field)(vm, o, "flags", "I", &v);
   return v.i;
 }
 
@@ -2662,7 +2662,7 @@ static bool opb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)out;
   const int flags = nargs > 0 && ARG(0).l ? open_params_flags(vm, ARG(0).l)
                     : OPEN_CREATE_IF_NECESSARY;
-  (void)dvm_set_field(vm, self, "flags", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "flags", "I", (union dvm_value) {
     .i = flags
   });
   RETV();
@@ -2681,7 +2681,7 @@ static bool opb_set_flags(struct dvm *vm, dvm_ref self, const union dvm_value *a
                           int nargs, union dvm_value *out)
 {
   (void)nargs;
-  (void)dvm_set_field(vm, self, "flags", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "flags", "I", (union dvm_value) {
     .i = ARG(0).i
   });
   RETL(self);
@@ -2691,7 +2691,7 @@ static bool opb_add_flags(struct dvm *vm, dvm_ref self, const union dvm_value *a
                           int nargs, union dvm_value *out)
 {
   (void)nargs;
-  (void)dvm_set_field(vm, self, "flags", "I",
+  (void)(dvm_set_field)(vm, self, "flags", "I",
   (union dvm_value) {
     .i = open_params_flags(vm, self) | ARG(0).i
   });
@@ -2702,7 +2702,7 @@ static bool opb_remove_flags(struct dvm *vm, dvm_ref self, const union dvm_value
                              int nargs, union dvm_value *out)
 {
   (void)nargs;
-  (void)dvm_set_field(vm, self, "flags", "I",
+  (void)(dvm_set_field)(vm, self, "flags", "I",
   (union dvm_value) {
     .i = open_params_flags(vm, self) & ~ARG(0).i
   });
@@ -2733,7 +2733,7 @@ static bool db_open_with_params(struct dvm *vm, dvm_ref self, const union dvm_va
   (void)self;
   (void)nargs;
   union dvm_value p = { 0 };
-  if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &p);
+  if (ARG(0).l) (void)(dvm_get_field)(vm, ARG(0).l, "path", "Ljava/lang/String;", &p);
   const char *path;
   if (!sq_str(vm, p.l, &path)) {
     dvm__throw(vm, "java/lang/IllegalArgumentException", "path must not be null");
@@ -3002,8 +3002,8 @@ static bool stmt_prepare(struct dvm *vm, dvm_ref self, struct sq_db **dbp,
                          sqlite3_stmt **stp, const char **sqlp)
 {
   union dvm_value db = { 0 }, sql = { 0 };
-  (void)dvm_get_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
-  (void)dvm_get_field(vm, self, "sql", "Ljava/lang/String;", &sql);
+  (void)(dvm_get_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
+  (void)(dvm_get_field)(vm, self, "sql", "Ljava/lang/String;", &sql);
   struct sq_db *d = db.l ? db_of(vm, db.l) : NULL;
   if (!d) return false;
   const char *text = sql.l ? dvm_string_utf8(vm, sql.l) : "";
@@ -3157,15 +3157,15 @@ static bool sqcur_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
     dvm__throw(vm, "java/lang/NullPointerException", "query");
     return false;
   }
-  (void)dvm_get_field(vm, q, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
-  (void)dvm_get_field(vm, q, "sql", "Ljava/lang/String;", &sql);
+  (void)(dvm_get_field)(vm, q, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
+  (void)(dvm_get_field)(vm, q, "sql", "Ljava/lang/String;", &sql);
   struct sq_db *d = db.l ? db_of(vm, db.l) : NULL;
   const char *text;
   if (!d || !sq_str(vm, sql.l, &text)) return false;
   struct sq_cursor *c = sq_query_data(vm, d, text, host_data(vm, q));
   if (!c) return false;
   host_data_set(vm, self, c, cursor_destroy);
-  (void)dvm_set_field(vm, self, "position", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "position", "I", (union dvm_value) {
     .i = -1
   });
   return true;
@@ -3213,13 +3213,13 @@ static bool helper_init(struct dvm *vm, dvm_ref self, const union dvm_value *arg
 {
   (void)out;
   /* (Context, name, factory, version[, errorHandler]) */
-  (void)dvm_set_field(vm, self, "name", "Ljava/lang/String;", ARG(1));
+  (void)(dvm_set_field)(vm, self, "name", "Ljava/lang/String;", ARG(1));
   const int version = ARG(3).i;
   if (version < 1) {
     dvm__throw(vm, "java/lang/IllegalArgumentException", "Version must be >= 1, was %d", version);
     return false;
   }
-  (void)dvm_set_field(vm, self, "version", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "version", "I", (union dvm_value) {
     .i = version
   });
   return true;
@@ -3231,7 +3231,7 @@ static bool helper_name(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   (void)args;
   (void)nargs;
   union dvm_value n = { 0 };
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &n);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &n);
   RETL(n.l);
 }
 
@@ -3252,21 +3252,21 @@ static bool helper_database(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)args;
   (void)nargs;
   union dvm_value cached = { 0 };
-  (void)dvm_get_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &cached);
+  (void)(dvm_get_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &cached);
   if (cached.l) {
     union dvm_value open = { 0 };
     if (db_is_open(vm, cached.l, NULL, 0, &open) && open.i) RETL(cached.l);
   }
   union dvm_value name = { 0 }, version = { 0 }, wal = { 0 };
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &name);
-  (void)dvm_get_field(vm, self, "version", "I", &version);
-  (void)dvm_get_field(vm, self, "wal", "Z", &wal);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &name);
+  (void)(dvm_get_field)(vm, self, "version", "I", &version);
+  (void)(dvm_get_field)(vm, self, "wal", "Z", &wal);
   const char *dbname = name.l ? dvm_string_utf8(vm, name.l) : NULL;
   char path[1024];
   dvm_sqlite_database_path(dbname, path, sizeof path);
   dvm_ref db = dvm_sqlite_open(vm, path, 0x10000000 | (wal.i ? 0x20000000 : 0));
   if (!db) return false;
-  (void)dvm_set_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;",
+  (void)(dvm_set_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;",
   (union dvm_value) {
     .l = db
   });
@@ -3309,7 +3309,7 @@ fail:
     dvm_ref pending = vm->exception;
     vm->exception = 0;
     db_close(vm, db, NULL, 0, out);
-    (void)dvm_set_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;",
+    (void)(dvm_set_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;",
     (union dvm_value) {
       .l = 0
     });
@@ -3322,11 +3322,11 @@ static bool helper_set_wal(struct dvm *vm, dvm_ref self, const union dvm_value *
                            int nargs, union dvm_value *out)
 {
   (void)out;
-  (void)dvm_set_field(vm, self, "wal", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "wal", "Z", (union dvm_value) {
     .i = ARG(0).i
   });
   union dvm_value db = { 0 };
-  (void)dvm_get_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
+  (void)(dvm_get_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
   union dvm_value open = { 0 };
   if (db.l && db_is_open(vm, db.l, NULL, 0, &open) && open.i)
     return ARG(0).i ? db_enable_wal(vm, db.l, NULL, 0, &open)
@@ -3340,8 +3340,8 @@ static bool helper_close(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)args;
   (void)nargs;
   union dvm_value db = { 0 };
-  (void)dvm_get_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
-  (void)dvm_set_field(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;",
+  (void)(dvm_get_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;", &db);
+  (void)(dvm_set_field)(vm, self, "database", "Landroid/database/sqlite/SQLiteDatabase;",
   (union dvm_value) {
     .l = 0
   });

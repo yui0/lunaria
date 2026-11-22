@@ -22,7 +22,7 @@ static const char *const rt_basic_params_iface[]= {"Ljava/io/Serializable;","Lja
 static dvm_ref http_params_field(struct dvm *vm,dvm_ref self,const char *name,const char *type)
 {
   union dvm_value value= {0};
-  dvm_get_field(vm,self,name,type,&value);
+  (dvm_get_field)(vm,self,name,type,&value);
   return value.l;
 }
 static bool http_params_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -30,7 +30,7 @@ static bool http_params_init(struct dvm *vm,dvm_ref self,const union dvm_value *
   (void)args;
   (void)nargs;
   (void)out;
-  dvm_set_field(vm,self,"parameters","Ljava/util/HashMap;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"parameters","Ljava/util/HashMap;",(union dvm_value) {
     0
   });
   RETV();
@@ -48,7 +48,7 @@ static bool http_params_set(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(!map) {
     map=dvm_new_object(vm,dvm_find_class(vm,"java/util/HashMap"));
     if(!map || !map_init(vm,map,NULL,0,&ignored))return false;
-    dvm_set_field(vm,self,"parameters","Ljava/util/HashMap;",(union dvm_value) {
+    (dvm_set_field)(vm,self,"parameters","Ljava/util/HashMap;",(union dvm_value) {
       .l=map
     });
   }
@@ -69,7 +69,7 @@ static bool http_params_clear(struct dvm *vm,dvm_ref self,const union dvm_value 
   (void)args;
   (void)nargs;
   (void)out;
-  dvm_set_field(vm,self,"parameters","Ljava/util/HashMap;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"parameters","Ljava/util/HashMap;",(union dvm_value) {
     0
   });
   RETV();
@@ -164,7 +164,7 @@ static bool http_params_copy(struct dvm *vm,dvm_ref self,const union dvm_value *
    * source's lazy HashMap is shallowly shared. copy() starts with a new map. */
   if(!strcmp(builtin_name(),"clone")) {
     dvm_ref map=http_params_field(vm,self,"parameters","Ljava/util/HashMap;");
-    dvm_set_field(vm,copy,"parameters","Ljava/util/HashMap;",(union dvm_value) {
+    (dvm_set_field)(vm,copy,"parameters","Ljava/util/HashMap;",(union dvm_value) {
       .l=map
     });
   }
@@ -180,8 +180,8 @@ static bool http_defaulted_init(struct dvm *vm,dvm_ref self,const union dvm_valu
     dvm__throw(vm,"java/lang/IllegalArgumentException","HTTP parameters may not be null");
     return false;
   }
-  dvm_set_field(vm,self,"local","Lorg/apache/http/params/HttpParams;",ARG(0));
-  dvm_set_field(vm,self,"defaults","Lorg/apache/http/params/HttpParams;",ARG(1));
+  (dvm_set_field)(vm,self,"local","Lorg/apache/http/params/HttpParams;",ARG(0));
+  (dvm_set_field)(vm,self,"defaults","Lorg/apache/http/params/HttpParams;",ARG(1));
   RETV();
 }
 static bool http_defaulted_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -306,15 +306,15 @@ static bool http_pair_init(struct dvm *vm,dvm_ref self,const union dvm_value *ar
     dvm__throw(vm,"java/lang/IllegalArgumentException","Name may not be null");
     return false;
   }
-  dvm_set_field(vm,self,"name","Ljava/lang/String;",ARG(0));
-  dvm_set_field(vm,self,"value","Ljava/lang/String;",ARG(1));
+  (dvm_set_field)(vm,self,"name","Ljava/lang/String;",ARG(0));
+  (dvm_set_field)(vm,self,"value","Ljava/lang/String;",ARG(1));
   RETV();
 }
 static bool http_pair_get(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm,self,!strcmp(builtin_name(),"getName") ? "name" : "value","Ljava/lang/String;",out);
+  return (dvm_get_field)(vm,self,!strcmp(builtin_name(),"getName") ? "name" : "value","Ljava/lang/String;",out);
 }
 static bool http_pair_text(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -398,7 +398,7 @@ static bool http_entity_header_get(struct dvm *vm,dvm_ref self,const union dvm_v
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm,self,!strcmp(builtin_name(),"getContentType") ? "contentType" : "contentEncoding","Lorg/apache/http/Header;",out);
+  return (dvm_get_field)(vm,self,!strcmp(builtin_name(),"getContentType") ? "contentType" : "contentEncoding","Lorg/apache/http/Header;",out);
 }
 static bool http_entity_header_set(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -411,23 +411,23 @@ static bool http_entity_header_set(struct dvm *vm,dvm_ref self,const union dvm_v
     if(ARG(0).l && !header.l)return false;
     return am_vcall(vm,self,method,"(Lorg/apache/http/Header;)V",&header,1,&ignored);
   }
-  dvm_set_field(vm,self,type ? "contentType" : "contentEncoding","Lorg/apache/http/Header;",ARG(0));
+  (dvm_set_field)(vm,self,type ? "contentType" : "contentEncoding","Lorg/apache/http/Header;",ARG(0));
   RETV();
 }
 static bool http_entity_chunked(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(nargs) {
-    dvm_set_field(vm,self,"chunked","Z",ARG(0));
+    (dvm_set_field)(vm,self,"chunked","Z",ARG(0));
     RETV();
   }
-  return dvm_get_field(vm,self,"chunked","Z",out);
+  return (dvm_get_field)(vm,self,"chunked","Z",out);
 }
 static bool http_entity_basic_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)args;
   (void)nargs;
   (void)out;
-  dvm_set_field(vm,self,"length","J",(union dvm_value) {
+  (dvm_set_field)(vm,self,"length","J",(union dvm_value) {
     .j=-1
   });
   RETV();
@@ -440,7 +440,7 @@ static bool http_entity_byte_init(struct dvm *vm,dvm_ref self,const union dvm_va
     dvm__throw(vm,"java/lang/IllegalArgumentException","Source byte array may not be null");
     return false;
   }
-  dvm_set_field(vm,self,"content","[B",ARG(0));
+  (dvm_set_field)(vm,self,"content","[B",ARG(0));
   RETV();
 }
 static bool http_entity_string_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -465,7 +465,7 @@ static bool http_entity_string_init(struct dvm *vm,dvm_ref self,const union dvm_
   if(array && count)memcpy(dvm_array_data(vm,array),bytes,count);
   free(bytes);
   if(!array)return false;
-  dvm_set_field(vm,self,"content","[B",(union dvm_value) {
+  (dvm_set_field)(vm,self,"content","[B",(union dvm_value) {
     .l=array
   });
   struct rt_bytes type= {0};
@@ -492,13 +492,13 @@ static bool http_entity_length(struct dvm *vm,dvm_ref self,const union dvm_value
     dvm_ref array=http_params_field(vm,self,"content","[B");
     RETJ(dvm_array_length(vm,array));
   }
-  return dvm_get_field(vm,self,"length","J",out);
+  return (dvm_get_field)(vm,self,"length","J",out);
 }
 static bool http_entity_set_length(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)nargs;
   (void)out;
-  dvm_set_field(vm,self,"length","J",ARG(0));
+  (dvm_set_field)(vm,self,"length","J",ARG(0));
   RETV();
 }
 static bool http_entity_get_content(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -513,12 +513,12 @@ static bool http_entity_get_content(struct dvm *vm,dvm_ref self,const union dvm_
   }
   dvm_ref content=http_params_field(vm,self,"content","Ljava/io/InputStream;");
   union dvm_value obtained= {0};
-  dvm_get_field(vm,self,"contentObtained","Z",&obtained);
+  (dvm_get_field)(vm,self,"contentObtained","Z",&obtained);
   if(!content || obtained.i) {
     dvm__throw(vm,"java/lang/IllegalStateException",!content ? "Content has not been provided" : "Content has been consumed");
     return false;
   }
-  dvm_set_field(vm,self,"contentObtained","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"contentObtained","Z",(union dvm_value) {
     .i=1
   });
   RETL(content);
@@ -527,8 +527,8 @@ static bool http_entity_set_content(struct dvm *vm,dvm_ref self,const union dvm_
 {
   (void)nargs;
   (void)out;
-  dvm_set_field(vm,self,"content","Ljava/io/InputStream;",ARG(0));
-  dvm_set_field(vm,self,"contentObtained","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"content","Ljava/io/InputStream;",ARG(0));
+  (dvm_set_field)(vm,self,"contentObtained","Z",(union dvm_value) {
     0
   });
   RETV();
@@ -545,7 +545,7 @@ static bool http_entity_streaming(struct dvm *vm,dvm_ref self,const union dvm_va
   (void)nargs;
   if(http_entity_buffered(vm,self))RETI(0);
   union dvm_value obtained= {0};
-  dvm_get_field(vm,self,"contentObtained","Z",&obtained);
+  (dvm_get_field)(vm,self,"contentObtained","Z",&obtained);
   RETI(!obtained.i && http_params_field(vm,self,"content","Ljava/io/InputStream;")!=0);
 }
 static bool http_entity_write(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -606,7 +606,7 @@ static bool http_form_encode_piece(struct dvm *vm,dvm_ref value,dvm_ref encoding
   if(object_is_a(vm,failure,"java/io/UnsupportedEncodingException")) {
     dvm_clear_exception(vm);
     dvm__throw(vm,"java/lang/IllegalArgumentException","Unsupported form encoding");
-    dvm_set_field(vm,dvm_exception(vm),"cause","Ljava/lang/Throwable;",(union dvm_value) {
+    (dvm_set_field)(vm,dvm_exception(vm),"cause","Ljava/lang/Throwable;",(union dvm_value) {
       .l=failure
     });
   }
@@ -724,11 +724,11 @@ static bool http_version_init(struct dvm *vm,dvm_ref self,const union dvm_value 
     dvm__throw(vm,"java/lang/IllegalArgumentException","Invalid protocol version");
     return false;
   }
-  dvm_set_field(vm,self,"protocol","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"protocol","Ljava/lang/String;",(union dvm_value) {
     .l=protocol
   });
-  dvm_set_field(vm,self,"major","I",ARG(index));
-  dvm_set_field(vm,self,"minor","I",ARG(index+1));
+  (dvm_set_field)(vm,self,"major","I",ARG(index));
+  (dvm_set_field)(vm,self,"minor","I",ARG(index+1));
   RETV();
 }
 static dvm_ref http_version_new(struct dvm *vm,int major,int minor)
@@ -742,15 +742,15 @@ static bool http_version_get(struct dvm *vm,dvm_ref self,const union dvm_value *
   (void)args;
   (void)nargs;
   const char *name=builtin_name();
-  return dvm_get_field(vm,self,!strcmp(name,"getProtocol") ? "protocol" : !strcmp(name,"getMajor") ? "major" : "minor",!strcmp(name,"getProtocol") ? "Ljava/lang/String;" : "I",out);
+  return (dvm_get_field)(vm,self,!strcmp(name,"getProtocol") ? "protocol" : !strcmp(name,"getMajor") ? "major" : "minor",!strcmp(name,"getProtocol") ? "Ljava/lang/String;" : "I",out);
 }
 static bool http_version_text(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)args;
   (void)nargs;
   union dvm_value major= {0},minor= {0};
-  dvm_get_field(vm,self,"major","I",&major);
-  dvm_get_field(vm,self,"minor","I",&minor);
+  (dvm_get_field)(vm,self,"major","I",&major);
+  (dvm_get_field)(vm,self,"minor","I",&minor);
   dvm_ref protocol=http_params_field(vm,self,"protocol","Ljava/lang/String;");
   size_t length=0;
   const char *text=sdata(vm,protocol,&length);
@@ -777,14 +777,14 @@ static bool http_line_init(struct dvm *vm,dvm_ref self,const union dvm_value *ar
     return false;
   }
   if(status) {
-    dvm_set_field(vm,self,"version","Lorg/apache/http/ProtocolVersion;",ARG(0));
-    dvm_set_field(vm,self,"statusCode","I",ARG(1));
-    dvm_set_field(vm,self,"reasonPhrase","Ljava/lang/String;",ARG(2));
+    (dvm_set_field)(vm,self,"version","Lorg/apache/http/ProtocolVersion;",ARG(0));
+    (dvm_set_field)(vm,self,"statusCode","I",ARG(1));
+    (dvm_set_field)(vm,self,"reasonPhrase","Ljava/lang/String;",ARG(2));
   }
   else {
-    dvm_set_field(vm,self,"method","Ljava/lang/String;",ARG(0));
-    dvm_set_field(vm,self,"uri","Ljava/lang/String;",ARG(1));
-    dvm_set_field(vm,self,"version","Lorg/apache/http/ProtocolVersion;",ARG(2));
+    (dvm_set_field)(vm,self,"method","Ljava/lang/String;",ARG(0));
+    (dvm_set_field)(vm,self,"uri","Ljava/lang/String;",ARG(1));
+    (dvm_set_field)(vm,self,"version","Lorg/apache/http/ProtocolVersion;",ARG(2));
   }
   RETV();
 }
@@ -793,9 +793,9 @@ static bool http_line_get(struct dvm *vm,dvm_ref self,const union dvm_value *arg
   (void)args;
   (void)nargs;
   const char *name=builtin_name();
-  if(!strcmp(name,"getProtocolVersion"))return dvm_get_field(vm,self,"version","Lorg/apache/http/ProtocolVersion;",out);
-  if(!strcmp(name,"getStatusCode"))return dvm_get_field(vm,self,"statusCode","I",out);
-  return dvm_get_field(vm,self,!strcmp(name,"getMethod") ? "method" : !strcmp(name,"getUri") ? "uri" : "reasonPhrase","Ljava/lang/String;",out);
+  if(!strcmp(name,"getProtocolVersion"))return (dvm_get_field)(vm,self,"version","Lorg/apache/http/ProtocolVersion;",out);
+  if(!strcmp(name,"getStatusCode"))return (dvm_get_field)(vm,self,"statusCode","I",out);
+  return (dvm_get_field)(vm,self,!strcmp(name,"getMethod") ? "method" : !strcmp(name,"getUri") ? "uri" : "reasonPhrase","Ljava/lang/String;",out);
 }
 static bool http_line_text(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -811,7 +811,7 @@ static bool http_line_text(struct dvm *vm,dvm_ref self,const union dvm_value *ar
   if(object_is_a(vm,self,"org/apache/http/StatusLine")) {
     text=sdata(vm,r.l,&length);
     union dvm_value code= {0};
-    dvm_get_field(vm,self,"statusCode","I",&code);
+    (dvm_get_field)(vm,self,"statusCode","I",&code);
     good=bytes_append(&result,text,length) && bytes_printf(&result," %d ",code.i);
     dvm_ref reason=http_params_field(vm,self,"reasonPhrase","Ljava/lang/String;");
     if(reason) {
@@ -843,7 +843,7 @@ static dvm_ref http_message_headers(struct dvm *vm,dvm_ref self)
   dvm_ref list=http_params_field(vm,self,"headers","Ljava/util/ArrayList;");
   if(!list) {
     list=coll_new_list(vm,"Ljava/util/ArrayList;");
-    if(list)dvm_set_field(vm,self,"headers","Ljava/util/ArrayList;",(union dvm_value) {
+    if(list)(dvm_set_field)(vm,self,"headers","Ljava/util/ArrayList;",(union dvm_value) {
       .l=list
     });
   }
@@ -856,13 +856,13 @@ static bool http_message_params(struct dvm *vm,dvm_ref self,const union dvm_valu
       dvm__throw(vm,"java/lang/IllegalArgumentException","HTTP parameters may not be null");
       return false;
     }
-    dvm_set_field(vm,self,"params","Lorg/apache/http/params/HttpParams;",ARG(0));
+    (dvm_set_field)(vm,self,"params","Lorg/apache/http/params/HttpParams;",ARG(0));
     RETV();
   }
   dvm_ref params=http_params_field(vm,self,"params","Lorg/apache/http/params/HttpParams;");
   if(!params) {
     params=dvm_new_object(vm,dvm_find_class(vm,"org/apache/http/params/BasicHttpParams"));
-    if(params)dvm_set_field(vm,self,"params","Lorg/apache/http/params/HttpParams;",(union dvm_value) {
+    if(params)(dvm_set_field)(vm,self,"params","Lorg/apache/http/params/HttpParams;",(union dvm_value) {
       .l=params
     });
   }
@@ -959,10 +959,10 @@ static const struct rt_field rt_http_response_fields[]= {
 static bool http_message_entity(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(nargs) {
-    dvm_set_field(vm,self,"entity","Lorg/apache/http/HttpEntity;",ARG(0));
+    (dvm_set_field)(vm,self,"entity","Lorg/apache/http/HttpEntity;",ARG(0));
     RETV();
   }
-  return dvm_get_field(vm,self,"entity","Lorg/apache/http/HttpEntity;",out);
+  return (dvm_get_field)(vm,self,"entity","Lorg/apache/http/HttpEntity;",out);
 }
 static bool http_request_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -972,17 +972,17 @@ static bool http_request_init(struct dvm *vm,dvm_ref self,const union dvm_value 
     if(strstr(builtin_sig(),"Ljava/lang/String;")) {
       if(!juri_create(vm,0,args,1,&uri))return false;
     }
-    dvm_set_field(vm,self,"uri","Ljava/net/URI;",uri);
+    (dvm_set_field)(vm,self,"uri","Ljava/net/URI;",uri);
   }
   RETV();
 }
 static bool http_request_uri(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(nargs) {
-    dvm_set_field(vm,self,"uri","Ljava/net/URI;",ARG(0));
+    (dvm_set_field)(vm,self,"uri","Ljava/net/URI;",ARG(0));
     RETV();
   }
-  return dvm_get_field(vm,self,"uri","Ljava/net/URI;",out);
+  return (dvm_get_field)(vm,self,"uri","Ljava/net/URI;",out);
 }
 static bool http_request_method(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -1032,12 +1032,12 @@ static bool http_request_aborted(struct dvm *vm,dvm_ref self,const union dvm_val
   (void)args;
   (void)nargs;
   if(!strcmp(builtin_name(),"abort")) {
-    dvm_set_field(vm,self,"aborted","Z",(union dvm_value) {
+    (dvm_set_field)(vm,self,"aborted","Z",(union dvm_value) {
       .i=1
     });
     return http_client_abort_request(vm,self);
   }
-  return dvm_get_field(vm,self,"aborted","Z",out);
+  return (dvm_get_field)(vm,self,"aborted","Z",out);
 }
 static bool http_response_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -1053,7 +1053,7 @@ static bool http_response_init(struct dvm *vm,dvm_ref self,const union dvm_value
     dvm__throw(vm,"java/lang/IllegalArgumentException","Status line may not be null");
     return false;
   }
-  dvm_set_field(vm,self,"statusLine","Lorg/apache/http/StatusLine;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"statusLine","Lorg/apache/http/StatusLine;",(union dvm_value) {
     .l=line
   });
   RETV();
@@ -1061,7 +1061,7 @@ static bool http_response_init(struct dvm *vm,dvm_ref self,const union dvm_value
 static bool http_response_status(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(nargs)return http_response_init(vm,self,args,nargs,out);
-  return dvm_get_field(vm,self,"statusLine","Lorg/apache/http/StatusLine;",out);
+  return (dvm_get_field)(vm,self,"statusLine","Lorg/apache/http/StatusLine;",out);
 }
 static bool http_response_version(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {

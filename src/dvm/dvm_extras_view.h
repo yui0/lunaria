@@ -18,7 +18,7 @@
 /* A small helper for the many "store the value, answer it back" settings. */
 static bool x_flag_set(struct dvm *vm, dvm_ref self, const char *field, int32_t v)
 {
-  return dvm_set_field(vm, self, field, "Z", (union dvm_value) {
+  return (dvm_set_field)(vm, self, field, "Z", (union dvm_value) {
     .i = v != 0
   });
 }
@@ -54,8 +54,8 @@ static bool x_view_dispatchSave(struct dvm *vm, dvm_ref self, const union dvm_va
   (void)out;
   (void)nargs;
   union dvm_value id = { .i = -1 }, disabled = { 0 };
-  (void)dvm_get_field(vm, self, "id", "I", &id);
-  (void)dvm_get_field(vm, self, "saveDisabled", "Z", &disabled);
+  (void)(dvm_get_field)(vm, self, "id", "I", &id);
+  (void)(dvm_get_field)(vm, self, "saveDisabled", "Z", &disabled);
   if (id.i != -1 && !disabled.i && ARG(0).l) {
     union dvm_value state = { 0 }, ignored = { 0 };
     if (!am_vcall(vm, self, "onSaveInstanceState", "()Landroid/os/Parcelable;", NULL, 0, &state)) return false;
@@ -73,7 +73,7 @@ static bool x_view_dispatchRestore(struct dvm *vm, dvm_ref self, const union dvm
   (void)out;
   (void)nargs;
   union dvm_value id = { .i = -1 };
-  (void)dvm_get_field(vm, self, "id", "I", &id);
+  (void)(dvm_get_field)(vm, self, "id", "I", &id);
   if (id.i != -1 && ARG(0).l) {
     union dvm_value state = { 0 }, ignored = { 0 };
     if (!am_vcall(vm, ARG(0).l, "get", "(I)Ljava/lang/Object;", &id, 1, &state)) return false;
@@ -93,7 +93,7 @@ static bool x_group_dispatch_state(struct dvm *vm, dvm_ref self, const union dvm
   const uint32_t nk = ui_children(vm, self, kids, UI_MAX_KIDS);
   for (uint32_t i = 0; i < nk; ++i) {
     union dvm_value skip = { 0 }, ignored = { 0 };
-    (void)dvm_get_field(vm, kids[i], "saveFromParentDisabled", "Z", &skip);
+    (void)(dvm_get_field)(vm, kids[i], "saveFromParentDisabled", "Z", &skip);
     if (skip.i) continue;
     if (!am_vcall(vm, kids[i], builtin_name(), "(Landroid/util/SparseArray;)V", args, 1, &ignored)) return false;
   }
@@ -141,7 +141,7 @@ static bool x_saved_init(struct dvm *vm, dvm_ref self, const union dvm_value *ar
         read.l)
       super = read.l;
   }
-  (void)dvm_set_field(vm, self, "superState", "Landroid/os/Parcelable;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "superState", "Landroid/os/Parcelable;", (union dvm_value) {
     .l = super
   });
   RETV();
@@ -152,7 +152,7 @@ static bool x_saved_getSuperState(struct dvm *vm, dvm_ref self, const union dvm_
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm, self, "superState", "Landroid/os/Parcelable;", out);
+  return (dvm_get_field)(vm, self, "superState", "Landroid/os/Parcelable;", out);
 }
 
 static bool x_saved_writeToParcel(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -161,7 +161,7 @@ static bool x_saved_writeToParcel(struct dvm *vm, dvm_ref self, const union dvm_
   (void)nargs;
   (void)out;
   union dvm_value super = { 0 }, ignored = { 0 };
-  (void)dvm_get_field(vm, self, "superState", "Landroid/os/Parcelable;", &super);
+  (void)(dvm_get_field)(vm, self, "superState", "Landroid/os/Parcelable;", &super);
   if (ARG(0).l && dvm_find_method(vm, dvm_object_class(vm, ARG(0).l), "writeParcelable",
                                   "(Landroid/os/Parcelable;I)V")) {
     const union dvm_value w[2] = { super, ARG(1) };
@@ -329,9 +329,9 @@ static bool x_view_setLongClickListener(struct dvm *vm, dvm_ref self, const unio
 {
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "longClickListener", "Landroid/view/View$OnLongClickListener;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "longClickListener", "Landroid/view/View$OnLongClickListener;", ARG(0));
   /* Giving a view a long-click listener makes it long-clickable. */
-  if (ARG(0).l) (void)dvm_set_field(vm, self, "longClickable", "Z", (union dvm_value) {
+  if (ARG(0).l) (void)(dvm_set_field)(vm, self, "longClickable", "Z", (union dvm_value) {
     .i = 1
   });
   ui_invalidate();
@@ -343,7 +343,7 @@ static bool x_view_setLongClickable(struct dvm *vm, dvm_ref self, const union dv
 {
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "longClickable", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "longClickable", "Z", (union dvm_value) {
     .i = ARG(0).i != 0
   });
   RETV();
@@ -355,7 +355,7 @@ static bool x_view_isLongClickable(struct dvm *vm, dvm_ref self, const union dvm
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "longClickable", "Z", &v);
+  (void)(dvm_get_field)(vm, self, "longClickable", "Z", &v);
   RETI(v.i != 0);
 }
 
@@ -366,7 +366,7 @@ static bool x_view_performLongClick(struct dvm *vm, dvm_ref self, const union dv
   (void)args;
   (void)nargs;
   union dvm_value listener = { 0 }, handled = { 0 };
-  (void)dvm_get_field(vm, self, "longClickListener", "Landroid/view/View$OnLongClickListener;", &listener);
+  (void)(dvm_get_field)(vm, self, "longClickListener", "Landroid/view/View$OnLongClickListener;", &listener);
   if (listener.l) {
     const union dvm_value arg = { .l = self };
     if (!am_vcall(vm, listener.l, "onLongClick", "(Landroid/view/View;)Z", &arg, 1, &handled)) return false;
@@ -396,7 +396,7 @@ static bool x_view_setClipToOutline(struct dvm *vm, dvm_ref self, const union dv
 {
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "clipToOutline", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "clipToOutline", "Z", (union dvm_value) {
     .i = ARG(0).i != 0
   });
   ui_invalidate();
@@ -572,7 +572,7 @@ static bool x_gesture_timer_run(struct dvm *vm, dvm_ref self, const union dvm_va
   (void)nargs;
   (void)out;
   union dvm_value det = { 0 };
-  (void)dvm_get_field(vm, self, "detector", "Landroid/view/GestureDetector;", &det);
+  (void)(dvm_get_field)(vm, self, "detector", "Landroid/view/GestureDetector;", &det);
   struct x_gesture *g = det.l ? x_gesture_of(vm, det.l) : NULL;
   if (!g) RETV();
   const int kind = rt_get_int(vm, self, "kind");
@@ -610,7 +610,7 @@ static dvm_ref x_gesture_timer(struct dvm *vm, dvm_ref detector, int kind)
 {
   dvm_ref t = dvm_new_object(vm, dvm_find_class(vm, "lunaria/GestureTimer"));
   if (!t) return 0;
-  (void)dvm_set_field(vm, t, "detector", "Landroid/view/GestureDetector;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, t, "detector", "Landroid/view/GestureDetector;", (union dvm_value) {
     .l = detector
   });
   rt_set_int(vm, t, "kind", kind);
@@ -941,10 +941,10 @@ static const struct rt_method rt_x_simple_gesture_listener[] = {
 static dvm_ref x_if_list_for(struct dvm *vm, dvm_ref self, const char *field, bool create)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, field, "Ljava/util/List;", &v);
+  (void)(dvm_get_field)(vm, self, field, "Ljava/util/List;", &v);
   if (!v.l && create) {
     v.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, field, "Ljava/util/List;", v);
+    (void)(dvm_set_field)(vm, self, field, "Ljava/util/List;", v);
   }
   return v.l;
 }
@@ -963,7 +963,7 @@ static bool x_flag_bool(struct dvm *vm, dvm_ref self, const union dvm_value *arg
     RETV();
   }
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, field, "Z", &v);
+  (void)(dvm_get_field)(vm, self, field, "Z", &v);
   RETI(v.i != 0);
 }
 
@@ -981,7 +981,7 @@ static bool x_view_getForeground(struct dvm *vm, dvm_ref self, const union dvm_v
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm, self, "foreground", "Landroid/graphics/drawable/Drawable;", out);
+  return (dvm_get_field)(vm, self, "foreground", "Landroid/graphics/drawable/Drawable;", out);
 }
 
 /* The state of one View only, without its children: what a ViewGroup that saves
@@ -1007,8 +1007,8 @@ static bool x_apply_tint(struct dvm *vm, dvm_ref drawable, dvm_ref list, dvm_ref
 static bool x_view_apply_background_tint(struct dvm *vm, dvm_ref view)
 {
   union dvm_value list = { 0 }, mode = { 0 };
-  (void)dvm_get_field(vm, view, "bgTintList", "Landroid/content/res/ColorStateList;", &list);
-  (void)dvm_get_field(vm, view, "bgTintMode", "Landroid/graphics/PorterDuff$Mode;", &mode);
+  (void)(dvm_get_field)(vm, view, "bgTintList", "Landroid/content/res/ColorStateList;", &list);
+  (void)(dvm_get_field)(vm, view, "bgTintMode", "Landroid/graphics/PorterDuff$Mode;", &mode);
   if (!list.l && !mode.l) return true;
   return x_apply_tint(vm, ui_obj(vm, view, "background", "Landroid/graphics/drawable/Drawable;"), list.l, mode.l);
 }
@@ -1021,8 +1021,8 @@ static bool x_view_backgroundTint(struct dvm *vm, dvm_ref self, const union dvm_
   const bool mode = strstr(name, "Mode") != NULL;
   const char *field = mode ? "bgTintMode" : "bgTintList";
   const char *type = mode ? "Landroid/graphics/PorterDuff$Mode;" : "Landroid/content/res/ColorStateList;";
-  if (!strncmp(name, "get", 3)) return dvm_get_field(vm, self, field, type, out);
-  (void)dvm_set_field(vm, self, field, type, ARG(0));
+  if (!strncmp(name, "get", 3)) return (dvm_get_field)(vm, self, field, type, out);
+  (void)(dvm_set_field)(vm, self, field, type, ARG(0));
   if (!x_view_apply_background_tint(vm, self)) return false;
   ui_invalidate();
   RETV();
@@ -1047,13 +1047,13 @@ static bool x_image_tint_alpha(struct dvm *vm, dvm_ref self, const union dvm_val
     RETV();
   }
   if (!strcmp(name, "getImageAlpha")) RETI(rt_get_int(vm, self, "imageAlphaSet") ? rt_get_int(vm, self, "imageAlpha") : 255);
-  if (!strcmp(name, "getImageTintList")) return dvm_get_field(vm, self, "imageTintList", "Landroid/content/res/ColorStateList;", out);
-  if (!strcmp(name, "getImageTintMode")) return dvm_get_field(vm, self, "imageTintMode", "Landroid/graphics/PorterDuff$Mode;", out);
+  if (!strcmp(name, "getImageTintList")) return (dvm_get_field)(vm, self, "imageTintList", "Landroid/content/res/ColorStateList;", out);
+  if (!strcmp(name, "getImageTintMode")) return (dvm_get_field)(vm, self, "imageTintMode", "Landroid/graphics/PorterDuff$Mode;", out);
   if (!strcmp(name, "setImageTintList"))
-    (void)dvm_set_field(vm, self, "imageTintList", "Landroid/content/res/ColorStateList;", ARG(0));
-  else (void)dvm_set_field(vm, self, "imageTintMode", "Landroid/graphics/PorterDuff$Mode;", ARG(0));
-  (void)dvm_get_field(vm, self, "imageTintList", "Landroid/content/res/ColorStateList;", &list);
-  (void)dvm_get_field(vm, self, "imageTintMode", "Landroid/graphics/PorterDuff$Mode;", &mode);
+    (void)(dvm_set_field)(vm, self, "imageTintList", "Landroid/content/res/ColorStateList;", ARG(0));
+  else (void)(dvm_set_field)(vm, self, "imageTintMode", "Landroid/graphics/PorterDuff$Mode;", ARG(0));
+  (void)(dvm_get_field)(vm, self, "imageTintList", "Landroid/content/res/ColorStateList;", &list);
+  (void)(dvm_get_field)(vm, self, "imageTintMode", "Landroid/graphics/PorterDuff$Mode;", &mode);
   if (!x_apply_tint(vm, drawable, list.l, mode.l)) return false;
   ui_invalidate();
   RETV();
@@ -1067,16 +1067,16 @@ static bool x_image_tint_alpha(struct dvm *vm, dvm_ref self, const union dvm_val
 static dvm_ref x_caps_source(struct dvm *vm, dvm_ref view, dvm_ref source)
 {
   union dvm_value from = { 0 }, to = { 0 };
-  (void)dvm_get_field(vm, view, "capsFrom", "Ljava/lang/CharSequence;", &from);
-  (void)dvm_get_field(vm, view, "capsTo", "Ljava/lang/CharSequence;", &to);
+  (void)(dvm_get_field)(vm, view, "capsFrom", "Ljava/lang/CharSequence;", &from);
+  (void)(dvm_get_field)(vm, view, "capsTo", "Ljava/lang/CharSequence;", &to);
   if (from.l == source && to.l) return to.l;
   union dvm_value text = { .l = source }, upper = { 0 };
   if (!dvm_string_utf8(vm, source) && !am_vcall(vm, source, "toString", "()Ljava/lang/String;", NULL, 0, &text)) return 0;
   if (!am_vcall(vm, text.l, "toUpperCase", "()Ljava/lang/String;", NULL, 0, &upper) || !upper.l) return 0;
-  (void)dvm_set_field(vm, view, "capsFrom", "Ljava/lang/CharSequence;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, view, "capsFrom", "Ljava/lang/CharSequence;", (union dvm_value) {
     .l = source
   });
-  (void)dvm_set_field(vm, view, "capsTo", "Ljava/lang/CharSequence;", upper);
+  (void)(dvm_set_field)(vm, view, "capsTo", "Ljava/lang/CharSequence;", upper);
   return upper.l;
 }
 
@@ -1095,8 +1095,8 @@ static bool x_text_ellipsize(struct dvm *vm, dvm_ref self, const union dvm_value
                              int nargs, union dvm_value *out)
 {
   (void)nargs;
-  if (!strcmp(builtin_name(), "getEllipsize")) return dvm_get_field(vm, self, "ellipsize", "Landroid/text/TextUtils$TruncateAt;", out);
-  (void)dvm_set_field(vm, self, "ellipsize", "Landroid/text/TextUtils$TruncateAt;", ARG(0));
+  if (!strcmp(builtin_name(), "getEllipsize")) return (dvm_get_field)(vm, self, "ellipsize", "Landroid/text/TextUtils$TruncateAt;", out);
+  (void)(dvm_set_field)(vm, self, "ellipsize", "Landroid/text/TextUtils$TruncateAt;", ARG(0));
   ui_layout_changed();
   ui_invalidate();
   RETV();
@@ -1108,7 +1108,7 @@ static bool x_text_getTextColors(struct dvm *vm, dvm_ref self, const union dvm_v
   (void)args;
   (void)nargs;
   union dvm_value list = { 0 };
-  (void)dvm_get_field(vm, self, "textColors", "Landroid/content/res/ColorStateList;", &list);
+  (void)(dvm_get_field)(vm, self, "textColors", "Landroid/content/res/ColorStateList;", &list);
   if (list.l) RETL(list.l);
   /* A plain setTextColor(int): a one-colour list. */
   dvm_ref cl = dvm_new_object(vm, dvm_find_class(vm, "android/content/res/ColorStateList"));
@@ -1198,7 +1198,7 @@ static bool x_text_setTextAppearance(struct dvm *vm, dvm_ref self, const union d
       good = am_vcall(vm, ta.l, "getColorStateList", "(I)Landroid/content/res/ColorStateList;", &idx, 1, &v);
       if (good && v.l) {
         union dvm_value def = { 0 };
-        (void)dvm_get_field(vm, v.l, "color", "I", &def);
+        (void)(dvm_get_field)(vm, v.l, "color", "I", &def);
         good = am_vcall(vm, self, "setHintTextColor", "(I)V", &def, 1, &ignored);
       }
       break;
@@ -1346,7 +1346,7 @@ static void x_vto_fire(struct dvm *vm, const char *field, const char *method, co
   for (size_t i = 0; i < count; ++i) dvm_pin(vm, observers[i]);
   for (size_t i = 0; i < count; ++i) {
     union dvm_value list = { 0 };
-    (void)dvm_get_field(vm, observers[i], field, "Ljava/util/List;", &list);
+    (void)(dvm_get_field)(vm, observers[i], field, "Ljava/util/List;", &list);
     struct rt_list *items = list.l ? list_of(vm, list.l) : NULL;
     const uint32_t listeners = items ? items->size : 0;
     dvm_ref *snapshot = listeners ? malloc((size_t)listeners * sizeof *snapshot) : NULL;
@@ -1492,15 +1492,15 @@ static bool x_cursor_builder(struct dvm *vm, dvm_ref self, const union dvm_value
     rt_set_int(vm, self, "selectionStart", ARG(0).i);
     rt_set_int(vm, self, "selectionEnd", ARG(1).i);
   }
-  else if (!strcmp(name, "setMatrix")) (void)dvm_set_field(vm, self, "matrix", "Landroid/graphics/Matrix;", ARG(0));
+  else if (!strcmp(name, "setMatrix")) (void)(dvm_set_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", ARG(0));
   else if (!strcmp(name, "setComposingText")) {
     rt_set_int(vm, self, "composingStart", ARG(0).i);
-    (void)dvm_set_field(vm, self, "composingText", "Ljava/lang/CharSequence;", ARG(1));
+    (void)(dvm_set_field)(vm, self, "composingText", "Ljava/lang/CharSequence;", ARG(1));
   } else if (!strcmp(name, "setInsertionMarkerLocation")) {
-    (void)dvm_set_field(vm, self, "markerHorizontal", "F", ARG(0));
-    (void)dvm_set_field(vm, self, "markerTop", "F", ARG(1));
-    (void)dvm_set_field(vm, self, "markerBaseline", "F", ARG(2));
-    (void)dvm_set_field(vm, self, "markerBottom", "F", ARG(3));
+    (void)(dvm_set_field)(vm, self, "markerHorizontal", "F", ARG(0));
+    (void)(dvm_set_field)(vm, self, "markerTop", "F", ARG(1));
+    (void)(dvm_set_field)(vm, self, "markerBaseline", "F", ARG(2));
+    (void)(dvm_set_field)(vm, self, "markerBottom", "F", ARG(3));
     rt_set_int(vm, self, "markerFlags", ARG(4).i);
   } else if (!strcmp(name, "build")) {
     dvm_ref info = dvm_new_object(vm, dvm_find_class(vm, "android/view/inputmethod/CursorAnchorInfo"));
@@ -1510,14 +1510,14 @@ static bool x_cursor_builder(struct dvm *vm, dvm_ref self, const union dvm_value
     static const char *const floats[] = { "markerHorizontal", "markerTop", "markerBaseline", "markerBottom" };
     for (int i = 0; i < 4; ++i) {
       union dvm_value f = { 0 };
-      (void)dvm_get_field(vm, self, floats[i], "F", &f);
-      (void)dvm_set_field(vm, info, floats[i], "F", f);
+      (void)(dvm_get_field)(vm, self, floats[i], "F", &f);
+      (void)(dvm_set_field)(vm, info, floats[i], "F", f);
     }
     union dvm_value t = { 0 }, m = { 0 };
-    (void)dvm_get_field(vm, self, "composingText", "Ljava/lang/CharSequence;", &t);
-    (void)dvm_set_field(vm, info, "composingText", "Ljava/lang/CharSequence;", t);
-    (void)dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", &m);
-    (void)dvm_set_field(vm, info, "matrix", "Landroid/graphics/Matrix;", m);
+    (void)(dvm_get_field)(vm, self, "composingText", "Ljava/lang/CharSequence;", &t);
+    (void)(dvm_set_field)(vm, info, "composingText", "Ljava/lang/CharSequence;", t);
+    (void)(dvm_get_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", &m);
+    (void)(dvm_set_field)(vm, info, "matrix", "Landroid/graphics/Matrix;", m);
     RETL(info);
   }
   RETL(self);                      /* addCharacterBounds and the setters that follow the call chain */
@@ -1532,13 +1532,13 @@ static bool x_cursor_get(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   if (!strcmp(name, "getSelectionStart")) RETI(rt_get_int(vm, self, "selectionStart"));
   if (!strcmp(name, "getSelectionEnd")) RETI(rt_get_int(vm, self, "selectionEnd"));
   if (!strcmp(name, "getComposingTextStart")) RETI(rt_get_int(vm, self, "composingStart"));
-  if (!strcmp(name, "getComposingText")) return dvm_get_field(vm, self, "composingText", "Ljava/lang/CharSequence;", out);
-  if (!strcmp(name, "getMatrix")) return dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", out);
+  if (!strcmp(name, "getComposingText")) return (dvm_get_field)(vm, self, "composingText", "Ljava/lang/CharSequence;", out);
+  if (!strcmp(name, "getMatrix")) return (dvm_get_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", out);
   if (!strcmp(name, "getInsertionMarkerFlags")) RETI(rt_get_int(vm, self, "markerFlags"));
   const char *field = !strcmp(name, "getInsertionMarkerHorizontal") ? "markerHorizontal" :
                       !strcmp(name, "getInsertionMarkerTop") ? "markerTop" :
                       !strcmp(name, "getInsertionMarkerBaseline") ? "markerBaseline" : "markerBottom";
-  return dvm_get_field(vm, self, field, "F", out);
+  return (dvm_get_field)(vm, self, field, "F", out);
 }
 
 static const struct rt_method rt_x_cursor_builder[] = {
@@ -1601,9 +1601,9 @@ static float x_complex_to_dimension(struct dvm *vm, int32_t data, dvm_ref metric
   static const float radix[] = { 1.0f, 1.0f / 128.0f, 1.0f / 32768.0f, 1.0f / 8388608.0f };
   const float value = (float)(data >> 8) * radix[((uint32_t)data >> 4) & 3u];
   union dvm_value density = { 0 }, scaled = { 0 }, xdpi = { 0 };
-  (void)dvm_get_field(vm, metrics, "density", "F", &density);
-  (void)dvm_get_field(vm, metrics, "scaledDensity", "F", &scaled);
-  (void)dvm_get_field(vm, metrics, "xdpi", "F", &xdpi);
+  (void)(dvm_get_field)(vm, metrics, "density", "F", &density);
+  (void)(dvm_get_field)(vm, metrics, "scaledDensity", "F", &scaled);
+  (void)(dvm_get_field)(vm, metrics, "xdpi", "F", &xdpi);
   switch ((uint32_t)data & 15u) {
   case 0:
     return value;
@@ -1686,7 +1686,7 @@ static bool x_typed_array_textArray(struct dvm *vm, dvm_ref self, const union dv
   union dvm_value id = { 0 }, res = { 0 };
   if (!am_vcall(vm, self, "getResourceId", "(II)I", id_args, 2, &id)) return false;
   if (!id.i) RETL(0);
-  (void)dvm_get_field(vm, self, "resources", "Landroid/content/res/Resources;", &res);
+  (void)(dvm_get_field)(vm, self, "resources", "Landroid/content/res/Resources;", &res);
   if (!res.l) RETL(0);
   return am_vcall(vm, res.l, "getTextArray", "(I)[Ljava/lang/CharSequence;", &id, 1, out);
 }
@@ -1709,7 +1709,7 @@ static bool x_scroller_currVelocity(struct dvm *vm, dvm_ref self, const union dv
   (void)nargs;
   if (rt_get_int(vm, self, "finished")) RETF(0.f);
   union dvm_value st = { 0 };
-  (void)dvm_get_field(vm, self, "start", "J", &st);
+  (void)(dvm_get_field)(vm, self, "start", "J", &st);
   const int32_t dur = rt_get_int(vm, self, "duration");
   if (dur <= 0) RETF(0.f);
   const float t = (float)(scroller_now_ms() - st.j) / (float)dur;
@@ -1800,12 +1800,12 @@ static bool x_va_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   const char *name = builtin_name();
   if (!strcmp(name, "getRepeatCount")) RETI(rt_get_int(vm, self, "repeatCount"));
   if (!strcmp(name, "getRepeatMode")) RETI(rt_get_int(vm, self, "repeatMode") ? rt_get_int(vm, self, "repeatMode") : 1);
-  if (!strcmp(name, "getInterpolator")) return dvm_get_field(vm, self, "interpolator", "Landroid/animation/TimeInterpolator;", out);
+  if (!strcmp(name, "getInterpolator")) return (dvm_get_field)(vm, self, "interpolator", "Landroid/animation/TimeInterpolator;", out);
   if (!strcmp(name, "isPaused")) RETI(0);
   /* getTotalDuration(): the repeats multiply the duration; infinite is -1. */
   union dvm_value d = { 0 }, delay = { 0 };
-  (void)dvm_get_field(vm, self, "duration", "J", &d);
-  (void)dvm_get_field(vm, self, "delay", "J", &delay);
+  (void)(dvm_get_field)(vm, self, "duration", "J", &d);
+  (void)(dvm_get_field)(vm, self, "delay", "J", &delay);
   const int32_t repeat = rt_get_int(vm, self, "repeatCount");
   if (repeat == -1) RETJ(-1);
   RETJ(delay.j + d.j * (int64_t)(repeat + 1));

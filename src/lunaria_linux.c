@@ -1299,7 +1299,7 @@ int luna_os_audio_devices(char (*names)[128], char (*descs)[128], int max)
       char d[256];
       snprintf(d, sizeof d, "%s", desc ? desc : name);
       for (char *c = d; *c; ++c) if (*c == '\n') *c = ' ';
-      snprintf(descs[n], 128, "%s", d);
+      snprintf(descs[n], 128, "%.127s", d);
       ++n;
     }
     free(name);

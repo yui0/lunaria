@@ -78,19 +78,19 @@ static const struct rt_field rt_account_callback_run_fields[] = {
 static int aa_int(struct dvm *vm, dvm_ref o, const char *name)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, o, name, "I", &v);
+  (void)(dvm_get_field)(vm, o, name, "I", &v);
   return v.i;
 }
 static bool aa_bool(struct dvm *vm, dvm_ref o, const char *name)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, o, name, "Z", &v);
+  (void)(dvm_get_field)(vm, o, name, "Z", &v);
   return v.i != 0;
 }
 static dvm_ref aa_ref(struct dvm *vm, dvm_ref o, const char *name, const char *desc)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, o, name, desc, &v);
+  (void)(dvm_get_field)(vm, o, name, desc, &v);
   return v.l;
 }
 
@@ -102,7 +102,7 @@ static void aa_future_notify(struct dvm *vm, dvm_ref future)
   dvm_ref job = callback && c ? dvm_new_object(vm, c) : 0;
   if (!job) return;
   union dvm_value f = { .l = future };
-  (void)dvm_set_field(vm, job, "future", "Llunaria/AccountFuture;", f);
+  (void)(dvm_set_field)(vm, job, "future", "Llunaria/AccountFuture;", f);
   dvm_ref handler = aa_ref(vm, future, "handler", "Landroid/os/Handler;");
   if (handler) {
     union dvm_value a = { .l = job }, posted = { 0 };
@@ -128,13 +128,13 @@ static void aa_future_finish(struct dvm *vm, dvm_ref future, dvm_ref result, int
 {
   if (aa_bool(vm, future, "done")) return;
   union dvm_value v = { .l = result };
-  (void)dvm_set_field(vm, future, "result", "Landroid/os/Bundle;", v);
+  (void)(dvm_set_field)(vm, future, "result", "Landroid/os/Bundle;", v);
   v.i = kind;
-  (void)dvm_set_field(vm, future, "kind", "I", v);
+  (void)(dvm_set_field)(vm, future, "kind", "I", v);
   v.l = message ? dvm_new_string(vm, message) : 0;
-  (void)dvm_set_field(vm, future, "message", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, future, "message", "Ljava/lang/String;", v);
   v.i = 1;
-  (void)dvm_set_field(vm, future, "done", "Z", v);
+  (void)(dvm_set_field)(vm, future, "done", "Z", v);
   aa_future_notify(vm, future);
 }
 
@@ -296,7 +296,7 @@ static bool aa_future_cancel(struct dvm *vm, dvm_ref self, const union dvm_value
   (void)nargs;
   if (aa_bool(vm, self, "done")) RETI(0);
   union dvm_value one = { .i = 1 };
-  (void)dvm_set_field(vm, self, "cancelled", "Z", one);
+  (void)(dvm_set_field)(vm, self, "cancelled", "Z", one);
   RETI(1);
 }
 
@@ -443,7 +443,7 @@ static bool aa_response_init_parcel(struct dvm *vm, dvm_ref self, const union dv
   (void)nargs;
   union dvm_value binder = { 0 };
   if (!parcel_readStrongBinder(vm, args[0].l, NULL, 0, &binder)) return false;
-  (void)dvm_set_field(vm, self, "binder", "Landroid/os/IBinder;", binder);
+  (void)(dvm_set_field)(vm, self, "binder", "Landroid/os/IBinder;", binder);
   RETV();
 }
 static bool aa_response_writeToParcel(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -546,7 +546,7 @@ static bool aa_authenticator_init(struct dvm *vm, dvm_ref self, const union dvm_
 {
   (void)nargs;
   union dvm_value context = { .l = args[0].l };
-  (void)dvm_set_field(vm, self, "context", "Landroid/content/Context;", context);
+  (void)(dvm_set_field)(vm, self, "context", "Landroid/content/Context;", context);
   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/accounts/AbstractAccountAuthenticator$Transport;");
   dvm_ref transport = c ? dvm_new_object(vm, c) : 0;
   if (!transport) {
@@ -555,8 +555,8 @@ static bool aa_authenticator_init(struct dvm *vm, dvm_ref self, const union dvm_
   }
   union dvm_value auth = { .l = self }, t = { .l = transport }, ignored = { 0 };
   (void)binder_init(vm, transport, NULL, 0, &ignored);
-  (void)dvm_set_field(vm, transport, "auth", "Landroid/accounts/AbstractAccountAuthenticator;", auth);
-  (void)dvm_set_field(vm, self, "transport", "Landroid/os/IBinder;", t);
+  (void)(dvm_set_field)(vm, transport, "auth", "Landroid/accounts/AbstractAccountAuthenticator;", auth);
+  (void)(dvm_set_field)(vm, self, "transport", "Landroid/os/IBinder;", t);
   RETV();
 }
 static bool aa_authenticator_getIBinder(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -637,7 +637,7 @@ static bool aa_transport_onTransact(struct dvm *vm, dvm_ref self, const union dv
   union dvm_value binder = { 0 }, ignored = { 0 }, result = { 0 };
   if (!response || !parcel_readStrongBinder(vm, data, NULL, 0, &binder)) return false;
   dvm_pin(vm, response);
-  (void)dvm_set_field(vm, response, "binder", "Landroid/os/IBinder;", binder);
+  (void)(dvm_set_field)(vm, response, "binder", "Landroid/os/IBinder;", binder);
   bool ok = true;
   if (code == AA_TX_ADD_ACCOUNT) {
     union dvm_value call[5] = { { .l = response }, { 0 }, { 0 }, { 0 }, { 0 } }, strings = { 0 };
@@ -905,22 +905,22 @@ static dvm_ref aa_start(struct dvm *vm, int request, const char *type, dvm_ref a
       dvm_unpin(vm, future);
       return 0;
     }
-    (void)dvm_set_field(vm, future, "options", "Landroid/os/Bundle;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, future, "options", "Landroid/os/Bundle;", (union dvm_value) {
       .l = options
     });
   }
   union dvm_value v = { .i = request };
-  (void)dvm_set_field(vm, future, "request", "I", v);
+  (void)(dvm_set_field)(vm, future, "request", "I", v);
   v.l = callback;
-  (void)dvm_set_field(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
+  (void)(dvm_set_field)(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
   v.l = handler;
-  (void)dvm_set_field(vm, future, "handler", "Landroid/os/Handler;", v);
+  (void)(dvm_set_field)(vm, future, "handler", "Landroid/os/Handler;", v);
   v.l = activity;
-  (void)dvm_set_field(vm, future, "activity", "Landroid/app/Activity;", v);
+  (void)(dvm_set_field)(vm, future, "activity", "Landroid/app/Activity;", v);
   v.l = account;
-  (void)dvm_set_field(vm, future, "account", "Landroid/accounts/Account;", v);
+  (void)(dvm_set_field)(vm, future, "account", "Landroid/accounts/Account;", v);
   v.l = token_type;
-  (void)dvm_set_field(vm, future, "tokenType", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, future, "tokenType", "Ljava/lang/String;", v);
 
   dvm_ref intent = type ? aa_authenticator_intent(vm, type) : 0;
   dvm_ref response = rc ? dvm_new_object(vm, rc) : 0;
@@ -934,26 +934,26 @@ static dvm_ref aa_start(struct dvm *vm, int request, const char *type, dvm_ref a
     return future;
   }
   v.l = future;
-  (void)dvm_set_field(vm, response, "future", "Llunaria/AccountFuture;", v);
+  (void)(dvm_set_field)(vm, response, "future", "Llunaria/AccountFuture;", v);
   {
     union dvm_value ignored = { 0 };
     (void)binder_init(vm, response, NULL, 0, &ignored);
   }
-  (void)dvm_set_field(vm, binding, "future", "Llunaria/AccountFuture;", v);
+  (void)(dvm_set_field)(vm, binding, "future", "Llunaria/AccountFuture;", v);
   v.l = response;
-  (void)dvm_set_field(vm, binding, "response", "Landroid/os/Binder;", v);
+  (void)(dvm_set_field)(vm, binding, "response", "Landroid/os/Binder;", v);
   v.i = request;
-  (void)dvm_set_field(vm, binding, "request", "I", v);
+  (void)(dvm_set_field)(vm, binding, "request", "I", v);
   v.l = account;
-  (void)dvm_set_field(vm, binding, "account", "Landroid/accounts/Account;", v);
+  (void)(dvm_set_field)(vm, binding, "account", "Landroid/accounts/Account;", v);
   v.l = type ? dvm_new_string(vm, type) : 0;
-  (void)dvm_set_field(vm, binding, "type", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, binding, "type", "Ljava/lang/String;", v);
   v.l = token_type;
-  (void)dvm_set_field(vm, binding, "tokenType", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, binding, "tokenType", "Ljava/lang/String;", v);
   v.l = features;
-  (void)dvm_set_field(vm, binding, "features", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, binding, "features", "[Ljava/lang/String;", v);
   v.l = options;
-  (void)dvm_set_field(vm, binding, "options", "Landroid/os/Bundle;", v);
+  (void)(dvm_set_field)(vm, binding, "options", "Landroid/os/Bundle;", v);
   dvm_pin(vm, binding);
   dvm_pin(vm, response);   /* held while the bind is in flight */
   union dvm_value bind[3] = { { .l = intent }, { .l = binding }, { .i = 1 /* BIND_AUTO_CREATE */ } }, bound = { 0 };
@@ -1014,9 +1014,9 @@ static bool accman_getAuthToken(struct dvm *vm, dvm_ref self, const union dvm_va
     dvm_ref future = fc ? dvm_new_object(vm, fc) : 0;
     if (!future) RETL(0);
     union dvm_value v = { .l = args[4].l };
-    (void)dvm_set_field(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
+    (void)(dvm_set_field)(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
     v.l = args[5].l;
-    (void)dvm_set_field(vm, future, "handler", "Landroid/os/Handler;", v);
+    (void)(dvm_set_field)(vm, future, "handler", "Landroid/os/Handler;", v);
     aa_future_finish(vm, future, cached, AA_OK, NULL);
     RETL(future);
   }
@@ -1103,10 +1103,10 @@ static bool x_accman_accounts_by_features(struct dvm *vm, dvm_ref self, const un
   union dvm_value kv[2] = { { .l = dvm_new_string(vm, "accounts") }, list }, ignored = { 0 };
   (void)map_put(vm, bundle, kv, 2, &ignored);
   union dvm_value v = { .l = args[2].l };
-  (void)dvm_set_field(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
+  (void)(dvm_set_field)(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
   v.l = args[3].l;
-  (void)dvm_set_field(vm, future, "handler", "Landroid/os/Handler;", v);
-  (void)dvm_set_field(vm, future, "request", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, future, "handler", "Landroid/os/Handler;", v);
+  (void)(dvm_set_field)(vm, future, "request", "I", (union dvm_value) {
     .i = AA_ACCOUNTS
   });
   aa_future_finish(vm, future, bundle, AA_OK, NULL);
@@ -1129,9 +1129,9 @@ static bool x_accman_getAuthToken_legacy(struct dvm *vm, dvm_ref self, const uni
     dvm_ref future = fc ? dvm_new_object(vm, fc) : 0;
     if (!future) RETL(0);
     union dvm_value v = { .l = args[3].l };
-    (void)dvm_set_field(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
+    (void)(dvm_set_field)(vm, future, "callback", "Landroid/accounts/AccountManagerCallback;", v);
     v.l = args[4].l;
-    (void)dvm_set_field(vm, future, "handler", "Landroid/os/Handler;", v);
+    (void)(dvm_set_field)(vm, future, "handler", "Landroid/os/Handler;", v);
     aa_future_finish(vm, future, cached, AA_OK, NULL);
     RETL(future);
   }
@@ -1239,7 +1239,7 @@ static bool aa_add_account_onCreate(struct dvm *vm, dvm_ref self, const union dv
     return false;
   }
   union dvm_value a = { .l = self };
-  (void)dvm_set_field(vm, done, "activity", "Landroid/app/Activity;", a);
+  (void)(dvm_set_field)(vm, done, "activity", "Landroid/app/Activity;", a);
   union dvm_value call[7] = { { .l = dvm_new_string(vm, want) }, { 0 }, { 0 }, { 0 }, { .l = self }, { .l = done }, { 0 } }, future = { 0 };
   if (!accman_addAccount(vm, 0, call, 7, &future)) return false;
   fprintf(stderr, "[accounts] adding an account of type %s\n", want);
@@ -1396,12 +1396,12 @@ static bool account_init_parcel(struct dvm *vm,dvm_ref self,const union dvm_valu
   dvm_pin(vm,self);
   union dvm_value values[3]= {{0},{0},{0}},ignored= {0};
   bool ok=parcel_take_string(vm,p,&values[0].l);
-  if(ok)dvm_set_field(vm,self,"name","Ljava/lang/String;",values[0]);
+  if(ok)(dvm_set_field)(vm,self,"name","Ljava/lang/String;",values[0]);
   if(ok)ok=parcel_take_string(vm,p,&values[1].l);
-  if(ok)dvm_set_field(vm,self,"type","Ljava/lang/String;",values[1]);
+  if(ok)(dvm_set_field)(vm,self,"type","Ljava/lang/String;",values[1]);
   if(ok)ok=parcel_take_string(vm,p,&values[2].l);
   if(ok) {
-    dvm_set_field(vm,self,"accessId","Ljava/lang/String;",values[2]);
+    (dvm_set_field)(vm,self,"accessId","Ljava/lang/String;",values[2]);
     ok=account_init(vm,self,values,2,&ignored);
   }
   dvm_unpin(vm,self);
@@ -1433,7 +1433,7 @@ static bool account_get_access_id(struct dvm *vm,dvm_ref self,const union dvm_va
   (void)args;
   (void)nargs;
   union dvm_value id= {0};
-  dvm_get_field(vm,self,"accessId","Ljava/lang/String;",&id);
+  (dvm_get_field)(vm,self,"accessId","Ljava/lang/String;",&id);
   RETL(id.l);
 }
 static const struct rt_method rt_account_parcel_more[]= {

@@ -33,7 +33,8 @@ static int64_t deadline = INT64_MAX;
 static void (*on_ready)(void);
 static void notify(void) {
   uint64_t one = 1;
-  (void)write(wakefd, &one, sizeof one);
+  ssize_t _wr = write(wakefd, &one, sizeof one);
+  (void)_wr;
 }
 static int64_t now_ms(void) {
   struct timespec t;

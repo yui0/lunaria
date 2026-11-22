@@ -60,18 +60,18 @@ static const struct rt_field rt_dom_list_fields[]= {
 static dvm_ref dom_ref(struct dvm *vm,dvm_ref self,const char *field,const char *type)
 {
   union dvm_value v= {0};
-  (void)dvm_get_field(vm,self,field,type,&v);
+  (void)(dvm_get_field)(vm,self,field,type,&v);
   return v.l;
 }
 static int dom_int(struct dvm *vm,dvm_ref self,const char *field,const char *type)
 {
   union dvm_value v= {0};
-  (void)dvm_get_field(vm,self,field,type,&v);
+  (void)(dvm_get_field)(vm,self,field,type,&v);
   return v.i;
 }
 static void dom_string(struct dvm *vm,dvm_ref self,const char *field,const unsigned char *text)
 {
-  (void)dvm_set_field(vm,self,field,"Ljava/lang/String;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,field,"Ljava/lang/String;",(union dvm_value) {
     .l=text ? dvm_new_string(vm,(const char*)text) : 0
   });
 }
@@ -89,7 +89,7 @@ static bool dom_source(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   else field="encoding";
   type=!strcmp(field,"characterStream") ? "Ljava/io/Reader;" : !strcmp(field,"byteStream") ? "Ljava/io/InputStream;" : "Ljava/lang/String;";
   if(nargs) {
-    (void)dvm_set_field(vm,self,field,type,ARG(0));
+    (void)(dvm_set_field)(vm,self,field,type,ARG(0));
     RETV();
   }
   RETL(dom_ref(vm,self,field,type));
@@ -105,7 +105,7 @@ static bool dom_factory_option(struct dvm *vm,dvm_ref self,const union dvm_value
 {
   const char *field=strstr(builtin_name(),"NamespaceAware") ? "namespaceAware" : "validating";
   if(nargs) {
-    (void)dvm_set_field(vm,self,field,"Z",ARG(0));
+    (void)(dvm_set_field)(vm,self,field,"Z",ARG(0));
     RETV();
   }
   RETI(dom_int(vm,self,field,"Z"));
@@ -120,7 +120,7 @@ static bool dom_factory_builder(struct dvm *vm,dvm_ref self,const union dvm_valu
     return false;
   }
   dvm_ref builder=dvm_new_object(vm,dvm_find_class(vm,"lunaria/xml/DocumentBuilder"));
-  (void)dvm_set_field(vm,builder,"namespaceAware","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,builder,"namespaceAware","Z",(union dvm_value) {
     .i=dom_int(vm,self,"namespaceAware","Z")
   });
   RETL(builder);
@@ -131,19 +131,19 @@ static dvm_ref dom_new_node(struct dvm *vm,int type,const unsigned char *name,co
                   type==3 ? "lunaria/xml/Text" : type==4 ? "lunaria/xml/CDATA" : type==8 ? "lunaria/xml/Comment" : "lunaria/xml/Node";
   dvm_ref node=dvm_new_object(vm,dvm_find_class(vm,cls));
   if(!node)return 0;
-  (void)dvm_set_field(vm,node,"nodeType","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,node,"nodeType","I",(union dvm_value) {
     .i=type
   });
   dom_string(vm,node,"nodeName",name);
   dom_string(vm,node,"nodeValue",value);
-  (void)dvm_set_field(vm,node,"ownerDocument","Lorg/w3c/dom/Document;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,node,"ownerDocument","Lorg/w3c/dom/Document;",(union dvm_value) {
     .l=document
   });
   dvm_ref children=coll_new_list(vm,"Ljava/util/ArrayList;"),attrs=coll_new_list(vm,"Ljava/util/ArrayList;");
-  (void)dvm_set_field(vm,node,"children","Ljava/util/List;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,node,"children","Ljava/util/List;",(union dvm_value) {
     .l=children
   });
-  (void)dvm_set_field(vm,node,"attributes","Ljava/util/List;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,node,"attributes","Ljava/util/List;",(union dvm_value) {
     .l=attrs
   });
   return node;
@@ -264,7 +264,7 @@ static bool dom_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
       break;
     }
     dvm_ref parent=depth ? stack[depth-1] : document;
-    (void)dvm_set_field(vm,node,"parent","Lorg/w3c/dom/Node;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,node,"parent","Lorg/w3c/dom/Node;",(union dvm_value) {
       .l=parent
     });
     union dvm_value child= {.l=node},ignored= {0};
@@ -344,13 +344,13 @@ static bool dom_node_relation(struct dvm *vm,dvm_ref self,const union dvm_value 
 static dvm_ref dom_list(struct dvm *vm,dvm_ref root,dvm_ref query,bool attributes)
 {
   dvm_ref list=dvm_new_object(vm,dvm_find_class(vm,attributes ? "lunaria/xml/NamedNodeMap" : "lunaria/xml/NodeList"));
-  (void)dvm_set_field(vm,list,"root","Lorg/w3c/dom/Node;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,list,"root","Lorg/w3c/dom/Node;",(union dvm_value) {
     .l=root
   });
-  (void)dvm_set_field(vm,list,"query","Ljava/lang/String;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,list,"query","Ljava/lang/String;",(union dvm_value) {
     .l=query
   });
-  (void)dvm_set_field(vm,list,"attributes","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,list,"attributes","Z",(union dvm_value) {
     .i=attributes
   });
   return list;

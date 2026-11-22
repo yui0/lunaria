@@ -350,10 +350,10 @@ static inline uint32_t luna_blend_argb(uint32_t source,uint32_t destination,int 
           b[i]=fmaxf(x,y);
           break;
         case 18:
-          b[i]=y==0 ? 0 : x==1 ? 1 : fminf(1,y/(1-x));
+          b[i]=y<=0.0f ? 0.0f : x>=1.0f ? 1.0f : fminf(1.0f,y/(1.0f-x));
           break;
         case 19:
-          b[i]=y==1 ? 1 : x==0 ? 0 : 1-fminf(1,(1-y)/x);
+          b[i]=y>=1.0f ? 1.0f : x<=0.0f ? 0.0f : 1.0f-fminf(1.0f,(1.0f-y)/x);
           break;
         case 20:
           b[i]=x<=.5f ? 2*x*y : 1-2*(1-x)*(1-y);

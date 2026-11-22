@@ -1434,7 +1434,7 @@ void dvm__throw(struct dvm *vm, const char *class_name, const char *fmt, ...)
   dvm_ref e = dvm_new_object(vm, cls);
   if (e) {
     union dvm_value v = { .l = msg[0] ? dvm_new_string(vm, msg) : 0 };
-    (void)dvm_set_field(vm, e, "detailMessage", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, e, "detailMessage", "Ljava/lang/String;", v);
     struct dvm_object *o = dvm__obj(vm, e);
     if (o && !o->utf8 && msg[0]) o->utf8 = strdup(msg);   /* always readable */
   }
@@ -1472,7 +1472,7 @@ void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
     const char *cn = o->cls ? o->cls->name : "java/lang/Throwable";
     union dvm_value msg = { 0 };
     const char *text = NULL;
-    if (dvm_get_field(vm, exc, "detailMessage", "Ljava/lang/String;", &msg) &&
+    if ((dvm_get_field)(vm, exc, "detailMessage", "Ljava/lang/String;", &msg) &&
         msg.l)
       text = dvm_string_utf8(vm, msg.l);
     if (!text) text = o->utf8;
@@ -1481,7 +1481,7 @@ void dvm_describe_exception(struct dvm *vm, dvm_ref exc, char *buf, size_t sz)
                            hop ? " <- " : "", cn,
                            text ? ": " : "", text ? text : "");
     union dvm_value cause = { 0 };
-    if (!dvm_get_field(vm, exc, "cause", "Ljava/lang/Throwable;", &cause) ||
+    if (!(dvm_get_field)(vm, exc, "cause", "Ljava/lang/Throwable;", &cause) ||
         cause.l == exc)
       return;
     exc = cause.l;
@@ -1509,7 +1509,7 @@ static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
    * handler's current stack, which would point at Crashlytics instead of the
    * failure. */
   union dvm_value trace = { 0 };
-  if (!dvm_get_field(vm, exc, "stackTrace", "[Ljava/lang/StackTraceElement;",
+  if (!(dvm_get_field)(vm, exc, "stackTrace", "[Ljava/lang/StackTraceElement;",
                      &trace) || !trace.l)
     return;
   struct dvm_object *array = dvm__obj(vm, trace.l);
@@ -1521,9 +1521,9 @@ static void log_forwarded_uncaught(struct dvm *vm, dvm_ref exc,
   for (uint32_t i = 0; i < n; ++i) {
     union dvm_value cls = { 0 }, method = { 0 };
     if (!items[i]) continue;
-    (void)dvm_get_field(vm, items[i], "declaringClass", "Ljava/lang/String;",
+    (void)(dvm_get_field)(vm, items[i], "declaringClass", "Ljava/lang/String;",
                         &cls);
-    (void)dvm_get_field(vm, items[i], "methodName", "Ljava/lang/String;",
+    (void)(dvm_get_field)(vm, items[i], "methodName", "Ljava/lang/String;",
                         &method);
     fprintf(stderr, "[dvm]   at %s.%s\n",
             cls.l ? dvm_string_utf8(vm, cls.l) : "?",
@@ -1571,13 +1571,13 @@ bool (dvm__set_field_from)(struct dvm *vm, dvm_ref obj, struct dvm_class *owner,
 bool (dvm_get_field)(struct dvm *vm, dvm_ref obj, const char *name,
                      const char *type, union dvm_value *out)
 {
-  return dvm__get_field_from(vm, obj, NULL, name, type, out);
+  return (dvm__get_field_from)(vm, obj, NULL, name, type, out);
 }
 
 bool (dvm_set_field)(struct dvm *vm, dvm_ref obj, const char *name,
                      const char *type, union dvm_value val)
 {
-  return dvm__set_field_from(vm, obj, NULL, name, type, val);
+  return (dvm__set_field_from)(vm, obj, NULL, name, type, val);
 }
 
 bool dvm_get_static(struct dvm *vm, struct dvm_class *cls, const char *name,
@@ -5575,7 +5575,7 @@ static int drain_pending(struct dvm *vm, bool nested)
          * thread would have resumed on a real runtime. */
         const bool parked_here = vm->parked;
         if (entry_is_thread && !parked_here) {
-          (void)dvm_set_field(vm, entry, "alive", "Z", (union dvm_value) {
+          (void)(dvm_set_field)(vm, entry, "alive", "Z", (union dvm_value) {
             .i = 0
           });
           dvm__thread_set_state(vm, entry, DVM_THREAD_TERMINATED);

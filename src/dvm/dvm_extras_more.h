@@ -85,10 +85,10 @@ static bool x_cancel(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)args;
   (void)nargs;
   union dvm_value was = { 0 }, listener = { 0 }, one = { .i = 1 };
-  (void)dvm_get_field(vm, self, "cancelled", "Z", &was);
+  (void)(dvm_get_field)(vm, self, "cancelled", "Z", &was);
   if (was.i) RETV();
-  (void)dvm_set_field(vm, self, "cancelled", "Z", one);
-  (void)dvm_get_field(vm, self, "listener", "Landroid/os/CancellationSignal$OnCancelListener;", &listener);
+  (void)(dvm_set_field)(vm, self, "cancelled", "Z", one);
+  (void)(dvm_get_field)(vm, self, "listener", "Landroid/os/CancellationSignal$OnCancelListener;", &listener);
   if (!x_cancel_listener_call(vm, listener.l)) return false;
   RETV();
 }
@@ -98,7 +98,7 @@ static bool x_is_cancelled(struct dvm *vm, dvm_ref self, const union dvm_value *
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "cancelled", "Z", &v);
+  (void)(dvm_get_field)(vm, self, "cancelled", "Z", &v);
   RETI(v.i != 0);
 }
 static bool x_throw_if_cancelled(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -108,7 +108,7 @@ static bool x_throw_if_cancelled(struct dvm *vm, dvm_ref self, const union dvm_v
   (void)args;
   (void)nargs;
   (void)out;
-  (void)dvm_get_field(vm, self, "cancelled", "Z", &v);
+  (void)(dvm_get_field)(vm, self, "cancelled", "Z", &v);
   if (v.i) {
     dvm__throw(vm, "android/os/OperationCanceledException", "The operation has been canceled.");
     return false;
@@ -120,8 +120,8 @@ static bool x_set_cancel_listener(struct dvm *vm, dvm_ref self, const union dvm_
 {
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_set_field(vm, self, "listener", "Landroid/os/CancellationSignal$OnCancelListener;", args[0]);
-  (void)dvm_get_field(vm, self, "cancelled", "Z", &v);
+  (void)(dvm_set_field)(vm, self, "listener", "Landroid/os/CancellationSignal$OnCancelListener;", args[0]);
+  (void)(dvm_get_field)(vm, self, "cancelled", "Z", &v);
   if (v.i && !x_cancel_listener_call(vm, args[0].l)) return false;   /* already cancelled: told at once */
   RETV();
 }
@@ -203,17 +203,17 @@ static bool x_trust_anchor_init(struct dvm *vm, dvm_ref self, const union dvm_va
       dvm__throw(vm, "java/lang/NullPointerException", "the trustedCert parameter must be non-null");
       return false;
     }
-    (void)dvm_set_field(vm, self, "cert", "Ljava/security/cert/X509Certificate;", args[0]);
-    (void)dvm_set_field(vm, self, "constraints", "[B", args[1]);
+    (void)(dvm_set_field)(vm, self, "cert", "Ljava/security/cert/X509Certificate;", args[0]);
+    (void)(dvm_set_field)(vm, self, "constraints", "[B", args[1]);
   } else {
     /* (String caName, PublicKey, byte[]) or (X500Principal, PublicKey, byte[]) */
     if (!args[0].l || !args[1].l) {
       dvm__throw(vm, "java/lang/NullPointerException", "the caName and pubKey parameters must be non-null");
       return false;
     }
-    (void)dvm_set_field(vm, self, "name", "Ljava/lang/String;", args[0]);
-    (void)dvm_set_field(vm, self, "key", "Ljava/security/PublicKey;", args[1]);
-    (void)dvm_set_field(vm, self, "constraints", "[B", args[2]);
+    (void)(dvm_set_field)(vm, self, "name", "Ljava/lang/String;", args[0]);
+    (void)(dvm_set_field)(vm, self, "key", "Ljava/security/PublicKey;", args[1]);
+    (void)(dvm_set_field)(vm, self, "constraints", "[B", args[2]);
   }
   RETV();
 }
@@ -224,10 +224,10 @@ static bool x_trust_anchor_get(struct dvm *vm, dvm_ref self, const union dvm_val
   (void)nargs;
   const char *name = dvm__builtin_method()->name;
   union dvm_value v = { 0 };
-  if (!strcmp(name, "getTrustedCert")) (void)dvm_get_field(vm, self, "cert", "Ljava/security/cert/X509Certificate;", &v);
-  else if (!strcmp(name, "getCAName")) (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &v);
-  else if (!strcmp(name, "getCAPublicKey")) (void)dvm_get_field(vm, self, "key", "Ljava/security/PublicKey;", &v);
-  else (void)dvm_get_field(vm, self, "constraints", "[B", &v);
+  if (!strcmp(name, "getTrustedCert")) (void)(dvm_get_field)(vm, self, "cert", "Ljava/security/cert/X509Certificate;", &v);
+  else if (!strcmp(name, "getCAName")) (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &v);
+  else if (!strcmp(name, "getCAPublicKey")) (void)(dvm_get_field)(vm, self, "key", "Ljava/security/PublicKey;", &v);
+  else (void)(dvm_get_field)(vm, self, "constraints", "[B", &v);
   RETL(v.l);
 }
 static const struct rt_method rt_trust_anchor[] = {
@@ -360,7 +360,7 @@ static bool x_md_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
   (void)nargs;
-  (void)dvm_set_field(vm, self, "algorithm", "Ljava/lang/String;", args[0]);
+  (void)(dvm_set_field)(vm, self, "algorithm", "Ljava/lang/String;", args[0]);
   RETV();
 }
 static const struct rt_method rt_x_message_digest_more[] = {
@@ -452,7 +452,7 @@ static const struct rt_field rt_ssl_context_spi_fields[] = {
 static dvm_ref ssl_spi_of(struct dvm *vm, dvm_ref context)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, context, "spi", "Ljavax/net/ssl/SSLContextSpi;", &v);
+  (void)(dvm_get_field)(vm, context, "spi", "Ljavax/net/ssl/SSLContextSpi;", &v);
   return v.l;
 }
 static bool x_ssl_context_get_instance_provider(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -468,8 +468,8 @@ static bool x_ssl_context_get_instance_provider(struct dvm *vm, dvm_ref self, co
   dvm_ref context = cc ? dvm_new_object(vm, cc) : 0;
   if (!context) RETL(0);
   dvm_pin(vm, context);
-  (void)dvm_set_field(vm, context, "protocol", "Ljava/lang/String;", args[0]);
-  (void)dvm_set_field(vm, context, "provider", "Ljava/security/Provider;", args[1]);
+  (void)(dvm_set_field)(vm, context, "protocol", "Ljava/lang/String;", args[0]);
+  (void)(dvm_set_field)(vm, context, "provider", "Ljava/security/Provider;", args[1]);
   char key[160];
   snprintf(key, sizeof key, "SSLContext.%s", protocol);
   union dvm_value k = { .l = dvm_new_string(vm, key) }, name = { 0 };
@@ -487,7 +487,7 @@ static bool x_ssl_context_get_instance_provider(struct dvm *vm, dvm_ref self, co
         dvm_unpin(vm, context);
         return false;
       }
-      (void)dvm_set_field(vm, context, "spi", "Ljavax/net/ssl/SSLContextSpi;", (union dvm_value) {
+      (void)(dvm_set_field)(vm, context, "spi", "Ljavax/net/ssl/SSLContextSpi;", (union dvm_value) {
         .l = spi
       });
       dvm_unpin(vm, spi);
@@ -496,7 +496,7 @@ static bool x_ssl_context_get_instance_provider(struct dvm *vm, dvm_ref self, co
   /* The Default SPI initializes itself in its constructor. Java forbids
    * callers from initializing that SPI again, so its wrapper is ready now. */
   if (!strcasecmp(protocol, "Default"))
-    dvm_set_field(vm, context, "initialized", "Z", (union dvm_value) {
+    (dvm_set_field)(vm, context, "initialized", "Z", (union dvm_value) {
     .i = 1
   });
   (void)self;
@@ -509,7 +509,7 @@ static bool x_ssl_context_provider(struct dvm *vm, dvm_ref self, const union dvm
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "provider", "Ljava/security/Provider;", &v);
+  (void)(dvm_get_field)(vm, self, "provider", "Ljava/security/Provider;", &v);
   RETL(v.l ? v.l : security_builtin_provider(vm));
 }
 static bool x_ssl_context_protocol(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -518,7 +518,7 @@ static bool x_ssl_context_protocol(struct dvm *vm, dvm_ref self, const union dvm
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "protocol", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, self, "protocol", "Ljava/lang/String;", &v);
   RETL(v.l ? v.l : dvm_new_string(vm, "TLS"));
 }
 /* javax.net.ssl.SSLSessionContext of the host-backed SSLContext.  The host TLS keeps its own session cache, so
@@ -623,7 +623,7 @@ static bool x_reverse_compare(struct dvm *vm, dvm_ref self, const union dvm_valu
 {
   (void)nargs;
   union dvm_value inner = { 0 }, swapped[2] = { args[1], args[0] };
-  (void)dvm_get_field(vm, self, "inner", "Ljava/util/Comparator;", &inner);
+  (void)(dvm_get_field)(vm, self, "inner", "Ljava/util/Comparator;", &inner);
   if (inner.l) return am_vcall(vm, inner.l, "compare", "(Ljava/lang/Object;Ljava/lang/Object;)I", swapped, 2, out);
   return am_vcall(vm, args[1].l, "compareTo", "(Ljava/lang/Object;)I", &args[0], 1, out);
 }
@@ -637,7 +637,7 @@ static bool x_collections_reverse_order(struct dvm *vm, dvm_ref self, const unio
   struct dvm_class *c = dvm__class_by_desc(vm, "Llunaria/ReverseComparator;");
   dvm_ref r = c ? dvm_new_object(vm, c) : 0;
   if (!r) RETL(0);
-  (void)dvm_set_field(vm, r, "inner", "Ljava/util/Comparator;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, r, "inner", "Ljava/util/Comparator;", (union dvm_value) {
     .l = nargs ? args[0].l : 0
   });
   RETL(r);
@@ -662,16 +662,16 @@ static bool x_barrier_init(struct dvm *vm, dvm_ref self, const union dvm_value *
     return false;
   }
   (void)out;
-  (void)dvm_set_field(vm, self, "parties", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "parties", "I", (union dvm_value) {
     .i = args[0].i
   });
-  if (nargs > 1) (void)dvm_set_field(vm, self, "action", "Ljava/lang/Runnable;", args[1]);
+  if (nargs > 1) (void)(dvm_set_field)(vm, self, "action", "Ljava/lang/Runnable;", args[1]);
   RETV();
 }
 static int x_barrier_int(struct dvm *vm, dvm_ref self, const char *f)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, f, "I", &v);
+  (void)(dvm_get_field)(vm, self, f, "I", &v);
   return v.i;
 }
 static bool x_barrier_await(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -690,24 +690,24 @@ static bool x_barrier_await(struct dvm *vm, dvm_ref self, const union dvm_value 
   const int index = parties - arrived;
   if (arrived == parties) {
     union dvm_value action = { 0 }, ignored = { 0 };
-    (void)dvm_get_field(vm, self, "action", "Ljava/lang/Runnable;", &action);
+    (void)(dvm_get_field)(vm, self, "action", "Ljava/lang/Runnable;", &action);
     if (action.l && !am_vcall(vm, action.l, "run", "()V", NULL, 0, &ignored)) {
-      (void)dvm_set_field(vm, self, "broken", "Z", (union dvm_value) {
+      (void)(dvm_set_field)(vm, self, "broken", "Z", (union dvm_value) {
         .i = 1
       });
       dvm_gil_notify_for(self);
       return false;
     }
-    (void)dvm_set_field(vm, self, "waiting", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "waiting", "I", (union dvm_value) {
       .i = 0
     });
-    (void)dvm_set_field(vm, self, "generation", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "generation", "I", (union dvm_value) {
       .i = generation + 1
     });
     dvm_gil_notify_for(self);
     RETI(0);
   }
-  (void)dvm_set_field(vm, self, "waiting", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "waiting", "I", (union dvm_value) {
     .i = arrived
   });
   for (;;) {
@@ -719,7 +719,7 @@ static bool x_barrier_await(struct dvm *vm, dvm_ref self, const union dvm_value 
     }
     const uint64_t now = dvm__now_ms();
     if (now >= deadline) {
-      (void)dvm_set_field(vm, self, "broken", "Z", (union dvm_value) {
+      (void)(dvm_set_field)(vm, self, "broken", "Z", (union dvm_value) {
         .i = 1
       });
       dvm_gil_notify_for(self);
@@ -753,13 +753,13 @@ static bool x_barrier_reset(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)args;
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "waiting", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "waiting", "I", (union dvm_value) {
     .i = 0
   });
-  (void)dvm_set_field(vm, self, "broken", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "broken", "Z", (union dvm_value) {
     .i = 0
   });
-  (void)dvm_set_field(vm, self, "generation", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "generation", "I", (union dvm_value) {
     .i = x_barrier_int(vm, self, "generation") + 1
   });
   dvm_gil_notify_for(self);
@@ -802,7 +802,7 @@ static bool x_rect_floats(struct dvm *vm, dvm_ref r, float v[4])
   }
   for (int i = 0; i < 4; ++i) {
     union dvm_value f = { 0 };
-    (void)dvm_get_field(vm, r, edges[i], "F", &f);
+    (void)(dvm_get_field)(vm, r, edges[i], "F", &f);
     v[i] = f.f;
   }
   return true;
@@ -827,7 +827,7 @@ static bool x_matrix_set_rect_to_rect(struct dvm *vm, dvm_ref self, const union 
     RETI(1);
   }
   union dvm_value name = { 0 };
-  const char *fit = ARG(2).l && dvm_get_field(vm, ARG(2).l, "name", "Ljava/lang/String;", &name) && name.l
+  const char *fit = ARG(2).l && (dvm_get_field)(vm, ARG(2).l, "name", "Ljava/lang/String;", &name) && name.l
                     ? dvm_string_utf8(vm, name.l) : "FILL";
   float sx = dw / sw, sy = dh / sh;
   bool x_larger = false;
@@ -861,7 +861,7 @@ static bool x_csl_is_stateful(struct dvm *vm, dvm_ref self, const union dvm_valu
 {
   (void)args; (void)nargs;
   union dvm_value specs = { 0 };
-  (void)dvm_get_field(vm, self, "stateSpecs", "[[I", &specs);
+  (void)(dvm_get_field)(vm, self, "stateSpecs", "[[I", &specs);
   RETI(specs.l && dvm_array_length(vm, specs.l) > 1);
 }
 static const struct rt_method rt_x_color_state_more[] = {
@@ -876,21 +876,21 @@ static bool x_paint_letter_spacing(struct dvm *vm, dvm_ref self, const union dvm
   (void)nargs;
   if (!strcmp(builtin_name(), "getLetterSpacing")) {
     union dvm_value v = { 0 };
-    (void)dvm_get_field(vm, self, "letterSpacing", "F", &v);
+    (void)(dvm_get_field)(vm, self, "letterSpacing", "F", &v);
     RETF(v.f);
   }
   (void)out;
-  (void)dvm_set_field(vm, self, "letterSpacing", "F", ARG(0));
+  (void)(dvm_set_field)(vm, self, "letterSpacing", "F", ARG(0));
   RETV();
 }
 static bool x_paint_shadow(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                            int nargs, union dvm_value *out)
 {
   (void)nargs; (void)out;
-  (void)dvm_set_field(vm, self, "shadowRadius", "F", ARG(0));
-  (void)dvm_set_field(vm, self, "shadowDx", "F", ARG(1));
-  (void)dvm_set_field(vm, self, "shadowDy", "F", ARG(2));
-  (void)dvm_set_field(vm, self, "shadowColor", "I", ARG(3));
+  (void)(dvm_set_field)(vm, self, "shadowRadius", "F", ARG(0));
+  (void)(dvm_set_field)(vm, self, "shadowDx", "F", ARG(1));
+  (void)(dvm_set_field)(vm, self, "shadowDy", "F", ARG(2));
+  (void)(dvm_set_field)(vm, self, "shadowColor", "I", ARG(3));
   RETV();
 }
 static bool x_paint_linear_text(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -898,9 +898,9 @@ static bool x_paint_linear_text(struct dvm *vm, dvm_ref self, const union dvm_va
 {
   (void)nargs; (void)out;
   union dvm_value flags = { 0 };
-  (void)dvm_get_field(vm, self, "flags", "I", &flags);
+  (void)(dvm_get_field)(vm, self, "flags", "I", &flags);
   flags.i = ARG(0).i ? flags.i | 0x40 : flags.i & ~0x40;
-  (void)dvm_set_field(vm, self, "flags", "I", flags);
+  (void)(dvm_set_field)(vm, self, "flags", "I", flags);
   RETV();
 }
 static const struct rt_method rt_x_paint_more[] = {
@@ -918,11 +918,11 @@ static bool x_text_drawable_padding(struct dvm *vm, dvm_ref self, const union dv
   (void)nargs;
   if (!strcmp(builtin_name(), "getCompoundDrawablePadding")) {
     union dvm_value v = { 0 };
-    (void)dvm_get_field(vm, self, "drawablePadding", "I", &v);
+    (void)(dvm_get_field)(vm, self, "drawablePadding", "I", &v);
     RETI(v.i);
   }
   (void)out;
-  (void)dvm_set_field(vm, self, "drawablePadding", "I", ARG(0));
+  (void)(dvm_set_field)(vm, self, "drawablePadding", "I", ARG(0));
   ui_layout_changed();
   ui_invalidate();
   RETV();
@@ -932,16 +932,16 @@ static bool x_text_autosize_step(struct dvm *vm, dvm_ref self, const union dvm_v
 {
   (void)args; (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "autoSizeStep", "I", &v);
+  (void)(dvm_get_field)(vm, self, "autoSizeStep", "I", &v);
   RETI(v.i ? v.i : -1);
 }
 static bool x_text_autosize_config(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                                    int nargs, union dvm_value *out)
 {
   (void)nargs; (void)out;
-  (void)dvm_set_field(vm, self, "autoSizeMin", "I", ARG(0));
-  (void)dvm_set_field(vm, self, "autoSizeMax", "I", ARG(1));
-  (void)dvm_set_field(vm, self, "autoSizeStep", "I", ARG(2));
+  (void)(dvm_set_field)(vm, self, "autoSizeMin", "I", ARG(0));
+  (void)(dvm_set_field)(vm, self, "autoSizeMax", "I", ARG(1));
+  (void)(dvm_set_field)(vm, self, "autoSizeStep", "I", ARG(2));
   ui_layout_changed();
   ui_invalidate();
   RETV();

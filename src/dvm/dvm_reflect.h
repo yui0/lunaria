@@ -69,22 +69,22 @@ static bool cl_getMethod(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   dvm_ref m = mc ? dvm_new_object(vm, mc) : 0;
   if (!m) RETL(0);
   union dvm_value v = { .l = self };
-  (void)dvm_set_field(vm, m, "owner", "Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, m, "owner", "Ljava/lang/Class;", v);
   v.l = ARG(0).l;
-  (void)dvm_set_field(vm, m, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, m, "name", "Ljava/lang/String;", v);
   v.l = nargs > 1 ? ARG(1).l : 0;
   dvm_pin(vm, v.l);
-  (void)dvm_set_field(vm, m, "paramTypes", "[Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, m, "paramTypes", "[Ljava/lang/Class;", v);
   struct dvm_method *found = (target && name)
                              ? reflect_find_overload(vm, target, name, nargs > 1 ? ARG(1).l : 0)
                              : NULL;
   if (!found && target && name) found = dvm_find_method(vm, target, name, NULL);
   if (found) {
     v.i = (int32_t)found->access;
-    (void)dvm_set_field(vm, m, "access", "I", v);
+    (void)(dvm_set_field)(vm, m, "access", "I", v);
     if (found->sig) {
       v.l = dvm_new_string(vm, found->sig);
-      (void)dvm_set_field(vm, m, "sig", "Ljava/lang/String;", v);
+      (void)(dvm_set_field)(vm, m, "sig", "Ljava/lang/String;", v);
     }
   }
   RETL(m);
@@ -97,13 +97,13 @@ static dvm_ref reflect_field_object(struct dvm *vm, struct dvm_class *owner,
   dvm_ref field = fc ? dvm_new_object(vm, fc) : 0;
   if (!field) return 0;
   union dvm_value v = { .l = dvm_class_object(vm, owner) };
-  (void)dvm_set_field(vm, field, "owner", "Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, field, "owner", "Ljava/lang/Class;", v);
   v.l = dvm_new_string(vm, fd->name ? fd->name : "");
-  (void)dvm_set_field(vm, field, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, field, "name", "Ljava/lang/String;", v);
   v.l = dvm_new_string(vm, fd->type ? fd->type : "Ljava/lang/Object;");
-  (void)dvm_set_field(vm, field, "sig", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, field, "sig", "Ljava/lang/String;", v);
   v.i = (int32_t)fd->access;
-  (void)dvm_set_field(vm, field, "access", "I", v);
+  (void)(dvm_set_field)(vm, field, "access", "I", v);
   return field;
 }
 
@@ -261,7 +261,7 @@ static bool rm_getName(struct dvm *vm, dvm_ref self, const union dvm_value *args
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &v);
   RETL(v.l);
 }
 
@@ -440,7 +440,7 @@ static bool reflect_target_failed(struct dvm *vm, const char *what)
   const dvm_ref ite = dvm_exception(vm);
   if (ite && target) {
     union dvm_value v = { .l = target };
-    (void)dvm_set_field(vm, ite, "cause", "Ljava/lang/Throwable;", v);
+    (void)(dvm_set_field)(vm, ite, "cause", "Ljava/lang/Throwable;", v);
   }
   return false;
 }
@@ -449,9 +449,9 @@ static bool rm_invoke(struct dvm *vm, dvm_ref self, const union dvm_value *args,
                       int nargs, union dvm_value *out)
 {
   union dvm_value ownerv = { 0 }, namev = { 0 }, ptypesv = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &ownerv);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &namev);
-  (void)dvm_get_field(vm, self, "paramTypes", "[Ljava/lang/Class;", &ptypesv);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &ownerv);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &namev);
+  (void)(dvm_get_field)(vm, self, "paramTypes", "[Ljava/lang/Class;", &ptypesv);
   const char *name = dvm_string_utf8(vm, namev.l);
   const bool is_static = (rt_get_int(vm, self, "access") & 0x0008) != 0;
 
@@ -700,7 +700,7 @@ static bool rm_getDeclaringClass(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &v);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &v);
   RETL(v.l);
 }
 
@@ -720,7 +720,7 @@ static bool rm_getReturnType(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value sv = { 0 };
-  (void)dvm_get_field(vm, self, "sig", "Ljava/lang/String;", &sv);
+  (void)(dvm_get_field)(vm, self, "sig", "Ljava/lang/String;", &sv);
   const char *sig = dvm_string_utf8(vm, sv.l);
   if (!sig) RETL(0);
   const char *r = strchr(sig, ')');
@@ -740,11 +740,11 @@ static bool rm_getParameterTypes(struct dvm *vm, dvm_ref self,
    * for a Method built by name lookup.  getDeclaredMethods() leaves it
    * empty and fills `sig` instead. */
   union dvm_value pv = { 0 };
-  if (dvm_get_field(vm, self, "paramTypes", "[Ljava/lang/Class;", &pv) &&
+  if ((dvm_get_field)(vm, self, "paramTypes", "[Ljava/lang/Class;", &pv) &&
       pv.l)
     RETL(pv.l);
   union dvm_value sv = { 0 };
-  (void)dvm_get_field(vm, self, "sig", "Ljava/lang/String;", &sv);
+  (void)(dvm_get_field)(vm, self, "sig", "Ljava/lang/String;", &sv);
   const char *sig = dvm_string_utf8(vm, sv.l);
   if (!sig || sig[0] != '(') RETL(dvm_new_array(vm, 'L', "Ljava/lang/Class;", 0));
   const char *p = sig + 1;
@@ -774,7 +774,7 @@ static bool ao_setAccessible(struct dvm *vm, dvm_ref self,
 {
   (void)nargs;
   union dvm_value v = { .i = ARG(0).i != 0 };
-  (void)dvm_set_field(vm, self, "accessible", "Z", v);
+  (void)(dvm_set_field)(vm, self, "accessible", "Z", v);
   RETV();
 }
 
@@ -785,7 +785,7 @@ static bool ao_isAccessible(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "accessible", "Z", &v);
+  (void)(dvm_get_field)(vm, self, "accessible", "Z", &v);
   RETI(v.i ? 1 : 0);
 }
 
@@ -816,7 +816,7 @@ static bool ao_setAccessibleAll(struct dvm *vm, dvm_ref self,
   const uint32_t n = dvm_array_length(vm, ARG(0).l);
   union dvm_value v = { .i = ARG(1).i != 0 };
   for (uint32_t i = 0; items && i < n; ++i)
-    if (items[i]) (void)dvm_set_field(vm, items[i], "accessible", "Z", v);
+    if (items[i]) (void)(dvm_set_field)(vm, items[i], "accessible", "Z", v);
   RETV();
 }
 static const struct rt_method rt_accessible_object[]= {
@@ -916,7 +916,7 @@ static bool reflect_proxy_init(struct dvm *vm, dvm_ref self, const union dvm_val
     dvm__throw(vm,"java/lang/NullPointerException","InvocationHandler");
     return false;
   }
-  if(!dvm_set_field(vm,self,"h","Ljava/lang/reflect/InvocationHandler;",ARG(0))) return false;
+  if(!(dvm_set_field)(vm,self,"h","Ljava/lang/reflect/InvocationHandler;",ARG(0))) return false;
   RETV();
 }
 
@@ -1044,18 +1044,18 @@ static dvm_ref proxy_make_method(struct dvm *vm, struct dvm_class *decl,
   dvm_ref m = mc ? dvm_new_object(vm, mc) : 0;
   if (!m) return 0;
   union dvm_value v = { .l = class_object_for(vm, decl) };
-  (void)dvm_set_field(vm, m, "owner", "Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, m, "owner", "Ljava/lang/Class;", v);
   v.l = dvm_new_string(vm, name ? name : "");
-  (void)dvm_set_field(vm, m, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, m, "name", "Ljava/lang/String;", v);
   if (sig) {
     v.l = dvm_new_string(vm, sig);
-    (void)dvm_set_field(vm, m, "sig", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, m, "sig", "Ljava/lang/String;", v);
   }
   struct dvm_method *found =
     (decl && name) ? dvm_find_method(vm, decl, name, sig) : NULL;
   if (found) {
     v.i = (int32_t)found->access;
-    (void)dvm_set_field(vm, m, "access", "I", v);
+    (void)(dvm_set_field)(vm, m, "access", "I", v);
   }
   /* Parameter Class[] so Method.invoke / getParameterTypes stay consistent. */
   int np = dvm_sig_arg_count(sig);
@@ -1069,7 +1069,7 @@ static dvm_ref proxy_make_method(struct dvm *vm, struct dvm_class *decl,
   }
   v.l = pt;
   dvm_pin(vm, pt);
-  (void)dvm_set_field(vm, m, "paramTypes", "[Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, m, "paramTypes", "[Ljava/lang/Class;", v);
   return m;
 }
 
@@ -1109,7 +1109,7 @@ bool dvm_proxy_try_invoke(struct dvm *vm, dvm_ref self, struct dvm_class *cls,
     return false;
 
   union dvm_value hv = { 0 };
-  if (!dvm_get_field(vm, self, "h", "Ljava/lang/reflect/InvocationHandler;",
+  if (!(dvm_get_field)(vm, self, "h", "Ljava/lang/reflect/InvocationHandler;",
                      &hv) ||
       !hv.l) {
     dvm__throw(vm, "java/lang/IllegalArgumentException",
@@ -1203,7 +1203,7 @@ static bool proxy_newProxyInstance(struct dvm *vm, dvm_ref self,
     return false;
   }
   union dvm_value v = { .l = handler };
-  (void)dvm_set_field(vm, obj, "h", "Ljava/lang/reflect/InvocationHandler;",
+  (void)(dvm_set_field)(vm, obj, "h", "Ljava/lang/reflect/InvocationHandler;",
                       v);
   if (dvm__env("LUNARIA_DVM_PROXY"))
     fprintf(stderr, "[proxy] newProxyInstance %s ifaces=%u h=%u -> %u\n",
@@ -1238,7 +1238,7 @@ static bool proxy_getInvocationHandler(struct dvm *vm, dvm_ref self,
     return false;
   }
   union dvm_value hv = { 0 };
-  (void)dvm_get_field(vm, proxy, "h", "Ljava/lang/reflect/InvocationHandler;",
+  (void)(dvm_get_field)(vm, proxy, "h", "Ljava/lang/reflect/InvocationHandler;",
                       &hv);
   RETL(hv.l);
 }
@@ -1356,8 +1356,8 @@ static bool rf_get(struct dvm *vm, dvm_ref self,
                    union dvm_value *out)
 {
   union dvm_value owner = { 0 }, namev = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &namev);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &namev);
   struct dvm_object *co = dvm__obj(vm, owner.l);
   struct dvm_class *target = co ? co->klass : NULL;
   const char *name = dvm_string_utf8(vm, namev.l);
@@ -1419,7 +1419,7 @@ static bool rf_getDeclaringClass(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value owner = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
   RETL(owner.l);
 }
 
@@ -1433,7 +1433,7 @@ static bool rf_getType(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value sig = { 0 };
-  (void)dvm_get_field(vm, self, "sig", "Ljava/lang/String;", &sig);
+  (void)(dvm_get_field)(vm, self, "sig", "Ljava/lang/String;", &sig);
   const char *desc = sig.l ? dvm_string_utf8(vm, sig.l) : NULL;
   RETL(desc ? class_for_type_desc(vm, desc, strlen(desc)) : 0);
 }
@@ -1471,8 +1471,8 @@ static bool rf_set(struct dvm *vm, dvm_ref self,
 {
   (void)out;
   union dvm_value owner = { 0 }, namev = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &namev);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &namev);
   struct dvm_object *co = dvm__obj(vm, owner.l);
   struct dvm_class *target = co ? co->klass : NULL;
   const char *name = dvm_string_utf8(vm, namev.l);
@@ -1553,8 +1553,8 @@ static bool class_declares_field(struct dvm_class *c, const char *name)
 static dvm_ref field_annotation(struct dvm *vm, dvm_ref self, dvm_ref ann_ref)
 {
   union dvm_value owner = { 0 }, namev = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &namev);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &namev);
   struct dvm_object *co = dvm__obj(vm, owner.l);
   struct dvm_object *ao = dvm__obj(vm, ann_ref);
   struct dvm_class *target = co ? co->klass : NULL;
@@ -1654,8 +1654,8 @@ static bool rc_getAccessor(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value owner = { 0 }, name = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &name);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &name);
   union dvm_value a[2] = { { .l = name.l }, { .l = 0 } };
   return cl_getMethod(vm, owner.l, a, 2, out);
 }
@@ -1691,12 +1691,12 @@ static int64_t unsafe_array_index(const struct dvm_object *o, int64_t offset)
 static struct dvm_field *unsafe_reflected_field(struct dvm *vm, dvm_ref ref)
 {
   union dvm_value owner = { 0 }, namev = { 0 }, typev = {0};
-  if (!dvm_get_field(vm, ref, "owner", "Ljava/lang/Class;", &owner) ||
-      !dvm_get_field(vm, ref, "name", "Ljava/lang/String;", &namev))
+  if (!(dvm_get_field)(vm, ref, "owner", "Ljava/lang/Class;", &owner) ||
+      !(dvm_get_field)(vm, ref, "name", "Ljava/lang/String;", &namev))
     return NULL;
   struct dvm_object *co = dvm__obj(vm, owner.l);
   const char *name = dvm_string_utf8(vm, namev.l);
-  (void)dvm_get_field(vm, ref, "sig", "Ljava/lang/String;", &typev);
+  (void)(dvm_get_field)(vm, ref, "sig", "Ljava/lang/String;", &typev);
   const char *type = typev.l ? dvm_string_utf8(vm, typev.l) : NULL;
   for (struct dvm_class *c = co ? co->klass : NULL; c; c = c->super)
     for (int i = 0; name && i < c->nifields; ++i)
@@ -1734,7 +1734,7 @@ static bool unsafe_objectFieldOffset(struct dvm *vm, dvm_ref self,
     return false;
   }
   union dvm_value access = {0};
-  (void)dvm_get_field(vm, ARG(0).l, "access", "I", &access);
+  (void)(dvm_get_field)(vm, ARG(0).l, "access", "I", &access);
   struct dvm_field *field = (access.i & DEX_ACC_STATIC) ? NULL : unsafe_reflected_field(vm, ARG(0).l);
   if (!field) {
     dvm__throw(vm, "java/lang/IllegalArgumentException", "valid for instance fields only");
@@ -1756,7 +1756,7 @@ static bool unsafe_get_prim(struct dvm *vm, dvm_ref self,
   (void)nargs;
   struct dvm_field *f = unsafe_field(vm, ARG(0).l, ARG(1).j);
   union dvm_value value = { 0 };
-  if (f) (void)dvm__get_field_from(vm, ARG(0).l, f->cls, f->name, f->type, &value);
+  if (f) (void)(dvm__get_field_from)(vm, ARG(0).l, f->cls, f->name, f->type, &value);
   *out = value;
   return true;
 }
@@ -1768,7 +1768,7 @@ static bool unsafe_put_prim(struct dvm *vm, dvm_ref self,
   (void)self;
   (void)nargs;
   struct dvm_field *f = unsafe_field(vm, ARG(0).l, ARG(1).j);
-  if (f) (void)dvm__set_field_from(vm, ARG(0).l, f->cls, f->name, f->type, args[2]);
+  if (f) (void)(dvm__set_field_from)(vm, ARG(0).l, f->cls, f->name, f->type, args[2]);
   RETV();
 }
 
@@ -1976,10 +1976,10 @@ static bool unsafe_cas_int(struct dvm *vm, dvm_ref self,
   }
   struct dvm_field *f = unsafe_field(vm, object, ARG(1).j);
   union dvm_value current = { 0 };
-  if (!f || !dvm__get_field_from(vm, object, f->cls, f->name, f->type, &current)) RETI(0);
+  if (!f || !(dvm__get_field_from)(vm, object, f->cls, f->name, f->type, &current)) RETI(0);
   if (current.i != ARG(2).i) RETI(0);
   union dvm_value update = { .i = ARG(3).i };
-  (void)dvm__set_field_from(vm, object, f->cls, f->name, f->type, update);
+  (void)(dvm__set_field_from)(vm, object, f->cls, f->name, f->type, update);
   RETI(1);
 }
 
@@ -1991,10 +1991,10 @@ static bool unsafe_cas_long(struct dvm *vm, dvm_ref self,
   (void)nargs;
   struct dvm_field *f = unsafe_field(vm, ARG(0).l, ARG(1).j);
   union dvm_value current = { 0 };
-  if (!f || !dvm__get_field_from(vm, ARG(0).l, f->cls, f->name, f->type, &current)) RETI(0);
+  if (!f || !(dvm__get_field_from)(vm, ARG(0).l, f->cls, f->name, f->type, &current)) RETI(0);
   if (current.j != ARG(2).j) RETI(0);
   union dvm_value update = { .j = ARG(3).j };
-  (void)dvm__set_field_from(vm, ARG(0).l, f->cls, f->name, f->type, update);
+  (void)(dvm__set_field_from)(vm, ARG(0).l, f->cls, f->name, f->type, update);
   RETI(1);
 }
 
@@ -2017,10 +2017,10 @@ static bool unsafe_cas_object(struct dvm *vm, dvm_ref self,
   }
   struct dvm_field *f = unsafe_field(vm, object, ARG(1).j);
   union dvm_value current = { 0 };
-  if (!f || !dvm__get_field_from(vm, object, f->cls, f->name, f->type, &current)) RETI(0);
+  if (!f || !(dvm__get_field_from)(vm, object, f->cls, f->name, f->type, &current)) RETI(0);
   if (current.l != ARG(2).l) RETI(0);
   union dvm_value update = { .l = ARG(3).l };
-  (void)dvm__set_field_from(vm, object, f->cls, f->name, f->type, update);
+  (void)(dvm__set_field_from)(vm, object, f->cls, f->name, f->type, update);
   RETI(1);
 }
 
@@ -2039,7 +2039,7 @@ static bool unsafe_get_object(struct dvm *vm, dvm_ref self,
   }
   struct dvm_field *f = unsafe_field(vm, ARG(0).l, ARG(1).j);
   union dvm_value value = { 0 };
-  if (f) (void)dvm__get_field_from(vm, ARG(0).l, f->cls, f->name, f->type, &value);
+  if (f) (void)(dvm__get_field_from)(vm, ARG(0).l, f->cls, f->name, f->type, &value);
   RETL(value.l);
 }
 
@@ -2061,7 +2061,7 @@ static bool unsafe_put_object(struct dvm *vm, dvm_ref self,
   struct dvm_field *f = unsafe_field(vm, ARG(0).l, ARG(1).j);
   if (f) {
     union dvm_value value = { .l = ARG(2).l };
-    (void)dvm__set_field_from(vm, ARG(0).l, f->cls, f->name, f->type, value);
+    (void)(dvm__set_field_from)(vm, ARG(0).l, f->cls, f->name, f->type, value);
   }
   RETV();
 }
@@ -2282,7 +2282,7 @@ static bool dexfile_open(struct dvm *vm, dvm_ref self, const char *guest_path)
   }
   fprintf(stderr, "[dex] loaded %s\n", guest_path);
   union dvm_value v = { .l = dvm_new_string(vm, guest_path) };
-  (void)dvm_set_field(vm, self, "path", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, self, "path", "Ljava/lang/String;", v);
   dvm_ref classes = coll_new_list(vm, "Ljava/util/ArrayList;");
   if (!classes) return false;
   size_t capacity = 0, count = 0;
@@ -2324,7 +2324,7 @@ static bool dexfile_open(struct dvm *vm, dvm_ref self, const char *guest_path)
   }
   free(descriptors);
   v.l = classes;
-  (void)dvm_set_field(vm, self, "classes", "Ljava/util/List;", v);
+  (void)(dvm_set_field)(vm, self, "classes", "Ljava/util/List;", v);
   return true;
 }
 
@@ -2335,10 +2335,10 @@ static bool dexfile_entries(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value classes = { 0 };
-  (void)dvm_get_field(vm, self, "classes", "Ljava/util/List;", &classes);
+  (void)(dvm_get_field)(vm, self, "classes", "Ljava/util/List;", &classes);
   dvm_ref enumeration = dvm_new_object(vm, dvm_find_class(vm, "lunaria/util/ResourceKeys"));
   if (!enumeration) return false;
-  (void)dvm_set_field(vm, enumeration, "target", "Ljava/lang/Object;", classes);
+  (void)(dvm_set_field)(vm, enumeration, "target", "Ljava/lang/Object;", classes);
   RETL(enumeration);
 }
 
@@ -2381,7 +2381,7 @@ static bool dexfile_loadClass(struct dvm *vm, dvm_ref self,
   /* loadClass() answers null for a class this dex does not define — that is
    * its documented behaviour, and the caller checks for it. */
   union dvm_value classes = { 0 };
-  (void)dvm_get_field(vm, self, "classes", "Ljava/util/List;", &classes);
+  (void)(dvm_get_field)(vm, self, "classes", "Ljava/util/List;", &classes);
   struct rt_list *list = list_of(vm, classes.l);
   bool defined = false;
   for (uint32_t i = 0; n && list && i < list->size; ++i) {
@@ -2406,7 +2406,7 @@ static bool dexfile_getName(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "path", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, self, "path", "Ljava/lang/String;", &v);
   RETL(v.l);
 }
 
@@ -2465,17 +2465,17 @@ static bool cl_getConstructor(struct dvm *vm, dvm_ref self,
   dvm_ref k = cc ? dvm_new_object(vm, cc) : 0;
   if (!k) RETL(0);
   union dvm_value v = { .l = self };
-  (void)dvm_set_field(vm, k, "owner", "Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, k, "owner", "Ljava/lang/Class;", v);
   v.l = dvm_new_string(vm, "<init>");
-  (void)dvm_set_field(vm, k, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, k, "name", "Ljava/lang/String;", v);
   /* Which overload.  Kept as the descriptor rather than the Class[] so
    * newInstance() can hand it straight to the method lookup. */
   if (have_sig) {
     v.l = dvm_new_string(vm, sig);
-    (void)dvm_set_field(vm, k, "sig", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, k, "sig", "Ljava/lang/String;", v);
   }
   v.i = declared ? (int32_t)declared->access : 0;
-  (void)dvm_set_field(vm, k, "access", "I", v);
+  (void)(dvm_set_field)(vm, k, "access", "I", v);
   RETL(k);
 }
 
@@ -2487,15 +2487,15 @@ static dvm_ref reflect_constructor(struct dvm *vm, dvm_ref owner,
   dvm_ref ctor = cc ? dvm_new_object(vm, cc) : 0;
   if (!ctor) return 0;
   union dvm_value v = { .l = owner };
-  (void)dvm_set_field(vm, ctor, "owner", "Ljava/lang/Class;", v);
+  (void)(dvm_set_field)(vm, ctor, "owner", "Ljava/lang/Class;", v);
   v.l = dvm_new_string(vm, "<init>");
-  (void)dvm_set_field(vm, ctor, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ctor, "name", "Ljava/lang/String;", v);
   if (method && method->sig) {
     v.l = dvm_new_string(vm, method->sig);
-    (void)dvm_set_field(vm, ctor, "sig", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, ctor, "sig", "Ljava/lang/String;", v);
   }
   v.i = method ? (int32_t)method->access : 0;
-  (void)dvm_set_field(vm, ctor, "access", "I", v);
+  (void)(dvm_set_field)(vm, ctor, "access", "I", v);
   return ctor;
 }
 
@@ -2555,7 +2555,7 @@ static bool rc_newInstance(struct dvm *vm, dvm_ref self,
                            union dvm_value *out)
 {
   union dvm_value ownerv = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &ownerv);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &ownerv);
   struct dvm_object *co = ownerv.l ? dvm__obj(vm, ownerv.l) : NULL;
   struct dvm_class *cls = co ? co->klass : NULL;
   if (!cls) {
@@ -2582,7 +2582,7 @@ static bool rc_newInstance(struct dvm *vm, dvm_ref self,
    * whose overload this VM does not model working as before. */
   struct dvm_method *ctor = NULL;
   union dvm_value sigv = { 0 };
-  if (dvm_get_field(vm, self, "sig", "Ljava/lang/String;", &sigv) && sigv.l) {
+  if ((dvm_get_field)(vm, self, "sig", "Ljava/lang/String;", &sigv) && sigv.l) {
     const char *sig = dvm_string_utf8(vm, sigv.l);
     if (sig) ctor = dvm_find_method(vm, cls, "<init>", sig);
   }
@@ -2909,11 +2909,11 @@ static bool cl_getRecordComponents(struct dvm *vm, dvm_ref self,
     dvm_ref c = dvm_new_object(vm, rc);
     if (!c) return false;
     union dvm_value v = { .l = self };
-    (void)dvm_set_field(vm, c, "owner", "Ljava/lang/Class;", v);
+    (void)(dvm_set_field)(vm, c, "owner", "Ljava/lang/Class;", v);
     v.l = dvm_new_string(vm, fd->name ? fd->name : "");
-    (void)dvm_set_field(vm, c, "name", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, c, "name", "Ljava/lang/String;", v);
     v.l = dvm_new_string(vm, fd->type ? fd->type : "Ljava/lang/Object;");
-    (void)dvm_set_field(vm, c, "sig", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, c, "sig", "Ljava/lang/String;", v);
     items[i] = c;
   }
   RETL(arr);
@@ -3250,13 +3250,13 @@ static bool cl_getEnclosingExecutable(struct dvm *vm, dvm_ref self,
   if (!result) RETL(0);
   dvm_pin(vm, result);
   union dvm_value value = { .l = owner_ref };
-  (void)dvm_set_field(vm, result, "owner", "Ljava/lang/Class;", value);
+  (void)(dvm_set_field)(vm, result, "owner", "Ljava/lang/Class;", value);
   value.l = dvm_new_string(vm, method->name);
-  (void)dvm_set_field(vm, result, "name", "Ljava/lang/String;", value);
+  (void)(dvm_set_field)(vm, result, "name", "Ljava/lang/String;", value);
   value.l = dvm_new_string(vm, method->sig);
-  (void)dvm_set_field(vm, result, "sig", "Ljava/lang/String;", value);
+  (void)(dvm_set_field)(vm, result, "sig", "Ljava/lang/String;", value);
   value.i = (int32_t)method->access;
-  (void)dvm_set_field(vm, result, "access", "I", value);
+  (void)(dvm_set_field)(vm, result, "access", "I", value);
   dvm_unpin(vm, result);
   RETL(result);
 }
@@ -3411,7 +3411,7 @@ static bool reflect_get_raw_type(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "rawType", "Ljava/lang/reflect/Type;", out))
+  if (!(dvm_get_field)(vm, self, "rawType", "Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
 }
@@ -3422,7 +3422,7 @@ static bool reflect_get_type_arguments(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "actualTypeArguments",
+  if (!(dvm_get_field)(vm, self, "actualTypeArguments",
                      "[Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
@@ -3434,7 +3434,7 @@ static bool reflect_get_owner_type(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "ownerType", "Ljava/lang/reflect/Type;", out))
+  if (!(dvm_get_field)(vm, self, "ownerType", "Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
 }
@@ -3445,7 +3445,7 @@ static bool reflect_get_upper_bounds(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "upperBounds",
+  if (!(dvm_get_field)(vm, self, "upperBounds",
                      "[Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
@@ -3457,7 +3457,7 @@ static bool reflect_get_lower_bounds(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "lowerBounds",
+  if (!(dvm_get_field)(vm, self, "lowerBounds",
                      "[Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
@@ -3469,7 +3469,7 @@ static bool reflect_get_generic_component(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "genericComponentType",
+  if (!(dvm_get_field)(vm, self, "genericComponentType",
                      "Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
@@ -3481,7 +3481,7 @@ static bool type_variable_get_name(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "name", "Ljava/lang/String;", out)) out->l = 0;
+  if (!(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", out)) out->l = 0;
   return true;
 }
 
@@ -3491,7 +3491,7 @@ static bool type_variable_get_declaration(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "genericDeclaration",
+  if (!(dvm_get_field)(vm, self, "genericDeclaration",
                      "Ljava/lang/reflect/GenericDeclaration;", out))
     out->l = 0;
   return true;
@@ -3503,7 +3503,7 @@ static bool type_variable_get_bounds(struct dvm *vm, dvm_ref self,
 {
   (void)args;
   (void)nargs;
-  if (!dvm_get_field(vm, self, "bounds", "[Ljava/lang/reflect/Type;", out))
+  if (!(dvm_get_field)(vm, self, "bounds", "[Ljava/lang/reflect/Type;", out))
     out->l = 0;
   return true;
 }
@@ -3585,9 +3585,9 @@ static dvm_ref generic_variable_new(struct generic_sig_parser *sp,
   sp->var_names[at][len] = '\0';
   sp->variables[at] = ref;
   union dvm_value v = { .l = dvm_new_string_n(sp->vm, name, len) };
-  (void)dvm_set_field(sp->vm, ref, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(sp->vm, ref, "name", "Ljava/lang/String;", v);
   v.l = sp->declaration;
-  (void)dvm_set_field(sp->vm, ref, "genericDeclaration",
+  (void)(dvm_set_field)(sp->vm, ref, "genericDeclaration",
                       "Ljava/lang/reflect/GenericDeclaration;", v);
   return ref;
 }
@@ -3601,7 +3601,7 @@ static void generic_sig_cached_formals(struct generic_sig_parser *sp)
                                 sp->declaring_class->type_parameters);
   for (int i = 0; cached && i < n && sp->nvariables < 16; ++i) {
     union dvm_value name = { 0 };
-    if (!dvm_get_field(sp->vm, cached[i], "name", "Ljava/lang/String;",
+    if (!(dvm_get_field)(sp->vm, cached[i], "name", "Ljava/lang/String;",
                        &name))
       continue;
     const char *s = dvm_string_utf8(sp->vm, name.l);
@@ -3640,7 +3640,7 @@ static void generic_sig_formals(struct generic_sig_parser *sp)
       bounds[nbounds++] = class_object_for(sp->vm,
                                            dvm__class_by_desc(sp->vm, "Ljava/lang/Object;"));
     union dvm_value v = { .l = generic_type_array(sp->vm, bounds, nbounds) };
-    (void)dvm_set_field(sp->vm, variable, "bounds",
+    (void)(dvm_set_field)(sp->vm, variable, "bounds",
                         "[Ljava/lang/reflect/Type;", v);
   }
   if (*sp->p == '>') ++sp->p;
@@ -3673,9 +3673,9 @@ static dvm_ref generic_wildcard(struct generic_sig_parser *sp, char variance)
                          "Llunaria/reflect/WildcardTypeImpl;");
   dvm_ref ref = wc ? dvm_new_object(vm, wc) : 0;
   union dvm_value v = { .l = upper };
-  (void)dvm_set_field(vm, ref, "upperBounds", "[Ljava/lang/reflect/Type;", v);
+  (void)(dvm_set_field)(vm, ref, "upperBounds", "[Ljava/lang/reflect/Type;", v);
   v.l = lower;
-  (void)dvm_set_field(vm, ref, "lowerBounds", "[Ljava/lang/reflect/Type;", v);
+  (void)(dvm_set_field)(vm, ref, "lowerBounds", "[Ljava/lang/reflect/Type;", v);
   return ref;
 }
 
@@ -3717,12 +3717,12 @@ static dvm_ref generic_class_type(struct generic_sig_parser *sp)
                          "Llunaria/reflect/ParameterizedTypeImpl;");
   dvm_ref ref = pc ? dvm_new_object(sp->vm, pc) : 0;
   union dvm_value v = { .l = raw_type };
-  (void)dvm_set_field(sp->vm, ref, "rawType", "Ljava/lang/reflect/Type;", v);
+  (void)(dvm_set_field)(sp->vm, ref, "rawType", "Ljava/lang/reflect/Type;", v);
   v.l = argv;
-  (void)dvm_set_field(sp->vm, ref, "actualTypeArguments",
+  (void)(dvm_set_field)(sp->vm, ref, "actualTypeArguments",
                       "[Ljava/lang/reflect/Type;", v);
   v.l = 0;
-  (void)dvm_set_field(sp->vm, ref, "ownerType", "Ljava/lang/reflect/Type;", v);
+  (void)(dvm_set_field)(sp->vm, ref, "ownerType", "Ljava/lang/reflect/Type;", v);
   return ref;
 }
 
@@ -3753,7 +3753,7 @@ static dvm_ref generic_sig_type(struct generic_sig_parser *sp)
                            "Llunaria/reflect/GenericArrayTypeImpl;");
     result = gc ? dvm_new_object(sp->vm, gc) : 0;
     union dvm_value v = { .l = component };
-    (void)dvm_set_field(sp->vm, result, "genericComponentType",
+    (void)(dvm_set_field)(sp->vm, result, "genericComponentType",
                         "Ljava/lang/reflect/Type;", v);
     break;
   }
@@ -3790,8 +3790,8 @@ static bool rf_getGenericType(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value owner = { 0 }, namev = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &namev);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &namev);
   struct dvm_object *co = dvm__obj(vm, owner.l);
   struct dvm_class *target = co ? co->klass : NULL;
   const char *name = dvm_string_utf8(vm, namev.l);
@@ -3848,9 +3848,9 @@ struct refl_decl {
 static bool refl_decl_of(struct dvm *vm, dvm_ref self, struct refl_decl *d)
 {
   union dvm_value owner = { 0 }, namev = { 0 }, sigv = { 0 }, pv = { 0 };
-  (void)dvm_get_field(vm, self, "owner", "Ljava/lang/Class;", &owner);
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &namev);
-  (void)dvm_get_field(vm, self, "sig", "Ljava/lang/String;", &sigv);
+  (void)(dvm_get_field)(vm, self, "owner", "Ljava/lang/Class;", &owner);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &namev);
+  (void)(dvm_get_field)(vm, self, "sig", "Ljava/lang/String;", &sigv);
   struct dvm_object *co = dvm__obj(vm, owner.l);
   const char *name = namev.l ? dvm_string_utf8(vm, namev.l) : NULL;
   if (!co || !co->klass) return false;
@@ -3863,7 +3863,7 @@ static bool refl_decl_of(struct dvm *vm, dvm_ref self, struct refl_decl *d)
     /* getMethod(name, Class...) stored the parameter types instead. */
     size_t used = 0;
     d->sig[used++] = '(';
-    if (dvm_get_field(vm, self, "paramTypes", "[Ljava/lang/Class;", &pv) &&
+    if ((dvm_get_field)(vm, self, "paramTypes", "[Ljava/lang/Class;", &pv) &&
         pv.l) {
       dvm_ref *items = dvm_array_data(vm, pv.l);
       uint32_t n = dvm_array_length(vm, pv.l);
@@ -3937,8 +3937,8 @@ static bool rf_getAnnotations(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value owner= {0},field_name= {0};
-  dvm_get_field(vm,self,"owner","Ljava/lang/Class;",&owner);
-  dvm_get_field(vm,self,"name","Ljava/lang/String;",&field_name);
+  (dvm_get_field)(vm,self,"owner","Ljava/lang/Class;",&owner);
+  (dvm_get_field)(vm,self,"name","Ljava/lang/String;",&field_name);
   struct dvm_object *object=dvm__obj(vm,owner.l);
   struct dvm_class *c=object ? object->klass : NULL;
   const char *name=dvm_string_utf8(vm,field_name.l);
@@ -4251,7 +4251,7 @@ static bool cl_asSubclass(struct dvm *vm, dvm_ref self,
 static bool rc_getName(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value owner= {0};
-  (void)dvm_get_field(vm,self,"owner","Ljava/lang/Class;",&owner);
+  (void)(dvm_get_field)(vm,self,"owner","Ljava/lang/Class;",&owner);
   return cl_getName(vm,owner.l,args,nargs,out);
 }
 static const struct rt_method rt_reflect_ctor[] = {
@@ -4674,7 +4674,7 @@ static bool clsl_init_parent(struct dvm *vm, dvm_ref self,
 {
   (void)out;
   union dvm_value parent = { .l = nargs > 0 ? ARG(0).l : 0 };
-  (void)dvm_set_field(vm, self, "parent", "Ljava/lang/ClassLoader;", parent);
+  (void)(dvm_set_field)(vm, self, "parent", "Ljava/lang/ClassLoader;", parent);
   RETV();
 }
 
@@ -4685,7 +4685,7 @@ static bool clsl_get_parent(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "parent", "Ljava/lang/ClassLoader;", &v);
+  (void)(dvm_get_field)(vm, self, "parent", "Ljava/lang/ClassLoader;", &v);
   RETL(v.l);
 }
 
@@ -4730,7 +4730,7 @@ static bool clsl_get_package(struct dvm *vm, dvm_ref self, const union dvm_value
   if (!defined) RETL(0);
   struct dvm_class *pc = dvm__class_by_desc(vm, "Ljava/lang/Package;");
   dvm_ref r = pc ? dvm_new_object(vm, pc) : 0;
-  if (r) (void)dvm_set_field(vm, r, "name", "Ljava/lang/String;", (union dvm_value) {
+  if (r) (void)(dvm_set_field)(vm, r, "name", "Ljava/lang/String;", (union dvm_value) {
     .l = args[0].l
   });
   RETL(r);
@@ -4783,7 +4783,7 @@ static bool clsl_get_packages(struct dvm *vm, dvm_ref self, const union dvm_valu
       } else {
         dvm_ref r = pc ? dvm_new_object(vm, pc) : 0;
         if (r) {
-          (void)dvm_set_field(vm, r, "name", "Ljava/lang/String;", (union dvm_value) {
+          (void)(dvm_set_field)(vm, r, "name", "Ljava/lang/String;", (union dvm_value) {
             .l = dvm_new_string(vm, pkg)
           });
           ((dvm_ref *)dvm_array_data(vm, array))[k] = r;
@@ -4854,8 +4854,8 @@ static bool dexcl_init(struct dvm *vm, dvm_ref self, const union dvm_value *args
   if (nargs == 2) parent.l = ARG(1).l;
   else if (nargs == 3) parent.l = ARG(2).l;
   else if (nargs >= 4) parent.l = ARG(3).l;
-  (void)dvm_set_field(vm, self, "dexPath", "Ljava/lang/String;", path);
-  (void)dvm_set_field(vm, self, "parent", "Ljava/lang/ClassLoader;", parent);
+  (void)(dvm_set_field)(vm, self, "dexPath", "Ljava/lang/String;", path);
+  (void)(dvm_set_field)(vm, self, "parent", "Ljava/lang/ClassLoader;", parent);
   /* If the path names a guest .dex/.apk that is not yet loaded, open it the
    * same way DexFile does so subsequent loadClass can see its types. */
   if (path.l) {
@@ -4941,7 +4941,7 @@ static bool memory_dex_init(struct dvm *vm, dvm_ref self,
       return false;
     }
   }
-  (void)dvm_set_field(vm, self, "parent", "Ljava/lang/ClassLoader;", ARG(nargs - 1));
+  (void)(dvm_set_field)(vm, self, "parent", "Ljava/lang/ClassLoader;", ARG(nargs - 1));
   const char *library_path = nargs == 3 && ARG(1).l ? dvm_string_utf8(vm, ARG(1).l) : "";
   int first = vm->ndexes;
   bool valid = true;
@@ -4975,14 +4975,14 @@ static bool memory_dex_init(struct dvm *vm, dvm_ref self,
   if (vm->ndexes > first) dvm_pin(vm, self); /* DEXes live until VM teardown. */
   if (!dex_path_list_build(vm, self, first, vm->ndexes, library_path)) return false;
   union dvm_value list = {0}, elements = {0};
-  (void)dvm_get_field(vm, self, "pathList", "Ldalvik/system/DexPathList;", &list);
-  (void)dvm_get_field(vm, list.l, "dexElements", "[Ldalvik/system/DexPathList$Element;", &elements);
+  (void)(dvm_get_field)(vm, self, "pathList", "Ldalvik/system/DexPathList;", &list);
+  (void)(dvm_get_field)(vm, list.l, "dexElements", "[Ldalvik/system/DexPathList$Element;", &elements);
   for (uint32_t i = 0; i < dvm_array_length(vm, elements.l); ++i) {
     dvm_ref element = ((dvm_ref *)dvm_array_data(vm, elements.l))[i];
     union dvm_value dex = {0}, null = {0};
-    (void)dvm_set_field(vm, element, "path", "Ljava/io/File;", null);
-    (void)dvm_get_field(vm, element, "dexFile", "Ldalvik/system/DexFile;", &dex);
-    (void)dvm_set_field(vm, dex.l, "path", "Ljava/lang/String;", null);
+    (void)(dvm_set_field)(vm, element, "path", "Ljava/io/File;", null);
+    (void)(dvm_get_field)(vm, element, "dexFile", "Ldalvik/system/DexFile;", &dex);
+    (void)(dvm_set_field)(vm, dex.l, "path", "Ljava/lang/String;", null);
   }
   if (!valid) {
     dvm__throw(vm, "java/io/IOException", "Invalid in-memory DEX");
@@ -4991,7 +4991,7 @@ static bool memory_dex_init(struct dvm *vm, dvm_ref self,
     dvm_ref errors = dvm_new_array(vm, 'L', "Ljava/io/IOException;", 1);
     if (!errors) return false;
     ((dvm_ref *)dvm_array_data(vm, errors))[0] = error;
-    (void)dvm_set_field(vm, list.l, "dexElementsSuppressedExceptions", "[Ljava/io/IOException;",
+    (void)(dvm_set_field)(vm, list.l, "dexElementsSuppressedExceptions", "[Ljava/io/IOException;",
     (union dvm_value) {
       .l = errors
     });
@@ -5018,7 +5018,7 @@ static dvm_ref loader_file(struct dvm *vm, const char *path)
 {
   dvm_ref file = dvm_new_object(vm, dvm_find_class(vm, "java/io/File"));
   union dvm_value value = {.l = dvm_new_string(vm, path)};
-  if (!file || !value.l || !dvm_set_field(vm, file, "path", "Ljava/lang/String;", value)) return 0;
+  if (!file || !value.l || !(dvm_set_field)(vm, file, "path", "Ljava/lang/String;", value)) return 0;
   return file;
 }
 
@@ -5033,11 +5033,11 @@ static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
 {
   dvm_ref path_list = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList"));
   if (!path_list) return false;
-  (void)dvm_set_field(vm, loader, "pathList", "Ldalvik/system/DexPathList;",
+  (void)(dvm_set_field)(vm, loader, "pathList", "Ldalvik/system/DexPathList;",
   (union dvm_value) {
     .l = path_list
   });
-  (void)dvm_set_field(vm, path_list, "definingContext", "Ljava/lang/ClassLoader;",
+  (void)(dvm_set_field)(vm, path_list, "definingContext", "Ljava/lang/ClassLoader;",
   (union dvm_value) {
     .l = loader
   });
@@ -5062,7 +5062,7 @@ static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
   }
   union dvm_value elements = {.l = dvm_new_array(vm, 'L', "Ldalvik/system/DexPathList$Element;", count)};
   if (!elements.l) goto failed;
-  (void)dvm_set_field(vm, path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;", elements);
+  (void)(dvm_set_field)(vm, path_list, "dexElements", "[Ldalvik/system/DexPathList$Element;", elements);
   for (int i = 0; i < count; ++i) {
     dvm_ref element = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList$Element"));
     dvm_ref dexfile = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexFile"));
@@ -5070,16 +5070,16 @@ static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
     dvm_ref file = loader_file(vm, origins[i]);
     if (!element || !dexfile || !classes || !file) goto failed;
     ((dvm_ref *)dvm_array_data(vm, elements.l))[i] = element;
-    (void)dvm_set_field(vm, element, "path", "Ljava/io/File;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, element, "path", "Ljava/io/File;", (union dvm_value) {
       .l = file
     });
-    (void)dvm_set_field(vm, element, "dexFile", "Ldalvik/system/DexFile;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, element, "dexFile", "Ldalvik/system/DexFile;", (union dvm_value) {
       .l = dexfile
     });
-    (void)dvm_set_field(vm, dexfile, "path", "Ljava/lang/String;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, dexfile, "path", "Ljava/lang/String;", (union dvm_value) {
       .l = dvm_new_string(vm, origins[i])
     });
-    (void)dvm_set_field(vm, dexfile, "classes", "Ljava/util/List;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, dexfile, "classes", "Ljava/util/List;", (union dvm_value) {
       .l = classes
     });
     size_t length = strlen(origins[i]);
@@ -5105,10 +5105,10 @@ static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
   dvm_ref native = coll_new_list(vm, "Ljava/util/ArrayList;");
   dvm_ref system = coll_new_list(vm, "Ljava/util/ArrayList;");
   if (!native || !system) goto failed;
-  (void)dvm_set_field(vm, path_list, "nativeLibraryDirectories", "Ljava/util/List;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, path_list, "nativeLibraryDirectories", "Ljava/util/List;", (union dvm_value) {
     .l = native
   });
-  (void)dvm_set_field(vm, path_list, "systemNativeLibraryDirectories", "Ljava/util/List;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, path_list, "systemNativeLibraryDirectories", "Ljava/util/List;", (union dvm_value) {
     .l = system
   });
   char *paths = strdup(library_path ? library_path : ""), *save = NULL;
@@ -5127,13 +5127,13 @@ static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
   uint32_t n = app_dirs->size + system_dirs->size;
   union dvm_value native_elements = {.l = dvm_new_array(vm, 'L', "Ldalvik/system/DexPathList$NativeLibraryElement;", n)};
   if (!native_elements.l) goto failed;
-  (void)dvm_set_field(vm, path_list, "nativeLibraryPathElements", "[Ldalvik/system/DexPathList$NativeLibraryElement;", native_elements);
+  (void)(dvm_set_field)(vm, path_list, "nativeLibraryPathElements", "[Ldalvik/system/DexPathList$NativeLibraryElement;", native_elements);
   for (uint32_t i = 0; i < n; ++i) {
     dvm_ref element = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/DexPathList$NativeLibraryElement"));
     dvm_ref file = i < app_dirs->size ? app_dirs->items[i] : system_dirs->items[i - app_dirs->size];
     if (!element) goto failed;
     ((dvm_ref *)dvm_array_data(vm, native_elements.l))[i] = element;
-    (void)dvm_set_field(vm, element, "path", "Ljava/io/File;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, element, "path", "Ljava/io/File;", (union dvm_value) {
       .l = file
     });
   }
@@ -5153,11 +5153,11 @@ static dvm_ref application_class_loader(struct dvm *vm)
   dvm_ref loader = dvm_new_object(vm, dvm_find_class(vm, "dalvik/system/PathClassLoader"));
   if (!loader) return 0;
   dvm_pin(vm, loader);
-  (void)dvm_set_field(vm, loader, "parent", "Ljava/lang/ClassLoader;",
+  (void)(dvm_set_field)(vm, loader, "parent", "Ljava/lang/ClassLoader;",
   (union dvm_value) {
     .l = bootstrap_class_loader(vm)
   });
-  (void)dvm_set_field(vm, loader, "dexPath", "Ljava/lang/String;",
+  (void)(dvm_set_field)(vm, loader, "dexPath", "Ljava/lang/String;",
   (union dvm_value) {
     .l = dvm_new_string(vm, lunaria_android_apk_path())
   });
@@ -5179,19 +5179,19 @@ static bool dexcl_library_path(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value path_list = {0}, directories = {0}, path = {0};
-  (void)dvm_get_field(vm, self, "pathList", "Ldalvik/system/DexPathList;", &path_list);
-  (void)dvm_get_field(vm, path_list.l, "nativeLibraryDirectories", "Ljava/util/List;", &directories);
+  (void)(dvm_get_field)(vm, self, "pathList", "Ldalvik/system/DexPathList;", &path_list);
+  (void)(dvm_get_field)(vm, path_list.l, "nativeLibraryDirectories", "Ljava/util/List;", &directories);
   struct rt_list *list = list_of(vm, directories.l);
   size_t size = 1;
   for (uint32_t i = 0; list && i < list->size; ++i) {
-    (void)dvm_get_field(vm, list->items[i], "path", "Ljava/lang/String;", &path);
+    (void)(dvm_get_field)(vm, list->items[i], "path", "Ljava/lang/String;", &path);
     const char *s = dvm_string_utf8(vm, path.l);
     if(s)size += strlen(s) + 1;
   }
   char *text = calloc(size, 1);
   if(!text)return false;
   for (uint32_t i = 0; list && i < list->size; ++i) {
-    (void)dvm_get_field(vm, list->items[i], "path", "Ljava/lang/String;", &path);
+    (void)(dvm_get_field)(vm, list->items[i], "path", "Ljava/lang/String;", &path);
     const char *s = dvm_string_utf8(vm, path.l);
     if(!s)continue;
     if (*text) strcat(text, ":");
@@ -5213,13 +5213,13 @@ static bool dexcl_find_library(struct dvm *vm, dvm_ref self,
   }
   if(strchr(name,'/'))RETL(0);
   union dvm_value path_list= {0},elements= {0},file= {0},path= {0};
-  (void)dvm_get_field(vm,self,"pathList","Ldalvik/system/DexPathList;",&path_list);
-  (void)dvm_get_field(vm,path_list.l,"nativeLibraryPathElements","[Ldalvik/system/DexPathList$NativeLibraryElement;",&elements);
+  (void)(dvm_get_field)(vm,self,"pathList","Ldalvik/system/DexPathList;",&path_list);
+  (void)(dvm_get_field)(vm,path_list.l,"nativeLibraryPathElements","[Ldalvik/system/DexPathList$NativeLibraryElement;",&elements);
   uint32_t count=dvm_array_length(vm,elements.l);
   for(uint32_t i=0; i<count; ++i) {
     dvm_ref element=((dvm_ref *)dvm_array_data(vm,elements.l))[i];
-    (void)dvm_get_field(vm,element,"path","Ljava/io/File;",&file);
-    (void)dvm_get_field(vm,file.l,"path","Ljava/lang/String;",&path);
+    (void)(dvm_get_field)(vm,element,"path","Ljava/io/File;",&file);
+    (void)(dvm_get_field)(vm,file.l,"path","Ljava/lang/String;",&path);
     const char *directory=dvm_string_utf8(vm,path.l);
     if(!directory)continue;
     char guest[DVM_PATH_MAX],host[DVM_PATH_MAX];
@@ -5316,9 +5316,9 @@ static bool dex_path_make_elements(struct dvm *vm, dvm_ref self,
       goto done;
     }
     ((dvm_ref *)dvm_array_data(vm, elements))[count++] = element;
-    dvm_set_field(vm, element, "path", "Ljava/io/File;",
+    (dvm_set_field)(vm, element, "path", "Ljava/io/File;",
                   (union dvm_value){.l = dexfile && raw ? 0 : item.l});
-    dvm_set_field(vm, element, "dexFile", "Ldalvik/system/DexFile;",
+    (dvm_set_field)(vm, element, "dexFile", "Ldalvik/system/DexFile;",
                   (union dvm_value){.l = dexfile});
     if (dexfile) dvm_unpin(vm, dexfile);
   }
@@ -5353,13 +5353,13 @@ static dvm_ref legacy_enumeration_new(struct dvm *vm,dvm_ref target,int kind);
 static dvm_ref props_defaults(struct dvm *vm,dvm_ref self)
 {
   union dvm_value value= {0};
-  dvm_get_field(vm,self,"defaults","Ljava/util/Properties;",&value);
+  (dvm_get_field)(vm,self,"defaults","Ljava/util/Properties;",&value);
   return value.l;
 }
 static bool props_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   if(!map_init(vm,self,NULL,0,out))return false;
-  dvm_set_field(vm,self,"defaults","Ljava/util/Properties;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"defaults","Ljava/util/Properties;",(union dvm_value) {
     .l=nargs ? ARG(0).l : 0
   });
   RETV();

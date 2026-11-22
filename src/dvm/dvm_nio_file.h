@@ -10,8 +10,8 @@
 static dvm_ref nio_invalid_message_ref(struct dvm *vm,dvm_ref self)
 {
   union dvm_value input= {0},reason= {0};
-  dvm_get_field(vm,self,"input","Ljava/lang/String;",&input);
-  dvm_get_field(vm,self,"reason","Ljava/lang/String;",&reason);
+  (dvm_get_field)(vm,self,"input","Ljava/lang/String;",&input);
+  (dvm_get_field)(vm,self,"reason","Ljava/lang/String;",&reason);
   int32_t index=rt_get_int(vm,self,"index");
   char suffix[48];
   int n=index<0 ? snprintf(suffix,sizeof suffix,": ") : snprintf(suffix,sizeof suffix," at index %d: ",index);
@@ -31,15 +31,15 @@ static bool nio_invalid_path(struct dvm *vm,dvm_ref input)
 {
   dvm__throw(vm,"java/nio/file/InvalidPathException","Nul character not allowed: %s",sref(vm,input));
   dvm_ref error=dvm_exception(vm);
-  dvm_set_field(vm,error,"input","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,error,"input","Ljava/lang/String;",(union dvm_value) {
     .l=input
   });
-  dvm_set_field(vm,error,"reason","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,error,"reason","Ljava/lang/String;",(union dvm_value) {
     .l=dvm_new_string(vm,"Nul character not allowed")
   });
   rt_set_int(vm,error,"index",-1);
   dvm_ref message=nio_invalid_message_ref(vm,error);
-  if(message) dvm_set_field(vm,error,"detailMessage","Ljava/lang/String;",(union dvm_value) {
+  if(message) (dvm_set_field)(vm,error,"detailMessage","Ljava/lang/String;",(union dvm_value) {
     .l=message
   });
   return false;
@@ -78,7 +78,7 @@ static dvm_ref nio_path_from_string(struct dvm *vm,dvm_ref string)
   }
   dvm_pin(vm,string);
   dvm_ref path=dvm_new_object(vm,dvm_find_class(vm,"sun/nio/fs/UnixPath"));
-  if(path) dvm_set_field(vm,path,"path","Ljava/lang/String;",(union dvm_value) {
+  if(path) (dvm_set_field)(vm,path,"path","Ljava/lang/String;",(union dvm_value) {
     .l=string
   });
   dvm_unpin(vm,string);
@@ -151,7 +151,7 @@ static dvm_ref nio_path_text(struct dvm *vm,dvm_ref self)
     return 0;
   }
   union dvm_value value= {0};
-  dvm_get_field(vm,self,"path","Ljava/lang/String;",&value);
+  (dvm_get_field)(vm,self,"path","Ljava/lang/String;",&value);
   return value.l;
 }
 static bool nio_path_string(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -168,7 +168,7 @@ static bool nio_path_to_file(struct dvm *vm,dvm_ref self,const union dvm_value *
   dvm_ref text=nio_path_text(vm,self);
   if(!text) return false;
   dvm_ref file=dvm_new_object(vm,dvm_find_class(vm,"java/io/File"));
-  if(file) dvm_set_field(vm,file,"path","Ljava/lang/String;",(union dvm_value) {
+  if(file) (dvm_set_field)(vm,file,"path","Ljava/lang/String;",(union dvm_value) {
     .l=text
   });
   RETL(file);
@@ -240,8 +240,8 @@ static bool nio_invalid_init(struct dvm *vm,dvm_ref self,const union dvm_value *
     dvm__throw(vm,"java/lang/IllegalArgumentException","index < -1");
     return false;
   }
-  dvm_set_field(vm,self,"input","Ljava/lang/String;",ARG(0));
-  dvm_set_field(vm,self,"reason","Ljava/lang/String;",ARG(1));
+  (dvm_set_field)(vm,self,"input","Ljava/lang/String;",ARG(0));
+  (dvm_set_field)(vm,self,"reason","Ljava/lang/String;",ARG(1));
   rt_set_int(vm,self,"index",index);
   union dvm_value message= {.l=nio_invalid_message_ref(vm,self)};
   if(!message.l) {
@@ -257,9 +257,9 @@ static bool nio_exception_init(struct dvm *vm,dvm_ref self,const union dvm_value
     other=ARG(1);
     reason=ARG(2);
   }
-  dvm_set_field(vm,self,"file","Ljava/lang/String;",file);
-  dvm_set_field(vm,self,"other","Ljava/lang/String;",other);
-  dvm_set_field(vm,self,"reason","Ljava/lang/String;",reason);
+  (dvm_set_field)(vm,self,"file","Ljava/lang/String;",file);
+  (dvm_set_field)(vm,self,"other","Ljava/lang/String;",other);
+  (dvm_set_field)(vm,self,"reason","Ljava/lang/String;",reason);
   const char *a=file.l ? sref(vm,file.l) : "",*b=other.l ? sref(vm,other.l) : "",*r=reason.l ? sref(vm,reason.l) : "";
   if(!file.l && !other.l) return th_init(vm,self,&reason,1,out);
   size_t length=strlen(a)+strlen(b)+strlen(r)+7;
@@ -280,7 +280,7 @@ static bool nio_exception_field(struct dvm *vm,dvm_ref self,const union dvm_valu
   const char *name=builtin_name();
   if(!strcmp(name,"getIndex")) RETI(rt_get_int(vm,self,"index"));
   const char *field=!strcmp(name,"getInput") ? "input" : !strcmp(name,"getFile") ? "file" : !strcmp(name,"getOtherFile") ? "other" : "reason";
-  return dvm_get_field(vm,self,field,"Ljava/lang/String;",out);
+  return (dvm_get_field)(vm,self,field,"Ljava/lang/String;",out);
 }
 static bool nio_io_error(struct dvm *vm,dvm_ref path,int error)
 {
@@ -289,10 +289,10 @@ static bool nio_io_error(struct dvm *vm,dvm_ref path,int error)
   const char *type=error==ENOENT ? "java/nio/file/NoSuchFileException" : error==EACCES ? "java/nio/file/AccessDeniedException" : "java/nio/file/FileSystemException";
   dvm__throw(vm,type,"%s: %s",sref(vm,text),strerror(error));
   dvm_ref exception=dvm_exception(vm);
-  dvm_set_field(vm,exception,"file","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,exception,"file","Ljava/lang/String;",(union dvm_value) {
     .l=text
   });
-  dvm_set_field(vm,exception,"reason","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,exception,"reason","Ljava/lang/String;",(union dvm_value) {
     .l=dvm_new_string(vm,strerror(error))
   });
   return false;
@@ -348,7 +348,7 @@ static dvm_ref nio_time_make(struct dvm *vm,luna_file_time value)
 {
   dvm_ref time=dvm_new_object(vm,dvm_find_class(vm,"java/nio/file/attribute/FileTime"));
   if(time) {
-    dvm_set_field(vm,time,"seconds","J",(union dvm_value) {
+    (dvm_set_field)(vm,time,"seconds","J",(union dvm_value) {
       .j=value.seconds
     });
     rt_set_int(vm,time,"nanos",(int32_t)value.nanoseconds);
@@ -373,7 +373,7 @@ static bool nio_time_millis(struct dvm *vm,dvm_ref self,const union dvm_value *a
   (void)args;
   (void)nargs;
   union dvm_value seconds= {0};
-  dvm_get_field(vm,self,"seconds","J",&seconds);
+  (dvm_get_field)(vm,self,"seconds","J",&seconds);
   int64_t millis=rt_get_int(vm,self,"nanos")/1000000;
   if(seconds.j>=0) {
     if(seconds.j>INT64_MAX/1000) RETJ(INT64_MAX);
@@ -401,8 +401,8 @@ static bool nio_time_compare(struct dvm *vm,dvm_ref self,const union dvm_value *
     return false;
   }
   union dvm_value a= {0},b= {0};
-  dvm_get_field(vm,self,"seconds","J",&a);
-  dvm_get_field(vm,ARG(0).l,"seconds","J",&b);
+  (dvm_get_field)(vm,self,"seconds","J",&a);
+  (dvm_get_field)(vm,ARG(0).l,"seconds","J",&b);
   int32_t x=rt_get_int(vm,self,"nanos"),y=rt_get_int(vm,ARG(0).l,"nanos");
   int order=a.j==b.j ? (x>y)-(x<y) : (a.j>b.j)-(a.j<b.j);
   RETI(equal ? order==0 : order);
@@ -412,7 +412,7 @@ static bool nio_time_hash(struct dvm *vm,dvm_ref self,const union dvm_value *arg
   (void)args;
   (void)nargs;
   union dvm_value seconds= {0};
-  dvm_get_field(vm,self,"seconds","J",&seconds);
+  (dvm_get_field)(vm,self,"seconds","J",&seconds);
   uint64_t value=(uint64_t)seconds.j;
   RETI((int32_t)((uint32_t)(value^(value>>32))+51u*(uint32_t)rt_get_int(vm,self,"nanos")));
 }
@@ -435,29 +435,29 @@ static bool nio_attrs_value(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(!strcmp(name,"isOther")) RETI(type!=0100000 && type!=0040000 && type!=0120000);
   union dvm_value cached= {0};
   if(!strcmp(name,"fileKey")) {
-    dvm_get_field(vm,self,"key","Ljava/lang/Object;",&cached);
+    (dvm_get_field)(vm,self,"key","Ljava/lang/Object;",&cached);
     if(!cached.l) {
       dvm_ref key=dvm_new_object(vm,dvm_find_class(vm,"sun/nio/fs/UnixFileKey"));
       if(!key) return false;
-      dvm_set_field(vm,key,"device","J",(union dvm_value) {
+      (dvm_set_field)(vm,key,"device","J",(union dvm_value) {
         .j=(int64_t)info->device
       });
-      dvm_set_field(vm,key,"inode","J",(union dvm_value) {
+      (dvm_set_field)(vm,key,"inode","J",(union dvm_value) {
         .j=(int64_t)info->inode
       });
       cached.l=key;
-      dvm_set_field(vm,self,"key","Ljava/lang/Object;",cached);
+      (dvm_set_field)(vm,self,"key","Ljava/lang/Object;",cached);
     }
     RETL(cached.l);
   }
   /* Linux's UnixFileAttributes uses mtime when birth time is unavailable. */
   bool access=!strcmp(name,"lastAccessTime");
   const char *field=access ? "accessed" : "modified";
-  dvm_get_field(vm,self,field,"Ljava/nio/file/attribute/FileTime;",&cached);
+  (dvm_get_field)(vm,self,field,"Ljava/nio/file/attribute/FileTime;",&cached);
   if(!cached.l) {
     cached.l=nio_time_make(vm,access ? info->accessed : info->modified);
     if(!cached.l) return false;
-    dvm_set_field(vm,self,field,"Ljava/nio/file/attribute/FileTime;",cached);
+    (dvm_set_field)(vm,self,field,"Ljava/nio/file/attribute/FileTime;",cached);
   }
   RETL(cached.l);
 }
@@ -465,8 +465,8 @@ static bool nio_key_value(struct dvm *vm,dvm_ref self,const union dvm_value *arg
 {
   (void)nargs;
   union dvm_value dev= {0},ino= {0};
-  dvm_get_field(vm,self,"device","J",&dev);
-  dvm_get_field(vm,self,"inode","J",&ino);
+  (dvm_get_field)(vm,self,"device","J",&dev);
+  (dvm_get_field)(vm,self,"inode","J",&ino);
   uint64_t a=(uint64_t)dev.j,b=(uint64_t)ino.j;
   const char *name=builtin_name();
   if(!strcmp(name,"hashCode")) RETI((int32_t)((uint32_t)(a^(a>>32))+(uint32_t)(b^(b>>32))));
@@ -477,8 +477,8 @@ static bool nio_key_value(struct dvm *vm,dvm_ref self,const union dvm_value *arg
   }
   if(!ARG(0).l || !object_is_a(vm,ARG(0).l,"Lsun/nio/fs/UnixFileKey;")) RETI(0);
   union dvm_value otherdev= {0},otherino= {0};
-  dvm_get_field(vm,ARG(0).l,"device","J",&otherdev);
-  dvm_get_field(vm,ARG(0).l,"inode","J",&otherino);
+  (dvm_get_field)(vm,ARG(0).l,"device","J",&otherdev);
+  (dvm_get_field)(vm,ARG(0).l,"inode","J",&otherino);
   RETI(dev.j==otherdev.j && ino.j==otherino.j);
 }
 static bool nio_read_attributes(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)

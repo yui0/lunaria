@@ -185,7 +185,7 @@ static bool surface_refresh_bitmap_mode(struct dvm *vm, dvm_ref surface,bool dir
     bitmap = bitmap_new(vm, w, h);
     if (!bitmap) return false;
     bm = bitmap_of(vm, bitmap);
-    (void)dvm_set_field(vm, surface, "bufferBitmap", "Landroid/graphics/Bitmap;",
+    (void)(dvm_set_field)(vm, surface, "bufferBitmap", "Landroid/graphics/Bitmap;",
     (union dvm_value) {
       .l=bitmap
     });
@@ -495,7 +495,7 @@ static bool bitmap_png_ninepatch(struct dvm *vm,dvm_ref bitmap,const uint8_t *pn
         }
         memcpy(native+i,&value,4);
       }
-      (void)dvm_set_field(vm,bitmap,"ninePatchChunk","[B",(union dvm_value){.l=array});
+      (void)(dvm_set_field)(vm,bitmap,"ninePatchChunk","[B",(union dvm_value){.l=array});
       return true;
     }
     at+=(size_t)n+12;
@@ -559,7 +559,7 @@ static dvm_ref bitmap_decode(struct dvm *vm, const uint8_t *data, size_t len,
     rt_set_int(vm, opts, "outWidth", ow);
     rt_set_int(vm, opts, "outHeight", oh);
     union dvm_value m = { .l = mime ? dvm_new_string(vm, mime) : 0 };
-    (void)dvm_set_field(vm, opts, "outMimeType", "Ljava/lang/String;", m);
+    (void)(dvm_set_field)(vm, opts, "outMimeType", "Ljava/lang/String;", m);
     if (rt_get_int(vm, opts, "inJustDecodeBounds")) {
       if (webp) free(rgba);
       else stbi_image_free(rgba);
@@ -698,7 +698,7 @@ static bool drawable_create_from_resource_stream(struct dvm *vm, dvm_ref self,
   dvm_ref drawable = klass ? dvm_new_object(vm, klass) : 0;
   if (drawable) {
     union dvm_value value = { .l = bitmap };
-    (void)dvm_set_field(vm, drawable, "bitmap", "Landroid/graphics/Bitmap;",
+    (void)(dvm_set_field)(vm, drawable, "bitmap", "Landroid/graphics/Bitmap;",
                         value);
   }
   dvm_unpin(vm, bitmap);
@@ -1141,7 +1141,7 @@ static bool bm_reconfigure(struct dvm *vm, dvm_ref self,
     return false;
   }
   union dvm_value ordinal = { 0 };
-  (void)dvm_get_field(vm, ARG(2).l, "ordinal", "I", &ordinal);
+  (void)(dvm_get_field)(vm, ARG(2).l, "ordinal", "I", &ordinal);
   if (ordinal.i < 0 || ordinal.i > 4) {
     dvm__throw(vm, "java/lang/IllegalArgumentException", "Unknown Bitmap config");
     return false;
@@ -1228,13 +1228,13 @@ static float *matrix_values(struct dvm *vm, dvm_ref m)
 {
   union dvm_value v = { 0 };
   if (!m) return NULL;
-  (void)dvm_get_field(vm, m, "values", "[F", &v);
+  (void)(dvm_get_field)(vm, m, "values", "[F", &v);
   if (!v.l) {
     v.l = dvm_new_array(vm, 'F', "F", 9);
     if (!v.l) return NULL;
     float *f = dvm_array_data(vm, v.l);
     f[0] = f[4] = f[8] = 1.0f;
-    (void)dvm_set_field(vm, m, "values", "[F", v);
+    (void)(dvm_set_field)(vm, m, "values", "[F", v);
   }
   return dvm_array_data(vm, v.l);
 }
@@ -1286,7 +1286,7 @@ static bool view_transform_coordinates(struct dvm *vm, dvm_ref self,
   }
   const bool local = !strcmp(builtin_name(), "transformMatrixToLocal");
   union dvm_value parent = {0}, own = {0}, ignored = {0};
-  (void)dvm_get_field(vm, self, "parent", "Landroid/view/ViewParent;", &parent);
+  (void)(dvm_get_field)(vm, self, "parent", "Landroid/view/ViewParent;", &parent);
   bool parent_view = parent.l && ui_is_a(vm, parent.l, "android/view/View");
   if (parent_view && !am_vcall(vm, parent.l,
                                local ? "transformMatrixToLocal" : "transformMatrixToGlobal",
@@ -1537,7 +1537,7 @@ static bool matrix_map_rect(struct dvm *vm, dvm_ref self,
     result[3] = fmaxf(result[3], ys[i]);
   }
   for (int i = 0; i < 4; ++i)
-    (void)dvm_set_field(vm, dst, edges[i], "F", (union dvm_value) {
+    (void)(dvm_set_field)(vm, dst, edges[i], "F", (union dvm_value) {
     .f = result[i]
   });
   RETI(m[6] == 0.f && m[7] == 0.f && m[8] == 1.f &&
@@ -1729,7 +1729,7 @@ static struct rt_bitmap *canvas_bitmap_peek(struct dvm *vm,dvm_ref self)
   struct canvas_state *state=canvas_state(vm,self);
   if(state && state->target) return state->target;
   union dvm_value bitmap= {0};
-  dvm_get_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",&bitmap);
+  (dvm_get_field)(vm,self,"bitmap","Landroid/graphics/Bitmap;",&bitmap);
   return bitmap_of(vm,bitmap.l);
 }
 /* The clear a capture put off (see canvas_state::defer_clear). */
@@ -1762,7 +1762,7 @@ static void canvas_read_matrix(struct dvm *vm, dvm_ref self, float matrix[9])
 {
   const float identity[9] = {1,0,0,0,1,0,0,0,1};
   union dvm_value ref = {0};
-  (void)dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", &ref);
+  (void)(dvm_get_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", &ref);
   const float *values = ref.l ? matrix_values(vm, ref.l) : NULL;
   memcpy(matrix, values ? values : identity, 9*sizeof *matrix);
 }
@@ -1770,11 +1770,11 @@ static void canvas_read_matrix(struct dvm *vm, dvm_ref self, float matrix[9])
 static bool canvas_write_matrix(struct dvm *vm, dvm_ref self, const float matrix[9])
 {
   union dvm_value ref = {0};
-  (void)dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", &ref);
+  (void)(dvm_get_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", &ref);
   if (!ref.l) {
     ref.l = dvm_new_object(vm, dvm_find_class(vm, "android/graphics/Matrix"));
     if (!ref.l) return false;
-    (void)dvm_set_field(vm, self, "matrix", "Landroid/graphics/Matrix;", ref);
+    (void)(dvm_set_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", ref);
   }
   float *values = matrix_values(vm, ref.l);
   if (!values) return false;
@@ -2229,7 +2229,7 @@ static bool canvas_rect_args(struct dvm *vm, const union dvm_value *args,
     const char *fields[]= {"left","top","right","bottom"};
     for (int i=0; i<4; ++i) {
       union dvm_value v= {0};
-      (void)dvm_get_field(vm,args[0].l,fields[i],ints ? "I" : "F",&v);
+      (void)(dvm_get_field)(vm,args[0].l,fields[i],ints ? "I" : "F",&v);
       rect[i]=ints ? (float)v.i : v.f;
     }
   }
@@ -2242,7 +2242,7 @@ static bool canvas_clip_operation(struct dvm *vm,const union dvm_value *args,int
   if(!strstr(builtin_sig(),"Landroid/graphics/Region$Op;")) return true;
   dvm_ref op=args[nargs-1].l;
   union dvm_value value= {0};
-  if(op && !dvm_get_field(vm,op,"nativeInt","I",&value)) return false;
+  if(op && !(dvm_get_field)(vm,op,"nativeInt","I",&value)) return false;
   if(lunaria_app_target_sdk()>=28 && (!op || (value.i!=0 && value.i!=1))) {
     dvm__throw(vm,"java/lang/IllegalArgumentException","Only INTERSECT and DIFFERENCE are allowed");
     return false;
@@ -2405,7 +2405,7 @@ static bool canvas_porter_mode(struct dvm *vm,dvm_ref ref,int *mode)
     return false;
   }
   union dvm_value value= {0};
-  if(!dvm_get_field(vm,ref,"nativeInt","I",&value)) return false;
+  if(!(dvm_get_field)(vm,ref,"nativeInt","I",&value)) return false;
   if(value.i<0 || value.i>17) {
     dvm__throw(vm,"java/lang/IllegalArgumentException","PorterDuff mode");
     return false;
@@ -2418,7 +2418,7 @@ static bool canvas_paint_mode(struct dvm *vm,dvm_ref paint,int *mode)
   *mode=3;
   if(!paint) return true;
   union dvm_value xfer= {0};
-  dvm__get_field_from(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"xfermode","Landroid/graphics/Xfermode;",&xfer);
+  (dvm__get_field_from)(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"xfermode","Landroid/graphics/Xfermode;",&xfer);
   *mode=xfermode_value(vm,xfer.l);
   if(*mode<0 || *mode>28) {
     dvm__throw(vm,"java/lang/IllegalArgumentException","Blend mode");
@@ -2469,9 +2469,9 @@ static bool canvas_save_layer(struct dvm *vm,dvm_ref self,const union dvm_value 
   else if(args[paint_index].l) {
     dvm_ref paint=args[paint_index].l;
     union dvm_value color= {0},ref= {0};
-    dvm__get_field_from(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"color","I",&color);
+    (dvm__get_field_from)(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"color","I",&color);
     alpha=color.u>>24;
-    dvm__get_field_from(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"colorFilter","Landroid/graphics/ColorFilter;",&ref);
+    (dvm__get_field_from)(vm,paint,dvm_find_class(vm,"android/graphics/Paint"),"colorFilter","Landroid/graphics/ColorFilter;",&ref);
     if(!color_filter_prepare(vm,ref.l,&filter) || !canvas_paint_mode(vm,paint,&mode)) return false;
   }
   struct rt_bitmap *parent=canvas_bitmap(vm,self),*layer=NULL;
@@ -2525,10 +2525,10 @@ static bool shader_matrix(struct dvm *vm,dvm_ref self,const union dvm_value *arg
       if(!stored.l) return false;
       memcpy(dvm_array_data(vm,stored.l),source,9*sizeof(float));
     }
-    dvm_set_field(vm,self,"localMatrix","[F",stored);
+    (dvm_set_field)(vm,self,"localMatrix","[F",stored);
     RETV();
   }
-  dvm_get_field(vm,self,"localMatrix","[F",&stored);
+  (dvm_get_field)(vm,self,"localMatrix","[F",&stored);
   float *target=matrix_values(vm,ARG(0).l);
   if(!target) return false;
   if(stored.l) memcpy(target,dvm_array_data(vm,stored.l),9*sizeof(float));
@@ -2585,7 +2585,7 @@ static bool bitmap_shader_init(struct dvm *vm,dvm_ref self,const union dvm_value
     return false;
   }
   if(!bitmap_live(vm,bitmap_of(vm,ARG(0).l))) return false;
-  dvm_set_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",ARG(0));
+  (dvm_set_field)(vm,self,"bitmap","Landroid/graphics/Bitmap;",ARG(0));
   rt_set_int(vm,self,"tileX",path_enum_ordinal(vm,ARG(1).l));
   rt_set_int(vm,self,"tileY",path_enum_ordinal(vm,ARG(2).l));
   RETV();
@@ -2624,13 +2624,13 @@ static bool canvas_shader_prepare(struct dvm *vm,dvm_ref paint,struct canvas_sha
   memset(s,0,sizeof *s);
   mat_identity(s->inverse);
   union dvm_value shader= {0},matrix= {0},color= {0},filter= {0};
-  dvm_get_field(vm,paint,"shader","Landroid/graphics/Shader;",&shader);
+  (dvm_get_field)(vm,paint,"shader","Landroid/graphics/Shader;",&shader);
   if(!shader.l) return true;
   struct dvm_object *o=dvm__obj(vm,shader.l);
   if(object_is_a(vm,shader.l,"Landroid/graphics/LinearGradient;")) s->gradient=o ? o->data : NULL;
   else if(object_is_a(vm,shader.l,"Landroid/graphics/BitmapShader;")) {
     union dvm_value bitmap= {0};
-    dvm_get_field(vm,shader.l,"bitmap","Landroid/graphics/Bitmap;",&bitmap);
+    (dvm_get_field)(vm,shader.l,"bitmap","Landroid/graphics/Bitmap;",&bitmap);
     s->bitmap=bitmap_of(vm,bitmap.l);
     if(!bitmap_live(vm,s->bitmap)) return false;
     s->tile_x=ui_int(vm,shader.l,"tileX");
@@ -2640,11 +2640,11 @@ static bool canvas_shader_prepare(struct dvm *vm,dvm_ref paint,struct canvas_sha
     dvm__throw(vm,"java/lang/UnsupportedOperationException","Shader implementation");
     return false;
   }
-  dvm_get_field(vm,shader.l,"localMatrix","[F",&matrix);
+  (dvm_get_field)(vm,shader.l,"localMatrix","[F",&matrix);
   if(matrix.l && !mat_invert(dvm_array_data(vm,matrix.l),s->inverse)) memset(s->inverse,0,sizeof s->inverse);
-  dvm_get_field(vm,paint,"color","I",&color);
+  (dvm_get_field)(vm,paint,"color","I",&color);
   s->alpha=color.u>>24;
-  dvm_get_field(vm,paint,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
+  (dvm_get_field)(vm,paint,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
   return color_filter_prepare(vm,filter.l,&s->filter);
 }
 static int shader_tile(float value,int extent,int mode)
@@ -3058,13 +3058,13 @@ static bool canvas_path_paint(struct dvm *vm,dvm_ref self,const luna_path *path,
   }
   union dvm_value color= {0},stroke= {0},flags= {0},style= {0},cap= {0},join= {0},miter= {0};
 
-  (void)dvm_get_field(vm,paint,"color","I",&color);
-  (void)dvm_get_field(vm,paint,"strokeWidth","F",&stroke);
-  (void)dvm_get_field(vm,paint,"flags","I",&flags);
-  (void)dvm_get_field(vm,paint,"style","Landroid/graphics/Paint$Style;",&style);
-  (void)dvm_get_field(vm,paint,"strokeCap","Landroid/graphics/Paint$Cap;",&cap);
-  (void)dvm_get_field(vm,paint,"strokeJoin","Landroid/graphics/Paint$Join;",&join);
-  (void)dvm_get_field(vm,paint,"strokeMiter","F",&miter);
+  (void)(dvm_get_field)(vm,paint,"color","I",&color);
+  (void)(dvm_get_field)(vm,paint,"strokeWidth","F",&stroke);
+  (void)(dvm_get_field)(vm,paint,"flags","I",&flags);
+  (void)(dvm_get_field)(vm,paint,"style","Landroid/graphics/Paint$Style;",&style);
+  (void)(dvm_get_field)(vm,paint,"strokeCap","Landroid/graphics/Paint$Cap;",&cap);
+  (void)(dvm_get_field)(vm,paint,"strokeJoin","Landroid/graphics/Paint$Join;",&join);
+  (void)(dvm_get_field)(vm,paint,"strokeMiter","F",&miter);
   if(!paint_filter_color(vm,paint,&color.u)) return false;
   return canvas_path_color(vm,self,path,color.u,style.l ? path_enum_ordinal(vm,style.l) : 0,stroke.f,
                            cap.l ? path_enum_ordinal(vm,cap.l) : 0,join.l ? path_enum_ordinal(vm,join.l) : 0,miter.f>0 ? miter.f : 4,(flags.i&1)!=0,paint,out);
@@ -3357,22 +3357,22 @@ static bool canvas_fill(struct dvm *vm, dvm_ref self,
       return false;
     }
     union dvm_value c= {0};
-    (void)dvm_get_field(vm,paint,"xfermode","Landroid/graphics/Xfermode;",&c);
+    (void)(dvm_get_field)(vm,paint,"xfermode","Landroid/graphics/Xfermode;",&c);
     if(!canvas_paint_mode(vm,paint,&mode)) return false;
-    (void)dvm_get_field(vm,paint,"color","I",&c);
+    (void)(dvm_get_field)(vm,paint,"color","I",&c);
     color=c.u;
     if(!paint_filter_color(vm,paint,&color)) return false;
-    (void)dvm_get_field(vm,paint,"strokeWidth","F",&c);
+    (void)(dvm_get_field)(vm,paint,"strokeWidth","F",&c);
     stroke=c.f;
-    (void)dvm_get_field(vm,paint,"flags","I",&c);
+    (void)(dvm_get_field)(vm,paint,"flags","I",&c);
     aa=(c.i&1)!=0;
-    (void)dvm_get_field(vm,paint,"style","Landroid/graphics/Paint$Style;",&c);
+    (void)(dvm_get_field)(vm,paint,"style","Landroid/graphics/Paint$Style;",&c);
     if (c.l) {
-      (void)dvm_get_field(vm,c.l,"ordinal","I",&c);
+      (void)(dvm_get_field)(vm,c.l,"ordinal","I",&c);
       style=c.i;
     }
     union dvm_value shader= {0};
-    dvm_get_field(vm,paint,"shader","Landroid/graphics/Shader;",&shader);
+    (dvm_get_field)(vm,paint,"shader","Landroid/graphics/Shader;",&shader);
     if(shader.l) {
       luna_path path= {0};
       bool good=luna_path_move(&path,rect[0],rect[1]) && luna_path_line(&path,rect[2],rect[1]) &&
@@ -3410,10 +3410,10 @@ static bool canvas_set_bitmap(struct dvm *vm, dvm_ref self,
       return false;
     }
   }
-  (void)dvm_set_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "bitmap", "Landroid/graphics/Bitmap;", (union dvm_value) {
     .l = bitmap
   });
-  (void)dvm_set_field(vm, self, "matrix", "Landroid/graphics/Matrix;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", (union dvm_value) {
     0
   });
   struct canvas_state *state=canvas_state(vm,self);
@@ -3445,7 +3445,7 @@ static bool canvas_size(struct dvm *vm, dvm_ref self,
          !strcmp(name,"getHeight") ? state->viewport_height : 0);
   }
   union dvm_value bitmap = {0};
-  (void)dvm_get_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &bitmap);
+  (void)(dvm_get_field)(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &bitmap);
   struct rt_bitmap *bm = bitmap_of(vm, bitmap.l);
   const char *name = builtin_name();
   RETI(!bm ? 0 : !strcmp(name, "getWidth") ? bm->w :
@@ -3456,7 +3456,7 @@ static bool canvas_matrix(struct dvm *vm, dvm_ref self,
                           const union dvm_value *args, int nargs, union dvm_value *out)
 {
   union dvm_value value = {0};
-  (void)dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", &value);
+  (void)(dvm_get_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", &value);
   bool setting = !strcmp(builtin_name(), "setMatrix");
   dvm_ref src = setting ? ARG(0).l : value.l;
   float data[9] = {1,0,0,0,1,0,0,0,1};
@@ -3475,7 +3475,7 @@ static bool canvas_matrix(struct dvm *vm, dvm_ref self,
   if (!m) return false;
   memcpy(m, data, sizeof data);
   if (setting) {
-    (void)dvm_set_field(vm, self, "matrix", "Landroid/graphics/Matrix;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", (union dvm_value) {
       .l = dst
     });
     RETV();
@@ -3792,7 +3792,7 @@ static bool canvas_draw_bitmap_with(struct dvm *vm, dvm_ref self, dvm_ref bitmap
     memcpy(transform,m,sizeof transform);
   }
   union dvm_value current = {0};
-  (void)dvm_get_field(vm, self, "matrix", "Landroid/graphics/Matrix;", &current);
+  (void)(dvm_get_field)(vm, self, "matrix", "Landroid/graphics/Matrix;", &current);
   if (current.l) {
     m = matrix_values(vm, current.l);
     if (!m) return false;
@@ -3805,10 +3805,10 @@ static bool canvas_draw_bitmap_with(struct dvm *vm, dvm_ref self, dvm_ref bitmap
   for (int i = 0; i < 9; ++i) if (!isfinite(inverse[i])) RETV();
   union dvm_value flags = {0}, color = {.u = 0xff000000u}, xfer = {0}, filter= {0};
   if (paint) {
-    (void)dvm_get_field(vm, paint, "flags", "I", &flags);
-    (void)dvm_get_field(vm, paint, "color", "I", &color);
-    (void)dvm_get_field(vm, paint, "xfermode", "Landroid/graphics/Xfermode;", &xfer);
-    (void)dvm_get_field(vm, paint, "colorFilter", "Landroid/graphics/ColorFilter;", &filter);
+    (void)(dvm_get_field)(vm, paint, "flags", "I", &flags);
+    (void)(dvm_get_field)(vm, paint, "color", "I", &color);
+    (void)(dvm_get_field)(vm, paint, "xfermode", "Landroid/graphics/Xfermode;", &xfer);
+    (void)(dvm_get_field)(vm, paint, "colorFilter", "Landroid/graphics/ColorFilter;", &filter);
   }
   struct color_filter_state filter_state;
   if(!color_filter_prepare(vm,filter.l,&filter_state)) return false;
@@ -3944,15 +3944,15 @@ static bool canvas_text_run(struct dvm *vm,dvm_ref canvas,dvm_ref paint,
   if(recording->recording) return recording_text_run(vm,canvas,paint,run,x,baseline,apply_align,out);
   union dvm_value target= {0},size= {0},scale= {0},skew= {0},flags= {0},color= {0},align= {0},style= {0},xfer= {0};
   struct rt_bitmap *dst=canvas_bitmap(vm,canvas);
-  (void)dvm_get_field(vm,paint,"textSize","F",&size);
-  (void)dvm_get_field(vm,paint,"textScaleX","F",&scale);
-  (void)dvm_get_field(vm,paint,"textSkewX","F",&skew);
-  (void)dvm_get_field(vm,paint,"flags","I",&flags);
-  (void)dvm_get_field(vm,paint,"color","I",&color);
+  (void)(dvm_get_field)(vm,paint,"textSize","F",&size);
+  (void)(dvm_get_field)(vm,paint,"textScaleX","F",&scale);
+  (void)(dvm_get_field)(vm,paint,"textSkewX","F",&skew);
+  (void)(dvm_get_field)(vm,paint,"flags","I",&flags);
+  (void)(dvm_get_field)(vm,paint,"color","I",&color);
   if(!paint_filter_color(vm,paint,&color.u)) return false;
-  (void)dvm_get_field(vm,paint,"textAlign","Landroid/graphics/Paint$Align;",&align);
-  (void)dvm_get_field(vm,paint,"style","Landroid/graphics/Paint$Style;",&style);
-  (void)dvm_get_field(vm,paint,"xfermode","Landroid/graphics/Xfermode;",&xfer);
+  (void)(dvm_get_field)(vm,paint,"textAlign","Landroid/graphics/Paint$Align;",&align);
+  (void)(dvm_get_field)(vm,paint,"style","Landroid/graphics/Paint$Style;",&style);
+  (void)(dvm_get_field)(vm,paint,"xfermode","Landroid/graphics/Xfermode;",&xfer);
   int mode;
   if(!canvas_paint_mode(vm,paint,&mode)) return false;
   if (style.l && path_enum_ordinal(vm,style.l)!=0) {
@@ -4208,7 +4208,7 @@ static bool text_on_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args
   dvm_ref content=ui_obj(vm,self,"text","Ljava/lang/CharSequence;");
   bool hint=layout->source!=content;
   union dvm_value color= {.i=ui_int(vm,self,hint ? "hintTextColor" : "textColor")};
-  (void)dvm_set_field(vm,layout->paint,"color","I",color);
+  (void)(dvm_set_field)(vm,layout->paint,"color","I",color);
   int gravity=ui_int(vm,self,"gravity");
   /* CheckBox/RadioButton default to CENTER_VERTICAL|START, unlike a Button. */
   if(!gravity) gravity=ui_is_a(vm,self,"android/widget/CompoundButton") ? 0x13 :
@@ -4259,9 +4259,9 @@ static bool color_drawable_draw(struct dvm *vm,dvm_ref self,const union dvm_valu
     return false;
   }
   union dvm_value filter= {0},bounds= {0},color= {0};
-  (void)dvm_get_field(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
+  (void)(dvm_get_field)(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
   if (!drawable_get_bounds(vm,self,NULL,0,&bounds)) return false;
-  (void)dvm_get_field(vm,self,"color","I",&color);
+  (void)(dvm_get_field)(vm,self,"color","I",&color);
   if (!color_filter_apply(vm,filter.l,color.u,&color.u)) return false;
   float rect[4];
   for (int i=0; i<4; ++i) rect[i]=(float)ui_int(vm,bounds.l,layer_edges[i]);
@@ -4371,7 +4371,7 @@ static dvm_ref recording_snapshot(struct dvm *vm,dvm_ref ref)
   struct dvm_object *dst=dvm__obj(vm,result);
   if(src->slots) memcpy(dst->slots,src->slots,src->cls->islots*sizeof(*src->slots));
   if(!strcmp(name,"android/graphics/Matrix")) {
-    dvm_set_field(vm,result,"values","[F",(union dvm_value) {
+    (dvm_set_field)(vm,result,"values","[F",(union dvm_value) {
       0
     });
     float *from=matrix_values(vm,ref),*to=matrix_values(vm,result);
@@ -4579,16 +4579,16 @@ static bool render_node_init(struct dvm *vm,dvm_ref self,const union dvm_value *
 {
   (void)args;
   (void)nargs;
-  dvm_set_field(vm,self,"scaleX","F",(union dvm_value) {
+  (dvm_set_field)(vm,self,"scaleX","F",(union dvm_value) {
     .f=1
   });
-  dvm_set_field(vm,self,"scaleY","F",(union dvm_value) {
+  (dvm_set_field)(vm,self,"scaleY","F",(union dvm_value) {
     .f=1
   });
-  dvm_set_field(vm,self,"clipToBounds","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"clipToBounds","Z",(union dvm_value) {
     .i=1
   });
-  dvm_set_field(vm,self,"alpha","F",(union dvm_value) {
+  (dvm_set_field)(vm,self,"alpha","F",(union dvm_value) {
     .f=1
   });
   RETV();
@@ -4596,7 +4596,7 @@ static bool render_node_init(struct dvm *vm,dvm_ref self,const union dvm_value *
 static float render_node_float(struct dvm *vm,dvm_ref self,const char *field)
 {
   union dvm_value value= {0};
-  dvm_get_field(vm,self,field,"F",&value);
+  (dvm_get_field)(vm,self,field,"F",&value);
   return value.f;
 }
 /* RenderNode.setAlpha / getAlpha: how opaque the node and everything it draws
@@ -4608,7 +4608,7 @@ static bool render_node_alpha(struct dvm *vm,dvm_ref self,const union dvm_value 
   const float old=render_node_float(vm,self,"alpha");
   if(!strcmp(builtin_name(),"getAlpha")) RETF(old);
   const float value=fminf(fmaxf(args[0].f,0.f),1.f);
-  dvm_set_field(vm,self,"alpha","F",(union dvm_value) {
+  (dvm_set_field)(vm,self,"alpha","F",(union dvm_value) {
     .f=value
   });
   RETI(old!=value);
@@ -4616,14 +4616,14 @@ static bool render_node_alpha(struct dvm *vm,dvm_ref self,const union dvm_value 
 static void render_node_pivot(struct dvm *vm,dvm_ref self,float *x,float *y)
 {
   union dvm_value explicit= {0};
-  dvm_get_field(vm,self,"pivotExplicit","Z",&explicit);
+  (dvm_get_field)(vm,self,"pivotExplicit","Z",&explicit);
   if(!explicit.i) {
     float px=(float)((int32_t)((uint32_t)rt_get_int(vm,self,"right")-(uint32_t)rt_get_int(vm,self,"left")))*.5f;
     float py=(float)((int32_t)((uint32_t)rt_get_int(vm,self,"bottom")-(uint32_t)rt_get_int(vm,self,"top")))*.5f;
-    dvm_set_field(vm,self,"pivotX","F",(union dvm_value) {
+    (dvm_set_field)(vm,self,"pivotX","F",(union dvm_value) {
       .f=px
     });
-    dvm_set_field(vm,self,"pivotY","F",(union dvm_value) {
+    (dvm_set_field)(vm,self,"pivotY","F",(union dvm_value) {
       .f=py
     });
   }
@@ -4665,8 +4665,8 @@ static bool render_node_transform(struct dvm *vm,dvm_ref self,const union dvm_va
   }
   if(!strcmp(name,"resetPivot") || !strcmp(name,"isPivotExplicitlySet")) {
     union dvm_value value= {0};
-    dvm_get_field(vm,self,"pivotExplicit","Z",&value);
-    if(name[0]=='r') dvm_set_field(vm,self,"pivotExplicit","Z",(union dvm_value) {
+    (dvm_get_field)(vm,self,"pivotExplicit","Z",&value);
+    if(name[0]=='r') (dvm_set_field)(vm,self,"pivotExplicit","Z",(union dvm_value) {
       0
     });
     RETI(value.i);
@@ -4683,13 +4683,13 @@ static bool render_node_transform(struct dvm *vm,dvm_ref self,const union dvm_va
       bool changed=old!=args[0].f;
       if(i>=5) {
         union dvm_value explicit= {0};
-        dvm_get_field(vm,self,"pivotExplicit","Z",&explicit);
+        (dvm_get_field)(vm,self,"pivotExplicit","Z",&explicit);
         changed=changed || !explicit.i;
-        dvm_set_field(vm,self,"pivotExplicit","Z",(union dvm_value) {
+        (dvm_set_field)(vm,self,"pivotExplicit","Z",(union dvm_value) {
           .i=1
         });
       }
-      dvm_set_field(vm,self,properties[i],"F",args[0]);
+      (dvm_set_field)(vm,self,properties[i],"F",args[0]);
       RETI(changed);
     }
   return false;
@@ -4709,12 +4709,12 @@ static uint64_t g_recording_serial;
 static bool render_node_record(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value current= {0},list= {0};
-  dvm_get_field(vm,self,"recording","Landroid/graphics/RecordingCanvas;",&current);
-  dvm_get_field(vm,self,"displayList","Landroid/graphics/RecordingCanvas;",&list);
+  (dvm_get_field)(vm,self,"recording","Landroid/graphics/RecordingCanvas;",&current);
+  (dvm_get_field)(vm,self,"displayList","Landroid/graphics/RecordingCanvas;",&list);
   const char *name=builtin_name();
   if(!strcmp(name,"hasDisplayList")) RETI(list.l!=0);
   if(!strcmp(name,"discardDisplayList")) {
-    dvm_set_field(vm,self,"displayList","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
+    (dvm_set_field)(vm,self,"displayList","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
       0
     });
     RETV();
@@ -4731,7 +4731,7 @@ static bool render_node_record(struct dvm *vm,dvm_ref self,const union dvm_value
     state->serial=++g_recording_serial;
     state->viewport_width=nargs ? args[0].i : (int32_t)((uint32_t)rt_get_int(vm,self,"right")-(uint32_t)rt_get_int(vm,self,"left"));
     state->viewport_height=nargs ? args[1].i : (int32_t)((uint32_t)rt_get_int(vm,self,"bottom")-(uint32_t)rt_get_int(vm,self,"top"));
-    dvm_set_field(vm,self,"recording","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
+    (dvm_set_field)(vm,self,"recording","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
       .l=canvas
     });
     RETL(canvas);
@@ -4743,8 +4743,8 @@ static bool render_node_record(struct dvm *vm,dvm_ref self,const union dvm_value
   struct canvas_state *state=canvas_state(vm,current.l);
   if(!state) return false;
   state->recording_active=false;
-  dvm_set_field(vm,self,"displayList","Landroid/graphics/RecordingCanvas;",current);
-  dvm_set_field(vm,self,"recording","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"displayList","Landroid/graphics/RecordingCanvas;",current);
+  (dvm_set_field)(vm,self,"recording","Landroid/graphics/RecordingCanvas;",(union dvm_value) {
     0
   });
   RETV();
@@ -4753,8 +4753,8 @@ static bool render_node_clip(struct dvm *vm,dvm_ref self,const union dvm_value *
 {
   (void)nargs;
   union dvm_value old= {0};
-  dvm_get_field(vm,self,"clipToBounds","Z",&old);
-  dvm_set_field(vm,self,"clipToBounds","Z",args[0]);
+  (dvm_get_field)(vm,self,"clipToBounds","Z",&old);
+  (dvm_set_field)(vm,self,"clipToBounds","Z",args[0]);
   RETI((old.i!=0)!=(args[0].i!=0));
 }
 static bool canvas_replay_render_node(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -4766,7 +4766,7 @@ static bool canvas_replay_render_node(struct dvm *vm,dvm_ref self,const union dv
     return false;
   }
   union dvm_value list= {0};
-  dvm_get_field(vm,node,"displayList","Landroid/graphics/RecordingCanvas;",&list);
+  (dvm_get_field)(vm,node,"displayList","Landroid/graphics/RecordingCanvas;",&list);
   if(!list.l) RETV();
   struct canvas_state *recording=canvas_state(vm,list.l);
   if(!recording) return false;
@@ -4780,7 +4780,7 @@ static bool canvas_replay_render_node(struct dvm *vm,dvm_ref self,const union dv
   mat_mul(base,base,local);
   if(good) good=canvas_write_matrix(vm,self,base);
   union dvm_value clip= {0};
-  dvm_get_field(vm,node,"clipToBounds","Z",&clip);
+  (dvm_get_field)(vm,node,"clipToBounds","Z",&clip);
   if(good && clip.i) {
     union dvm_value rect[]= {{.i=0},{.i=0},{.i=(int32_t)((uint32_t)rt_get_int(vm,node,"right")-(uint32_t)rt_get_int(vm,node,"left"))},
       {.i=(int32_t)((uint32_t)rt_get_int(vm,node,"bottom")-(uint32_t)rt_get_int(vm,node,"top"))}
@@ -4790,7 +4790,7 @@ static bool canvas_replay_render_node(struct dvm *vm,dvm_ref self,const union dv
   bool clipped_away=false;
   if(good && rt_get_int(vm,node,"clipToOutline")) {
     union dvm_value outline= {0},empty= {0};
-    dvm_get_field(vm,node,"outline","Landroid/graphics/Outline;",&outline);
+    (dvm_get_field)(vm,node,"outline","Landroid/graphics/Outline;",&outline);
     /* An outline that was set and is empty clips everything (a node with no
      * outline at all does not clip).  Compose parks an item it does not want
      * drawn, such as the copy of a sticky header that is not stuck, in a node
@@ -4910,7 +4910,7 @@ static bool render_paint_deps(struct dvm *vm,struct canvas_state *list,dvm_ref p
   };
   for(size_t i=0; i<sizeof live/sizeof *live; ++i) {
     union dvm_value v= {0};
-    if(!dvm_get_field(vm,paint,live[i].name,live[i].type,&v) || !v.l) continue;
+    if(!(dvm_get_field)(vm,paint,live[i].name,live[i].type,&v) || !v.l) continue;
     if(i==0) {
       const char *name=dvm_object_class(vm,v.l)->name;
       if(strcmp(name,"android/graphics/LinearGradient") && strcmp(name,"android/graphics/RadialGradient") &&
@@ -4973,18 +4973,18 @@ static bool render_node_sig(struct dvm *vm,dvm_ref node,int depth,uint64_t *h)
   static const char *const flags[]= {"pivotExplicit","clipToBounds","clipToOutline"};
   for(int i=0; i<3; ++i) {
     union dvm_value flag= {0};
-    (void)dvm_get_field(vm,node,flags[i],"Z",&flag);
+    (void)(dvm_get_field)(vm,node,flags[i],"Z",&flag);
     sig_mix(h,flag.i!=0);
   }
   union dvm_value outline= {0},list= {0};
-  (void)dvm_get_field(vm,node,"outline","Landroid/graphics/Outline;",&outline);
+  (void)(dvm_get_field)(vm,node,"outline","Landroid/graphics/Outline;",&outline);
   if(outline.l) {
     const struct dvm_object *o=dvm__obj(vm,outline.l);
     if(!o || !o->cls) return false;
     sig_mix(h,1);
     for(uint32_t i=0; o->slots && i<o->cls->islots; ++i) sig_mix(h,(uint64_t)o->slots[i].j);
   } else sig_mix(h,0);
-  (void)dvm_get_field(vm,node,"displayList","Landroid/graphics/RecordingCanvas;",&list);
+  (void)(dvm_get_field)(vm,node,"displayList","Landroid/graphics/RecordingCanvas;",&list);
   if(!list.l) {
     sig_mix(h,0);
     return true;
@@ -5137,7 +5137,7 @@ static bool view_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
       if (!rect) {
         rect=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Rect"));
         if (!rect) return false;
-        (void)dvm_set_field(vm,surface,"bufferRect","Landroid/graphics/Rect;",(union dvm_value) {
+        (void)(dvm_set_field)(vm,surface,"bufferRect","Landroid/graphics/Rect;",(union dvm_value) {
           .l=rect
         });
       }
@@ -5521,14 +5521,14 @@ static bool vector_property(struct dvm *vm,dvm_ref self,const union dvm_value *a
       vector->tint=true;
       vector->tint_color=ARG(0).u;
     }
-    (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",(union dvm_value) {
       0
     });
   } else if(!strcmp(name,"setTintList")) {
     if(vector) vector->tint=ARG(0).l!=0;
-    (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",ARG(0));
+    (void)(dvm_set_field)(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",ARG(0));
   } else if(!strcmp(name,"setTintMode")) {
-    (void)dvm_set_field(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",ARG(0));
+    (void)(dvm_set_field)(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",ARG(0));
   }
   ui_invalidate();
   RETV();
@@ -5554,7 +5554,7 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if(!bitmap || bitmap->w!=cache_w || bitmap->h!=cache_h || bitmap->recycled) {
     cached=bitmap_new(vm,cache_w,cache_h);
     if(!cached) return false;
-    (void)dvm_set_field(vm,self,"vectorCache","Landroid/graphics/Bitmap;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,self,"vectorCache","Landroid/graphics/Bitmap;",(union dvm_value) {
       .l=cached
     });
     bitmap=bitmap_of(vm,cached);
@@ -5564,7 +5564,7 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     float viewport[]= {cache_w/vector->viewport_width,0,0,0,cache_h/vector->viewport_height,0,0,0,1};
     if(!vector_render_nodes(vector->root.children,cache_w,cache_h,identity,viewport,
                             fminf(viewport[0],viewport[4]),NULL,bitmap->px)) {
-      (void)dvm_set_field(vm,self,"vectorCache","Landroid/graphics/Bitmap;",(union dvm_value) {
+      (void)(dvm_set_field)(vm,self,"vectorCache","Landroid/graphics/Bitmap;",(union dvm_value) {
         0
       });
       dvm__throw(vm,"java/lang/OutOfMemoryError","Vector raster");
@@ -5574,15 +5574,15 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   }
   /* Tint/filter affect the completed vector, rather than each overlapping path. */
   union dvm_value tint_list= {0},mode= {0},filter= {0};
-  dvm_get_field(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
-  (void)dvm_get_field(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",&tint_list);
-  (void)dvm_get_field(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",&mode);
+  (dvm_get_field)(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
+  (void)(dvm_get_field)(vm,vector_state_ref(vm,self),"vectorTint","Landroid/content/res/ColorStateList;",&tint_list);
+  (void)(dvm_get_field)(vm,vector_state_ref(vm,self),"vectorTintMode","Landroid/graphics/PorterDuff$Mode;",&mode);
   uint32_t tint=vector->tint_color;
   if(tint_list.l) {
     dvm_ref states=ui_obj(vm,self,"stateSet","[I");
     struct dvm_object *array=states ? dvm__obj(vm,states) : NULL;
     union dvm_value def= {0};
-    (void)dvm_get_field(vm,tint_list.l,"color","I",&def);
+    (void)(dvm_get_field)(vm,tint_list.l,"color","I",&def);
     tint=(uint32_t)color_state_lookup(vm,tint_list.l,array ? array->data : NULL,array ? array->length : 0,def.i);
   }
   if(vector->tint && !filter.l && mode.l && path_enum_ordinal(vm,mode.l)!=5) {
@@ -5596,7 +5596,7 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     if(!tinted || tinted->w!=cache_w || tinted->h!=cache_h || tinted->recycled) {
       shown=bitmap_new(vm,cache_w,cache_h);
       if(!shown) return false;
-      (void)dvm_set_field(vm,self,"vectorTintCache","Landroid/graphics/Bitmap;",(union dvm_value) {
+      (void)(dvm_set_field)(vm,self,"vectorTintCache","Landroid/graphics/Bitmap;",(union dvm_value) {
         .l=shown
       });
       tinted=bitmap_of(vm,shown);
@@ -5616,7 +5616,7 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if(!paint) {
     paint=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Paint"));
     if(!paint) return false;
-    (void)dvm_set_field(vm,self,"vectorPaint","Landroid/graphics/Paint;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,self,"vectorPaint","Landroid/graphics/Paint;",(union dvm_value) {
       .l=paint
     });
     union dvm_value flags= {.i=2},ignored= {0};
@@ -5624,12 +5624,12 @@ static bool vector_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   }
   union dvm_value alpha= {.i=(int)vector_alpha_byte(vector->alpha)},ignored= {0};
   if(!paint_alpha(vm,paint,&alpha,1,&ignored)) return false;
-  dvm_set_field(vm,paint,"colorFilter","Landroid/graphics/ColorFilter;",filter);
+  (dvm_set_field)(vm,paint,"colorFilter","Landroid/graphics/ColorFilter;",filter);
   dvm_ref transform=ui_obj(vm,self,"vectorMatrix","Landroid/graphics/Matrix;");
   if(!transform) {
     transform=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Matrix"));
     if(!transform) return false;
-    (void)dvm_set_field(vm,self,"vectorMatrix","Landroid/graphics/Matrix;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,self,"vectorMatrix","Landroid/graphics/Matrix;",(union dvm_value) {
       .l=transform
     });
   }
@@ -5677,8 +5677,8 @@ static bool vector_mutate(struct dvm *vm,dvm_ref self,
     const char *sigs[]= {"Landroid/content/res/ColorStateList;","Landroid/graphics/PorterDuff$Mode;"};
     for (int i=0; i<2; ++i) {
       union dvm_value value= {0};
-      dvm_get_field(vm,old,names[i],sigs[i],&value);
-      dvm_set_field(vm,vector_state_ref(vm,self),names[i],sigs[i],value);
+      (dvm_get_field)(vm,old,names[i],sigs[i],&value);
+      (dvm_set_field)(vm,vector_state_ref(vm,self),names[i],sigs[i],value);
     }
     dvm_unpin(vm,old);
     rt_set_int(vm,self,"vectorMutated",1);
@@ -5692,7 +5692,7 @@ static bool vector_new_drawable(struct dvm *vm,dvm_ref self,
   dvm_ref drawable=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/drawable/VectorDrawable"));
   if (!drawable) return false;
   dvm_pin(vm,drawable);
-  bool good=dvm_set_field(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;",
+  bool good=(dvm_set_field)(vm,drawable,"vectorState","Landroid/graphics/drawable/VectorDrawable$VectorDrawableState;",
   (union dvm_value) {
     .l=self
   });
@@ -5958,7 +5958,7 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
     dvm_ref surface=ui_obj(vm,holder,"surface","Landroid/view/Surface;");
     struct rt_bitmap *sb=bitmap_of(vm,ui_obj(vm,surface,"bufferBitmap","Landroid/graphics/Bitmap;"));
     if (sb && sb->surface_frame && sb->overlay_key[0] && sb->overlay_gen==sb->gen) {
-      (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
+      (void)(dvm_set_field)(vm,view,"drawingSeq","I",(union dvm_value) {
         .i=(int32_t)g_ui_build_seq
       });
       return sb->overlay_key;
@@ -5969,13 +5969,13 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
   /* Nothing invalidated it and it kept its size: the picture it left in the
    * last build is still its picture, whatever else made the document stale. */
   union dvm_value recorded_epoch= {0};
-  (void)dvm_get_field(vm,view,"drawingEpoch","J",&recorded_epoch);
+  (void)(dvm_get_field)(vm,view,"drawingEpoch","J",&recorded_epoch);
   const uint64_t capture_epoch=g_ui_draw_epoch;
   const bool epoch_matches=(uint64_t)recorded_epoch.j==capture_epoch;
   if (app_draw && epoch_matches && bm && bm->w==node->w && bm->h==node->h && bm->overlay_key[0] && bm->overlay_gen==bm->gen &&
       ((uint32_t)ui_int(vm,view,"drawingSeq")==g_ui_build_seq ||
        (uint32_t)ui_int(vm,view,"drawingSeq")+1==g_ui_build_seq) && !ui_int(vm,view,"drawDirty")) {
-    (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
+    (void)(dvm_set_field)(vm,view,"drawingSeq","I",(union dvm_value) {
       .i=(int32_t)g_ui_build_seq
     });
     ++g_ui_render_prof.reused;
@@ -5998,7 +5998,7 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
     float ox,oy;
     if (!ui_view_to_root(vm,view,&ox,&oy)) partial=false;
     else if (!g_ui_frame_damage.any) {
-      (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
+      (void)(dvm_set_field)(vm,view,"drawingSeq","I",(union dvm_value) {
         .i=(int32_t)g_ui_build_seq
       });
       return bm->overlay_key;
@@ -6008,7 +6008,7 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
       area[2]=(int32_t)fminf((float)node->w,ceilf((float)g_ui_frame_damage.r-ox));
       area[3]=(int32_t)fminf((float)node->h,ceilf((float)g_ui_frame_damage.b-oy));
       if (area[2]<=area[0] || area[3]<=area[1]) {
-        (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
+        (void)(dvm_set_field)(vm,view,"drawingSeq","I",(union dvm_value) {
           .i=(int32_t)g_ui_build_seq
         });
         return bm->overlay_key;             /* the damage is elsewhere */
@@ -6020,7 +6020,7 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
     if (!bitmap) return NULL;
     bm=bitmap_of(vm,bitmap);
     bm->is_mutable=true;
-    (void)dvm_set_field(vm,view,"drawingBitmap","Landroid/graphics/Bitmap;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,view,"drawingBitmap","Landroid/graphics/Bitmap;",(union dvm_value) {
       .l=bitmap
     });
     partial=false;
@@ -6029,15 +6029,15 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
   if (!canvas) {
     canvas=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Canvas"));
     if (!canvas) return NULL;
-    (void)dvm_set_field(vm,view,"drawingCanvas","Landroid/graphics/Canvas;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,view,"drawingCanvas","Landroid/graphics/Canvas;",(union dvm_value) {
       .l=canvas
     });
   }
   /* Until this draw completes the bitmap is not a picture of anything. */
-  (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,view,"drawingSeq","I",(union dvm_value) {
     .i=0
   });
-  (void)dvm_set_field(vm,view,"drawDirty","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,view,"drawDirty","Z",(union dvm_value) {
     .i=0
   });
   uint64_t draw_started=ui_render_ns();
@@ -6078,10 +6078,10 @@ static const char *ui_capture_custom_view(struct dvm *vm,dvm_ref view)
   capture->last_sig=capture->cur_sig;
   capture->last_gen=bm->gen;
   capture->last_dst=bm;
-  (void)dvm_set_field(vm,view,"drawingEpoch","J",(union dvm_value) {
+  (void)(dvm_set_field)(vm,view,"drawingEpoch","J",(union dvm_value) {
     .j=(int64_t)capture_epoch
   });
-  (void)dvm_set_field(vm,view,"drawingSeq","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,view,"drawingSeq","I",(union dvm_value) {
     .i=(int32_t)g_ui_build_seq
   });
   uint64_t publish_started=ui_render_ns();
@@ -6200,7 +6200,7 @@ static bool bm_create(struct dvm *vm, dvm_ref self,
       return false;
     }
     union dvm_value ordinal= {0};
-    if(config) dvm_get_field(vm,config,"ordinal","I",&ordinal);
+    if(config) (dvm_get_field)(vm,config,"ordinal","I",&ordinal);
     if(config && ordinal.i==5) {
       dvm__throw(vm,"java/lang/IllegalArgumentException","Cannot create mutable HARDWARE bitmap");
       return false;
@@ -6375,7 +6375,7 @@ static bool bm_compress(struct dvm *vm, dvm_ref self,
     return false;
   }
   union dvm_value fname = { 0 };
-  if (ARG(0).l) (void)dvm_get_field(vm, ARG(0).l, "name", "Ljava/lang/String;", &fname);
+  if (ARG(0).l) (void)(dvm_get_field)(vm, ARG(0).l, "name", "Ljava/lang/String;", &fname);
   const char *fmt = fname.l ? dvm_string_utf8(vm, fname.l) : "PNG";
   if (!ARG(2).l) {
     dvm__throw(vm, "java/lang/NullPointerException", "stream");
@@ -6430,7 +6430,7 @@ static bool bm_ninepatch_chunk(struct dvm *vm,dvm_ref self,const union dvm_value
   (void)args;
   (void)nargs;
   union dvm_value chunk={0};
-  (void)dvm_get_field(vm,self,"ninePatchChunk","[B",&chunk);
+  (void)(dvm_get_field)(vm,self,"ninePatchChunk","[B",&chunk);
   RETL(chunk.l);
 }
 static const struct rt_field rt_bitmap_fields[] = {
@@ -6589,7 +6589,7 @@ static bool bd_get_paint(struct dvm *vm,dvm_ref self,const union dvm_value *args
   if (!paint) {
     paint=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Paint"));
     if (!paint) return false;
-    (void)dvm_set_field(vm,self,"paint","Landroid/graphics/Paint;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,self,"paint","Landroid/graphics/Paint;",(union dvm_value) {
       .l=paint
     });
     union dvm_value flags= {.i=6},ignored= {0};
@@ -6611,8 +6611,8 @@ static void bd_compute_size(struct dvm *vm,dvm_ref self)
   int32_t target=ui_int(vm,self,"targetDensity");
   union dvm_value width= {.i=bm ? bd_scaled_dimension(bm->w,bm->density,target) : -1};
   union dvm_value height= {.i=bm ? bd_scaled_dimension(bm->h,bm->density,target) : -1};
-  (void)dvm_set_field(vm,self,"bitmapWidth","I",width);
-  (void)dvm_set_field(vm,self,"bitmapHeight","I",height);
+  (void)(dvm_set_field)(vm,self,"bitmapWidth","I",width);
+  (void)(dvm_set_field)(vm,self,"bitmapHeight","I",height);
 }
 static bool bd_init(struct dvm *vm, dvm_ref self,
                     const union dvm_value *args, int nargs,
@@ -6622,8 +6622,8 @@ static bool bd_init(struct dvm *vm, dvm_ref self,
   if (!drawable_init(vm, self, NULL, 0, &ignored)) return false;
   bool resource_ctor=strstr(builtin_sig(),"Landroid/content/res/Resources;")!=NULL;
   union dvm_value b= {.l=nargs>=2 ? ARG(1).l : nargs && !resource_ctor ? ARG(0).l : 0};
-  (void)dvm_set_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",b);
-  (void)dvm_set_field(vm,self,"gravity","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"bitmap","Landroid/graphics/Bitmap;",b);
+  (void)(dvm_set_field)(vm,self,"gravity","I",(union dvm_value) {
     .i=0x77
   });
   int32_t density=160;
@@ -6633,13 +6633,13 @@ static bool bd_init(struct dvm *vm, dvm_ref self,
     density=ui_int(vm,metrics.l,"densityDpi");
     if (!density) density=160;
   }
-  (void)dvm_set_field(vm,self,"targetDensity","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"targetDensity","I",(union dvm_value) {
     .i=density
   });
-  (void)dvm_set_field(vm,self,"tileModeX","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"tileModeX","I",(union dvm_value) {
     .i=-1
   });
-  (void)dvm_set_field(vm,self,"tileModeY","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"tileModeY","I",(union dvm_value) {
     .i=-1
   });
   bd_compute_size(vm,self);
@@ -6655,7 +6655,7 @@ static bool bd_getBitmap(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value b = { 0 };
-  (void)dvm_get_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &b);
+  (void)(dvm_get_field)(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &b);
   RETL(b.l);
 }
 
@@ -6675,12 +6675,12 @@ static bool bd_color_filter(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(!bd_get_paint(vm,self,NULL,0,&paint))return false;
   if(builtin_name()[0]=='s') {
     filter=nargs ? ARG(0) : filter;
-    dvm_set_field(vm,paint.l,"colorFilter","Landroid/graphics/ColorFilter;",filter);
-    dvm_set_field(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",filter);
+    (dvm_set_field)(vm,paint.l,"colorFilter","Landroid/graphics/ColorFilter;",filter);
+    (dvm_set_field)(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",filter);
     ui_invalidate();
     RETV();
   }
-  dvm_get_field(vm,paint.l,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
+  (dvm_get_field)(vm,paint.l,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
   RETL(filter.l);
 }
 static bool bd_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
@@ -6690,7 +6690,7 @@ static bool bd_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   const char *name=builtin_name();
   if (!strcmp(name,"setBitmap")) {
     if (ui_obj(vm,self,"bitmap","Landroid/graphics/Bitmap;")!=ARG(0).l) {
-      (void)dvm_set_field(vm,self,"bitmap","Landroid/graphics/Bitmap;",ARG(0));
+      (void)(dvm_set_field)(vm,self,"bitmap","Landroid/graphics/Bitmap;",ARG(0));
       bd_compute_size(vm,self);
       ui_invalidate();
     }
@@ -6711,7 +6711,7 @@ static bool bd_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     }
     if (!density) density=160;
     if (density!=ui_int(vm,self,"targetDensity")) {
-      (void)dvm_set_field(vm,self,"targetDensity","I",(union dvm_value) {
+      (void)(dvm_set_field)(vm,self,"targetDensity","I",(union dvm_value) {
         .i=density
       });
       bd_compute_size(vm,self);
@@ -6723,10 +6723,10 @@ static bool bd_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     bool gravity=strstr(name,"Gravity")!=NULL;
     const char *field=gravity ? "gravity" : "autoMirrored", *type=gravity ? "I" : "Z";
     union dvm_value old= {0};
-    (void)dvm_get_field(vm,self,field,type,&old);
+    (void)(dvm_get_field)(vm,self,field,type,&old);
     if (name[0]!='s') RETI(old.i);
     if (old.i!=ARG(0).i) {
-      (void)dvm_set_field(vm,self,field,type,ARG(0));
+      (void)(dvm_set_field)(vm,self,field,type,ARG(0));
       ui_invalidate();
     }
     RETV();
@@ -6734,16 +6734,16 @@ static bool bd_property(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   union dvm_value paint= {0},value= {0};
   if (!bd_get_paint(vm,self,NULL,0,&paint)) return false;
   if (strstr(name,"Alpha")) {
-    (void)dvm_get_field(vm,paint.l,"color","I",&value);
+    (void)(dvm_get_field)(vm,paint.l,"color","I",&value);
     if (name[0]!='s') RETI(value.u>>24);
     value.u=(value.u&0x00ffffffu) | ((ARG(0).u&255u)<<24);
-    (void)dvm_set_field(vm,paint.l,"color","I",value);
+    (void)(dvm_set_field)(vm,paint.l,"color","I",value);
   } else {
     int bit=strstr(name,"AntiAlias") ? 1 : strstr(name,"FilterBitmap") ? 2 : 4;
-    (void)dvm_get_field(vm,paint.l,"flags","I",&value);
+    (void)(dvm_get_field)(vm,paint.l,"flags","I",&value);
     if (name[0]!='s') RETI((value.i&bit)!=0);
     value.i=ARG(0).i ? value.i|bit : value.i&~bit;
-    (void)dvm_set_field(vm,paint.l,"flags","I",value);
+    (void)(dvm_set_field)(vm,paint.l,"flags","I",value);
   }
   ui_invalidate();
   RETV();
@@ -6772,7 +6772,7 @@ static bool bd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if (!rect) {
     rect=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Rect"));
     if (!rect) return false;
-    (void)dvm_set_field(vm,self,"drawRect","Landroid/graphics/Rect;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,self,"drawRect","Landroid/graphics/Rect;",(union dvm_value) {
       .l=rect
     });
   }
@@ -6787,7 +6787,7 @@ static bool bd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if (!matrix) {
     matrix=dvm_new_object(vm,dvm_find_class(vm,"android/graphics/Matrix"));
     if (!matrix) return false;
-    (void)dvm_set_field(vm,self,"drawMatrix","Landroid/graphics/Matrix;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,self,"drawMatrix","Landroid/graphics/Matrix;",(union dvm_value) {
       .l=matrix
     });
   }
@@ -6825,7 +6825,7 @@ static dvm_ref np_obj(struct dvm *vm, dvm_ref o, const char *name,
                       const char *type)
 {
   union dvm_value v = { 0 };
-  if (o) (void)dvm_get_field(vm, o, name, type, &v);
+  if (o) (void)(dvm_get_field)(vm, o, name, type, &v);
   return v.l;
 }
 
@@ -6855,11 +6855,11 @@ static bool np_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 {
   (void)out;
   union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
-  (void)dvm_set_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", v);
+  (void)(dvm_set_field)(vm, self, "bitmap", "Landroid/graphics/Bitmap;", v);
   v.l = nargs > 1 ? ARG(1).l : 0;
-  (void)dvm_set_field(vm, self, "chunk", "[B", v);
+  (void)(dvm_set_field)(vm, self, "chunk", "[B", v);
   v.l = nargs > 2 ? ARG(2).l : 0;
-  (void)dvm_set_field(vm, self, "name", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, self, "name", "Ljava/lang/String;", v);
   RETV();
 }
 
@@ -6944,7 +6944,7 @@ static bool npd_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     if (nargs > 1 && !(got && want && dvm__class_assignable(vm, got, want)))
       np.l = 0;
   }
-  (void)dvm_set_field(vm, self, "ninePatch", "Landroid/graphics/NinePatch;", np);
+  (void)(dvm_set_field)(vm, self, "ninePatch", "Landroid/graphics/NinePatch;", np);
   RETV();
 }
 
@@ -7043,7 +7043,7 @@ static bool npd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     if(!rects[i]) {
       rects[i]=dvm_new_object(vm,dvm__class_by_desc(vm,types[i]));
       if(!rects[i]) return false;
-      (void)dvm_set_field(vm,self,fields[i],types[i],(union dvm_value){.l=rects[i]});
+      (void)(dvm_set_field)(vm,self,fields[i],types[i],(union dvm_value){.l=rects[i]});
     }
   }
   const char *edges[]={"left","top","right","bottom"};
@@ -7053,7 +7053,7 @@ static bool npd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     float dst[]={dx[x],dy[y],dx[x+1],dy[y+1]};
     for(int i=0;i<4;++i) {
       rt_set_int(vm,rects[0],edges[i],src[i]);
-      (void)dvm_set_field(vm,rects[1],edges[i],"F",(union dvm_value){.f=dst[i]});
+      (void)(dvm_set_field)(vm,rects[1],edges[i],"F",(union dvm_value){.f=dst[i]});
     }
     if(!canvas_draw_bitmap_with(vm,ARG(0).l,bitmap,rects[0],rects[1],0,NULL,paint.l,true,out)) return false;
   }
@@ -7171,10 +7171,10 @@ static bool gd_setColors(struct dvm *vm, dvm_ref self,
     if (!colors) return false;
     if (n) memcpy(dvm_array_data(vm,colors),dvm_array_data(vm,ARG(0).l),(size_t)n*sizeof(int32_t));
   }
-  (void)dvm_set_field(vm,self,"colors","[I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"colors","[I",(union dvm_value) {
     .l=colors
   });
-  (void)dvm_set_field(vm,self,"positions","[F",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"positions","[F",(union dvm_value) {
     .l=nargs>1 ? ARG(1).l : 0
   });
   ui_invalidate();
@@ -7193,7 +7193,7 @@ static bool gd_init(struct dvm *vm, dvm_ref self,
   rt_set_int(vm,self,"color",0);
   if (nargs >= 2) {         /* (Orientation, int[] colors) */
     if (!gd_setColors(vm,self,args+1,1,out)) return false;
-    (void)dvm_set_field(vm, self, "orientation",
+    (void)(dvm_set_field)(vm, self, "orientation",
                         "Landroid/graphics/drawable/GradientDrawable$Orientation;",
                         ARG(0));
   }
@@ -7222,8 +7222,8 @@ static bool gd_setCornerRadius(struct dvm *vm, dvm_ref self,
   (void)nargs;
   (void)out;
   union dvm_value v = { .f = fmaxf(0,ARG(0).f) };
-  (void)dvm_set_field(vm, self, "cornerRadius", "F", v);
-  (void)dvm_set_field(vm,self,"cornerRadii","[F",(union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "cornerRadius", "F", v);
+  (void)(dvm_set_field)(vm,self,"cornerRadii","[F",(union dvm_value) {
     0
   });
   ui_invalidate();
@@ -7237,10 +7237,10 @@ static bool gd_setCornerRadii(struct dvm *vm, dvm_ref self,
 {
   (void)nargs;
   (void)out;
-  if (!ARG(0).l) (void)dvm_set_field(vm,self,"cornerRadius","F",(union dvm_value) {
+  if (!ARG(0).l) (void)(dvm_set_field)(vm,self,"cornerRadius","F",(union dvm_value) {
     0
   });
-  (void)dvm_set_field(vm, self, "cornerRadii", "[F", ARG(0));
+  (void)(dvm_set_field)(vm, self, "cornerRadii", "[F", ARG(0));
   ui_invalidate();
   RETV();
 }
@@ -7253,10 +7253,10 @@ static bool gd_setStroke(struct dvm *vm, dvm_ref self,
   (void)out;
   rt_set_int(vm, self, "strokeWidth", ARG(0).i);
   rt_set_int(vm, self, "strokeColor", ARG(1).i);
-  (void)dvm_set_field(vm,self,"dashWidth","F",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"dashWidth","F",(union dvm_value) {
     .f=nargs>=4 ? ARG(2).f : 0
   });
-  (void)dvm_set_field(vm,self,"dashGap","F",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"dashGap","F",(union dvm_value) {
     .f=nargs>=4 ? ARG(3).f : 0
   });
   ui_invalidate();
@@ -7305,7 +7305,7 @@ static bool gd_setOrientation(struct dvm *vm, dvm_ref self,
 {
   (void)nargs;
   (void)out;
-  (void)dvm_set_field(vm, self, "orientation",
+  (void)(dvm_set_field)(vm, self, "orientation",
                       "Landroid/graphics/drawable/GradientDrawable$Orientation;",
                       ARG(0));
   RETV();
@@ -7330,7 +7330,7 @@ static bool gd_getCornerRadius(struct dvm *vm, dvm_ref self,
   (void)args;
   (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "cornerRadius", "F", &v);
+  (void)(dvm_get_field)(vm, self, "cornerRadius", "F", &v);
   *out = v;
   return true;
 }
@@ -7478,11 +7478,11 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   }
   if (shape<0 || shape>3) RETV();
   union dvm_value filter= {0},colors_ref= {0},positions_ref= {0},radii_ref= {0},orientation= {0},target= {0};
-  (void)dvm_get_field(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
+  (void)(dvm_get_field)(vm,self,"colorFilter","Landroid/graphics/ColorFilter;",&filter);
   struct color_filter_state filter_state;
   if(!color_filter_prepare(vm,filter.l,&filter_state)) return false;
-  (void)dvm_get_field(vm,self,"colors","[I",&colors_ref);
-  (void)dvm_get_field(vm,self,"positions","[F",&positions_ref);
+  (void)(dvm_get_field)(vm,self,"colors","[I",&colors_ref);
+  (void)(dvm_get_field)(vm,self,"positions","[F",&positions_ref);
   const uint32_t *colors=dvm_array_data(vm,colors_ref.l);
   uint32_t count=colors_ref.l ? dvm_array_length(vm,colors_ref.l) : 0;
   const float *positions=dvm_array_data(vm,positions_ref.l);
@@ -7493,7 +7493,7 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   float radii[8],radius=ui_float(vm,self,"cornerRadius"),w=box[2]-box[0],h=box[3]-box[1];
   radius=fminf(fmaxf(0,radius),fminf(w,h)*0.5f);
   for (int i=0; i<8; ++i) radii[i]=radius;
-  (void)dvm_get_field(vm,self,"cornerRadii","[F",&radii_ref);
+  (void)(dvm_get_field)(vm,self,"cornerRadii","[F",&radii_ref);
   if (radii_ref.l && shape==0) {
     if (dvm_array_length(vm,radii_ref.l)<8) {
       dvm__throw(vm,"java/lang/ArrayIndexOutOfBoundsException","radii needs eight values");
@@ -7509,7 +7509,7 @@ static bool gd_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     }
     for (int i=0; i<8; ++i) radii[i]*=scale;
   }
-  (void)dvm_get_field(vm,self,"orientation","Landroid/graphics/drawable/GradientDrawable$Orientation;",&orientation);
+  (void)(dvm_get_field)(vm,self,"orientation","Landroid/graphics/drawable/GradientDrawable$Orientation;",&orientation);
   int ord=orientation.l ? ui_int(vm,orientation.l,"ordinal") : 0;
   static const int endpoints[8][4]= {{0,0,0,1},{1,0,0,1},{1,0,0,0},{1,1,0,0},{0,1,0,0},{0,1,1,0},{0,0,1,0},{0,0,1,1}};
   if (ord<0 || ord>=8) {
@@ -7680,12 +7680,12 @@ static const struct rt_field rt_gd_orientation_sfields[] = {
 static float rotate_float(struct dvm *vm,dvm_ref self,const char *field)
 {
   union dvm_value v= {0};
-  (void)dvm_get_field(vm,self,field,"F",&v);
+  (void)(dvm_get_field)(vm,self,field,"F",&v);
   return v.f;
 }
 static void rotate_set_float(struct dvm *vm,dvm_ref self,const char *field,float value)
 {
-  (void)dvm_set_field(vm,self,field,"F",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,field,"F",(union dvm_value) {
     .f=value
   });
 }
@@ -7697,10 +7697,10 @@ static bool rotate_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   rotate_set_float(vm,self,"fromDegrees",0.0f);
   rotate_set_float(vm,self,"toDegrees",360.0f);
   rotate_set_float(vm,self,"currentDegrees",0.0f);
-  (void)dvm_set_field(vm,self,"pivotXRelative","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"pivotXRelative","Z",(union dvm_value) {
     .i=1
   });
-  (void)dvm_set_field(vm,self,"pivotYRelative","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"pivotYRelative","Z",(union dvm_value) {
     .i=1
   });
   RETV();
@@ -7713,7 +7713,7 @@ static bool rotate_property(struct dvm *vm,dvm_ref self,const union dvm_value *a
   const bool relative=strstr(name,"Relative")!=NULL;
   if(relative) field=strstr(name,"PivotX") ? "pivotXRelative" : "pivotYRelative";
   union dvm_value v= {0};
-  (void)dvm_get_field(vm,self,field,relative ? "Z" : "F",&v);
+  (void)(dvm_get_field)(vm,self,field,relative ? "Z" : "F",&v);
   if(!nargs) {
     if(relative) RETI(v.i);
     RETF(v.f);
@@ -7722,7 +7722,7 @@ static bool rotate_property(struct dvm *vm,dvm_ref self,const union dvm_value *a
   if(changed) {
     v=ARG(0);
     if(relative)v.i=v.i!=0;
-    (void)dvm_set_field(vm,self,field,relative ? "Z" : "F",v);
+    (void)(dvm_set_field)(vm,self,field,relative ? "Z" : "F",v);
     if(!am_vcall(vm,self,"invalidateSelf","()V",NULL,0,out)) return false;
   }
   RETV();
@@ -7745,8 +7745,8 @@ static bool rotate_draw(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   float width=(float)rt_get_int(vm,bounds.l,"right")-(float)left;
   float height=(float)rt_get_int(vm,bounds.l,"bottom")-(float)top;
   union dvm_value relative_x= {0},relative_y= {0};
-  (void)dvm_get_field(vm,self,"pivotXRelative","Z",&relative_x);
-  (void)dvm_get_field(vm,self,"pivotYRelative","Z",&relative_y);
+  (void)(dvm_get_field)(vm,self,"pivotXRelative","Z",&relative_x);
+  (void)(dvm_get_field)(vm,self,"pivotYRelative","Z",&relative_y);
   float px=rotate_float(vm,self,"pivotX"),py=rotate_float(vm,self,"pivotY");
   union dvm_value rotation[3]= {{.f=rotate_float(vm,self,"currentDegrees")},
     {.f=left+(relative_x.i ? px*width : px)}, {.f=top+(relative_y.i ? py*height : py)}
@@ -7776,7 +7776,7 @@ static const struct rt_method rt_rotate_drawable[]= {
 static bool animated_rotate_next(struct dvm *vm,dvm_ref self,bool schedule)
 {
   union dvm_value action= {0},ignored= {0};
-  (void)dvm_get_field(vm,self,"nextFrame","Ljava/lang/Runnable;",&action);
+  (void)(dvm_get_field)(vm,self,"nextFrame","Ljava/lang/Runnable;",&action);
   if(!action.l) return true;
   if(!am_vcall(vm,self,"unscheduleSelf","(Ljava/lang/Runnable;)V",&action,1,&ignored)) return false;
   if(!schedule) return true;
@@ -7788,10 +7788,10 @@ static bool animated_rotate_init(struct dvm *vm,dvm_ref self,const union dvm_val
   if(!rotate_init(vm,self,args,nargs,out)) return false;
   rotate_set_float(vm,self,"pivotX",0);
   rotate_set_float(vm,self,"pivotY",0);
-  (void)dvm_set_field(vm,self,"pivotXRelative","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"pivotXRelative","Z",(union dvm_value) {
     0
   });
-  (void)dvm_set_field(vm,self,"pivotYRelative","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"pivotYRelative","Z",(union dvm_value) {
     0
   });
   rt_set_int(vm,self,"framesCount",12);
@@ -7799,10 +7799,10 @@ static bool animated_rotate_init(struct dvm *vm,dvm_ref self,const union dvm_val
   rt_set_int(vm,self,"running",0);
   dvm_ref action=dvm_new_object(vm,dvm_find_class(vm,"lunaria/AnimatedRotateFrame"));
   if(!action) return false;
-  (void)dvm_set_field(vm,action,"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,action,"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;",(union dvm_value) {
     .l=self
   });
-  (void)dvm_set_field(vm,self,"nextFrame","Ljava/lang/Runnable;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"nextFrame","Ljava/lang/Runnable;",(union dvm_value) {
     .l=action
   });
   RETV();
@@ -7836,7 +7836,7 @@ static bool animated_rotate_visible(struct dvm *vm,dvm_ref self,const union dvm_
 static bool animated_rotate_frame(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value owner= {0},ignored= {0};
-  (void)dvm_get_field(vm,self,"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;",&owner);
+  (void)(dvm_get_field)(vm,self,"owner","Landroid/graphics/drawable/AnimatedRotateDrawable;",&owner);
   if(!owner.l) RETV();
   float increment=360.0f/(float)rt_get_int(vm,owner.l,"framesCount");
   float degrees=rotate_float(vm,owner.l,"currentDegrees")+increment;

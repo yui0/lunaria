@@ -2081,6 +2081,8 @@ enum SvcId : uint32_t {
   SVC_LOADER_SHARED_GLOBALS,
   SVC_LOADER_THREAD_LOCAL_DTOR,
   SVC_LOADER_EXPORTED_NAMESPACE,
+  /* getopt(3) for processes whose libc is the host's (A32): the BSD algorithm bionic ships. */
+  SVC_GETOPT,
   SVC_TRAMP_TOTAL,
 };
 

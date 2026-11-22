@@ -12,7 +12,7 @@
 static int32_t vector_increment(struct dvm *vm,dvm_ref self)
 {
   union dvm_value v= {0};
-  dvm__get_field_from(vm,self,dvm_find_class(vm,"java/util/Vector"),"capacityIncrement","I",&v);
+  (dvm__get_field_from)(vm,self,dvm_find_class(vm,"java/util/Vector"),"capacityIncrement","I",&v);
   return v.i;
 }
 static bool vector_capacity_set(struct dvm *vm,dvm_ref self,uint32_t capacity)
@@ -80,7 +80,7 @@ static bool vector_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   struct rt_list *old=list_of(vm,self);
   for(uint32_t i=0; old && i<old->size; ++i)dvm_unpin(vm,old->items[i]);
   if(o) list_release(o);
-  dvm__set_field_from(vm,self,dvm_find_class(vm,"java/util/Vector"),"capacityIncrement","I",(union dvm_value) {
+  (dvm__set_field_from)(vm,self,dvm_find_class(vm,"java/util/Vector"),"capacityIncrement","I",(union dvm_value) {
     .i=increment
   });
   if(!vector_capacity_set(vm,self,(uint32_t)capacity)) {
@@ -457,7 +457,7 @@ static bool vector_iterator(struct dvm *vm,dvm_ref self,const union dvm_value *a
   }
   dvm_ref it=dvm_new_object(vm,dvm_find_class(vm,enumeration?"lunaria/util/VectorEnumeration":!strcmp(builtin_name(),"listIterator")?"lunaria/util/VectorListIterator":"lunaria/util/VectorIterator"));
   if(!it)return false;
-  dvm_set_field(vm,it,"target","Ljava/lang/Object;",(union dvm_value) {
+  (dvm_set_field)(vm,it,"target","Ljava/lang/Object;",(union dvm_value) {
     .l=self
   });
   rt_set_int(vm,it,"index",at);
@@ -470,7 +470,7 @@ static bool vector_iterator_step(struct dvm *vm,dvm_ref self,const union dvm_val
 {
   (void)nargs;
   union dvm_value target= {0};
-  dvm_get_field(vm,self,"target","Ljava/lang/Object;",&target);
+  (dvm_get_field)(vm,self,"target","Ljava/lang/Object;",&target);
   const char *name=builtin_name();
   bool enumeration=dvm_object_class(vm,self)==dvm_find_class(vm,"lunaria/util/VectorEnumeration");
   struct rt_list *v=list_of(vm,target.l);
@@ -582,26 +582,26 @@ static const struct rt_field rt_array_list_fields[]= {
 static dvm_ref array_list_array(struct dvm *vm,dvm_ref self)
 {
   union dvm_value a= {0};
-  (void)dvm_get_field(vm,self,"a","[Ljava/lang/Object;",&a);
+  (void)(dvm_get_field)(vm,self,"a","[Ljava/lang/Object;",&a);
   return a.l;
 }
 static int array_list_int(struct dvm *vm,dvm_ref self,const char *name)
 {
   union dvm_value v= {0};
-  (void)dvm_get_field(vm,self,name,"I",&v);
+  (void)(dvm_get_field)(vm,self,name,"I",&v);
   return v.i;
 }
 static dvm_ref array_list_create(struct dvm *vm,dvm_ref array,int offset,int length,bool sub)
 {
   dvm_ref list=dvm_new_object(vm,dvm_find_class(vm,sub ? "lunaria/util/ArraySubList" : "java/util/Arrays$ArrayList"));
   if(!list)return 0;
-  (void)dvm_set_field(vm,list,"a","[Ljava/lang/Object;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,list,"a","[Ljava/lang/Object;",(union dvm_value) {
     .l=array
   });
-  (void)dvm_set_field(vm,list,"offset","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,list,"offset","I",(union dvm_value) {
     .i=offset
   });
-  (void)dvm_set_field(vm,list,"length","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,list,"length","I",(union dvm_value) {
     .i=length
   });
   return list;
@@ -731,10 +731,10 @@ static bool array_list_iterator(struct dvm *vm,dvm_ref self,const union dvm_valu
   (void)nargs;
   dvm_ref it=dvm_new_object(vm,dvm_find_class(vm,"java/util/Arrays$ArrayItr"));
   if(!it)return false;
-  (void)dvm_set_field(vm,it,"target","Ljava/lang/Object;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,it,"target","Ljava/lang/Object;",(union dvm_value) {
     .l=self
   });
-  (void)dvm_set_field(vm,it,"last","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,it,"last","I",(union dvm_value) {
     .i=-1
   });
   RETL(it);
@@ -1044,10 +1044,10 @@ static bool manifest_filter_matches(struct dvm *vm, dvm_ref intent,
                                     const char *component, int flags, int *priority,const char *table)
 {
   union dvm_value action= {0}, categories= {0}, data= {0}, type= {0};
-  dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
-  dvm_get_field(vm,intent,"categories","Ljava/util/Set;",&categories);
-  dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
-  dvm_get_field(vm,intent,"type","Ljava/lang/String;",&type);
+  (dvm_get_field)(vm,intent,"action","Ljava/lang/String;",&action);
+  (dvm_get_field)(vm,intent,"categories","Ljava/util/Set;",&categories);
+  (dvm_get_field)(vm,intent,"data","Landroid/net/Uri;",&data);
+  (dvm_get_field)(vm,intent,"type","Ljava/lang/String;",&type);
   char *copy=table ? strdup(table) : NULL;
   bool matched=false;
   for (char *p=copy, *row; p && (row=luna_strsep(&p,"\n"));) {
@@ -1104,42 +1104,42 @@ static bool pm_activity_candidates(struct dvm *vm, dvm_ref intent, int flags,
       free(copy);
       return false;
     }
-    dvm_set_field(vm,info,"packageName","Ljava/lang/String;",(union dvm_value) {
+    (dvm_set_field)(vm,info,"packageName","Ljava/lang/String;",(union dvm_value) {
       .l=dvm_new_string(vm,package)
     });
-    dvm_set_field(vm,info,"name","Ljava/lang/String;",(union dvm_value) {
+    (dvm_set_field)(vm,info,"name","Ljava/lang/String;",(union dvm_value) {
       .l=dvm_new_string(vm,name)
     });
-    dvm_set_field(vm,info,"targetActivity","Ljava/lang/String;",(union dvm_value) {
+    (dvm_set_field)(vm,info,"targetActivity","Ljava/lang/String;",(union dvm_value) {
       .l=*target ? dvm_new_string(vm,target) : 0
     });
-    dvm_set_field(vm,info,"enabled","Z",(union dvm_value) {
+    (dvm_set_field)(vm,info,"enabled","Z",(union dvm_value) {
       .i=enabled
     });
-    dvm_set_field(vm,info,"exported","Z",(union dvm_value) {
+    (dvm_set_field)(vm,info,"exported","Z",(union dvm_value) {
       .i=exported_text ? atoi(exported_text)!=0 : 0
     });
-    dvm_set_field(vm,info,"processName","Ljava/lang/String;",(union dvm_value) {
+    (dvm_set_field)(vm,info,"processName","Ljava/lang/String;",(union dvm_value) {
       .l=dvm_new_string(vm,process && *process ? process : package)
     });
-    dvm_set_field(vm,info,"permission","Ljava/lang/String;",(union dvm_value) {
+    (dvm_set_field)(vm,info,"permission","Ljava/lang/String;",(union dvm_value) {
       .l=*permission ? dvm_new_string(vm,permission) : 0
     });
     struct lunaria_android_package installed;
     if (lunaria_android_package_find(package,&installed))
-      dvm_set_field(vm,info,"applicationInfo","Landroid/content/pm/ApplicationInfo;",
+      (dvm_set_field)(vm,info,"applicationInfo","Landroid/content/pm/ApplicationInfo;",
       (union dvm_value) {
       .l=pm_application_info(vm,&installed)
     });
     if ((flags & PM_GET_META_DATA) && current) {
       union dvm_value bundle= {0};
-      dvm_get_field(vm,info,"metaData","Landroid/os/Bundle;",&bundle);
+      (dvm_get_field)(vm,info,"metaData","Landroid/os/Bundle;",&bundle);
       manifest_bundle_fill(vm,bundle.l,arm_exec_apk_component_meta_keys(name), name);
     }
-    dvm_set_field(vm,resolve,"priority","I",(union dvm_value) {
+    (dvm_set_field)(vm,resolve,"priority","I",(union dvm_value) {
       .i=priority
     });
-    dvm_set_field(vm,resolve,"activityInfo","Landroid/content/pm/ActivityInfo;",(union dvm_value) {
+    (dvm_set_field)(vm,resolve,"activityInfo","Landroid/content/pm/ActivityInfo;",(union dvm_value) {
       .l=info
     });
     union dvm_value item= {.l=resolve}, ignored= {0};
@@ -1150,7 +1150,7 @@ static bool pm_activity_candidates(struct dvm *vm, dvm_ref intent, int flags,
     struct rt_list *results=list_of(vm,list);
     for (size_t j=results->size-1; j>0; --j) {
       union dvm_value previous= {0};
-      dvm_get_field(vm,results->items[j-1],"priority","I",&previous);
+      (dvm_get_field)(vm,results->items[j-1],"priority","I",&previous);
       if (previous.i>=priority) break;
       results->items[j]=results->items[j-1];
       results->items[j-1]=resolve;
@@ -1172,22 +1172,22 @@ static bool pm_browser_candidate(struct dvm *vm, dvm_ref intent, dvm_ref list,
   if ((wanted && strcmp(wanted,LUNA_BROWSER_PACKAGE)) || (name && strcmp(name,LUNA_BROWSER_ACTIVITY)))
     return true;
   union dvm_value action={0}, data={0}, text={0};
-  dvm_get_field(vm,intent,"action","Ljava/lang/String;",&action);
-  dvm_get_field(vm,intent,"data","Landroid/net/Uri;",&data);
+  (dvm_get_field)(vm,intent,"action","Ljava/lang/String;",&action);
+  (dvm_get_field)(vm,intent,"data","Landroid/net/Uri;",&data);
   const char *a=action.l ? dvm_string_utf8(vm,action.l) : NULL;
-  if (data.l) dvm_get_field(vm,data.l,"uri","Ljava/lang/String;",&text);
+  if (data.l) (dvm_get_field)(vm,data.l,"uri","Ljava/lang/String;",&text);
   const char *u=text.l ? dvm_string_utf8(vm,text.l) : NULL;
   if (!a || strcmp(a,"android.intent.action.VIEW") || !u ||
       (strncasecmp(u,"http://",7) && strncasecmp(u,"https://",8))) return true;
   dvm_ref resolve=resolve_info_new(vm);
   dvm_ref info=pm_component_info(vm,"Landroid/content/pm/ActivityInfo;");
   if (!resolve || !info) return false;
-  dvm_set_field(vm,info,"packageName","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_PACKAGE)});
-  dvm_set_field(vm,info,"name","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_ACTIVITY)});
-  dvm_set_field(vm,info,"processName","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_PACKAGE)});
-  dvm_set_field(vm,info,"enabled","Z",(union dvm_value){.i=1});
-  dvm_set_field(vm,info,"exported","Z",(union dvm_value){.i=1});
-  dvm_set_field(vm,resolve,"activityInfo","Landroid/content/pm/ActivityInfo;",(union dvm_value){.l=info});
+  (dvm_set_field)(vm,info,"packageName","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_PACKAGE)});
+  (dvm_set_field)(vm,info,"name","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_ACTIVITY)});
+  (dvm_set_field)(vm,info,"processName","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,LUNA_BROWSER_PACKAGE)});
+  (dvm_set_field)(vm,info,"enabled","Z",(union dvm_value){.i=1});
+  (dvm_set_field)(vm,info,"exported","Z",(union dvm_value){.i=1});
+  (dvm_set_field)(vm,resolve,"activityInfo","Landroid/content/pm/ActivityInfo;",(union dvm_value){.l=info});
   union dvm_value item={.l=resolve}, ignored={0};
   return list_add(vm,list,&item,1,&ignored);
 }
@@ -1201,11 +1201,11 @@ static bool pm_query_activities(struct dvm *vm, dvm_ref intent, int flags,
   if (!list || !intent) RETL(list);
   const char *self=getenv("ANDROID_PACKAGE_NAME");
   union dvm_value pkg={0}, component={0}, cp={0}, cc={0};
-  dvm_get_field(vm,intent,"package","Ljava/lang/String;",&pkg);
-  dvm_get_field(vm,intent,"component","Landroid/content/ComponentName;",&component);
+  (dvm_get_field)(vm,intent,"package","Ljava/lang/String;",&pkg);
+  (dvm_get_field)(vm,intent,"component","Landroid/content/ComponentName;",&component);
   if (component.l) {
-    dvm_get_field(vm,component.l,"pkg","Ljava/lang/String;",&cp);
-    dvm_get_field(vm,component.l,"cls","Ljava/lang/String;",&cc);
+    (dvm_get_field)(vm,component.l,"pkg","Ljava/lang/String;",&cp);
+    (dvm_get_field)(vm,component.l,"cls","Ljava/lang/String;",&cc);
     if (!cp.l || !cc.l) RETL(list);
   }
   const char *wanted=cp.l ? dvm_string_utf8(vm,cp.l) : pkg.l ? dvm_string_utf8(vm,pkg.l) : NULL;
@@ -1246,10 +1246,10 @@ static bool pm_launch_intent(struct dvm *vm, dvm_ref self,
   if (!intent) return false;
   union dvm_value action= {.l=dvm_new_string(vm,"android.intent.action.MAIN")}, ignored= {0};
   if (!intent_init(vm,intent,&action,1,&ignored)) return false;
-  dvm_set_field(vm,intent,"package","Ljava/lang/String;",ARG(0));
+  (dvm_set_field)(vm,intent,"package","Ljava/lang/String;",ARG(0));
   const char *cats[]= {"android.intent.category.INFO","android.intent.category.LAUNCHER"};
   for (size_t i=0; i<2; ++i) {
-    dvm_set_field(vm,intent,"categories","Ljava/util/Set;",(union dvm_value) {
+    (dvm_set_field)(vm,intent,"categories","Ljava/util/Set;",(union dvm_value) {
       0
     });
     union dvm_value category= {.l=dvm_new_string(vm,cats[i])};
@@ -1259,16 +1259,16 @@ static bool pm_launch_intent(struct dvm *vm, dvm_ref self,
     struct rt_list *l=result.l ? list_of(vm,result.l) : NULL;
     if (!l || !l->size) continue;
     union dvm_value info= {0}, package= {0}, name= {0};
-    dvm_get_field(vm,l->items[0],"activityInfo","Landroid/content/pm/ActivityInfo;",&info);
-    dvm_get_field(vm,info.l,"packageName","Ljava/lang/String;",&package);
-    dvm_get_field(vm,info.l,"name","Ljava/lang/String;",&name);
+    (dvm_get_field)(vm,l->items[0],"activityInfo","Landroid/content/pm/ActivityInfo;",&info);
+    (dvm_get_field)(vm,info.l,"packageName","Ljava/lang/String;",&package);
+    (dvm_get_field)(vm,info.l,"name","Ljava/lang/String;",&name);
     dvm_ref component=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/content/ComponentName;"));
     union dvm_value pair[2]= {package,name};
     if (!component || !cn_init(vm,component,pair,2,&ignored)) return false;
-    dvm_set_field(vm,intent,"component","Landroid/content/ComponentName;",(union dvm_value) {
+    (dvm_set_field)(vm,intent,"component","Landroid/content/ComponentName;",(union dvm_value) {
       .l=component
     });
-    dvm_set_field(vm,intent,"flags","I",(union dvm_value) {
+    (dvm_set_field)(vm,intent,"flags","I",(union dvm_value) {
       .i=0x10000000
     });
     RETL(intent);
@@ -1286,13 +1286,13 @@ static dvm_ref pm_activity_info_for_component(struct dvm *vm,
   dvm_ref intent=dvm_new_object(vm,dvm__class_by_desc(vm,"Landroid/content/Intent;"));
   union dvm_value ignored= {0};
   if (!intent || !intent_init(vm,intent,NULL,0,&ignored)) return 0;
-  dvm_set_field(vm,intent,"component","Landroid/content/ComponentName;",ARG(0));
+  (dvm_set_field)(vm,intent,"component","Landroid/content/ComponentName;",ARG(0));
   union dvm_value query[2]= {{.l=intent},{.i=nargs>1 ? ARG(1).i : 0}}, result= {0};
   if (!pm_queryIntentActivities(vm,0,query,2,&result)) return 0;
   struct rt_list *l=result.l ? list_of(vm,result.l) : NULL;
   if (l && l->size) {
     union dvm_value info= {0};
-    dvm_get_field(vm,l->items[0],"activityInfo","Landroid/content/pm/ActivityInfo;",&info);
+    (dvm_get_field)(vm,l->items[0],"activityInfo","Landroid/content/pm/ActivityInfo;",&info);
     return info.l;
   }
   dvm__throw(vm,"android/content/pm/PackageManager$NameNotFoundException","activity component");

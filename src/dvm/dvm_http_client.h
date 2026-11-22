@@ -27,7 +27,7 @@ static const char *const rt_http_manager_iface[]= {"Lorg/apache/http/conn/Client
 static bool http_client_flag(struct dvm *vm,dvm_ref self,const char *name)
 {
   union dvm_value r= {0};
-  dvm_get_field(vm,self,name,"Z",&r);
+  (dvm_get_field)(vm,self,name,"Z",&r);
   return r.i!=0;
 }
 static bool http_client_unsupported(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -50,7 +50,7 @@ static bool http_client_init(struct dvm *vm,dvm_ref self,const union dvm_value *
   if(nargs)params=ARG(nargs-1).l;
   if(!params)params=dvm_new_object(vm,dvm_find_class(vm,"org/apache/http/params/BasicHttpParams"));
   if(!params)return false;
-  dvm_set_field(vm,self,"params","Lorg/apache/http/params/HttpParams;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"params","Lorg/apache/http/params/HttpParams;",(union dvm_value) {
     .l=params
   });
   RETV();
@@ -75,10 +75,10 @@ static bool http_client_manager(struct dvm *vm,dvm_ref self,const union dvm_valu
   if(!manager) {
     manager=dvm_new_object(vm,dvm_find_class(vm,"org/apache/http/impl/conn/SingleClientConnManager"));
     if(!manager)return false;
-    dvm_set_field(vm,manager,"client","Lorg/apache/http/impl/client/AbstractHttpClient;",(union dvm_value) {
+    (dvm_set_field)(vm,manager,"client","Lorg/apache/http/impl/client/AbstractHttpClient;",(union dvm_value) {
       .l=self
     });
-    dvm_set_field(vm,self,"manager","Lorg/apache/http/conn/ClientConnectionManager;",(union dvm_value) {
+    (dvm_set_field)(vm,self,"manager","Lorg/apache/http/conn/ClientConnectionManager;",(union dvm_value) {
       .l=manager
     });
   }
@@ -91,18 +91,18 @@ static bool http_client_release(struct dvm *vm,dvm_ref client,dvm_ref connection
     return !connection || conn_disconnect(vm,connection,NULL,0,&ignored);
   }
   union dvm_value readers= {0};
-  dvm_get_field(vm,client,"readers","I",&readers);
+  (dvm_get_field)(vm,client,"readers","I",&readers);
   if(readers.i) {
-    dvm_set_field(vm,client,"releasePending","Z",(union dvm_value) {
+    (dvm_set_field)(vm,client,"releasePending","Z",(union dvm_value) {
       .i=1
     });
     return true;
   }
-  dvm_set_field(vm,client,"releasePending","Z",(union dvm_value) {
+  (dvm_set_field)(vm,client,"releasePending","Z",(union dvm_value) {
     0
   });
   if(http_params_field(vm,client,"connection","Ljava/net/HttpURLConnection;")==connection)
-    dvm_set_field(vm,client,"connection","Ljava/net/HttpURLConnection;",(union dvm_value) {
+    (dvm_set_field)(vm,client,"connection","Ljava/net/HttpURLConnection;",(union dvm_value) {
     0
   });
   union dvm_value ignored= {0};
@@ -120,7 +120,7 @@ static bool http_client_shutdown(struct dvm *vm,dvm_ref self,const union dvm_val
   (void)out;
   dvm_ref client=http_params_field(vm,self,"client","Lorg/apache/http/impl/client/AbstractHttpClient;");
   if(client) {
-    dvm_set_field(vm,client,"shutdown","Z",(union dvm_value) {
+    (dvm_set_field)(vm,client,"shutdown","Z",(union dvm_value) {
       .i=1
     });
     if(!http_client_release(vm,client,http_params_field(vm,client,"connection","Ljava/net/HttpURLConnection;")))return false;
@@ -133,12 +133,12 @@ static bool http_client_stream_close(struct dvm *vm,dvm_ref self,const union dvm
   (void)nargs;
   (void)out;
   if(http_client_flag(vm,self,"closed"))RETV();
-  dvm_set_field(vm,self,"closed","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"closed","Z",(union dvm_value) {
     .i=1
   });
   dvm_ref delegate=http_params_field(vm,self,"delegate","Ljava/io/InputStream;"),client=http_params_field(vm,self,"client","Lorg/apache/http/impl/client/AbstractHttpClient;"),connection=http_params_field(vm,self,"connection","Ljava/net/HttpURLConnection;");
   union dvm_value readers= {0};
-  dvm_get_field(vm,client,"readers","I",&readers);
+  (dvm_get_field)(vm,client,"readers","I",&readers);
   if(readers.i)return http_client_release(vm,client,connection);
   union dvm_value ignored= {0};
   bool good=am_vcall(vm,delegate,"close","()V",NULL,0,&ignored);
@@ -190,27 +190,27 @@ static bool http_client_stream_read(struct dvm *vm,dvm_ref self,const union dvm_
   }
   dvm_ref delegate=http_params_field(vm,self,"delegate","Ljava/io/InputStream;");
   union dvm_value readers= {0};
-  dvm_get_field(vm,client,"readers","I",&readers);
+  (dvm_get_field)(vm,client,"readers","I",&readers);
   ++readers.i;
-  dvm_set_field(vm,client,"readers","I",readers);
+  (dvm_set_field)(vm,client,"readers","I",readers);
   bool good=am_vcall(vm,delegate,builtin_name(),builtin_sig(),args,nargs,out);
   dvm_ref failure=dvm_exception(vm);
   if(good && request && !am_vcall(vm,request,"isAborted","()Z",NULL,0,&aborted)) {
     good=false;
     failure=dvm_exception(vm);
   }
-  dvm_get_field(vm,client,"readers","I",&readers);
+  (dvm_get_field)(vm,client,"readers","I",&readers);
   --readers.i;
-  dvm_set_field(vm,client,"readers","I",readers);
+  (dvm_set_field)(vm,client,"readers","I",readers);
   if(good && !strcmp(builtin_name(),"read") && out->i<0) {
-    dvm_set_field(vm,self,"eof","Z",(union dvm_value) {
+    (dvm_set_field)(vm,self,"eof","Z",(union dvm_value) {
       .i=1
     });
-    dvm_set_field(vm,client,"releasePending","Z",(union dvm_value) {
+    (dvm_set_field)(vm,client,"releasePending","Z",(union dvm_value) {
       .i=1
     });
   }
-  if(aborted.i)dvm_set_field(vm,client,"releasePending","Z",(union dvm_value) {
+  if(aborted.i)(dvm_set_field)(vm,client,"releasePending","Z",(union dvm_value) {
     .i=1
   });
   if(!readers.i && (http_client_flag(vm,client,"shutdown") || http_client_flag(vm,client,"releasePending"))) {
@@ -285,13 +285,13 @@ static bool http_client_prepare_tls(struct dvm *vm,dvm_ref self,dvm_ref connecti
     union dvm_value init[3]= {{0}};
     if(!am_vcall(vm,context,"init","([Ljavax/net/ssl/KeyManager;[Ljavax/net/ssl/TrustManager;Ljava/security/SecureRandom;)V",init,3,&r) || !am_vcall(vm,context,"getSocketFactory","()Ljavax/net/ssl/SSLSocketFactory;",NULL,0,&r))return false;
     factory=r.l;
-    dvm_set_field(vm,self,"socketFactory","Ljavax/net/ssl/SSLSocketFactory;",r);
+    (dvm_set_field)(vm,self,"socketFactory","Ljavax/net/ssl/SSLSocketFactory;",r);
   }
   dvm_ref verifier=http_params_field(vm,self,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;");
   if(!verifier) {
     verifier=dvm_new_object(vm,dvm_find_class(vm,"lunaria/net/HostnameVerifier"));
     if(!verifier)return false;
-    dvm_set_field(vm,self,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",(union dvm_value) {
+    (dvm_set_field)(vm,self,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",(union dvm_value) {
       .l=verifier
     });
   }
@@ -475,7 +475,7 @@ next_hop:
     if(!good) {
       if(failure) {
         dvm__throw(vm,"org/apache/http/client/ClientProtocolException","Invalid redirect URI");
-        dvm_set_field(vm,dvm_exception(vm),"cause","Ljava/lang/Throwable;",(union dvm_value) {
+        (dvm_set_field)(vm,dvm_exception(vm),"cause","Ljava/lang/Throwable;",(union dvm_value) {
           .l=failure
         });
       }
@@ -537,21 +537,21 @@ next_hop:
   }
   dvm_ref managed=dvm_new_object(vm,dvm_find_class(vm,"lunaria/http/ManagedEntityStream"));
   if(!managed)return false;
-  dvm_set_field(vm,managed,"delegate","Ljava/io/InputStream;",stream);
-  dvm_set_field(vm,managed,"client","Lorg/apache/http/impl/client/AbstractHttpClient;",(union dvm_value) {
+  (dvm_set_field)(vm,managed,"delegate","Ljava/io/InputStream;",stream);
+  (dvm_set_field)(vm,managed,"client","Lorg/apache/http/impl/client/AbstractHttpClient;",(union dvm_value) {
     .l=self
   });
-  dvm_set_field(vm,managed,"connection","Ljava/net/HttpURLConnection;",(union dvm_value) {
+  (dvm_set_field)(vm,managed,"connection","Ljava/net/HttpURLConnection;",(union dvm_value) {
     .l=connection
   });
-  dvm_set_field(vm,managed,"request","Lorg/apache/http/client/methods/HttpUriRequest;",(union dvm_value) {
+  (dvm_set_field)(vm,managed,"request","Lorg/apache/http/client/methods/HttpUriRequest;",(union dvm_value) {
     .l=request
   });
   stream.l=managed;
   if(!http_entity_set_content(vm,basic,&stream,1,&r))return false;
   union dvm_value length= {.j=c->resp.content_length};
   if(!http_entity_set_length(vm,basic,&length,1,&r))return false;
-  dvm_set_field(vm,basic,"chunked","Z",(union dvm_value) {
+  (dvm_set_field)(vm,basic,"chunked","Z",(union dvm_value) {
     .i=c->resp.chunked
   });
   const char *names[]= {"Content-Type","Content-Encoding"},*setters[]= {"setContentType","setContentEncoding"};
@@ -560,7 +560,7 @@ next_hop:
         if(!am_vcall(vm,basic,setters[i],"(Ljava/lang/String;)V",&value,1,&r))return false;
         break;
       }
-  dvm_set_field(vm,response,"entity","Lorg/apache/http/HttpEntity;",(union dvm_value) {
+  (dvm_set_field)(vm,response,"entity","Lorg/apache/http/HttpEntity;",(union dvm_value) {
     .l=basic
   });
   if(!am_vcall(vm,request,"isAborted","()Z",NULL,0,&aborted))return false;
@@ -569,14 +569,14 @@ next_hop:
     dvm__throw(vm,"java/io/InterruptedIOException","Request aborted");
     return false;
   }
-  dvm_set_field(vm,self,"connection","Ljava/net/HttpURLConnection;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"connection","Ljava/net/HttpURLConnection;",(union dvm_value) {
     .l=connection
   });
   if(object_is_a(vm,request,"org/apache/http/client/methods/HttpRequestBase")) {
-    dvm_set_field(vm,request,"activeClient","Lorg/apache/http/impl/client/AbstractHttpClient;",(union dvm_value) {
+    (dvm_set_field)(vm,request,"activeClient","Lorg/apache/http/impl/client/AbstractHttpClient;",(union dvm_value) {
       .l=self
     });
-    dvm_set_field(vm,request,"activeConnection","Ljava/net/HttpURLConnection;",(union dvm_value) {
+    (dvm_set_field)(vm,request,"activeConnection","Ljava/net/HttpURLConnection;",(union dvm_value) {
       .l=connection
     });
   }
@@ -589,11 +589,11 @@ static bool http_client_execute(struct dvm *vm,dvm_ref self,const union dvm_valu
     dvm__throw(vm,"java/lang/IllegalStateException","HTTP request already executing");
     return false;
   }
-  dvm_set_field(vm,self,"executing","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"executing","Z",(union dvm_value) {
     .i=1
   });
   bool good=http_client_execute_impl(vm,self,args,nargs,out);
-  dvm_set_field(vm,self,"executing","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"executing","Z",(union dvm_value) {
     0
   });
   return good;

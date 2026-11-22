@@ -33,7 +33,7 @@ static bool ps_io_error(struct dvm *vm,dvm_ref self,bool interruptible)
 static dvm_ref ps_target(struct dvm *vm,dvm_ref self)
 {
   union dvm_value value={0};
-  (void)dvm_get_field(vm,self,"out","Ljava/io/OutputStream;",&value);
+  (void)(dvm_get_field)(vm,self,"out","Ljava/io/OutputStream;",&value);
   if(!value.l) dvm__throw(vm,"java/io/IOException","Stream closed");
   return value.l;
 }
@@ -69,7 +69,7 @@ static bool ps_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int 
   struct dvm_object *object=dvm__obj(vm,self);
   if(object->data_destroy) object->data_destroy(object->data); else free(object->data);
   object->data=s; object->data_destroy=ps_destroy;
-  (void)dvm_set_field(vm,self,"out","Ljava/io/OutputStream;",(union dvm_value){.l=target});
+  (void)(dvm_set_field)(vm,self,"out","Ljava/io/OutputStream;",(union dvm_value){.l=target});
   rt_set_int(vm,self,"autoFlush",!file && nargs>1 && ARG(1).i);
   rt_set_int(vm,self,"trouble",0);
   RETV();
@@ -128,7 +128,7 @@ static bool ps_emit(struct dvm *vm,dvm_ref self,const uint16_t *units,size_t cou
   if(!s->encoder || !s->bytes) {
     if(!s->encoder) s->encoder=jcs_encoder_new(&s->charset);
     if(!s->bytes) s->bytes=dvm_new_array(vm,'B',"B",4096);
-    (void)dvm_set_field(vm,self,"encodedBytes","[B",(union dvm_value){.l=s->bytes});
+    (void)(dvm_set_field)(vm,self,"encodedBytes","[B",(union dvm_value){.l=s->bytes});
     if(!s->encoder || !s->bytes) { dvm__throw(vm,"java/lang/OutOfMemoryError","PrintStream encoder"); return false; }
   }
   if(s->has_pending) {
@@ -230,9 +230,9 @@ static bool ps_control(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
   }
   if(!strcmp(name,"checkError")) {
     union dvm_value target={0},ignored={0};
-    (void)dvm_get_field(vm,self,"out","Ljava/io/OutputStream;",&target);
+    (void)(dvm_get_field)(vm,self,"out","Ljava/io/OutputStream;",&target);
     if(target.l && !am_vcall(vm,self,"flush","()V",NULL,0,&ignored)) return false;
-    (void)dvm_get_field(vm,self,"out","Ljava/io/OutputStream;",&target);
+    (void)(dvm_get_field)(vm,self,"out","Ljava/io/OutputStream;",&target);
     if(target.l && dvm__class_assignable(vm,dvm_object_class(vm,target.l),dvm_find_class(vm,"java/io/PrintStream")))
       return am_vcall(vm,target.l,"checkError","()Z",NULL,0,out);
     RETI(rt_get_int(vm,self,"trouble"));
@@ -253,7 +253,7 @@ static bool ps_control(struct dvm *vm,dvm_ref self,const union dvm_value *args,i
         good=target && am_vcall(vm,target,"close","()V",NULL,0,&ignored);
       }
       if(!good) good=ps_io_error(vm,self,false);
-      if(good) (void)dvm_set_field(vm,self,"out","Ljava/io/OutputStream;",(union dvm_value){0});
+      if(good) (void)(dvm_set_field)(vm,self,"out","Ljava/io/OutputStream;",(union dvm_value){0});
     }
   }
   if(!dvm__monitor_exit(vm,self)) good=false;

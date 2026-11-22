@@ -20,7 +20,7 @@
 static struct rt_list *st_items(struct dvm *vm, dvm_ref self)
 {
   union dvm_value v = { 0 };
-  if (!dvm_get_field(vm, self, "items", "Ljava/util/ArrayList;", &v) || !v.l)
+  if (!(dvm_get_field)(vm, self, "items", "Ljava/util/ArrayList;", &v) || !v.l)
     return NULL;
   return list_of(vm, v.l);
 }
@@ -31,7 +31,7 @@ static dvm_ref st_new(struct dvm *vm, const char *desc, dvm_ref list)
   dvm_ref s = c ? dvm_new_object(vm, c) : 0;
   if (!s) return 0;
   union dvm_value v = { .l = list };
-  (void)dvm_set_field(vm, s, "items", "Ljava/util/ArrayList;", v);
+  (void)(dvm_set_field)(vm, s, "items", "Ljava/util/ArrayList;", v);
   return s;
 }
 
@@ -89,14 +89,14 @@ static dvm_ref opt_make(struct dvm *vm, dvm_ref value)
   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
   if (!o) return 0;
   union dvm_value v = { .l = value };
-  (void)dvm_set_field(vm, o, "value", "Ljava/lang/Object;", v);
+  (void)(dvm_set_field)(vm, o, "value", "Ljava/lang/Object;", v);
   return o;
 }
 
 static dvm_ref opt_value(struct dvm *vm, dvm_ref self)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "value", "Ljava/lang/Object;", &v);
+  (void)(dvm_get_field)(vm, self, "value", "Ljava/lang/Object;", &v);
   return v.l;
 }
 
@@ -495,11 +495,11 @@ static dvm_ref cl_make(struct dvm *vm, int kind, dvm_ref a, dvm_ref b, dvm_ref c
   dvm_ref o = k ? dvm_new_object(vm, k) : 0;
   if (!o) return 0;
   union dvm_value v = { .i = kind };
-  (void)dvm_set_field(vm, o, "kind", "I", v);
-  v.l = a; (void)dvm_set_field(vm, o, "a", "Ljava/lang/Object;", v);
-  v.l = b; (void)dvm_set_field(vm, o, "b", "Ljava/lang/Object;", v);
-  v.l = c; (void)dvm_set_field(vm, o, "c", "Ljava/lang/Object;", v);
-  v.l = d; (void)dvm_set_field(vm, o, "d", "Ljava/lang/Object;", v);
+  (void)(dvm_set_field)(vm, o, "kind", "I", v);
+  v.l = a; (void)(dvm_set_field)(vm, o, "a", "Ljava/lang/Object;", v);
+  v.l = b; (void)(dvm_set_field)(vm, o, "b", "Ljava/lang/Object;", v);
+  v.l = c; (void)(dvm_set_field)(vm, o, "c", "Ljava/lang/Object;", v);
+  v.l = d; (void)(dvm_set_field)(vm, o, "d", "Ljava/lang/Object;", v);
   return o;
 }
 
@@ -520,7 +520,7 @@ static bool cls_make(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 static dvm_ref cl_field(struct dvm *vm, dvm_ref o, const char *name)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, o, name, "Ljava/lang/Object;", &v);
+  (void)(dvm_get_field)(vm, o, name, "Ljava/lang/Object;", &v);
   return v.l;
 }
 
@@ -528,7 +528,7 @@ static bool st_run_collector(struct dvm *vm, dvm_ref collector, struct rt_list *
                              union dvm_value *out)
 {
   union dvm_value kind = { 0 };
-  (void)dvm_get_field(vm, collector, "kind", "I", &kind);
+  (void)(dvm_get_field)(vm, collector, "kind", "I", &kind);
   dvm_ref a = cl_field(vm, collector, "a"), b = cl_field(vm, collector, "b"),
           c = cl_field(vm, collector, "c");
   uint32_t n = src ? src->size : 0;

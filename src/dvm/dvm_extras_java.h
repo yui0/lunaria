@@ -380,7 +380,7 @@ static bool x_date_field(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)args;
   (void)nargs;
   union dvm_value millis = { 0 }, cal = { 0 }, arg = { 0 };
-  (void)dvm_get_field(vm, self, "millis", "J", &millis);
+  (void)(dvm_get_field)(vm, self, "millis", "J", &millis);
   if (!x_call_static(vm, "java/util/Calendar", "getInstance", "()Ljava/util/Calendar;", NULL, 0, &cal)) return false;
   arg.j = millis.j;
   union dvm_value ignored = { 0 };
@@ -857,7 +857,7 @@ static bool x_pb_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     union dvm_value all = { .l = ARG(0).l };
     if (!list_addAll(vm, list, &all, 1, &ignored)) return false;
   }
-  (void)dvm_set_field(vm, self, "command", "Ljava/util/List;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, self, "command", "Ljava/util/List;", (union dvm_value) {
     .l = list
   });
   RETV();
@@ -868,7 +868,7 @@ static bool x_pb_command(struct dvm *vm, dvm_ref self, const union dvm_value *ar
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm, self, "command", "Ljava/util/List;", out);
+  return (dvm_get_field)(vm, self, "command", "Ljava/util/List;", out);
 }
 
 /* start() runs the command exactly as Runtime.exec() would. */
@@ -878,7 +878,7 @@ static bool x_pb_start(struct dvm *vm, dvm_ref self, const union dvm_value *args
   (void)args;
   (void)nargs;
   union dvm_value command = { 0 };
-  (void)dvm_get_field(vm, self, "command", "Ljava/util/List;", &command);
+  (void)(dvm_get_field)(vm, self, "command", "Ljava/util/List;", &command);
   struct rt_list *l = command.l ? list_of(vm, command.l) : NULL;
   if (!l || !l->size) {
     dvm__throw(vm, "java/lang/IndexOutOfBoundsException", "Index: 0, Size: 0");
@@ -922,7 +922,7 @@ static const struct rt_field rt_interface_address_fields[] = {
 static dvm_ref ni_enumeration(struct dvm *vm, dvm_ref collection)
 {
   dvm_ref e = dvm_new_object(vm, dvm_find_class(vm, "lunaria/util/ResourceKeys"));
-  if (e) (void)dvm_set_field(vm, e, "target", "Ljava/lang/Object;", (union dvm_value) {
+  if (e) (void)(dvm_set_field)(vm, e, "target", "Ljava/lang/Object;", (union dvm_value) {
     .l = collection
   });
   return e;
@@ -934,7 +934,7 @@ static dvm_ref ni_make(struct dvm *vm, const struct luna_os_netif *host)
   dvm_ref addresses = coll_new_list(vm, "Ljava/util/ArrayList;");
   dvm_ref ifaddresses = coll_new_list(vm, "Ljava/util/ArrayList;");
   if (!ni || !addresses || !ifaddresses) return 0;
-  (void)dvm_set_field(vm, ni, "name", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, ni, "name", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, host->name)
   });
   rt_set_int(vm, ni, "index", (int32_t)host->index);
@@ -953,15 +953,15 @@ static dvm_ref ni_make(struct dvm *vm, const struct luna_os_netif *host)
     (void)list_add(vm, addresses, &item, 1, &ignored);
     dvm_ref ia = dvm_new_object(vm, dvm_find_class(vm, "java/net/InterfaceAddress"));
     if (!ia) return 0;
-    (void)dvm_set_field(vm, ia, "address", "Ljava/net/InetAddress;", address);
+    (void)(dvm_set_field)(vm, ia, "address", "Ljava/net/InetAddress;", address);
     rt_set_int(vm, ia, "prefix", host->addr[i].prefix);
     item.l = ia;
     (void)list_add(vm, ifaddresses, &item, 1, &ignored);
   }
-  (void)dvm_set_field(vm, ni, "addresses", "Ljava/util/List;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, ni, "addresses", "Ljava/util/List;", (union dvm_value) {
     .l = addresses
   });
-  (void)dvm_set_field(vm, ni, "interfaceAddresses", "Ljava/util/List;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, ni, "interfaceAddresses", "Ljava/util/List;", (union dvm_value) {
     .l = ifaddresses
   });
   return ni;
@@ -1020,13 +1020,13 @@ static bool ni_find(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     dvm_ref ni = l->items[i];
     if (by_name) {
       union dvm_value n = { 0 };
-      (void)dvm_get_field(vm, ni, "name", "Ljava/lang/String;", &n);
+      (void)(dvm_get_field)(vm, ni, "name", "Ljava/lang/String;", &n);
       if (n.l && !strcmp(dvm_string_utf8(vm, n.l), name)) RETL(ni);
     } else if (by_index) {
       if (rt_get_int(vm, ni, "index") == args[0].i) RETL(ni);
     } else {
       union dvm_value addresses = { 0 };
-      (void)dvm_get_field(vm, ni, "addresses", "Ljava/util/List;", &addresses);
+      (void)(dvm_get_field)(vm, ni, "addresses", "Ljava/util/List;", &addresses);
       struct rt_list *al = addresses.l ? list_of(vm, addresses.l) : NULL;
       for (uint32_t k = 0; al && k < al->size; ++k) {
         uint8_t have[16] = { 0 };
@@ -1045,7 +1045,7 @@ static bool ni_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   const char *n = builtin_name();
   union dvm_value v = { 0 };
   if (!strcmp(n, "getName") || !strcmp(n, "getDisplayName")) {
-    (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &v);
+    (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &v);
     RETL(v.l);
   }
   if (!strcmp(n, "getIndex")) RETI(rt_get_int(vm, self, "index"));
@@ -1056,11 +1056,11 @@ static bool ni_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   if (!strcmp(n, "supportsMulticast")) RETI(flags & NI_MULTICAST);
   if (!strcmp(n, "isPointToPoint")) RETI(flags & NI_POINT_TO_POINT);
   if (!strcmp(n, "getInetAddresses")) {
-    (void)dvm_get_field(vm, self, "addresses", "Ljava/util/List;", &v);
+    (void)(dvm_get_field)(vm, self, "addresses", "Ljava/util/List;", &v);
     RETL(v.l ? ni_enumeration(vm, v.l) : 0);
   }
   if (!strcmp(n, "getInterfaceAddresses")) {
-    (void)dvm_get_field(vm, self, "interfaceAddresses", "Ljava/util/List;", &v);
+    (void)(dvm_get_field)(vm, self, "interfaceAddresses", "Ljava/util/List;", &v);
     RETL(v.l);
   }
   if (!strcmp(n, "getSubInterfaces")) RETL(ni_enumeration(vm, coll_new_list(vm, "Ljava/util/ArrayList;")));
@@ -1074,8 +1074,8 @@ static bool ni_equals(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   if (args[0].l == self) RETI(1);
   if (!args[0].l || dvm_object_class(vm, args[0].l) != dvm_object_class(vm, self)) RETI(0);
   union dvm_value a = { 0 }, b = { 0 };
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &a);
-  (void)dvm_get_field(vm, args[0].l, "name", "Ljava/lang/String;", &b);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &a);
+  (void)(dvm_get_field)(vm, args[0].l, "name", "Ljava/lang/String;", &b);
   RETI(a.l && b.l && !strcmp(dvm_string_utf8(vm, a.l), dvm_string_utf8(vm, b.l)));
 }
 
@@ -1085,7 +1085,7 @@ static bool ni_toString(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   (void)args;
   (void)nargs;
   union dvm_value n = { 0 };
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &n);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &n);
   const char *name = n.l ? dvm_string_utf8(vm, n.l) : "";
   char text[160];
   snprintf(text, sizeof text, "name:%s (%s)", name, name);
@@ -1099,7 +1099,7 @@ static bool ni_hashCode(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   (void)nargs;
   union dvm_value n = { 0 };
   uint32_t h = 0;
-  if (dvm_get_field(vm, self, "name", "Ljava/lang/String;", &n) && n.l)
+  if ((dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &n) && n.l)
     for (const char *p = dvm_string_utf8(vm, n.l); p && *p; ++p) h = h * 31u + (unsigned char)*p;
   RETI((int32_t)h);
 }
@@ -1111,7 +1111,7 @@ static bool ia_get(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   (void)nargs;
   union dvm_value v = { 0 };
   if (!strcmp(builtin_name(), "getAddress")) {
-    (void)dvm_get_field(vm, self, "address", "Ljava/net/InetAddress;", &v);
+    (void)(dvm_get_field)(vm, self, "address", "Ljava/net/InetAddress;", &v);
     RETL(v.l);
   }
   if (!strcmp(builtin_name(), "getNetworkPrefixLength")) RETI(rt_get_int(vm, self, "prefix"));
@@ -1228,15 +1228,15 @@ static dvm_ref https_defaults(struct dvm *vm)
   static dvm_ref key;
   dvm_ref defaults=runtime_singleton(vm,"Llunaria/net/HttpsDefaults;",&key);
   union dvm_value factory= {0},verifier= {0},ignored= {0};
-  (void)dvm_get_field(vm,defaults,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",&factory);
+  (void)(dvm_get_field)(vm,defaults,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",&factory);
   if(!factory.l) {
     if(!sslsf_getDefault(vm,0,NULL,0,&factory))return 0;
-    (void)dvm_set_field(vm,defaults,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",factory);
+    (void)(dvm_set_field)(vm,defaults,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",factory);
   }
-  (void)dvm_get_field(vm,defaults,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",&verifier);
+  (void)(dvm_get_field)(vm,defaults,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",&verifier);
   if(!verifier.l) {
     verifier.l=dvm_new_object(vm,dvm_find_class(vm,"lunaria/net/HostnameVerifier"));
-    (void)dvm_set_field(vm,defaults,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",verifier);
+    (void)(dvm_set_field)(vm,defaults,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",verifier);
   }
   (void)ignored;
   return defaults;
@@ -1247,10 +1247,10 @@ static bool https_initialize(struct dvm *vm,dvm_ref self)
   dvm_ref defaults=https_defaults(vm);
   if(!defaults)return false;
   union dvm_value value= {0};
-  (void)dvm_get_field(vm,defaults,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",&value);
-  (void)dvm_set_field(vm,self,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",value);
-  (void)dvm_get_field(vm,defaults,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",&value);
-  (void)dvm_set_field(vm,self,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",value);
+  (void)(dvm_get_field)(vm,defaults,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",&value);
+  (void)(dvm_set_field)(vm,self,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",value);
+  (void)(dvm_get_field)(vm,defaults,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",&value);
+  (void)(dvm_set_field)(vm,self,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",value);
   return true;
 }
 static bool https_configuration(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -1265,11 +1265,11 @@ static bool https_configuration(struct dvm *vm,dvm_ref self,const union dvm_valu
       dvm__throw(vm,"java/lang/IllegalArgumentException","TLS configuration is null");
       return false;
     }
-    (void)dvm_set_field(vm,target,field,type,ARG(0));
+    (void)(dvm_set_field)(vm,target,field,type,ARG(0));
     RETV();
   }
   union dvm_value value= {0};
-  (void)dvm_get_field(vm,target,field,type,&value);
+  (void)(dvm_get_field)(vm,target,field,type,&value);
   RETL(value.l);
 }
 struct https_stream {
@@ -1362,8 +1362,8 @@ static void *https_open_transport(void *context,const char *url,int timeout,char
   union dvm_value connect[2]= {{.l=address},{.i=timeout}};
   good=good && am_vcall(vm,raw,"connect","(Ljava/net/SocketAddress;I)V",connect,2,&ignored);
   const char *step=good ? "tcp connect ok" : "tcp connect";
-  (void)dvm_get_field(vm,request->connection,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",&factory);
-  (void)dvm_get_field(vm,request->connection,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",&verifier);
+  (void)(dvm_get_field)(vm,request->connection,"sslSocketFactory","Ljavax/net/ssl/SSLSocketFactory;",&factory);
+  (void)(dvm_get_field)(vm,request->connection,"hostnameVerifier","Ljavax/net/ssl/HostnameVerifier;",&verifier);
   union dvm_value wrap[4]= {{.l=raw},host,port,{.i=1}};
   if(good && !factory.l) {
     dvm__throw(vm,"java/lang/IllegalStateException","HttpsURLConnection has no SSLSocketFactory");
@@ -1415,7 +1415,7 @@ static void *https_open_transport(void *context,const char *url,int timeout,char
       good=false;
     }
   }
-  if(good)(void)dvm_set_field(vm,request->connection,"sslSession","Ljavax/net/ssl/SSLSession;",session);
+  if(good)(void)(dvm_set_field)(vm,request->connection,"sslSession","Ljavax/net/ssl/SSLSession;",session);
   else {
     dvm_ref exception=dvm_exception(vm);
     if(exception) {

@@ -65,16 +65,16 @@ static bool sax_factory_parser(struct dvm *vm,dvm_ref self,const union dvm_value
   if(!parser || !reader)return false;
   int aware=dom_int(vm,self,"namespaceAware","Z");
   int prefixes=dom_int(vm,self,"prefixExplicit","Z") ? dom_int(vm,self,"namespacePrefixes","Z") : !aware;
-  (void)dvm_set_field(vm,parser,"reader","Lorg/xml/sax/XMLReader;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,parser,"reader","Lorg/xml/sax/XMLReader;",(union dvm_value) {
     .l=reader
   });
-  (void)dvm_set_field(vm,parser,"namespaceAware","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,parser,"namespaceAware","Z",(union dvm_value) {
     .i=aware
   });
-  (void)dvm_set_field(vm,reader,"namespaceAware","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,reader,"namespaceAware","Z",(union dvm_value) {
     .i=aware
   });
-  (void)dvm_set_field(vm,reader,"namespacePrefixes","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,reader,"namespacePrefixes","Z",(union dvm_value) {
     .i=prefixes
   });
   RETL(parser);
@@ -110,7 +110,7 @@ static bool sax_handler(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     type="Lorg/xml/sax/DTDHandler;";
   }
   if(nargs) {
-    (void)dvm_set_field(vm,self,field,type,ARG(0));
+    (void)(dvm_set_field)(vm,self,field,type,ARG(0));
     RETV();
   }
   RETL(dom_ref(vm,self,field,type));
@@ -133,8 +133,8 @@ static bool sax_feature(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   }
   if(nargs>1) {
     if(field) {
-      (void)dvm_set_field(vm,self,field,"Z",ARG(1));
-      if(!strcmp(field,"namespacePrefixes"))(void)dvm_set_field(vm,self,"prefixExplicit","Z",(union dvm_value) {
+      (void)(dvm_set_field)(vm,self,field,"Z",ARG(1));
+      if(!strcmp(field,"namespacePrefixes"))(void)(dvm_set_field)(vm,self,"prefixExplicit","Z",(union dvm_value) {
         .i=1
       });
     }
@@ -198,7 +198,7 @@ static bool sax_element(struct dvm *vm,dvm_ref self,void *xml,bool start,bool aw
   }
   dvm_pin(vm,attributes);
   dvm_ref values=coll_new_list(vm,"Ljava/util/ArrayList;");
-  (void)dvm_set_field(vm,attributes,"values","Ljava/util/List;",(union dvm_value) {
+  (void)(dvm_set_field)(vm,attributes,"values","Ljava/util/List;",(union dvm_value) {
     .l=values
   });
   names[3].l=attributes;
@@ -266,7 +266,7 @@ static bool sax_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
     dvm__throw(vm,"java/lang/NullPointerException","InputSource");
     return false;
   }
-  (void)dvm_set_field(vm,self,"parsing","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"parsing","Z",(union dvm_value) {
     .i=1
   });
   struct rt_bytes bytes= {0};
@@ -293,16 +293,16 @@ static bool sax_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
     if(!locator)good=false;
     else {
       dvm_pin(vm,locator);
-      (void)dvm_set_field(vm,locator,"lineNumber","I",(union dvm_value) {
+      (void)(dvm_set_field)(vm,locator,"lineNumber","I",(union dvm_value) {
         .i=-1
       });
-      (void)dvm_set_field(vm,locator,"columnNumber","I",(union dvm_value) {
+      (void)(dvm_set_field)(vm,locator,"columnNumber","I",(union dvm_value) {
         .i=-1
       });
-      (void)dvm_set_field(vm,locator,"publicId","Ljava/lang/String;",(union dvm_value) {
+      (void)(dvm_set_field)(vm,locator,"publicId","Ljava/lang/String;",(union dvm_value) {
         .l=dom_ref(vm,ARG(0).l,"publicId","Ljava/lang/String;")
       });
-      (void)dvm_set_field(vm,locator,"systemId","Ljava/lang/String;",(union dvm_value) {
+      (void)(dvm_set_field)(vm,locator,"systemId","Ljava/lang/String;",(union dvm_value) {
         .l=dom_ref(vm,ARG(0).l,"systemId","Ljava/lang/String;")
       });
       union dvm_value call= {.l=locator};
@@ -311,10 +311,10 @@ static bool sax_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
   }
   if(good)good=sax_call(vm,self,"startDocument","()V",NULL,0);
   while(good && (result=dom_xml.read(xml))==1) {
-    (void)dvm_set_field(vm,locator,"lineNumber","I",(union dvm_value) {
+    (void)(dvm_set_field)(vm,locator,"lineNumber","I",(union dvm_value) {
       .i=dom_xml.line(xml)
     });
-    (void)dvm_set_field(vm,locator,"columnNumber","I",(union dvm_value) {
+    (void)(dvm_set_field)(vm,locator,"columnNumber","I",(union dvm_value) {
       .i=dom_xml.column(xml)
     });
     int type=dom_xml.type(xml),depth=dom_xml.depth(xml);
@@ -373,10 +373,10 @@ static bool sax_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
     dvm__throw(vm,"org/xml/sax/SAXParseException","Malformed XML document");
     good=false;
     dvm_ref error=dvm_exception(vm),handler=dom_ref(vm,self,"errorHandler","Lorg/xml/sax/ErrorHandler;");
-    (void)dvm_set_field(vm,error,"lineNumber","I",(union dvm_value) {
+    (void)(dvm_set_field)(vm,error,"lineNumber","I",(union dvm_value) {
       .i=dom_xml.line(xml)
     });
-    (void)dvm_set_field(vm,error,"columnNumber","I",(union dvm_value) {
+    (void)(dvm_set_field)(vm,error,"columnNumber","I",(union dvm_value) {
       .i=dom_xml.column(xml)
     });
     if(handler) {
@@ -394,7 +394,7 @@ static bool sax_parse(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
   if(xml)dom_xml.destroy(xml);
   free(bytes.p);
   free(mappings);
-  (void)dvm_set_field(vm,self,"parsing","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,self,"parsing","Z",(union dvm_value) {
     0
   });
   return good;
@@ -405,7 +405,7 @@ static bool sax_parser_parse(struct dvm *vm,dvm_ref self,const union dvm_value *
   if(nargs>1 && ARG(1).l) {
     const char *fields[]= {"contentHandler","errorHandler","dtdHandler","entityResolver"};
     const char *types[]= {"Lorg/xml/sax/ContentHandler;","Lorg/xml/sax/ErrorHandler;","Lorg/xml/sax/DTDHandler;","Lorg/xml/sax/EntityResolver;"};
-    for(int i=0; i<4; ++i)(void)dvm_set_field(vm,reader,fields[i],types[i],ARG(1));
+    for(int i=0; i<4; ++i)(void)(dvm_set_field)(vm,reader,fields[i],types[i],ARG(1));
   }
   return sax_parse(vm,reader,args,1,out);
 }

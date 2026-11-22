@@ -65,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | su
 curl -fsSL https://raw.githubusercontent.com/yui0/lunaria/master/install.sh | bash -s -- --uninstall
 ```
 
-Manual install: unpack `lunaria-*-linux-x86_64.tar.gz` / `…-aarch64.tar.gz` and run `./lunaria`, or open the macOS `.dmg` and drag `Lunaria.app` out.
+Manual install: unpack `lunaria-*-linux-x86_64.tar.gz` / `…-aarch64.tar.gz` and run `./lunaria`, or unpack `lunaria-*-macos-*.tar.gz` and open `Lunaria.app`.
 
 **Windows (x86_64)**
 
@@ -144,7 +144,7 @@ The installer verifies Google's SHA-1 and copies the files unchanged into `runti
 
 ```bash
 make dist        # lunaria-<version>-linux-x86_64.tar.gz
-make dist-mac    # Lunaria.app + .dmg (Darwin only)
+make dist-mac    # Lunaria.app + .tar.gz (Darwin only)
 ```
 
 ## Usage

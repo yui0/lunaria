@@ -485,7 +485,7 @@ static int zip_read(struct zip *z, const struct zip_entry *e, FILE *out, unsigne
       if (e->method == 0 || ended)
         break;
     } while (stream.avail_in || stream.avail_out == 0);
-    if (status || ended && e->method == 8)
+    if (status || (ended && e->method == 8))
       break;
   }
   if (e->method == 8) {
@@ -1373,7 +1373,7 @@ static int parse_manifest_with_zip(const unsigned char *data, size_t size, struc
     0
   }, zip);
 }
-static int parse_manifest(const unsigned char *data,size_t size,struct manifest *m)
+static int __attribute__((unused)) parse_manifest(const unsigned char *data,size_t size,struct manifest *m)
 {
   return parse_manifest_with_zip(data,size,m,NULL);
 }
@@ -2653,7 +2653,10 @@ static int profile_storage(const char *root, const char *package, const char *pr
                                        "Android/obb", "Android/media"};
   for (size_t i = 0; i < sizeof shared / sizeof shared[0]; ++i) {
     char sub[PATH_MAX], tail[PATH_MAX];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
     snprintf(tail, sizeof tail, shared[i], package);
+#pragma GCC diagnostic pop
     if (path_join(sub, sizeof sub, common, "external/storage") || path_join(path, sizeof path, sub, tail) || mkdirs(path))
       return -1;
   }
@@ -3885,7 +3888,7 @@ int luna_apk_profile_list(char (*names)[65], int max)
     char path[APK_PATH];
     if (!profile_valid(e->d_name) || !strcmp(e->d_name, "default")) continue;
     if (path_join(path, sizeof path, dir, e->d_name) || !directory(path)) continue;
-    snprintf(names[n++], 65, "%s", e->d_name);
+    snprintf(names[n++], 65, "%.64s", e->d_name);
   }
   luna_directory_close(d);
   return n;

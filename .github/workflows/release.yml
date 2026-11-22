@@ -1,7 +1,7 @@
 # Build Lunaria release assets and attach them to a GitHub release.
 # install.sh downloads exactly these assets:
 #   lunaria-<date>-linux-x86_64.tar.gz   lunaria-<date>-linux-aarch64.tar.gz
-#   lunaria-<date>-macos-arm64.dmg      lunaria-<date>-macos-x86_64.dmg (Intel)
+#   lunaria-<date>-macos-arm64.tar.gz    lunaria-<date>-macos-x86_64.tar.gz (Intel)
 #
 #   git tag 2026.11.5 && git push origin 2026.11.5     # → release with assets
 # A manual run (workflow_dispatch) only uploads the files as workflow artifacts.
@@ -94,23 +94,24 @@ jobs:
       - name: Build guest system libraries
         run: make syslib || echo "syslib unavailable on this runner; shipping without it"
 
-      # Builds Lunaria.app, ad-hoc codesigns it and wraps it in a .dmg.
+      # Builds Lunaria.app, ad-hoc codesigns it and packages it as a .tar.gz.
       - name: Package
         run: make dist-mac
 
-      # Fail the job if the image does not mount or the bundle does not verify.
-      - name: Verify .dmg
+      # Fail the job if the archive does not extract or the bundle does not verify.
+      - name: Verify package
         run: |
-          dmg="$(ls lunaria-*-macos-*.dmg | head -n1)"
-          mp="$(hdiutil attach -nobrowse -readonly "$dmg" | tail -n1 | awk -F'\t' '{print $NF}')"
-          test -x "$mp/Lunaria.app/Contents/MacOS/Lunaria"
-          codesign --verify --deep --strict "$mp/Lunaria.app"
-          hdiutil detach "$mp" -quiet
+          pkg="$(ls lunaria-*-macos-*.tar.gz | head -n1)"
+          tmpdir="$(mktemp -d)"
+          tar -xzf "$pkg" -C "$tmpdir"
+          test -x "$tmpdir/Lunaria.app/Contents/MacOS/Lunaria"
+          codesign --verify --deep --strict "$tmpdir/Lunaria.app"
+          rm -rf "$tmpdir"
 
       - uses: actions/upload-artifact@v4
         with:
           name: lunaria-macos-${{ matrix.arch }}
-          path: lunaria-*-macos-${{ matrix.arch }}.dmg
+          path: lunaria-*-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -128,7 +129,6 @@ jobs:
           name: Lunaria ${{ github.ref_name }}
           files: |
             dist/*.tar.gz
-            dist/*.dmg
           generate_release_notes: true   # appends "Full Changelog"
           body: |
             An Android runtime that runs an APK on the desktop: AArch64 and ARM32 guest code on dynarmic, the platform's Java on its own bytecode interpreter, and GLES straight through to the host.
@@ -145,7 +145,9 @@ jobs:
             ```
 
             ### macOS (Apple silicon / Intel)
-            Open the .dmg, drag `Lunaria.app` where you like, then run
-            `/Applications/Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk`.
-            If you downloaded the .dmg in a browser: `xattr -dr com.apple.quarantine /Applications/Lunaria.app`
+            ```bash
+            tar -xzf lunaria-*-macos-arm64.tar.gz   # or -x86_64
+            open Lunaria.app                         # or move to /Applications first
+            ```
+            If you downloaded the archive in a browser: `xattr -dr com.apple.quarantine Lunaria.app`
             (installing with the script above avoids this).

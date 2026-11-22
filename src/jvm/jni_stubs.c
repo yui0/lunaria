@@ -2950,6 +2950,12 @@ activity_follow_orientation(jint orientation)
   arm_exec_request_view_resize(nw, nh);
 }
 
+void
+lunaria_activity_apply_orientation(int orientation)
+{
+  activity_follow_orientation((jint)orientation);
+}
+
 static void
 activity_set_requested_orientation(jobject activity, jint orientation)
 {

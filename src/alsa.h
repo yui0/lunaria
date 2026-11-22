@@ -56,7 +56,13 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 
 	// Allocate a hardware parameters object.
 	snd_pcm_hw_params_t *params;
-	snd_pcm_hw_params_alloca(&params);
+	if (snd_pcm_hw_params_malloc(&params) < 0) {
+		fprintf(stderr, "cannot allocate hw params\n");
+		snd_pcm_hw_params_free(params);
+		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
+		return 1;
+	}
 
 	// Fill it in with default values.
 	snd_pcm_hw_params_any(thiz->handle, params);
@@ -66,6 +72,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_access(thiz->handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set access type (%s)\n", snd_strerror(rc));
+		snd_pcm_hw_params_free(params);
 		snd_pcm_close(thiz->handle);
 		thiz->handle = NULL;
 		return 1;
@@ -75,6 +82,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_format(thiz->handle, params, format ? format : SND_PCM_FORMAT_S16_LE);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample format (%s)\n", snd_strerror(rc));
+		snd_pcm_hw_params_free(params);
 		snd_pcm_close(thiz->handle);
 		thiz->handle = NULL;
 		return 1;
@@ -84,6 +92,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_channels(thiz->handle, params, ch);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set channel count (%s)\n", snd_strerror(rc));
+		snd_pcm_hw_params_free(params);
 		snd_pcm_close(thiz->handle);
 		thiz->handle = NULL;
 		return 1;
@@ -97,6 +106,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_rate_near(thiz->handle, params, &freq, &dir);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample rate (%s)\n", snd_strerror(rc));
+		snd_pcm_hw_params_free(params);
 		snd_pcm_close(thiz->handle);
 		thiz->handle = NULL;
 		return 1;
@@ -140,6 +150,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params(thiz->handle, params);
 	if (rc < 0) {
 		fprintf(stderr, "unable to set parameters (%s)\n", snd_strerror(rc));
+		snd_pcm_hw_params_free(params);
 		snd_pcm_close(thiz->handle);
 		thiz->handle = NULL;
 		return 1;
@@ -149,6 +160,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	snd_pcm_hw_params_get_period_size(params, &thiz->frames, &dir);
 //	thiz->size = thiz->frames * 2 * ch; /* 2 bytes/sample, 2 channels */
 	thiz->size = thiz->frames * 4 * ch; /* 4 bytes/sample, 2 channels */
+	snd_pcm_hw_params_free(params);
 	thiz->buffer = (char*)malloc(thiz->size);
 
 	return 0;
@@ -281,22 +293,25 @@ static snd_mixer_elem_t *AUDIO_find_playback_volume(snd_mixer_t *mixer)
 		"Master", "PCM", "Speaker", "Headphone", "Playback", "Digital", NULL
 	};
 	snd_mixer_selem_id_t *sid;
-	snd_mixer_selem_id_alloca(&sid);
+	if (snd_mixer_selem_id_malloc(&sid) < 0) return NULL;
 	snd_mixer_selem_id_set_index(sid, 0);
 
 	for (int i = 0; prefer[i]; i++) {
 		snd_mixer_selem_id_set_name(sid, prefer[i]);
 		snd_mixer_elem_t *elem = snd_mixer_find_selem(mixer, sid);
 		if (elem && snd_mixer_selem_has_playback_volume(elem)) {
+			snd_mixer_selem_id_free(sid);
 			return elem;
 		}
 	}
 	for (snd_mixer_elem_t *elem = snd_mixer_first_elem(mixer); elem;
 	     elem = snd_mixer_elem_next(elem)) {
 		if (snd_mixer_selem_has_playback_volume(elem)) {
+			snd_mixer_selem_id_free(sid);
 			return elem;
 		}
 	}
+	snd_mixer_selem_id_free(sid);
 	return NULL;
 }
 

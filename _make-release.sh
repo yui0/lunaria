@@ -8,7 +8,7 @@
 #   ※ Orange Pi 等で panfork Mesa があると amd64 の libegl が multiarch 同居できない。
 #     その場合は .deb を .cross-sysroot-amd64/ に展開してクロスリンクする。
 #   ./_make-release.sh --windows           # + Windows (mingw クロス, .zip)
-#   ./_make-release.sh --macos             # Linux + macOS (.dmg; macOS ホスト上のみビルド可)
+#   ./_make-release.sh --macos             # Linux + macOS (.tar.gz; macOS ホスト上のみビルド可)
 #   ./_make-release.sh --all-targets       # Linux + Windows + macOS すべて
 #   ./_make-release.sh --push              # タグを自動的にリモートへプッシュ (確認省略)
 #   ./_make-release.sh --no-upload         # ビルドのみ (GitHub Release を作らない)
@@ -19,16 +19,16 @@
 #                            : Linux (同梱 lib/runtime/fonts 付き)。ホストが aarch64 なら
 #                              x86_64 を gcc クロス (crossbuild-essential-amd64) で作る
 #   lunaria-*-windows-x86_64.zip : Windows x86_64 UCRT (Linux から `make dist-cross-win`)
-#   lunaria-*-macos-arm64.dmg    : macOS (hdiutil/codesign が要るため macOS 上でのみ生成)
+#   lunaria-*-macos-arm64.tar.gz : macOS (.app バンドル同梱; codesign が要るため macOS 上でのみ生成)
 #
 # 注意: ツリー直下の lunaria / runtime/ / libdl.so / libpthread.so はビルドのたびに
 #       消して作り直す (アーキ違いのビルド成果物が混ざらないようにするため)。
 #       syslib-arm64/ は ARM64 ゲスト用でアーキ非依存のため両方で共用する。
 #
 # macOS について:
-#   Linux ホストでは .dmg を作れない。--macos 指定時、Linux ホストでは
-#   リポジトリ直下 (または MACOS_DMG=/path/to.dmg) に Mac で作成済みの
-#   lunaria-*-macos-*.dmg があればそれをリリースに含め、無ければ警告してスキップする。
+#   Linux ホストでは macOS パッケージを作れない。--macos 指定時、Linux ホストでは
+#   リポジトリ直下 (または MACOS_PKG=/path/to.tar.gz) に Mac で作成済みの
+#   lunaria-*-macos-*.tar.gz があればそれをリリースに含め、無ければ警告してスキップする。
 #
 # 環境変数:
 #   GITHUB_TOKEN        — Release 作成用 (未設定時は ~/.config/gh/hosts.yml から取得)
@@ -442,11 +442,11 @@ case "$HOST_OS" in
   Darwin)
     if [[ "$BUILD_MACOS" == "true" ]]; then
       NAME="lunaria-$DIST_DATE-macos-$HOST_ARCH"
-      info "ビルド中: $NAME.dmg ..."
+      info "ビルド中: $NAME.tar.gz ..."
       make macos-deps
       build_syslib
       make -j"$JOBS" dist DIST_NAME="$NAME"
-      collect "$NAME.dmg"
+      collect "$NAME.tar.gz"
     else
       warn "macOS ホストですが --macos が無いため macOS ビルドをスキップします。"
     fi
@@ -508,20 +508,20 @@ if [[ "$BUILD_WINDOWS" == "true" ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────
-# ③ macOS: Linux ホストでは作成済み .dmg を取り込むのみ
+# ③ macOS: Linux ホストでは作成済み .tar.gz を取り込むのみ
 # ─────────────────────────────────────────────────────────
 if [[ "$BUILD_MACOS" == "true" && "$HOST_OS" != "Darwin" ]]; then
-  DMG="${MACOS_DMG:-}"
-  if [[ -z "$DMG" ]]; then
-    DMG="$(ls -t lunaria-*-macos-*.dmg lunaria-*-macos.dmg 2>/dev/null | head -1 || true)"
+  PKG="${MACOS_PKG:-${MACOS_DMG:-}}"
+  if [[ -z "$PKG" ]]; then
+    PKG="$(ls -t lunaria-*-macos-*.tar.gz lunaria-*-macos-*.dmg lunaria-*-macos.dmg 2>/dev/null | head -1 || true)"
   fi
-  if [[ -n "$DMG" && -f "$DMG" ]]; then
-    cp "$DMG" "$ARTIFACTS_DIR/$(basename "$DMG")"
-    success "作成済みの macOS dmg を取り込みました: $(basename "$DMG")"
+  if [[ -n "$PKG" && -f "$PKG" ]]; then
+    cp "$PKG" "$ARTIFACTS_DIR/$(basename "$PKG")"
+    success "作成済みの macOS パッケージを取り込みました: $(basename "$PKG")"
   else
-    warn "macOS の .dmg は Linux では作れません (hdiutil/codesign が必要)。"
-    warn "Mac で ./_make-release.sh --macos --no-upload を実行して lunaria-*-macos-*.dmg を作り、"
-    warn "このディレクトリに置くか MACOS_DMG=/path/to.dmg を指定してください。macOS はスキップします。"
+    warn "macOS パッケージは Linux では作れません (codesign が必要)。"
+    warn "Mac で ./_make-release.sh --macos --no-upload を実行して lunaria-*-macos-*.tar.gz を作り、"
+    warn "このディレクトリに置くか MACOS_PKG=/path/to.tar.gz を指定してください。macOS はスキップします。"
   fi
 fi
 
@@ -584,8 +584,10 @@ The archive carries its own shim libraries, host libraries and fonts; it uses
 the running system's C library.
 
 ### macOS (manual)
-Open the .dmg, drag `Lunaria.app` where you like, then run
-`/Applications/Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk`.
+```bash
+tar -xzf lunaria-*-macos-arm64.tar.gz
+open Lunaria.app   # or: ./Lunaria.app/Contents/MacOS/Lunaria /path/to/app.apk
+```
 
 ### Windows
 Unzip `lunaria-*-windows-x86_64.zip` and run `lunaria.exe /path/to/app.apk`.

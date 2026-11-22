@@ -168,7 +168,7 @@ static bool abq_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,int
   struct dvm_object *o=dvm__obj(vm,self);
   if(o->data_destroy) o->data_destroy(o->data); else free(o->data);
   o->data=q; o->data_destroy=free;
-  (void)dvm_set_field(vm,self,"items","[Ljava/lang/Object;",(union dvm_value){.l=q->items});
+  (void)(dvm_set_field)(vm,self,"items","[Ljava/lang/Object;",(union dvm_value){.l=q->items});
   if(nargs==3) {
     if(!ARG(2).l) { dvm__throw(vm,"java/lang/NullPointerException","collection"); return false; }
     union dvm_value it={0},has={0},item={0};
@@ -304,8 +304,8 @@ static void abq_iter_cache(struct dvm *vm,dvm_ref it,struct abq_state *q,uint64_
     uint32_t slot=abq_slot(q,i);
     if(q->ids[slot]>after) { value=abq_items(vm,q)[slot]; id=q->ids[slot]; break; }
   }
-  (void)dvm_set_field(vm,it,"nextItem","Ljava/lang/Object;",(union dvm_value){.l=value});
-  (void)dvm_set_field(vm,it,"nextId","J",(union dvm_value){.j=(int64_t)id});
+  (void)(dvm_set_field)(vm,it,"nextItem","Ljava/lang/Object;",(union dvm_value){.l=value});
+  (void)(dvm_set_field)(vm,it,"nextId","J",(union dvm_value){.j=(int64_t)id});
 }
 static bool abq_iterator(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -314,7 +314,7 @@ static bool abq_iterator(struct dvm *vm,dvm_ref self,const union dvm_value *args
   if(!q || !abq_lock(vm,self,q,false,NULL)) return false;
   dvm_ref it=dvm_new_object(vm,dvm_find_class(vm,"java/util/concurrent/ArrayBlockingQueue$Itr"));
   if(it) {
-    (void)dvm_set_field(vm,it,"owner","Ljava/util/concurrent/ArrayBlockingQueue;",(union dvm_value){.l=self});
+    (void)(dvm_set_field)(vm,it,"owner","Ljava/util/concurrent/ArrayBlockingQueue;",(union dvm_value){.l=self});
     abq_iter_cache(vm,it,q,0);
   }
   abq_unlock(self,q);
@@ -325,10 +325,10 @@ static bool abq_iter_op(struct dvm *vm,dvm_ref self,const union dvm_value *args,
 {
   (void)args; (void)nargs;
   union dvm_value owner={0},next={0},id={0},last={0};
-  (void)dvm_get_field(vm,self,"owner","Ljava/util/concurrent/ArrayBlockingQueue;",&owner);
-  (void)dvm_get_field(vm,self,"nextItem","Ljava/lang/Object;",&next);
-  (void)dvm_get_field(vm,self,"nextId","J",&id);
-  (void)dvm_get_field(vm,self,"lastId","J",&last);
+  (void)(dvm_get_field)(vm,self,"owner","Ljava/util/concurrent/ArrayBlockingQueue;",&owner);
+  (void)(dvm_get_field)(vm,self,"nextItem","Ljava/lang/Object;",&next);
+  (void)(dvm_get_field)(vm,self,"nextId","J",&id);
+  (void)(dvm_get_field)(vm,self,"lastId","J",&last);
   const char *name=builtin_name();
   if(!strcmp(name,"hasNext")) RETI(next.l!=0);
   bool advance=!strcmp(name,"next");
@@ -337,11 +337,11 @@ static bool abq_iter_op(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   struct abq_state *q=abq_of(vm,owner.l);
   if(!q || !abq_lock(vm,owner.l,q,false,NULL)) return false;
   if(advance) {
-    (void)dvm_set_field(vm,self,"lastId","J",id);
+    (void)(dvm_set_field)(vm,self,"lastId","J",id);
     abq_iter_cache(vm,self,q,(uint64_t)id.j);
   } else {
     for(uint32_t i=0; i<q->count; ++i) if(q->ids[abq_slot(q,i)]==(uint64_t)last.j) { abq_remove_at(vm,owner.l,q,i); break; }
-    (void)dvm_set_field(vm,self,"lastId","J",(union dvm_value){0});
+    (void)(dvm_set_field)(vm,self,"lastId","J",(union dvm_value){0});
   }
   abq_unlock(owner.l,q);
   if(advance) RETL(next.l);

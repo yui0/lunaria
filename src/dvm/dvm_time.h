@@ -31,14 +31,14 @@ static int64_t now_millis(void)
 static int64_t time_millis(struct dvm *vm, dvm_ref self)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "millis", "J", &v);
+  (void)(dvm_get_field)(vm, self, "millis", "J", &v);
   return v.j;
 }
 
 static void time_set_millis(struct dvm *vm, dvm_ref self, int64_t ms)
 {
   union dvm_value v = { .j = ms };
-  (void)dvm_set_field(vm, self, "millis", "J", v);
+  (void)(dvm_set_field)(vm, self, "millis", "J", v);
 }
 
 /* The zone a Calendar/DateFormat renders in.  An empty id means the host's
@@ -46,7 +46,7 @@ static void time_set_millis(struct dvm *vm, dvm_ref self, int64_t ms)
 static bool time_zone_of(struct dvm *vm, dvm_ref self, char *buf, size_t sz)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "zone", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, self, "zone", "Ljava/lang/String;", &v);
   const char *s = v.l ? dvm_string_utf8(vm, v.l) : NULL;
   snprintf(buf, sz, "%s", s ? s : "");
   return buf[0] != '\0';
@@ -260,7 +260,7 @@ static dvm_ref zone_make(struct dvm *vm, const char *id)
   dvm_ref z = c ? dvm_new_object(vm, c) : 0;
   if (z) {
     union dvm_value v = { .l = dvm_new_string(vm, id ? id : "") };
-    (void)dvm_set_field(vm, z, "zone", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, z, "zone", "Ljava/lang/String;", v);
   }
   return z;
 }
@@ -558,10 +558,10 @@ static bool cal_zone_context(struct dvm *vm,dvm_ref zone,struct cal_zone_context
   memset(z,0,sizeof *z);
   union dvm_value id= {0},fixed= {0},offset= {0};
   if(zone) {
-    dvm_get_field(vm,zone,"rules","Ljava/lang/String;",&id);
-    if(!id.l) dvm_get_field(vm,zone,"zone","Ljava/lang/String;",&id);
-    dvm_get_field(vm,zone,"fixed","Z",&fixed);
-    dvm_get_field(vm,zone,"rawOffset","I",&offset);
+    (dvm_get_field)(vm,zone,"rules","Ljava/lang/String;",&id);
+    if(!id.l) (dvm_get_field)(vm,zone,"zone","Ljava/lang/String;",&id);
+    (dvm_get_field)(vm,zone,"fixed","Z",&fixed);
+    (dvm_get_field)(vm,zone,"rawOffset","I",&offset);
   }
   const char *text=id.l ? dvm_string_utf8(vm,id.l) : arm_exec_device_timezone();
   if(!text || strlen(text)>=sizeof z->id) {
@@ -601,16 +601,16 @@ static dvm_ref cal_zone_make(struct dvm *vm,const char *id,bool icu)
   }
   dvm_ref result=dvm_new_object(vm,dvm_find_class(vm,icu ? fixed ? "android/icu/util/SimpleTimeZone" : "android/icu/impl/OlsonTimeZone" : "java/util/TimeZone"));
   if(!result) return 0;
-  dvm_set_field(vm,result,"zone","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,result,"zone","Ljava/lang/String;",(union dvm_value) {
     .l=dvm_new_string(vm,id)
   });
   union dvm_value rules= {0};
-  dvm_get_field(vm,result,"zone","Ljava/lang/String;",&rules);
-  dvm_set_field(vm,result,"rules","Ljava/lang/String;",rules);
-  dvm_set_field(vm,result,"fixed","Z",(union dvm_value) {
+  (dvm_get_field)(vm,result,"zone","Ljava/lang/String;",&rules);
+  (dvm_set_field)(vm,result,"rules","Ljava/lang/String;",rules);
+  (dvm_set_field)(vm,result,"fixed","Z",(union dvm_value) {
     .i=fixed
   });
-  dvm_set_field(vm,result,"rawOffset","I",(union dvm_value) {
+  (dvm_set_field)(vm,result,"rawOffset","I",(union dvm_value) {
     .i=offset
   });
   return result;
@@ -655,7 +655,7 @@ static struct lc_calendar *cal_state(struct dvm *vm,dvm_ref self,struct cal_zone
     return NULL;
   }
   union dvm_value tz= {0};
-  dvm_get_field(vm,self,"timeZone","Ljava/lang/Object;",&tz);
+  (dvm_get_field)(vm,self,"timeZone","Ljava/lang/Object;",&tz);
   if(!cal_zone_context(vm,tz.l,context)) return NULL;
   *zone=(struct lc_zone) {
     context,cal_host_offset,cal_host_resolve
@@ -684,7 +684,7 @@ static bool cal_initialize(struct dvm *vm,dvm_ref self,dvm_ref tz,dvm_ref locale
   else free(o->data);
   o->data=state;
   o->data_destroy=free;
-  dvm_set_field(vm,self,"timeZone","Ljava/lang/Object;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"timeZone","Ljava/lang/Object;",(union dvm_value) {
     .l=tz
   });
   return true;
@@ -892,7 +892,7 @@ static bool cal_getTimeZone(struct dvm *vm,dvm_ref self,const union dvm_value *a
   (void)args;
   (void)nargs;
   union dvm_value tz= {0};
-  dvm_get_field(vm,self,"timeZone","Ljava/lang/Object;",&tz);
+  (dvm_get_field)(vm,self,"timeZone","Ljava/lang/Object;",&tz);
   if(cal_icu(vm,self)) RETL(tz.l);
   return o_clone(vm,tz.l,NULL,0,out);
 }
@@ -905,7 +905,7 @@ static bool cal_setTimeZone(struct dvm *vm,dvm_ref self,const union dvm_value *a
   }
   CAL_STATE();
   c->fields_valid=false;
-  dvm_set_field(vm,self,"timeZone","Ljava/lang/Object;",ARG(0));
+  (dvm_set_field)(vm,self,"timeZone","Ljava/lang/Object;",ARG(0));
   RETV();
 }
 static bool cal_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -923,9 +923,9 @@ static bool cal_clone(struct dvm *vm,dvm_ref self,const union dvm_value *args,in
   o->data=copy;
   o->data_destroy=free;
   union dvm_value tz= {0},newtz= {0};
-  dvm_get_field(vm,self,"timeZone","Ljava/lang/Object;",&tz);
+  (dvm_get_field)(vm,self,"timeZone","Ljava/lang/Object;",&tz);
   if(!o_clone(vm,tz.l,NULL,0,&newtz)) return false;
-  dvm_set_field(vm,clone.l,"timeZone","Ljava/lang/Object;",newtz);
+  (dvm_set_field)(vm,clone.l,"timeZone","Ljava/lang/Object;",newtz);
   RETL(clone.l);
 }
 static bool cal_type(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -952,11 +952,11 @@ static bool cal_tz_init(struct dvm *vm,dvm_ref self,const union dvm_value *args,
     dvm__throw(vm,"java/lang/NullPointerException","time zone ID");
     return false;
   }
-  dvm_set_field(vm,self,"zone","Ljava/lang/String;",ARG(1));
-  dvm_set_field(vm,self,"fixed","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"zone","Ljava/lang/String;",ARG(1));
+  (dvm_set_field)(vm,self,"fixed","Z",(union dvm_value) {
     .i=1
   });
-  dvm_set_field(vm,self,"rawOffset","I",ARG(0));
+  (dvm_set_field)(vm,self,"rawOffset","I",ARG(0));
   RETV();
 }
 static bool cal_tz_offset(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -975,7 +975,7 @@ static bool cal_tz_setID(struct dvm *vm,dvm_ref self,const union dvm_value *args
     dvm__throw(vm,"java/lang/NullPointerException","time zone ID");
     return false;
   }
-  dvm_set_field(vm,self,"zone","Ljava/lang/String;",ARG(0));
+  (dvm_set_field)(vm,self,"zone","Ljava/lang/String;",ARG(0));
   RETV();
 }
 #undef CAL_STATE
@@ -1226,7 +1226,7 @@ static bool dfs_init(struct dvm *vm, dvm_ref self,
   for (unsigned k = 0; k < sizeof dfs_arrays/sizeof dfs_arrays[0]; ++k) {
     dvm_ref array = dvm_new_array(vm, 'L', "Ljava/lang/String;", dfs_arrays[k].count);
     if (!array) return false;
-    dvm_set_field(vm, self, dfs_arrays[k].field, "[Ljava/lang/String;", (union dvm_value) {
+    (dvm_set_field)(vm, self, dfs_arrays[k].field, "[Ljava/lang/String;", (union dvm_value) {
       .l=array
     });
     for (unsigned i = 0; i < dfs_arrays[k].count; ++i) {
@@ -1234,7 +1234,7 @@ static bool dfs_init(struct dvm *vm, dvm_ref self,
       ((dvm_ref *)dvm__obj(vm, array)->data)[i] = value;
     }
   }
-  dvm_set_field(vm, self, "localPatternChars", "Ljava/lang/String;",
+  (dvm_set_field)(vm, self, "localPatternChars", "Ljava/lang/String;",
   (union dvm_value) {
     .l=dvm_new_string(vm,"GyMdkHmsSEDFwWahKzZ")
   });
@@ -1250,11 +1250,11 @@ static bool dfs_array(struct dvm *vm, dvm_ref self,
     if (!set && strcmp(m->name, dfs_arrays[k].get)) continue;
     union dvm_value v = {0};
     if (set) v = args[0];
-    else dvm_get_field(vm, self, dfs_arrays[k].field, "[Ljava/lang/String;", &v);
+    else (dvm_get_field)(vm, self, dfs_arrays[k].field, "[Ljava/lang/String;", &v);
     dvm_ref copy = dfs_copy_array(vm, v.l);
     if (!copy) return false;
     if (!set) RETL(copy);
-    dvm_set_field(vm, self, dfs_arrays[k].field, "[Ljava/lang/String;", (union dvm_value) {
+    (dvm_set_field)(vm, self, dfs_arrays[k].field, "[Ljava/lang/String;", (union dvm_value) {
       .l=copy
     });
     RETV();
@@ -1269,11 +1269,11 @@ static bool dfs_pattern(struct dvm *vm, dvm_ref self,
       dvm__throw(vm,"java/lang/NullPointerException","pattern characters");
       return false;
     }
-    dvm_set_field(vm,self,"localPatternChars","Ljava/lang/String;",args[0]);
+    (dvm_set_field)(vm,self,"localPatternChars","Ljava/lang/String;",args[0]);
     RETV();
   }
   union dvm_value v = {0};
-  dvm_get_field(vm,self,"localPatternChars","Ljava/lang/String;",&v);
+  (dvm_get_field)(vm,self,"localPatternChars","Ljava/lang/String;",&v);
   RETL(v.l);
 }
 static bool dfs_instance(struct dvm *vm, dvm_ref self,
@@ -1301,14 +1301,14 @@ static bool dfs_clone(struct dvm *vm, dvm_ref self,
   bool ok = true;
   for (unsigned k = 0; ok && k < sizeof dfs_arrays/sizeof dfs_arrays[0]; ++k) {
     union dvm_value v = {0};
-    dvm_get_field(vm,self,dfs_arrays[k].field,"[Ljava/lang/String;",&v);
+    (dvm_get_field)(vm,self,dfs_arrays[k].field,"[Ljava/lang/String;",&v);
     v.l = dfs_copy_array(vm,v.l);
     ok = v.l != 0;
-    if (ok) dvm_set_field(vm,copy,dfs_arrays[k].field,"[Ljava/lang/String;",v);
+    if (ok) (dvm_set_field)(vm,copy,dfs_arrays[k].field,"[Ljava/lang/String;",v);
   }
   union dvm_value v = {0};
-  dvm_get_field(vm,self,"localPatternChars","Ljava/lang/String;",&v);
-  dvm_set_field(vm,copy,"localPatternChars","Ljava/lang/String;",v);
+  (dvm_get_field)(vm,self,"localPatternChars","Ljava/lang/String;",&v);
+  (dvm_set_field)(vm,copy,"localPatternChars","Ljava/lang/String;",v);
   dvm_unpin(vm,copy);
   if (!ok) return false;
   RETL(copy);
@@ -1409,10 +1409,10 @@ static bool sdf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   else if (!loc_getDefault(vm,0,NULL,0,&locale)) return false;
   dvm_ref calendar=dvm_new_object(vm,dvm_find_class(vm,"java/util/GregorianCalendar"));
   if (!calendar || !cal_initialize(vm,calendar,0,locale.l,false)) return false;
-  dvm_set_field(vm,self,"calendar","Ljava/util/Calendar;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"calendar","Ljava/util/Calendar;",(union dvm_value) {
     .l=calendar
   });
-  dvm_set_field(vm,self,"locale","Ljava/util/Locale;",locale);
+  (dvm_set_field)(vm,self,"locale","Ljava/util/Locale;",locale);
   union dvm_value v = {0};
   if (nargs) v=ARG(0);
   else {
@@ -1421,7 +1421,7 @@ static bool sdf_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
     const char *pattern=date_time_pattern(name,3,3);
     if (!pattern || !(v.l=dvm_new_string(vm,pattern))) return false;
   }
-  (void)dvm_set_field(vm, self, "pattern", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, self, "pattern", "Ljava/lang/String;", v);
   RETV();
 }
 
@@ -1434,7 +1434,7 @@ static bool sdf_applyPattern(struct dvm *vm, dvm_ref self,
     dvm__throw(vm,"java/lang/NullPointerException","pattern");
     return false;
   }
-  dvm_set_field(vm,self,"pattern","Ljava/lang/String;",ARG(0));
+  (dvm_set_field)(vm,self,"pattern","Ljava/lang/String;",ARG(0));
   RETV();
 }
 
@@ -1594,7 +1594,7 @@ static bool sdf_format(struct dvm *vm, dvm_ref self,
 {
   (void)nargs;
   union dvm_value pv = { 0 };
-  (void)dvm_get_field(vm, self, "pattern", "Ljava/lang/String;", &pv);
+  (void)(dvm_get_field)(vm, self, "pattern", "Ljava/lang/String;", &pv);
   const char *pat = pv.l ? dvm_string_utf8(vm, pv.l) : "";
   if (!pat) pat = "";
 
@@ -1609,7 +1609,7 @@ static bool sdf_format(struct dvm *vm, dvm_ref self,
       ms = time_millis(vm, ARG(0).l);
   }
   union dvm_value calendar= {0};
-  dvm_get_field(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
+  (dvm_get_field)(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
   struct cal_zone_context context;
   struct lc_zone zone;
   struct lc_calendar *state=cal_state(vm,calendar.l,&context,&zone);
@@ -1638,7 +1638,7 @@ static bool sdf_format(struct dvm *vm, dvm_ref self,
 
   struct rt_bytes b = { 0 };
   union dvm_value locale= {0};
-  dvm_get_field(vm,self,"locale","Ljava/util/Locale;",&locale);
+  (dvm_get_field)(vm,self,"locale","Ljava/util/Locale;",&locale);
   if (!locale.l && !loc_getDefault(vm,0,NULL,0,&locale)) return false;
   char symbol_name[256],pattern_name[256];
   if (!date_locale_name(vm,locale.l,symbol_name,sizeof symbol_name)) return false;
@@ -1655,14 +1655,14 @@ static bool sdf_setTimeZone(struct dvm *vm, dvm_ref self,
                             union dvm_value *out)
 {
   union dvm_value calendar= {0};
-  dvm_get_field(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
+  (dvm_get_field)(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
   return cal_setTimeZone(vm,calendar.l,args,nargs,out);
 }
 
 static bool sdf_getTimeZone(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value calendar= {0};
-  dvm_get_field(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
+  (dvm_get_field)(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
   return cal_getTimeZone(vm,calendar.l,args,nargs,out);
 }
 
@@ -1673,17 +1673,17 @@ static bool sdf_calendar(struct dvm *vm,dvm_ref self,const union dvm_value *args
       dvm__throw(vm,"java/lang/NullPointerException","calendar");
       return false;
     }
-    dvm_set_field(vm,self,"calendar","Ljava/util/Calendar;",ARG(0));
+    (dvm_set_field)(vm,self,"calendar","Ljava/util/Calendar;",ARG(0));
     RETV();
   }
   union dvm_value calendar= {0};
-  dvm_get_field(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
+  (dvm_get_field)(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
   RETL(calendar.l);
 }
 static bool sdf_lenient(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value calendar= {0};
-  dvm_get_field(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
+  (dvm_get_field)(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
   return cal_attribute(vm,calendar.l,args,nargs,out);
 }
 
@@ -1696,7 +1696,7 @@ static bool sdf_parse(struct dvm *vm, dvm_ref self,
 {
   (void)nargs;
   union dvm_value pv = { 0 };
-  (void)dvm_get_field(vm, self, "pattern", "Ljava/lang/String;", &pv);
+  (void)(dvm_get_field)(vm, self, "pattern", "Ljava/lang/String;", &pv);
   const char *pat = pv.l ? dvm_string_utf8(vm, pv.l) : "";
   const char *s = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
   const size_t slen = ARG(0).l ? dvm_string_utf8_length(vm, ARG(0).l) : 0;
@@ -1784,7 +1784,7 @@ static bool sdf_parse(struct dvm *vm, dvm_ref self,
   }
 
   union dvm_value calendar= {0};
-  dvm_get_field(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
+  (dvm_get_field)(vm,self,"calendar","Ljava/util/Calendar;",&calendar);
   struct cal_zone_context context;
   struct lc_zone zone;
   struct lc_calendar *state=cal_state(vm,calendar.l,&context,&zone);
@@ -1902,7 +1902,7 @@ static bool android_context_locale(struct dvm *vm,dvm_ref context,union dvm_valu
   *locale=(union dvm_value) {0};
   if (!am_vcall(vm,context,"getResources","()Landroid/content/res/Resources;",NULL,0,&resources) ||
       !am_vcall(vm,resources.l,"getConfiguration","()Landroid/content/res/Configuration;",NULL,0,&configuration)) return false;
-  dvm_get_field(vm,configuration.l,"locale","Ljava/util/Locale;",locale);
+  (dvm_get_field)(vm,configuration.l,"locale","Ljava/util/Locale;",locale);
   return locale->l || loc_getDefault(vm,0,NULL,0,locale);
 }
 /* DateFormat.format(pattern, time): android.text.format.DateFormat's pattern
@@ -2002,7 +2002,7 @@ static bool sdf_toPattern(struct dvm *vm,dvm_ref self,const union dvm_value *arg
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm,self,"pattern","Ljava/lang/String;",out);
+  return (dvm_get_field)(vm,self,"pattern","Ljava/lang/String;",out);
 }
 static const struct rt_method rt_android_date_format[]= {
   SM("getDateFormat","(Landroid/content/Context;)Ljava/text/DateFormat;",android_date_instance),
@@ -2122,13 +2122,13 @@ static dvm_ref jt_new_parts(struct dvm *vm, const char *desc, int64_t seconds,
   struct dvm_class *c = dvm__class_by_desc(vm, desc);
   dvm_ref r = c ? dvm_new_object(vm, c) : 0;
   if (!r) return 0;
-  (void)dvm_set_field(vm, r, "seconds", "J", (union dvm_value) {
+  (void)(dvm_set_field)(vm, r, "seconds", "J", (union dvm_value) {
     .j=seconds
   });
-  (void)dvm_set_field(vm, r, "nano", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, r, "nano", "I", (union dvm_value) {
     .i=nano
   });
-  (void)dvm_set_field(vm, r, "offset", "I", (union dvm_value) {
+  (void)(dvm_set_field)(vm, r, "offset", "I", (union dvm_value) {
     .i=off
   });
   return r;
@@ -2146,21 +2146,21 @@ static dvm_ref jt_new(struct dvm *vm, const char *desc, int64_t ms, int32_t off)
 static int64_t jt_seconds(struct dvm *vm, dvm_ref self)
 {
   union dvm_value v = {0};
-  (void)dvm_get_field(vm, self, "seconds", "J", &v);
+  (void)(dvm_get_field)(vm, self, "seconds", "J", &v);
   return v.j;
 }
 
 static int32_t jt_nano(struct dvm *vm, dvm_ref self)
 {
   union dvm_value v = {0};
-  (void)dvm_get_field(vm, self, "nano", "I", &v);
+  (void)(dvm_get_field)(vm, self, "nano", "I", &v);
   return v.i;
 }
 
 static int32_t jt_offset(struct dvm *vm, dvm_ref self)
 {
   union dvm_value v = {0};
-  (void)dvm_get_field(vm, self, "offset", "I", &v);
+  (void)(dvm_get_field)(vm, self, "offset", "I", &v);
   return v.i;
 }
 
@@ -2246,7 +2246,7 @@ static dvm_ref jt_render(struct dvm *vm, dvm_ref temporal, const char *pattern)
 static dvm_ref jt_pattern_of(struct dvm *vm, dvm_ref formatter)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, formatter, "pattern", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, formatter, "pattern", "Ljava/lang/String;", &v);
   return v.l;
 }
 
@@ -2277,7 +2277,7 @@ static bool dtf_ofPattern(struct dvm *vm, dvm_ref self,
   dvm_ref f = c ? dvm_new_object(vm, c) : 0;
   if (f) {
     union dvm_value v = { .l = nargs > 0 ? ARG(0).l : 0 };
-    (void)dvm_set_field(vm, f, "pattern", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, f, "pattern", "Ljava/lang/String;", v);
   }
   RETL(f);
 }
@@ -2424,7 +2424,7 @@ static dvm_ref zone_offset_new(struct dvm *vm, int32_t seconds)
   dvm_ref z = c ? dvm_new_object(vm, c) : 0;
   if (z) {
     union dvm_value v = { .i = seconds };
-    (void)dvm_set_field(vm, z, "seconds", "I", v);
+    (void)(dvm_set_field)(vm, z, "seconds", "I", v);
   }
   return z;
 }
@@ -2458,7 +2458,7 @@ static bool zoff_ofTotalSeconds(struct dvm *vm, dvm_ref self,
 static int32_t zone_offset_seconds(struct dvm *vm, dvm_ref zone)
 {
   union dvm_value v = { 0 };
-  if (zone) (void)dvm_get_field(vm, zone, "seconds", "I", &v);
+  if (zone) (void)(dvm_get_field)(vm, zone, "seconds", "I", &v);
   return v.i;
 }
 
@@ -2617,7 +2617,7 @@ static bool month_of(struct dvm *vm, dvm_ref self, const union dvm_value *args,
 static int month_number(struct dvm *vm, dvm_ref self)
 {
   union dvm_value ordinal = {0};
-  (void)dvm_get_field(vm, self, "ordinal", "I", &ordinal);
+  (void)(dvm_get_field)(vm, self, "ordinal", "I", &ordinal);
   return ordinal.i + 1;
 }
 
@@ -3172,7 +3172,7 @@ static bool odt_parse_as(struct dvm *vm, const union dvm_value *args, union dvm_
   dvm_ref r = jt_new_parts(vm, desc, seconds, nano, offset);
   if (!r) return false;
   if (!strcmp(desc, "Ljava/time/ZonedDateTime;") && zone[0])
-    (void)dvm_set_field(vm, r, "zone", "Ljava/lang/String;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, r, "zone", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, zone)
   });
   RETL(r);
@@ -3204,7 +3204,7 @@ static const char *zone_id_text(struct dvm *vm, dvm_ref zone, char buf[64])
     return buf;
   }
   union dvm_value id = {0};
-  (void)dvm_get_field(vm, zone, "id", "Ljava/lang/String;", &id);
+  (void)(dvm_get_field)(vm, zone, "id", "Ljava/lang/String;", &id);
   const char *t = id.l ? dvm_string_utf8(vm, id.l) : NULL;
   snprintf(buf, 64, "%s", t ? t : "");
   return buf;
@@ -3255,7 +3255,7 @@ static bool zoneid_of(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/time/ZoneId;");
   dvm_ref z = c ? dvm_new_object(vm, c) : 0;
   if (!z) return false;
-  (void)dvm_set_field(vm, z, "id", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, z, "id", "Ljava/lang/String;", (union dvm_value) {
     .l = ARG(0).l
   });
   RETL(z);
@@ -3349,7 +3349,7 @@ static bool zdt_withZoneSameInstant(struct dvm *vm, dvm_ref self, const union dv
                    : time_offset(seconds * 1000, id);
   dvm_ref r = jt_new_parts(vm, "Ljava/time/ZonedDateTime;", seconds, jt_nano(vm, self), offset);
   if (!r) return false;
-  (void)dvm_set_field(vm, r, "zone", "Ljava/lang/String;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, r, "zone", "Ljava/lang/String;", (union dvm_value) {
     .l = dvm_new_string(vm, id)
   });
   RETL(r);
@@ -3361,7 +3361,7 @@ static bool zdt_getZone(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   (void)args;
   (void)nargs;
   union dvm_value id = {0}, a[1];
-  (void)dvm_get_field(vm, self, "zone", "Ljava/lang/String;", &id);
+  (void)(dvm_get_field)(vm, self, "zone", "Ljava/lang/String;", &id);
   if (!id.l) RETL(zone_offset_new(vm, jt_offset(vm, self)));
   a[0] = id;
   return zoneid_of(vm, 0, a, 1, out);
@@ -3405,7 +3405,7 @@ static bool clock_system(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   }
   dvm_ref clock = dvm_new_object(vm, dvm_find_class(vm, "java/time/Clock$SystemClock"));
   if (!clock) return false;
-  dvm_set_field(vm, clock, "zone", "Ljava/time/ZoneId;", ARG(0));
+  (dvm_set_field)(vm, clock, "zone", "Ljava/time/ZoneId;", ARG(0));
   RETL(clock);
 }
 
@@ -3429,7 +3429,7 @@ static bool clock_get_zone(struct dvm *vm, dvm_ref self, const union dvm_value *
                            int nargs, union dvm_value *out)
 {
   (void)args; (void)nargs;
-  return dvm_get_field(vm, self, "zone", "Ljava/time/ZoneId;", out);
+  return (dvm_get_field)(vm, self, "zone", "Ljava/time/ZoneId;", out);
 }
 
 static bool clock_with_zone(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -3563,7 +3563,7 @@ static bool zdt_of(struct dvm *vm,dvm_ref self,const union dvm_value *args,
   if (!jt_local_range(vm,seconds,offset)) return false;
   dvm_ref value=jt_new_parts(vm,"Ljava/time/ZonedDateTime;",seconds,ARG(6).i,offset);
   if (!value) return false;
-  dvm_set_field(vm,value,"zone","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,id)});
+  (dvm_set_field)(vm,value,"zone","Ljava/lang/String;",(union dvm_value){.l=dvm_new_string(vm,id)});
   RETL(value);
 }
 
@@ -3679,7 +3679,7 @@ static const char *const android_time_int_fields[]= {
 };
 static void android_time_int(struct dvm *vm,dvm_ref self,const char *name,int value)
 {
-  dvm_set_field(vm,self,name,"I",(union dvm_value) {
+  (dvm_set_field)(vm,self,name,"I",(union dvm_value) {
     .i=value
   });
 }
@@ -3691,13 +3691,13 @@ static bool android_time_current_zone(struct dvm *vm,dvm_ref self,const union dv
 }
 static void android_time_reset(struct dvm *vm,dvm_ref self,dvm_ref zone)
 {
-  dvm_set_field(vm,self,"timezone","Ljava/lang/String;",(union dvm_value) {
+  (dvm_set_field)(vm,self,"timezone","Ljava/lang/String;",(union dvm_value) {
     .l=zone
   });
-  dvm_set_field(vm,self,"allDay","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"allDay","Z",(union dvm_value) {
     .i=0
   });
-  dvm_set_field(vm,self,"gmtoff","J",(union dvm_value) {
+  (dvm_set_field)(vm,self,"gmtoff","J",(union dvm_value) {
     .j=0
   });
   for(size_t i=0; i<sizeof android_time_int_fields/sizeof android_time_int_fields[0]; ++i)
@@ -3712,8 +3712,8 @@ static bool android_time_copy(struct dvm *vm,dvm_ref self,const union dvm_value 
   }
   for(const struct rt_field *f=rt_android_time_fields; f->name; ++f) {
     union dvm_value value= {0};
-    dvm_get_field(vm,ARG(0).l,f->name,f->type,&value);
-    dvm_set_field(vm,self,f->name,f->type,value);
+    (dvm_get_field)(vm,ARG(0).l,f->name,f->type,&value);
+    (dvm_set_field)(vm,self,f->name,f->type,value);
   }
   RETV();
 }
@@ -3746,9 +3746,9 @@ static bool android_time_clear(struct dvm *vm,dvm_ref self,const union dvm_value
 static bool android_time_set_fields(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   union dvm_value zone= {0};
-  dvm_get_field(vm,self,"timezone","Ljava/lang/String;",&zone);
+  (dvm_get_field)(vm,self,"timezone","Ljava/lang/String;",&zone);
   android_time_reset(vm,self,zone.l);
-  dvm_set_field(vm,self,"allDay","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"allDay","Z",(union dvm_value) {
     .i=nargs==3
   });
   for(int i=0; i<6; ++i)android_time_int(vm,self,android_time_int_fields[i],nargs==3 ? (i<3 ? 0 : ARG(i-3).i) : ARG(i).i);
@@ -3758,7 +3758,7 @@ static bool android_time_set_millis(struct dvm *vm,dvm_ref self,const union dvm_
 {
   (void)nargs;
   union dvm_value zone= {0};
-  dvm_get_field(vm,self,"timezone","Ljava/lang/String;",&zone);
+  (dvm_get_field)(vm,self,"timezone","Ljava/lang/String;",&zone);
   const char *id=zone.l ? dvm_string_utf8(vm,zone.l) : NULL;
   int32_t seconds=(int32_t)(uint32_t)(ARG(0).j/1000);
   int64_t millis=(int64_t)seconds*1000;
@@ -3766,10 +3766,10 @@ static bool android_time_set_millis(struct dvm *vm,dvm_ref self,const union dvm_
   time_break(millis,id,&tm);
   int fields[]= {tm.tm_sec,tm.tm_min,tm.tm_hour,tm.tm_mday,tm.tm_mon,tm.tm_year+1900,tm.tm_wday,tm.tm_yday,tm.tm_isdst};
   for(size_t i=0; i<sizeof fields/sizeof fields[0]; ++i)android_time_int(vm,self,android_time_int_fields[i],fields[i]);
-  dvm_set_field(vm,self,"gmtoff","J",(union dvm_value) {
+  (dvm_set_field)(vm,self,"gmtoff","J",(union dvm_value) {
     .j=time_offset(millis,id)
   });
-  dvm_set_field(vm,self,"allDay","Z",(union dvm_value) {
+  (dvm_set_field)(vm,self,"allDay","Z",(union dvm_value) {
     .i=0
   });
   RETV();
@@ -3966,7 +3966,7 @@ static int32_t android_time_format_seconds(struct android_time_format *f)
   dvm_ref zone=cal_zone_make(f->vm,id,false);
   union dvm_value rules= {0};
   if(!zone)return -1;
-  dvm_get_field(f->vm,zone,"rules","Ljava/lang/String;",&rules);
+  (dvm_get_field)(f->vm,zone,"rules","Ljava/lang/String;",&rules);
   id=rules.l ? dvm_string_utf8(f->vm,rules.l) : "GMT";
   struct tm tm= {0};
   tm.tm_sec=f->fields[0];
@@ -4205,17 +4205,17 @@ static bool android_time_format(struct dvm *vm,dvm_ref self,const union dvm_valu
   struct android_time_format f= {.vm=vm};
   union dvm_value value= {0},locale= {0};
   for(size_t i=0; i<9; ++i) {
-    dvm_get_field(vm,self,android_time_int_fields[i],"I",&value);
+    (dvm_get_field)(vm,self,android_time_int_fields[i],"I",&value);
     f.fields[i]=value.i;
   }
-  dvm_get_field(vm,self,"gmtoff","J",&value);
+  (dvm_get_field)(vm,self,"gmtoff","J",&value);
   f.offset=(int32_t)(uint32_t)value.j;
-  dvm_get_field(vm,self,"allDay","Z",&value);
+  (dvm_get_field)(vm,self,"allDay","Z",&value);
   if(value.i && (f.fields[0] || f.fields[1] || f.fields[2])) {
     dvm__throw(vm,"java/lang/IllegalArgumentException","allDay requires zero hour, minute and second");
     return false;
   }
-  dvm_get_field(vm,self,"timezone","Ljava/lang/String;",&value);
+  (dvm_get_field)(vm,self,"timezone","Ljava/lang/String;",&value);
   f.timezone=value.l;
   if(!loc_getDefault(vm,0,NULL,0,&locale) || !date_locale_name(vm,locale.l,f.locale,sizeof f.locale))return false;
   char name[256];

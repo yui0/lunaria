@@ -633,7 +633,7 @@ static bool dvm_buffer_is_direct(struct dvm *vm, dvm_ref r)
   struct dvm_class *bytebuffer = dvm_find_class(vm, "java/nio/ByteBuffer");
   if (!c || !bytebuffer || !dvm__class_assignable(vm, c, bytebuffer)) return false;
   union dvm_value d = { 0 };
-  return dvm_get_field(vm, r, "direct", "Z", &d) && d.i != 0;
+  return (dvm_get_field)(vm, r, "direct", "Z", &d) && d.i != 0;
 }
 
 /* The buffer's bytes and their length, or NULL. */
@@ -641,7 +641,7 @@ static uint8_t *dvm_buffer_bytes(struct dvm *vm, dvm_ref r, uint32_t *len)
 {
   union dvm_value bufv = { 0 };
   *len = 0;
-  if (!dvm_get_field(vm, r, "buf", "[B", &bufv) || !bufv.l) return NULL;
+  if (!(dvm_get_field)(vm, r, "buf", "[B", &bufv) || !bufv.l) return NULL;
   *len = dvm_array_length(vm, bufv.l);
   return dvm_array_data(vm, bufv.l);
 }
@@ -650,7 +650,7 @@ static uint8_t *dvm_buffer_bytes(struct dvm *vm, dvm_ref r, uint32_t *len)
 static struct dvm_object *dvm_buffer_array(struct dvm *vm, dvm_ref r)
 {
   union dvm_value bufv = { 0 };
-  if (!dvm_get_field(vm, r, "buf", "[B", &bufv) || !bufv.l) return NULL;
+  if (!(dvm_get_field)(vm, r, "buf", "[B", &bufv) || !bufv.l) return NULL;
   return dvm__obj(vm, bufv.l);
 }
 
@@ -712,7 +712,7 @@ static uint32_t dvm_direct_buffer_to_host(struct dvm *vm, dvm_ref r)
 static void dvm_direct_buffer_from_host(struct dvm *vm, dvm_ref r)
 {
   union dvm_value readonly = {0};
-  (void)dvm_get_field(vm, r, "readOnly", "Z", &readonly);
+  (void)(dvm_get_field)(vm, r, "readOnly", "Z", &readonly);
   if (readonly.i) return;
   uint32_t len = 0;
   uint8_t *dst = dvm_buffer_bytes(vm, r, &len);
@@ -742,22 +742,22 @@ static dvm_ref native_buffer_import(struct dvm *vm,JNIEnv *env,jobject host,
   array->data=address;
   array->length=(uint32_t)capacity;
   array->data_destroy=native_buffer_data_release;
-  (void)dvm_set_field(vm,buffer,"buf","[B",(union dvm_value) {
+  (void)(dvm_set_field)(vm,buffer,"buf","[B",(union dvm_value) {
     .l=bytes
   });
-  (void)dvm_set_field(vm,buffer,"pos","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,buffer,"pos","I",(union dvm_value) {
     .i=0
   });
-  (void)dvm_set_field(vm,buffer,"count","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,buffer,"count","I",(union dvm_value) {
     .i=(int32_t)capacity
   });
-  (void)dvm_set_field(vm,buffer,"mark","I",(union dvm_value) {
+  (void)(dvm_set_field)(vm,buffer,"mark","I",(union dvm_value) {
     .i=-1
   });
-  (void)dvm_set_field(vm,buffer,"direct","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,buffer,"direct","Z",(union dvm_value) {
     .i=1
   });
-  (void)dvm_set_field(vm,buffer,"nativeBacked","Z",(union dvm_value) {
+  (void)(dvm_set_field)(vm,buffer,"nativeBacked","Z",(union dvm_value) {
     .i=1
   });
   return bind_payload(vm,env,buffer,host);
@@ -806,11 +806,11 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
       if (!member) return 0;
       struct dvm_class *c = dvm_find_class(vm, owner);
       union dvm_value v = { .l = c ? dvm_class_object(vm, c) : 0 };
-      (void)dvm_set_field(vm, member, "owner", "Ljava/lang/Class;", v);
+      (void)(dvm_set_field)(vm, member, "owner", "Ljava/lang/Class;", v);
       v.l = dvm_new_string(vm, name);
-      (void)dvm_set_field(vm, member, "name", "Ljava/lang/String;", v);
+      (void)(dvm_set_field)(vm, member, "name", "Ljava/lang/String;", v);
       v.l = dvm_new_string(vm, signature);
-      (void)dvm_set_field(vm, member, "sig", "Ljava/lang/String;", v);
+      (void)(dvm_set_field)(vm, member, "sig", "Ljava/lang/String;", v);
       v.i = 0;
       if (field) {
         for (struct dvm_class *k = c; k; k = k->super) {
@@ -833,7 +833,7 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
         struct dvm_method *method = dvm_find_method(vm, c, name, signature);
         if (method) v.i = (int32_t)method->access;
       }
-      (void)dvm_set_field(vm, member, "access", "I", v);
+      (void)(dvm_set_field)(vm, member, "access", "I", v);
       return member;
     }
   }
@@ -897,9 +897,9 @@ static dvm_ref from_jobject(struct dvm *vm, JNIEnv *env, jobject o)
               (void *)o, (int)grant_value, (void *)authority_value);
     dvm_ref r = wrapper_for(vm, env, cn, (uint32_t)(uintptr_t)o);
     union dvm_value value = { .i = grant_value ? 1 : 0 };
-    (void)dvm_set_field(vm, r, "grantUriPermissions", "Z", value);
+    (void)(dvm_set_field)(vm, r, "grantUriPermissions", "Z", value);
     value.l = authority_value ? from_jobject(vm, env, authority_value) : 0;
-    (void)dvm_set_field(vm, r, "authority", "Ljava/lang/String;", value);
+    (void)(dvm_set_field)(vm, r, "authority", "Ljava/lang/String;", value);
     return r;
   }
   return wrapper_for(vm, env, cn && *cn ? cn : "java/lang/Object",
@@ -1101,10 +1101,10 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
        !strcmp(c->name, "java/lang/reflect/Constructor") ||
        !strcmp(c->name, "java/lang/reflect/Field"))) {
     union dvm_value ownerv = { 0 }, namev = { 0 }, sigv = { 0 }, accv = { 0 };
-    (void)dvm_get_field(vm, r, "owner", "Ljava/lang/Class;", &ownerv);
-    (void)dvm_get_field(vm, r, "name", "Ljava/lang/String;", &namev);
-    (void)dvm_get_field(vm, r, "sig", "Ljava/lang/String;", &sigv);
-    (void)dvm_get_field(vm, r, "access", "I", &accv);
+    (void)(dvm_get_field)(vm, r, "owner", "Ljava/lang/Class;", &ownerv);
+    (void)(dvm_get_field)(vm, r, "name", "Ljava/lang/String;", &namev);
+    (void)(dvm_get_field)(vm, r, "sig", "Ljava/lang/String;", &sigv);
+    (void)(dvm_get_field)(vm, r, "access", "I", &accv);
     struct dvm_object *oo = dvm__obj(vm, ownerv.l);
     const char *cname = (oo && oo->kind == DVM_OBJ_CLASS && oo->klass)
                         ? oo->klass->name
@@ -1375,20 +1375,20 @@ static void dvm_fill_application_info_paths(struct dvm *vm, dvm_ref ai)
 {
   union dvm_value v;
   v.l = dvm_new_string(vm, lunaria_android_apk_path());
-  (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", v);
-  (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "sourceDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
   v.l = dvm_new_string(vm, lunaria_android_data_path());
-  (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "dataDir", "Ljava/lang/String;", v);
   v.l = dvm_new_string(vm, lunaria_android_native_lib_path());
-  (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
 
   dvm_ref names = 0, dirs = 0;
   if (!dvm_build_split_arrays(vm, &names, &dirs)) return;
   v.l = names;
-  (void)dvm_set_field(vm, ai, "splitNames", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "splitNames", "[Ljava/lang/String;", v);
   v.l = dirs;
-  (void)dvm_set_field(vm, ai, "splitSourceDirs", "[Ljava/lang/String;", v);
-  (void)dvm_set_field(vm, ai, "splitPublicSourceDirs", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "splitSourceDirs", "[Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "splitPublicSourceDirs", "[Ljava/lang/String;", v);
 }
 
 /* Is this PackageManager query about the app that is running?
@@ -1421,32 +1421,32 @@ static void dvm_fill_registered_application_info(
   struct dvm *vm, dvm_ref ai, const struct lunaria_android_package *record)
 {
   union dvm_value v = { .l = dvm_new_string(vm, record->name) };
-  (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "packageName", "Ljava/lang/String;", v);
   v.i = record->target_sdk;
-  (void)dvm_set_field(vm, ai, "targetSdkVersion", "I", v);
+  (void)(dvm_set_field)(vm, ai, "targetSdkVersion", "I", v);
   v.i = record->uid;
-  (void)dvm_set_field(vm, ai, "uid", "I", v);
+  (void)(dvm_set_field)(vm, ai, "uid", "I", v);
   v.i = record->flags;
-  (void)dvm_set_field(vm, ai, "flags", "I", v);
+  (void)(dvm_set_field)(vm, ai, "flags", "I", v);
   /* Installed and not disabled; the field default (false) reads as
    * SERVICE_DISABLED to Google Play services' availability check. */
   v.i = 1;
-  (void)dvm_set_field(vm, ai, "enabled", "Z", v);
+  (void)(dvm_set_field)(vm, ai, "enabled", "Z", v);
   v.l = dvm_new_string(vm, record->source_dir);
-  (void)dvm_set_field(vm, ai, "sourceDir", "Ljava/lang/String;", v);
-  (void)dvm_set_field(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "sourceDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "publicSourceDir", "Ljava/lang/String;", v);
   v.l = dvm_new_string(vm, record->data_dir);
-  (void)dvm_set_field(vm, ai, "dataDir", "Ljava/lang/String;", v);
-  (void)dvm_set_field(vm, ai, "credentialProtectedDataDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "dataDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "credentialProtectedDataDir", "Ljava/lang/String;", v);
   {
     /* Every package has a device-protected (direct boot) data directory too. */
     char de[512];
     snprintf(de, sizeof de, "/data/user_de/0/%s", record->name);
     v.l = dvm_new_string(vm, de);
-    (void)dvm_set_field(vm, ai, "deviceProtectedDataDir", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, ai, "deviceProtectedDataDir", "Ljava/lang/String;", v);
   }
   v.l = dvm_new_string(vm, record->lib_dir ? record->lib_dir : "");
-  (void)dvm_set_field(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
+  (void)(dvm_set_field)(vm, ai, "nativeLibraryDir", "Ljava/lang/String;", v);
 }
 
 static bool hook_call_external_inner(void *user, struct dvm *vm, const char *class_name,
@@ -1531,7 +1531,7 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
     union dvm_value v = { .l = meta_pkg && !strcmp(meta_pkg, record.name)
                                  ? dvm_runtime_manifest_bundle(vm) : 0
                           };
-    (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", v);
+    (void)(dvm_set_field)(vm, ai, "metaData", "Landroid/os/Bundle;", v);
     dvm_fill_registered_application_info(vm, ai, &record);
     const char *pkg = getenv("ANDROID_PACKAGE_NAME");
     if (pkg && !strcmp(pkg, record.name)) dvm_fill_application_info_paths(vm, ai);
@@ -1566,7 +1566,7 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
       union dvm_value bv = { .l = self_pkg && !strcmp(self_pkg, record.name)
                                     ? dvm_runtime_manifest_bundle(vm) : 0
                              };
-      if (bv.l) (void)dvm_set_field(vm, ai, "metaData", "Landroid/os/Bundle;", bv);
+      if (bv.l) (void)(dvm_set_field)(vm, ai, "metaData", "Landroid/os/Bundle;", bv);
     }
     /* Play Core's SplitInstallInfoProvider reads the installed split set off
      * PackageInfo, not off ApplicationInfo. */
@@ -1574,14 +1574,14 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
       dvm_ref sn = 0, sd = 0;
       if (dvm_build_split_arrays(vm, &sn, &sd)) {
         union dvm_value sv = { .l = sn };
-        (void)dvm_set_field(vm, pi, "splitNames", "[Ljava/lang/String;", sv);
+        (void)(dvm_set_field)(vm, pi, "splitNames", "[Ljava/lang/String;", sv);
       }
     }
     v.l = dvm_new_string(vm, record.name);
-    (void)dvm_set_field(vm, ai, "packageName", "Ljava/lang/String;", v);
-    (void)dvm_set_field(vm, pi, "packageName", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, ai, "packageName", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, pi, "packageName", "Ljava/lang/String;", v);
     v.l = ai;
-    (void)dvm_set_field(vm, pi, "applicationInfo",
+    (void)(dvm_set_field)(vm, pi, "applicationInfo",
                         "Landroid/content/pm/ApplicationInfo;", v);
     /* Straight from the manifest.  versionName was left unset, which reads
      * back as null — a value the framework never produces, so callers push it
@@ -1596,9 +1596,9 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
       vname = record.version_name;
     }
     v.i = vcode;
-    (void)dvm_set_field(vm, pi, "versionCode", "I", v);
+    (void)(dvm_set_field)(vm, pi, "versionCode", "I", v);
     v.l = vname ? dvm_new_string(vm, vname) : 0;
-    (void)dvm_set_field(vm, pi, "versionName", "Ljava/lang/String;", v);
+    (void)(dvm_set_field)(vm, pi, "versionName", "Ljava/lang/String;", v);
     (void)dvm_package_info_add_signatures(
       vm, pi, nargs > 1 ? (uint32_t)args[1].i : 0,
       self_pkg && !strcmp(self_pkg, record.name) ? NULL : record.source_dir);
@@ -1710,10 +1710,10 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
         else
           v.i = (*env)->CallIntMethod(env, disp, mid);
       }
-      (void)dvm_set_field(vm, mode, probe[i].field, probe[i].ft, v);
+      (void)(dvm_set_field)(vm, mode, probe[i].field, probe[i].ft, v);
     }
     union dvm_value id = { .i = 1 };   /* mode ids are 1-based on Android */
-    (void)dvm_set_field(vm, mode, "modeId", "I", id);
+    (void)(dvm_set_field)(vm, mode, "modeId", "I", id);
 
     if (!strcmp(method, "getMode")) {
       out->l = mode;
@@ -2618,7 +2618,7 @@ bool dvm_jni_activity_finishing(JNIEnv *env, jobject activity)
   unsigned cookie = dvm_gil_enter_from_guest(vm);
   dvm_ref ref = from_jobject(vm, env, activity);
   union dvm_value v = { 0 };
-  const bool r = ref && dvm_get_field(vm, ref, "finishing", "Z", &v) && v.i;
+  const bool r = ref && (dvm_get_field)(vm, ref, "finishing", "Z", &v) && v.i;
   dvm_gil_leave_to_guest(vm, cookie);
   return r;
 }
@@ -2717,11 +2717,11 @@ bool dvm_jni_field_locked(JNIEnv *env, jobject obj, jfieldID field, bool set,
       v.l = from_jobject(vm, env, (jobject)(uintptr_t)*bits);
       break;
     }
-    return dvm_set_field(vm, self, name, type, v);
+    return (dvm_set_field)(vm, self, name, type, v);
   }
 
   union dvm_value v = { 0 };
-  if (!dvm_get_field(vm, self, name, type, &v)) return false;
+  if (!(dvm_get_field)(vm, self, name, type, &v)) return false;
   if (dvm__env("LUNARIA_TRACE_FIELDS") && type[0] == 'L') {
     static int n;
     if (n++ < 128)

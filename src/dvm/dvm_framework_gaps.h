@@ -138,7 +138,7 @@ static dvm_ref icon_new(struct dvm *vm, int type)
 {
   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/graphics/drawable/Icon;");
   dvm_ref icon = c ? dvm_new_object(vm, c) : 0;
-  if (icon) (void)dvm_set_field(vm, icon, "type", "I", (union dvm_value) {
+  if (icon) (void)(dvm_set_field)(vm, icon, "type", "I", (union dvm_value) {
     .i = type
   });
   return icon;
@@ -161,8 +161,8 @@ static bool x_icon_create(struct dvm *vm, dvm_ref self, const union dvm_value *a
       }
       if (!am_vcall(vm, ARG(0).l, "getPackageName", "()Ljava/lang/String;", NULL, 0, &pkg)) return false;
     } else pkg = ARG(0);
-    (void)dvm_set_field(vm, icon, "resPackage", "Ljava/lang/String;", pkg);
-    (void)dvm_set_field(vm, icon, "resId", "I", ARG(1));
+    (void)(dvm_set_field)(vm, icon, "resPackage", "Ljava/lang/String;", pkg);
+    (void)(dvm_set_field)(vm, icon, "resId", "I", ARG(1));
     RETL(icon);
   }
   if (!strcmp(name, "createWithBitmap") || !strcmp(name, "createWithAdaptiveBitmap")) {
@@ -172,13 +172,13 @@ static bool x_icon_create(struct dvm *vm, dvm_ref self, const union dvm_value *a
     }
     icon = icon_new(vm, !strcmp(name, "createWithBitmap") ? ICON_BITMAP : ICON_ADAPTIVE);
     if (!icon) return false;
-    (void)dvm_set_field(vm, icon, "bitmap", "Landroid/graphics/Bitmap;", ARG(0));
+    (void)(dvm_set_field)(vm, icon, "bitmap", "Landroid/graphics/Bitmap;", ARG(0));
     RETL(icon);
   }
   if (!strcmp(name, "createWithData")) {
     icon = icon_new(vm, ICON_DATA);
     if (!icon) return false;
-    (void)dvm_set_field(vm, icon, "data", "[B", ARG(0));
+    (void)(dvm_set_field)(vm, icon, "data", "[B", ARG(0));
     RETL(icon);
   }
   icon = icon_new(vm, ICON_URI);   /* createWithContentUri */
@@ -189,8 +189,8 @@ static bool x_icon_create(struct dvm *vm, dvm_ref self, const union dvm_value *a
     struct dvm_class *uc = dvm_find_class(vm, "android/net/Uri");
     struct dvm_method *parse = uc ? dvm_find_method(vm, uc, "parse", "(Ljava/lang/String;)Landroid/net/Uri;") : NULL;
     if (!parse || !dvm_call(vm, parse, 0, &a, 1, &uri)) return false;
-    (void)dvm_set_field(vm, icon, "uri", "Landroid/net/Uri;", uri);
-  } else (void)dvm_set_field(vm, icon, "uri", "Landroid/net/Uri;", ARG(0));
+    (void)(dvm_set_field)(vm, icon, "uri", "Landroid/net/Uri;", uri);
+  } else (void)(dvm_set_field)(vm, icon, "uri", "Landroid/net/Uri;", ARG(0));
   RETL(icon);
 }
 static bool x_icon_get(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
@@ -199,11 +199,11 @@ static bool x_icon_get(struct dvm *vm, dvm_ref self, const union dvm_value *args
   (void)args;
   (void)nargs;
   const char *n = builtin_name();
-  if (!strcmp(n, "getType")) return dvm_get_field(vm, self, "type", "I", out);
-  if (!strcmp(n, "getResId")) return dvm_get_field(vm, self, "resId", "I", out);
-  if (!strcmp(n, "getResPackage")) return dvm_get_field(vm, self, "resPackage", "Ljava/lang/String;", out);
-  if (!strcmp(n, "getBitmap")) return dvm_get_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", out);
-  return dvm_get_field(vm, self, "uri", "Landroid/net/Uri;", out);   /* getUri */
+  if (!strcmp(n, "getType")) return (dvm_get_field)(vm, self, "type", "I", out);
+  if (!strcmp(n, "getResId")) return (dvm_get_field)(vm, self, "resId", "I", out);
+  if (!strcmp(n, "getResPackage")) return (dvm_get_field)(vm, self, "resPackage", "Ljava/lang/String;", out);
+  if (!strcmp(n, "getBitmap")) return (dvm_get_field)(vm, self, "bitmap", "Landroid/graphics/Bitmap;", out);
+  return (dvm_get_field)(vm, self, "uri", "Landroid/net/Uri;", out);   /* getUri */
 }
 static bool x_icon_tint(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
                         union dvm_value *out)
@@ -214,7 +214,7 @@ static bool x_icon_tint(struct dvm *vm, dvm_ref self, const union dvm_value *arg
     list.l = color_state_list_new(vm, ARG(0).i);
     if (!list.l) return false;
   }
-  (void)dvm_set_field(vm, self, "tintList", "Landroid/content/res/ColorStateList;", list);
+  (void)(dvm_set_field)(vm, self, "tintList", "Landroid/content/res/ColorStateList;", list);
   RETL(self);
 }
 /* loadDrawable(Context): a resource icon is that resource, a bitmap icon a
@@ -224,20 +224,20 @@ static bool x_icon_load(struct dvm *vm, dvm_ref self, const union dvm_value *arg
 {
   (void)nargs;
   union dvm_value type = { 0 }, drawable = { 0 };
-  (void)dvm_get_field(vm, self, "type", "I", &type);
+  (void)(dvm_get_field)(vm, self, "type", "I", &type);
   dvm_ref ctx = ARG(0).l;
   if (!ctx) RETL(0);
   union dvm_value res = { 0 };
   if (!am_vcall(vm, ctx, "getResources", "()Landroid/content/res/Resources;", NULL, 0, &res)) return false;
   if (type.i == ICON_RESOURCE) {
     union dvm_value id = { 0 }, ign = { 0 }, theme = { 0 };
-    (void)dvm_get_field(vm, self, "resId", "I", &id);
+    (void)(dvm_get_field)(vm, self, "resId", "I", &id);
     union dvm_value a[2] = { id, theme };
     if (!am_vcall(vm, res.l, "getDrawable", "(ILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;", a, 2, &drawable)) return false;
     (void)ign;
   } else if (type.i == ICON_BITMAP || type.i == ICON_ADAPTIVE) {
     union dvm_value bmp = { 0 };
-    (void)dvm_get_field(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &bmp);
+    (void)(dvm_get_field)(vm, self, "bitmap", "Landroid/graphics/Bitmap;", &bmp);
     dvm_ref d = dvm_new_object(vm, dvm_find_class(vm, "android/graphics/drawable/BitmapDrawable"));
     if (!d) return false;
     dvm_pin(vm, d);
@@ -249,7 +249,7 @@ static bool x_icon_load(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   }
   if (drawable.l) {
     union dvm_value tint = { 0 }, ign = { 0 };
-    (void)dvm_get_field(vm, self, "tintList", "Landroid/content/res/ColorStateList;", &tint);
+    (void)(dvm_get_field)(vm, self, "tintList", "Landroid/content/res/ColorStateList;", &tint);
     if (tint.l && !am_vcall(vm, drawable.l, "setTintList", "(Landroid/content/res/ColorStateList;)V", &tint, 1, &ign)) return false;
   }
   RETL(drawable.l);
@@ -292,8 +292,8 @@ static bool x_person_builder(struct dvm *vm, dvm_ref self, const union dvm_value
                                      };
       for (int i = 0; i < 6; ++i) {
         union dvm_value v = { 0 };
-        (void)dvm_get_field(vm, ARG(0).l, f[i], t[i], &v);
-        (void)dvm_set_field(vm, self, f[i], t[i], v);
+        (void)(dvm_get_field)(vm, ARG(0).l, f[i], t[i], &v);
+        (void)(dvm_set_field)(vm, self, f[i], t[i], v);
       }
     }
     RETV();
@@ -308,8 +308,8 @@ static bool x_person_builder(struct dvm *vm, dvm_ref self, const union dvm_value
                                    };
     for (int i = 0; i < 6; ++i) {
       union dvm_value v = { 0 };
-      (void)dvm_get_field(vm, self, f[i], t[i], &v);
-      (void)dvm_set_field(vm, p, f[i], t[i], v);
+      (void)(dvm_get_field)(vm, self, f[i], t[i], &v);
+      (void)(dvm_set_field)(vm, p, f[i], t[i], v);
     }
     RETL(p);
   }
@@ -317,7 +317,7 @@ static bool x_person_builder(struct dvm *vm, dvm_ref self, const union dvm_value
                       : !strcmp(n, "setKey") ? "key" : !strcmp(n, "setBot") ? "bot" : "important";
   const char *type = !strcmp(field, "name") ? "Ljava/lang/CharSequence;" : !strcmp(field, "icon") ? "Landroid/graphics/drawable/Icon;"
                      : (!strcmp(field, "bot") || !strcmp(field, "important")) ? "Z" : "Ljava/lang/String;";
-  (void)dvm_set_field(vm, self, field, type, ARG(0));
+  (void)(dvm_set_field)(vm, self, field, type, ARG(0));
   RETL(self);
 }
 static bool x_person_get(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
@@ -326,12 +326,12 @@ static bool x_person_get(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)args;
   (void)nargs;
   const char *n = builtin_name();
-  if (!strcmp(n, "getName")) return dvm_get_field(vm, self, "name", "Ljava/lang/CharSequence;", out);
-  if (!strcmp(n, "getIcon")) return dvm_get_field(vm, self, "icon", "Landroid/graphics/drawable/Icon;", out);
-  if (!strcmp(n, "getUri")) return dvm_get_field(vm, self, "uri", "Ljava/lang/String;", out);
-  if (!strcmp(n, "getKey")) return dvm_get_field(vm, self, "key", "Ljava/lang/String;", out);
-  if (!strcmp(n, "isBot")) return dvm_get_field(vm, self, "bot", "Z", out);
-  if (!strcmp(n, "isImportant")) return dvm_get_field(vm, self, "important", "Z", out);
+  if (!strcmp(n, "getName")) return (dvm_get_field)(vm, self, "name", "Ljava/lang/CharSequence;", out);
+  if (!strcmp(n, "getIcon")) return (dvm_get_field)(vm, self, "icon", "Landroid/graphics/drawable/Icon;", out);
+  if (!strcmp(n, "getUri")) return (dvm_get_field)(vm, self, "uri", "Ljava/lang/String;", out);
+  if (!strcmp(n, "getKey")) return (dvm_get_field)(vm, self, "key", "Ljava/lang/String;", out);
+  if (!strcmp(n, "isBot")) return (dvm_get_field)(vm, self, "bot", "Z", out);
+  if (!strcmp(n, "isImportant")) return (dvm_get_field)(vm, self, "important", "Z", out);
   /* toBuilder() */
   struct dvm_class *c = dvm__class_by_desc(vm, "Landroid/app/Person$Builder;");
   dvm_ref b = c ? dvm_new_object(vm, c) : 0;
@@ -392,7 +392,7 @@ static bool x_image_color_filter(struct dvm *vm, dvm_ref self, const union dvm_v
     if (!ok) return false;
     filter.l = f;
   }
-  (void)dvm_set_field(vm, self, "colorFilter", "Landroid/graphics/ColorFilter;", filter);
+  (void)(dvm_set_field)(vm, self, "colorFilter", "Landroid/graphics/ColorFilter;", filter);
   dvm_ref drawable = ui_obj(vm, self, "drawable", "Landroid/graphics/drawable/Drawable;");
   if (drawable && !am_vcall(vm, drawable, "setColorFilter", "(Landroid/graphics/ColorFilter;)V", &filter, 1, &ign)) return false;
   ui_invalidate_view(vm, self, NULL, 0);
@@ -403,7 +403,7 @@ static bool x_image_get_color_filter(struct dvm *vm, dvm_ref self, const union d
 {
   (void)args;
   (void)nargs;
-  return dvm_get_field(vm, self, "colorFilter", "Landroid/graphics/ColorFilter;", out);
+  return (dvm_get_field)(vm, self, "colorFilter", "Landroid/graphics/ColorFilter;", out);
 }
 static const struct rt_method rt_gap_image_view[] = {
   M("setColorFilter", "(I)V", x_image_color_filter),
@@ -420,11 +420,11 @@ static const struct rt_method rt_gap_image_view[] = {
   { \
     (void)nargs; \
     if (!strcmp(builtin_name(), set_name)) { \
-      (void)dvm_set_field(vm, self, field, type, ARG(0)); \
+      (void)(dvm_set_field)(vm, self, field, type, ARG(0)); \
       if (retself) RETL(self); \
       RETV(); \
     } \
-    return dvm_get_field(vm, self, field, type, out); \
+    return (dvm_get_field)(vm, self, field, type, out); \
   }
 GAP_PROP(x_msg_async, "asynchronous", "Z", "(Z)V", "()Z", "setAsynchronous", "isAsynchronous", 0)
 GAP_PROP(x_paint_hinting, "hinting", "I", "(I)V", "()I", "setHinting", "getHinting", 0)
@@ -441,7 +441,7 @@ static bool x_text_shadow_color(struct dvm *vm, dvm_ref self, const union dvm_va
   (void)nargs;
   /* The shadow's colour: whatever setShadowLayer() recorded, else none. */
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "shadowColor", "I", &v);
+  (void)(dvm_get_field)(vm, self, "shadowColor", "I", &v);
   RETI(v.i);
 }
 static bool x_list_selector(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
@@ -454,7 +454,7 @@ static bool x_list_selector(struct dvm *vm, dvm_ref self, const union dvm_value 
   union dvm_value res = { 0 }, a[2] = { ARG(0), { 0 } };
   if (!am_vcall(vm, ctx.l, "getResources", "()Landroid/content/res/Resources;", NULL, 0, &res) ||
       !am_vcall(vm, res.l, "getDrawable", "(ILandroid/content/res/Resources$Theme;)Landroid/graphics/drawable/Drawable;", a, 2, &d)) return false;
-  (void)dvm_set_field(vm, self, "listSelector", "Landroid/graphics/drawable/Drawable;", d);
+  (void)(dvm_set_field)(vm, self, "listSelector", "Landroid/graphics/drawable/Drawable;", d);
   (void)ign;
   (void)out;
   RETV();
@@ -600,25 +600,25 @@ static bool x_timing(struct dvm *vm, dvm_ref self, const union dvm_value *args, 
   (void)out;
   const char *n = builtin_name();
   if (!strcmp(n, "<init>")) {
-    (void)dvm_set_field(vm, self, "tag", "Ljava/lang/String;", ARG(0));
-    (void)dvm_set_field(vm, self, "label", "Ljava/lang/String;", ARG(1));
+    (void)(dvm_set_field)(vm, self, "tag", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "label", "Ljava/lang/String;", ARG(1));
     RETV();
   }
   if (!strcmp(n, "reset")) {
     union dvm_value l = { .l = 0 };
     if (nargs >= 2) {
-      (void)dvm_set_field(vm, self, "tag", "Ljava/lang/String;", ARG(0));
-      (void)dvm_set_field(vm, self, "label", "Ljava/lang/String;", ARG(1));
+      (void)(dvm_set_field)(vm, self, "tag", "Ljava/lang/String;", ARG(0));
+      (void)(dvm_set_field)(vm, self, "label", "Ljava/lang/String;", ARG(1));
     }
-    (void)dvm_set_field(vm, self, "splits", "Ljava/util/List;", l);
+    (void)(dvm_set_field)(vm, self, "splits", "Ljava/util/List;", l);
     RETV();
   }
   if (!strcmp(n, "addSplit")) {
     union dvm_value l = { 0 }, ign = { 0 };
-    (void)dvm_get_field(vm, self, "splits", "Ljava/util/List;", &l);
+    (void)(dvm_get_field)(vm, self, "splits", "Ljava/util/List;", &l);
     if (!l.l) {
       l.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-      (void)dvm_set_field(vm, self, "splits", "Ljava/util/List;", l);
+      (void)(dvm_set_field)(vm, self, "splits", "Ljava/util/List;", l);
     }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -656,8 +656,8 @@ static bool x_rational(struct dvm *vm, dvm_ref self, const union dvm_value *args
   (void)nargs;
   const char *n = builtin_name();
   union dvm_value a = { 0 }, b = { 0 };
-  (void)dvm_get_field(vm, self, "num", "I", &a);
-  (void)dvm_get_field(vm, self, "den", "I", &b);
+  (void)(dvm_get_field)(vm, self, "num", "I", &a);
+  (void)(dvm_get_field)(vm, self, "den", "I", &b);
   if (!strcmp(n, "<init>")) {
     int num = ARG(0).i, den = ARG(1).i;
     if (den == 0 && num == 0) { /* NaN */ }
@@ -673,10 +673,10 @@ static bool x_rational(struct dvm *vm, dvm_ref self, const union dvm_value *args
         den /= g;
       }
     }
-    (void)dvm_set_field(vm, self, "num", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "num", "I", (union dvm_value) {
       .i = num
     });
-    (void)dvm_set_field(vm, self, "den", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "den", "I", (union dvm_value) {
       .i = den
     });
     RETV();
@@ -699,8 +699,8 @@ static bool x_rational(struct dvm *vm, dvm_ref self, const union dvm_value *args
     struct dvm_object *o = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL, *me = dvm__obj(vm, self);
     union dvm_value x = { 0 }, y = { 0 };
     if (!o || !me || o->cls != me->cls) RETI(0);
-    (void)dvm_get_field(vm, ARG(0).l, "num", "I", &x);
-    (void)dvm_get_field(vm, ARG(0).l, "den", "I", &y);
+    (void)(dvm_get_field)(vm, ARG(0).l, "num", "I", &x);
+    (void)(dvm_get_field)(vm, ARG(0).l, "den", "I", &y);
     RETI(x.i == a.i && y.i == b.i);
   } else if (!strcmp(n, "hashCode")) RETI(a.i ^ ((b.i << 16) | ((unsigned)b.i >> 16)));
   return true;
@@ -718,11 +718,11 @@ static bool x_parcel_uuid(struct dvm *vm, dvm_ref self, const union dvm_value *a
   (void)nargs;
   const char *n = builtin_name();
   if (!strcmp(n, "<init>")) {
-    (void)dvm_set_field(vm, self, "uuid", "Ljava/util/UUID;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "uuid", "Ljava/util/UUID;", ARG(0));
     RETV();
   }
   union dvm_value u = { 0 };
-  (void)dvm_get_field(vm, self, "uuid", "Ljava/util/UUID;", &u);
+  (void)(dvm_get_field)(vm, self, "uuid", "Ljava/util/UUID;", &u);
   if (!strcmp(n, "getUuid")) RETL(u.l);
   if (!strcmp(n, "toString")) return am_vcall(vm, u.l, "toString", "()Ljava/lang/String;", NULL, 0, out);
   if (!strcmp(n, "hashCode")) return am_vcall(vm, u.l, "hashCode", "()I", NULL, 0, out);
@@ -730,7 +730,7 @@ static bool x_parcel_uuid(struct dvm *vm, dvm_ref self, const union dvm_value *a
     struct dvm_object *o = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL, *me = dvm__obj(vm, self);
     if (!o || !me || o->cls != me->cls) RETI(0);
     union dvm_value v = { 0 }, a = { 0 };
-    (void)dvm_get_field(vm, ARG(0).l, "uuid", "Ljava/util/UUID;", &v);
+    (void)(dvm_get_field)(vm, ARG(0).l, "uuid", "Ljava/util/UUID;", &v);
     a.l = v.l;
     return am_vcall(vm, u.l, "equals", "(Ljava/lang/Object;)Z", &a, 1, out);
   }
@@ -742,7 +742,7 @@ static bool x_parcel_uuid(struct dvm *vm, dvm_ref self, const union dvm_value *a
   if (!fs || !dvm_call(vm, fs, 0, &arg0, 1, &parsed)) return false;
   dvm_ref p = dvm_new_object(vm, dvm__class_by_desc(vm, "Landroid/os/ParcelUuid;"));
   if (!p) return false;
-  (void)dvm_set_field(vm, p, "uuid", "Ljava/util/UUID;", parsed);
+  (void)(dvm_set_field)(vm, p, "uuid", "Ljava/util/UUID;", parsed);
   RETL(p);
 }
 static const struct rt_method rt_parcel_uuid[] = {
@@ -832,7 +832,7 @@ static bool x_notif_channels(struct dvm *vm, dvm_ref self, const union dvm_value
     RETV();
   }
   /* deleteNotificationChannel(id): drop the channel with that id. */
-  (void)dvm_get_field(vm, self, "channels", "Ljava/util/List;", &list);
+  (void)(dvm_get_field)(vm, self, "channels", "Ljava/util/List;", &list);
   if (!list.l || !ARG(0).l) RETV();
   union dvm_value it = { 0 };
   if (!am_vcall(vm, list.l, "iterator", "()Ljava/util/Iterator;", NULL, 0, &it)) return false;
@@ -889,13 +889,13 @@ static dvm_ref optp_make(struct dvm *vm, const char *desc, bool present, int64_t
   struct dvm_class *c = dvm__class_by_desc(vm, desc);
   dvm_ref o = c ? dvm_new_object(vm, c) : 0;
   if (!o) return 0;
-  (void)dvm_set_field(vm, o, "present", "Z", (union dvm_value) {
+  (void)(dvm_set_field)(vm, o, "present", "Z", (union dvm_value) {
     .i = present
   });
-  (void)dvm_set_field(vm, o, "ivalue", "J", (union dvm_value) {
+  (void)(dvm_set_field)(vm, o, "ivalue", "J", (union dvm_value) {
     .j = i
   });
-  (void)dvm_set_field(vm, o, "dvalue", "D", (union dvm_value) {
+  (void)(dvm_set_field)(vm, o, "dvalue", "D", (union dvm_value) {
     .d = d
   });
   return o;
@@ -929,9 +929,9 @@ static bool x_optp(struct dvm *vm, dvm_ref self, const union dvm_value *args, in
          : optp_make(vm, optp_desc(kind), true, kind == 'I' ? (int64_t)ARG(0).i : ARG(0).j, 0));
   }
   union dvm_value present = { 0 }, iv = { 0 }, dv = { 0 };
-  (void)dvm_get_field(vm, self, "present", "Z", &present);
-  (void)dvm_get_field(vm, self, "ivalue", "J", &iv);
-  (void)dvm_get_field(vm, self, "dvalue", "D", &dv);
+  (void)(dvm_get_field)(vm, self, "present", "Z", &present);
+  (void)(dvm_get_field)(vm, self, "ivalue", "J", &iv);
+  (void)(dvm_get_field)(vm, self, "dvalue", "D", &dv);
   union dvm_value value = kind == 'D' ? (union dvm_value) {
     .d = dv.d
   } : kind == 'I' ? (union dvm_value) {
@@ -985,9 +985,9 @@ static bool x_optp(struct dvm *vm, dvm_ref self, const union dvm_value *args, in
     struct dvm_object *o = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL, *me = dvm__obj(vm, self);
     if (!o || !me || o->cls != me->cls) RETI(0);
     union dvm_value p2 = { 0 }, i2 = { 0 }, d2 = { 0 };
-    (void)dvm_get_field(vm, ARG(0).l, "present", "Z", &p2);
-    (void)dvm_get_field(vm, ARG(0).l, "ivalue", "J", &i2);
-    (void)dvm_get_field(vm, ARG(0).l, "dvalue", "D", &d2);
+    (void)(dvm_get_field)(vm, ARG(0).l, "present", "Z", &p2);
+    (void)(dvm_get_field)(vm, ARG(0).l, "ivalue", "J", &i2);
+    (void)(dvm_get_field)(vm, ARG(0).l, "dvalue", "D", &d2);
     if (!present.i || !p2.i) RETI(present.i == p2.i);
     RETI(kind == 'D' ? (dv.d == d2.d || (dv.d != dv.d && d2.d != d2.d)) : iv.j == i2.j);
   }
@@ -1037,12 +1037,12 @@ static bool x_optional_more(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)nargs;
   const char *n = builtin_name();
   union dvm_value v = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "value", "Ljava/lang/Object;", &v);
+  (void)(dvm_get_field)(vm, self, "value", "Ljava/lang/Object;", &v);
   if (!strcmp(n, "equals")) {
     struct dvm_object *o = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL, *me = dvm__obj(vm, self);
     if (!o || !me || o->cls != me->cls) RETI(0);
     union dvm_value w = { 0 };
-    (void)dvm_get_field(vm, ARG(0).l, "value", "Ljava/lang/Object;", &w);
+    (void)(dvm_get_field)(vm, ARG(0).l, "value", "Ljava/lang/Object;", &w);
     if (!v.l || !w.l) RETI(v.l == w.l);
     union dvm_value a = { .l = w.l };
     return am_vcall(vm, v.l, "equals", "(Ljava/lang/Object;)Z", &a, 1, out);
@@ -1079,13 +1079,13 @@ static bool x_overlay_of(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)args;
   (void)nargs;
   union dvm_value o = { 0 };
-  (void)dvm_get_field(vm, self, "overlay", "Landroid/view/ViewOverlay;", &o);
+  (void)(dvm_get_field)(vm, self, "overlay", "Landroid/view/ViewOverlay;", &o);
   if (!o.l) {
     const bool group = ui_is_a(vm, self, "android/view/ViewGroup");
     struct dvm_class *c = dvm__class_by_desc(vm, group ? "Landroid/view/ViewGroupOverlay;" : "Landroid/view/ViewOverlay;");
     o.l = c ? dvm_new_object(vm, c) : 0;
     if (!o.l) return false;
-    (void)dvm_set_field(vm, self, "overlay", "Landroid/view/ViewOverlay;", o);
+    (void)(dvm_set_field)(vm, self, "overlay", "Landroid/view/ViewOverlay;", o);
   }
   RETL(o.l);
 }
@@ -1095,10 +1095,10 @@ static bool x_overlay_items(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)nargs;
   const char *n = builtin_name();
   union dvm_value items = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "items", "Ljava/util/List;", &items);
+  (void)(dvm_get_field)(vm, self, "items", "Ljava/util/List;", &items);
   if (!items.l) {
     items.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "items", "Ljava/util/List;", items);
+    (void)(dvm_set_field)(vm, self, "items", "Ljava/util/List;", items);
   }
   if (!strcmp(n, "clear")) return am_vcall(vm, items.l, "clear", "()V", NULL, 0, &ign);
   if (!ARG(0).l) {
@@ -1137,14 +1137,14 @@ static bool animator_set_target(struct dvm *vm, dvm_ref a, dvm_ref target, unsig
 {
   if (depth > 8) return true;
   if (is_object_animator(vm, a)) {
-    (void)dvm_set_field(vm, a, "target", "Ljava/lang/Object;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, a, "target", "Ljava/lang/Object;", (union dvm_value) {
       .l = target
     });
     return true;
   }
   if (is_animator_set(vm, a)) {
     union dvm_value children = { 0 };
-    (void)dvm_get_field(vm, a, "children", "Ljava/util/List;", &children);
+    (void)(dvm_get_field)(vm, a, "children", "Ljava/util/List;", &children);
     struct rt_list *cl = children.l ? list_of(vm, children.l) : NULL;
     for (uint32_t i = 0; cl && i < cl->size; ++i)
       if (!animator_set_target(vm, cl->items[i], target, depth + 1)) return false;
@@ -1155,7 +1155,7 @@ static bool x_animator_target(struct dvm *vm, dvm_ref self, const union dvm_valu
                               union dvm_value *out)
 {
   (void)nargs;
-  if (!strcmp(builtin_name(), "getTarget")) return dvm_get_field(vm, self, "target", "Ljava/lang/Object;", out);
+  if (!strcmp(builtin_name(), "getTarget")) return (dvm_get_field)(vm, self, "target", "Ljava/lang/Object;", out);
   if (!animator_set_target(vm, self, ARG(0).l, 0)) return false;
   RETV();
 }
@@ -1189,11 +1189,11 @@ static bool x_color_listener(struct dvm *vm, dvm_ref self, const union dvm_value
   (void)nargs;
   dvm_ref animator = ARG(0).l;
   union dvm_value target = { 0 }, frac = { 0 }, prop = { 0 }, from = { 0 }, to = { 0 };
-  (void)dvm_get_field(vm, animator, "target", "Ljava/lang/Object;", &target);
-  (void)dvm_get_field(vm, animator, "fraction", "F", &frac);
-  (void)dvm_get_field(vm, self, "property", "Ljava/lang/String;", &prop);
-  (void)dvm_get_field(vm, self, "from", "I", &from);
-  (void)dvm_get_field(vm, self, "to", "I", &to);
+  (void)(dvm_get_field)(vm, animator, "target", "Ljava/lang/Object;", &target);
+  (void)(dvm_get_field)(vm, animator, "fraction", "F", &frac);
+  (void)(dvm_get_field)(vm, self, "property", "Ljava/lang/String;", &prop);
+  (void)(dvm_get_field)(vm, self, "from", "I", &from);
+  (void)(dvm_get_field)(vm, self, "to", "I", &to);
   const char *name = prop.l ? dvm_string_utf8(vm, prop.l) : NULL;
   if (!target.l || !name || !*name) RETV();   /* no target yet: nothing to drive */
   char setter[96];
@@ -1278,7 +1278,7 @@ static bool inflater_value_animator(struct dvm *vm, struct dx *x, const struct d
     }
     dvm_pin(vm, animator.l);
     /* no float Property: the colour listener drives the setter instead */
-    (void)dvm_set_field(vm, animator.l, "property", "Landroid/util/Property;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, animator.l, "property", "Landroid/util/Property;", (union dvm_value) {
       .l = 0
     });
     dvm_ref listener = dvm_new_object(vm, dvm__class_by_desc(vm, "Llunaria/ColorAnimatorListener;"));
@@ -1289,11 +1289,11 @@ static bool inflater_value_animator(struct dvm *vm, struct dx *x, const struct d
       return false;
     }
     dvm_pin(vm, listener);
-    (void)dvm_set_field(vm, listener, "property", "Ljava/lang/String;", a[1]);
-    (void)dvm_set_field(vm, listener, "from", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, listener, "property", "Ljava/lang/String;", a[1]);
+    (void)(dvm_set_field)(vm, listener, "from", "I", (union dvm_value) {
       .i = color_from
     });
-    (void)dvm_set_field(vm, listener, "to", "I", (union dvm_value) {
+    (void)(dvm_set_field)(vm, listener, "to", "I", (union dvm_value) {
       .i = color_to
     });
     union dvm_value l = { .l = listener };
@@ -1660,20 +1660,20 @@ static bool x_icw(struct dvm *vm, dvm_ref self, const union dvm_value *args, int
 {
   const char *name = builtin_name(), *sig = builtin_sig();
   if (!strcmp(name, "<init>")) {
-    (void)dvm_set_field(vm, self, "target", "Landroid/view/inputmethod/InputConnection;", ARG(0));
-    (void)dvm_set_field(vm, self, "mutable", "Z", ARG(1));
+    (void)(dvm_set_field)(vm, self, "target", "Landroid/view/inputmethod/InputConnection;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "mutable", "Z", ARG(1));
     RETV();
   }
   union dvm_value target = { 0 };
-  (void)dvm_get_field(vm, self, "target", "Landroid/view/inputmethod/InputConnection;", &target);
+  (void)(dvm_get_field)(vm, self, "target", "Landroid/view/inputmethod/InputConnection;", &target);
   if (!strcmp(name, "setTarget")) {
     union dvm_value m = { 0 };
-    (void)dvm_get_field(vm, self, "mutable", "Z", &m);
+    (void)(dvm_get_field)(vm, self, "mutable", "Z", &m);
     if (target.l && !m.i) {
       dvm__throw(vm, "java/lang/SecurityException", "not mutable");
       return false;
     }
-    (void)dvm_set_field(vm, self, "target", "Landroid/view/inputmethod/InputConnection;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "target", "Landroid/view/inputmethod/InputConnection;", ARG(0));
     RETV();
   }
   memset(out, 0, sizeof *out);
@@ -1755,16 +1755,16 @@ static bool x_completion(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)nargs;
   const char *n = builtin_name();
   if (!strcmp(n, "<init>")) {
-    (void)dvm_set_field(vm, self, "id", "J", ARG(0));
-    (void)dvm_set_field(vm, self, "position", "I", ARG(1));
-    (void)dvm_set_field(vm, self, "text", "Ljava/lang/CharSequence;", ARG(2));
-    if (nargs > 3) (void)dvm_set_field(vm, self, "label", "Ljava/lang/CharSequence;", ARG(3));
+    (void)(dvm_set_field)(vm, self, "id", "J", ARG(0));
+    (void)(dvm_set_field)(vm, self, "position", "I", ARG(1));
+    (void)(dvm_set_field)(vm, self, "text", "Ljava/lang/CharSequence;", ARG(2));
+    if (nargs > 3) (void)(dvm_set_field)(vm, self, "label", "Ljava/lang/CharSequence;", ARG(3));
     RETV();
   }
-  if (!strcmp(n, "getId")) return dvm_get_field(vm, self, "id", "J", out);
-  if (!strcmp(n, "getPosition")) return dvm_get_field(vm, self, "position", "I", out);
-  if (!strcmp(n, "getText")) return dvm_get_field(vm, self, "text", "Ljava/lang/CharSequence;", out);
-  return dvm_get_field(vm, self, "label", "Ljava/lang/CharSequence;", out);   /* getLabel */
+  if (!strcmp(n, "getId")) return (dvm_get_field)(vm, self, "id", "J", out);
+  if (!strcmp(n, "getPosition")) return (dvm_get_field)(vm, self, "position", "I", out);
+  if (!strcmp(n, "getText")) return (dvm_get_field)(vm, self, "text", "Ljava/lang/CharSequence;", out);
+  return (dvm_get_field)(vm, self, "label", "Ljava/lang/CharSequence;", out);   /* getLabel */
 }
 static const struct rt_method rt_completion_info[] = {
   M("<init>", "(JILjava/lang/CharSequence;)V", x_completion),
@@ -1892,8 +1892,8 @@ static bool x_if_ssp(struct dvm *vm, dvm_ref self, const union dvm_value *args, 
   (void)nargs;
   const char *n = builtin_name();
   union dvm_value parts = { 0 }, kinds = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "dataSchemeSpecificParts", "Ljava/util/List;", &parts);
-  (void)dvm_get_field(vm, self, "dataSchemeSpecificPartTypes", "Ljava/util/List;", &kinds);
+  (void)(dvm_get_field)(vm, self, "dataSchemeSpecificParts", "Ljava/util/List;", &parts);
+  (void)(dvm_get_field)(vm, self, "dataSchemeSpecificPartTypes", "Ljava/util/List;", &kinds);
   if (!strcmp(n, "addDataSchemeSpecificPart")) {
     if (!ARG(0).l) {
       dvm__throw(vm, "java/lang/NullPointerException", "ssp");
@@ -1902,8 +1902,8 @@ static bool x_if_ssp(struct dvm *vm, dvm_ref self, const union dvm_value *args, 
     if (!parts.l) {
       parts.l = coll_new_list(vm, "Ljava/util/ArrayList;");
       kinds.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-      (void)dvm_set_field(vm, self, "dataSchemeSpecificParts", "Ljava/util/List;", parts);
-      (void)dvm_set_field(vm, self, "dataSchemeSpecificPartTypes", "Ljava/util/List;", kinds);
+      (void)(dvm_set_field)(vm, self, "dataSchemeSpecificParts", "Ljava/util/List;", parts);
+      (void)(dvm_set_field)(vm, self, "dataSchemeSpecificPartTypes", "Ljava/util/List;", kinds);
     }
     union dvm_value p = { .l = ARG(0).l }, k = { .l = box_make(vm, "Ljava/lang/Integer;", (union dvm_value) {
       .i = ARG(1).i
@@ -1954,13 +1954,13 @@ static bool x_splitter(struct dvm *vm, dvm_ref self, const union dvm_value *args
       d[1] = (char)(0x80 | ((c >> 6) & 0x3f));
       d[2] = (char)(0x80 | (c & 0x3f));
     }
-    (void)dvm_set_field(vm, self, "delim", "Ljava/lang/String;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "delim", "Ljava/lang/String;", (union dvm_value) {
       .l = dvm_new_string(vm, d)
     });
     RETV();
   }
   if (!strcmp(n, "setString")) {
-    (void)dvm_set_field(vm, self, "string", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "string", "Ljava/lang/String;", ARG(0));
     rt_set_int(vm, self, "pos", 0);
     RETV();
   }
@@ -1970,8 +1970,8 @@ static bool x_splitter(struct dvm *vm, dvm_ref self, const union dvm_value *args
     return false;
   }
   union dvm_value str = { 0 }, delim = { 0 };
-  (void)dvm_get_field(vm, self, "string", "Ljava/lang/String;", &str);
-  (void)dvm_get_field(vm, self, "delim", "Ljava/lang/String;", &delim);
+  (void)(dvm_get_field)(vm, self, "string", "Ljava/lang/String;", &str);
+  (void)(dvm_get_field)(vm, self, "delim", "Ljava/lang/String;", &delim);
   const char *s = str.l ? dvm_string_utf8(vm, str.l) : "";
   const char *d = delim.l ? dvm_string_utf8(vm, delim.l) : ",";
   const size_t len = strlen(s), pos = (size_t)rt_get_int(vm, self, "pos");
@@ -2018,8 +2018,8 @@ static bool x_view_local_visible(struct dvm *vm, dvm_ref self, const union dvm_v
             am_vcall(vm, self, "getGlobalVisibleRect", "(Landroid/graphics/Rect;Landroid/graphics/Point;)Z", a, 2, &visible);
   union dvm_value px = { 0 }, py = { 0 };
   if (ok) {
-    (void)dvm_get_field(vm, pt, "x", "I", &px);
-    (void)dvm_get_field(vm, pt, "y", "I", &py);
+    (void)(dvm_get_field)(vm, pt, "x", "I", &px);
+    (void)(dvm_get_field)(vm, pt, "y", "I", &py);
     union dvm_value o[2] = { { .i = -px.i }, { .i = -py.i } };
     ok = am_vcall(vm, ARG(0).l, "offset", "(II)V", o, 2, &ign);
   }
@@ -2034,8 +2034,8 @@ static bool x_view_receive_content(struct dvm *vm, dvm_ref self, const union dvm
   (void)out;
   const char *n = builtin_name();
   if (!strcmp(n, "clearViewTranslationCallback")) RETV();   /* none was ever set */
-  (void)dvm_set_field(vm, self, "receiveContentMimeTypes", "[Ljava/lang/String;", ARG(0));
-  (void)dvm_set_field(vm, self, "receiveContentListener", "Ljava/lang/Object;", ARG(1));
+  (void)(dvm_set_field)(vm, self, "receiveContentMimeTypes", "[Ljava/lang/String;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "receiveContentListener", "Ljava/lang/Object;", ARG(1));
   RETV();
 }
 static const struct rt_method rt_gap_view2[] = {
@@ -2051,16 +2051,16 @@ static bool x_text_spacing(struct dvm *vm, dvm_ref self, const union dvm_value *
   (void)nargs;
   const char *n = builtin_name();
   if (!strcmp(n, "setLineSpacing")) {
-    (void)dvm_set_field(vm, self, "lineSpacingExtra", "F", ARG(0));
-    (void)dvm_set_field(vm, self, "lineSpacingMult", "F", ARG(1));
+    (void)(dvm_set_field)(vm, self, "lineSpacingExtra", "F", ARG(0));
+    (void)(dvm_set_field)(vm, self, "lineSpacingMult", "F", ARG(1));
     rt_set_int(vm, self, "lineSpacingMultSet", 1);
     ui_view_layout_changed(vm, self);
     ui_invalidate_view(vm, self, NULL, 0);
     RETV();
   }
-  if (!strcmp(n, "getLineSpacingExtra")) return dvm_get_field(vm, self, "lineSpacingExtra", "F", out);
+  if (!strcmp(n, "getLineSpacingExtra")) return (dvm_get_field)(vm, self, "lineSpacingExtra", "F", out);
   if (!rt_get_int(vm, self, "lineSpacingMultSet")) RETF(1.0f);
-  return dvm_get_field(vm, self, "lineSpacingMult", "F", out);   /* getLineSpacingMultiplier */
+  return (dvm_get_field)(vm, self, "lineSpacingMult", "F", out);   /* getLineSpacingMultiplier */
 }
 static bool x_text_ime_label(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
                              union dvm_value *out)
@@ -2068,11 +2068,11 @@ static bool x_text_ime_label(struct dvm *vm, dvm_ref self, const union dvm_value
   (void)nargs;
   const char *n = builtin_name();
   if (!strcmp(n, "setImeActionLabel")) {
-    (void)dvm_set_field(vm, self, "imeActionLabel", "Ljava/lang/CharSequence;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "imeActionLabel", "Ljava/lang/CharSequence;", ARG(0));
     rt_set_int(vm, self, "imeActionId", ARG(1).i);
     RETV();
   }
-  if (!strcmp(n, "getImeActionLabel")) return dvm_get_field(vm, self, "imeActionLabel", "Ljava/lang/CharSequence;", out);
+  if (!strcmp(n, "getImeActionLabel")) return (dvm_get_field)(vm, self, "imeActionLabel", "Ljava/lang/CharSequence;", out);
   RETI(rt_get_int(vm, self, "imeActionId"));
 }
 static const struct rt_method rt_gap_text_view2[] = {
@@ -2154,7 +2154,7 @@ static bool x_os_statvfs(struct dvm *vm, dvm_ref self, const union dvm_value *ar
     { "f_fsid", sv.f_fsid }, { "f_flag", sv.f_flag }, { "f_namemax", sv.f_namemax },
   };
   for (size_t i = 0; i < sizeof rows / sizeof rows[0]; ++i)
-    (void)dvm_set_field(vm, o, rows[i].f, "J", (union dvm_value) {
+    (void)(dvm_set_field)(vm, o, rows[i].f, "J", (union dvm_value) {
     .j = (int64_t)rows[i].v
   });
   RETL(o);
@@ -2178,23 +2178,23 @@ static bool x_channel_group(struct dvm *vm, dvm_ref self, const union dvm_value 
       dvm__throw(vm, "java/lang/IllegalArgumentException", "id must not be null");
       return false;
     }
-    (void)dvm_set_field(vm, self, "id", "Ljava/lang/String;", ARG(0));
-    (void)dvm_set_field(vm, self, "name", "Ljava/lang/CharSequence;", ARG(1));
+    (void)(dvm_set_field)(vm, self, "id", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "name", "Ljava/lang/CharSequence;", ARG(1));
     RETV();
   }
-  if (!strcmp(n, "getId")) return dvm_get_field(vm, self, "id", "Ljava/lang/String;", out);
-  if (!strcmp(n, "getName")) return dvm_get_field(vm, self, "name", "Ljava/lang/CharSequence;", out);
-  if (!strcmp(n, "getDescription")) return dvm_get_field(vm, self, "description", "Ljava/lang/String;", out);
+  if (!strcmp(n, "getId")) return (dvm_get_field)(vm, self, "id", "Ljava/lang/String;", out);
+  if (!strcmp(n, "getName")) return (dvm_get_field)(vm, self, "name", "Ljava/lang/CharSequence;", out);
+  if (!strcmp(n, "getDescription")) return (dvm_get_field)(vm, self, "description", "Ljava/lang/String;", out);
   if (!strcmp(n, "setDescription")) {
-    (void)dvm_set_field(vm, self, "description", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "description", "Ljava/lang/String;", ARG(0));
     RETV();
   }
-  if (!strcmp(n, "isBlocked")) return dvm_get_field(vm, self, "blocked", "Z", out);
+  if (!strcmp(n, "isBlocked")) return (dvm_get_field)(vm, self, "blocked", "Z", out);
   union dvm_value l = { 0 };
-  (void)dvm_get_field(vm, self, "channels", "Ljava/util/List;", &l);
+  (void)(dvm_get_field)(vm, self, "channels", "Ljava/util/List;", &l);
   if (!l.l) {
     l.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "channels", "Ljava/util/List;", l);
+    (void)(dvm_set_field)(vm, self, "channels", "Ljava/util/List;", l);
   }
   RETL(l.l);   /* getChannels */
 }
@@ -2210,10 +2210,10 @@ static bool x_notif_groups(struct dvm *vm, dvm_ref self, const union dvm_value *
   (void)nargs;
   const char *n = builtin_name();
   union dvm_value list = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "channelGroups", "Ljava/util/List;", &list);
+  (void)(dvm_get_field)(vm, self, "channelGroups", "Ljava/util/List;", &list);
   if (!list.l) {
     list.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "channelGroups", "Ljava/util/List;", list);
+    (void)(dvm_set_field)(vm, self, "channelGroups", "Ljava/util/List;", list);
   }
   struct rt_list *l = list_of(vm, list.l);
   if (!strcmp(n, "getNotificationChannelGroups")) {
@@ -2230,7 +2230,7 @@ static bool x_notif_groups(struct dvm *vm, dvm_ref self, const union dvm_value *
   if (want) {
     for (uint32_t i = 0; l && i < l->size; ++i) {
       union dvm_value id = { 0 };
-      (void)dvm_get_field(vm, l->items[i], "id", "Ljava/lang/String;", &id);
+      (void)(dvm_get_field)(vm, l->items[i], "id", "Ljava/lang/String;", &id);
       if (id.l && !strcmp(dvm_string_utf8(vm, id.l), want)) {
         dvm_ref g = l->items[i];
         if (!strcmp(n, "deleteNotificationChannelGroup")) {
@@ -2256,11 +2256,11 @@ static bool x_notif_groups(struct dvm *vm, dvm_ref self, const union dvm_value *
   for (uint32_t i = 0; i < count; ++i) {
     if (!items[i].l) continue;
     union dvm_value id = { 0 };
-    (void)dvm_get_field(vm, items[i].l, "id", "Ljava/lang/String;", &id);
+    (void)(dvm_get_field)(vm, items[i].l, "id", "Ljava/lang/String;", &id);
     bool known = false;
     for (uint32_t k = 0; l && k < l->size && !known; ++k) {
       union dvm_value other = { 0 };
-      (void)dvm_get_field(vm, l->items[k], "id", "Ljava/lang/String;", &other);
+      (void)(dvm_get_field)(vm, l->items[k], "id", "Ljava/lang/String;", &other);
       known = id.l && other.l && !strcmp(dvm_string_utf8(vm, id.l), dvm_string_utf8(vm, other.l));
     }
     if (!known && !list_add(vm, list.l, &items[i], 1, &ign)) return false;
@@ -2285,14 +2285,14 @@ static bool x_correction(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)nargs;
   const char *n = builtin_name();
   if (!strcmp(n, "<init>")) {
-    (void)dvm_set_field(vm, self, "offset", "I", ARG(0));
-    (void)dvm_set_field(vm, self, "oldText", "Ljava/lang/CharSequence;", ARG(1));
-    (void)dvm_set_field(vm, self, "newText", "Ljava/lang/CharSequence;", ARG(2));
+    (void)(dvm_set_field)(vm, self, "offset", "I", ARG(0));
+    (void)(dvm_set_field)(vm, self, "oldText", "Ljava/lang/CharSequence;", ARG(1));
+    (void)(dvm_set_field)(vm, self, "newText", "Ljava/lang/CharSequence;", ARG(2));
     RETV();
   }
-  if (!strcmp(n, "getOffset")) return dvm_get_field(vm, self, "offset", "I", out);
-  if (!strcmp(n, "getOldText")) return dvm_get_field(vm, self, "oldText", "Ljava/lang/CharSequence;", out);
-  return dvm_get_field(vm, self, "newText", "Ljava/lang/CharSequence;", out);
+  if (!strcmp(n, "getOffset")) return (dvm_get_field)(vm, self, "offset", "I", out);
+  if (!strcmp(n, "getOldText")) return (dvm_get_field)(vm, self, "oldText", "Ljava/lang/CharSequence;", out);
+  return (dvm_get_field)(vm, self, "newText", "Ljava/lang/CharSequence;", out);
 }
 static const struct rt_method rt_correction_info[] = {
   M("<init>", "(ILjava/lang/CharSequence;Ljava/lang/CharSequence;)V", x_correction),
@@ -2321,23 +2321,23 @@ static bool x_scan_builder(struct dvm *vm, dvm_ref self, const union dvm_value *
     if (!f) return false;
     for (int i = 0; i < 6; ++i) {
       union dvm_value v = { 0 };
-      (void)dvm_get_field(vm, self, scan_filter_fields[i], scan_filter_types[i], &v);
-      (void)dvm_set_field(vm, f, scan_filter_fields[i], scan_filter_types[i], v);
+      (void)(dvm_get_field)(vm, self, scan_filter_fields[i], scan_filter_types[i], &v);
+      (void)(dvm_set_field)(vm, f, scan_filter_fields[i], scan_filter_types[i], v);
     }
     RETL(f);
   }
   if (!strcmp(n, "setServiceUuid")) {
-    (void)dvm_set_field(vm, self, "serviceUuid", "Landroid/os/ParcelUuid;", ARG(0));
-    if (nargs > 1) (void)dvm_set_field(vm, self, "serviceUuidMask", "Landroid/os/ParcelUuid;", ARG(1));
-  } else if (!strcmp(n, "setDeviceName")) (void)dvm_set_field(vm, self, "deviceName", "Ljava/lang/String;", ARG(0));
-  else if (!strcmp(n, "setDeviceAddress")) (void)dvm_set_field(vm, self, "deviceAddress", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "serviceUuid", "Landroid/os/ParcelUuid;", ARG(0));
+    if (nargs > 1) (void)(dvm_set_field)(vm, self, "serviceUuidMask", "Landroid/os/ParcelUuid;", ARG(1));
+  } else if (!strcmp(n, "setDeviceName")) (void)(dvm_set_field)(vm, self, "deviceName", "Ljava/lang/String;", ARG(0));
+  else if (!strcmp(n, "setDeviceAddress")) (void)(dvm_set_field)(vm, self, "deviceAddress", "Ljava/lang/String;", ARG(0));
   else if (!strcmp(n, "setManufacturerData")) {
     if (ARG(0).i < 0) {
       dvm__throw(vm, "java/lang/IllegalArgumentException", "invalid manufacture id");
       return false;
     }
     rt_set_int(vm, self, "manufacturerId", ARG(0).i);
-    (void)dvm_set_field(vm, self, "manufacturerData", "[B", ARG(1));
+    (void)(dvm_set_field)(vm, self, "manufacturerData", "[B", ARG(1));
   }
   RETL(self);
 }
@@ -2350,7 +2350,7 @@ static bool x_scan_filter(struct dvm *vm, dvm_ref self, const union dvm_value *a
   for (int i = 0; i < 6; ++i) {
     char getter[40];
     snprintf(getter, sizeof getter, "get%c%s", toupper((unsigned char)scan_filter_fields[i][0]), scan_filter_fields[i] + 1);
-    if (!strcmp(n, getter)) return dvm_get_field(vm, self, scan_filter_fields[i], scan_filter_types[i], out);
+    if (!strcmp(n, getter)) return (dvm_get_field)(vm, self, scan_filter_fields[i], scan_filter_types[i], out);
   }
   RETL(0);
 }
@@ -2378,20 +2378,20 @@ static bool x_layout_anim(struct dvm *vm, dvm_ref self, const union dvm_value *a
 {
   const char *n = builtin_name();
   if (!strcmp(n, "<init>")) {
-    (void)dvm_set_field(vm, self, "animation", "Landroid/view/animation/Animation;", ARG(0));
-    (void)dvm_set_field(vm, self, "delay", "F", nargs > 1 ? ARG(1) : (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "animation", "Landroid/view/animation/Animation;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "delay", "F", nargs > 1 ? ARG(1) : (union dvm_value) {
       .f = 0.5f
     });
     RETV();
   }
-  if (!strcmp(n, "getAnimation")) return dvm_get_field(vm, self, "animation", "Landroid/view/animation/Animation;", out);
+  if (!strcmp(n, "getAnimation")) return (dvm_get_field)(vm, self, "animation", "Landroid/view/animation/Animation;", out);
   if (!strcmp(n, "setAnimation")) {
-    (void)dvm_set_field(vm, self, "animation", "Landroid/view/animation/Animation;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "animation", "Landroid/view/animation/Animation;", ARG(0));
     RETV();
   }
-  if (!strcmp(n, "getDelay")) return dvm_get_field(vm, self, "delay", "F", out);
+  if (!strcmp(n, "getDelay")) return (dvm_get_field)(vm, self, "delay", "F", out);
   if (!strcmp(n, "setDelay")) {
-    (void)dvm_set_field(vm, self, "delay", "F", ARG(0));
+    (void)(dvm_set_field)(vm, self, "delay", "F", ARG(0));
     RETV();
   }
   if (!strcmp(n, "getOrder")) RETI(rt_get_int(vm, self, "order"));
@@ -2410,8 +2410,8 @@ static bool x_group_layout_anim(struct dvm *vm, dvm_ref self, const union dvm_va
                                 union dvm_value *out)
 {
   (void)nargs;
-  if (!strcmp(builtin_name(), "getLayoutAnimation")) return dvm_get_field(vm, self, "layoutAnimation", "Landroid/view/animation/LayoutAnimationController;", out);
-  (void)dvm_set_field(vm, self, "layoutAnimation", "Landroid/view/animation/LayoutAnimationController;", ARG(0));
+  if (!strcmp(builtin_name(), "getLayoutAnimation")) return (dvm_get_field)(vm, self, "layoutAnimation", "Landroid/view/animation/LayoutAnimationController;", out);
+  (void)(dvm_set_field)(vm, self, "layoutAnimation", "Landroid/view/animation/LayoutAnimationController;", ARG(0));
   RETV();
 }
 static const struct rt_method rt_gap_group_layout_anim[] = {
@@ -2457,8 +2457,8 @@ static bool x_load_layout_animation(struct dvm *vm, dvm_ref self, const union dv
     }
     if (ok) {
       dvm_pin(vm, controller);
-      (void)dvm_set_field(vm, controller, "animation", "Landroid/view/animation/Animation;", anim);
-      (void)dvm_set_field(vm, controller, "delay", "F", (union dvm_value) {
+      (void)(dvm_set_field)(vm, controller, "animation", "Landroid/view/animation/Animation;", anim);
+      (void)(dvm_set_field)(vm, controller, "delay", "F", (union dvm_value) {
         .f = dx_float(&x, &t, "delay", 0.5f)
       });
       rt_set_int(vm, controller, "order", dx_int(&x, &t, "animationOrder", 0));
@@ -2485,10 +2485,10 @@ static const char *const rt_iface_delay_queue[] = {
 static struct rt_list *dq_items(struct dvm *vm, dvm_ref self)
 {
   union dvm_value l = { 0 };
-  (void)dvm_get_field(vm, self, "items", "Ljava/util/List;", &l);
+  (void)(dvm_get_field)(vm, self, "items", "Ljava/util/List;", &l);
   if (!l.l) {
     l.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "items", "Ljava/util/List;", l);
+    (void)(dvm_set_field)(vm, self, "items", "Ljava/util/List;", l);
   }
   return l.l ? list_of(vm, l.l) : NULL;
 }
@@ -2532,7 +2532,7 @@ static bool x_delay_queue(struct dvm *vm, dvm_ref self, const union dvm_value *a
     struct dvm_class *c = dvm__class_by_desc(vm, "Ljava/util/ArrayList;");
     (void)c;
     union dvm_value list = { 0 };
-    (void)dvm_get_field(vm, self, "items", "Ljava/util/List;", &list);
+    (void)(dvm_get_field)(vm, self, "items", "Ljava/util/List;", &list);
     if (!am_vcall(vm, list.l, "add", "(ILjava/lang/Object;)V", ia, 2, &ign)) return false;
     if (!strcmp(n, "put")) RETV();
     RETI(1);
@@ -2540,7 +2540,7 @@ static bool x_delay_queue(struct dvm *vm, dvm_ref self, const union dvm_value *a
   if (!strcmp(n, "size")) RETI(l->size);
   if (!strcmp(n, "isEmpty")) RETI(l->size == 0);
   union dvm_value list = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "items", "Ljava/util/List;", &list);
+  (void)(dvm_get_field)(vm, self, "items", "Ljava/util/List;", &list);
   if (!strcmp(n, "clear")) return am_vcall(vm, list.l, "clear", "()V", NULL, 0, &ign);
   if (!strcmp(n, "iterator")) return am_vcall(vm, list.l, "iterator", "()Ljava/util/Iterator;", NULL, 0, out);
   if (!strcmp(n, "remove")) {
@@ -2609,7 +2609,7 @@ static bool x_ldt_parse(struct dvm *vm, dvm_ref self, const union dvm_value *arg
     return false;
   }
   union dvm_value pat = { 0 };
-  if (nargs > 1 && ARG(1).l) (void)dvm_get_field(vm, ARG(1).l, "pattern", "Ljava/lang/String;", &pat);
+  if (nargs > 1 && ARG(1).l) (void)(dvm_get_field)(vm, ARG(1).l, "pattern", "Ljava/lang/String;", &pat);
   int64_t seconds = 0;
   int32_t nano = 0;
   if (!pat.l) {   /* ISO_LOCAL_DATE_TIME: 2011-12-03T10:15:30[.nnnnnnnnn] */
@@ -2687,7 +2687,7 @@ static bool x_files_create_directory(struct dvm *vm, dvm_ref self, const union d
     dvm__throw(vm, "java/lang/NullPointerException", "dir");
     return false;
   }
-  (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &pathv);
+  (void)(dvm_get_field)(vm, ARG(0).l, "path", "Ljava/lang/String;", &pathv);
   const char *p = pathv.l ? dvm_string_utf8(vm, pathv.l) : NULL;
   const char *hp = pathv.l ? file_host_path(vm, pathv.l) : NULL;
   if (!p || !*p) {
@@ -2713,7 +2713,7 @@ static bool x_new_directory_stream(struct dvm *vm, dvm_ref self, const union dvm
     dvm__throw(vm, "java/lang/NullPointerException", "dir");
     return false;
   }
-  (void)dvm_get_field(vm, ARG(0).l, "path", "Ljava/lang/String;", &pathv);
+  (void)(dvm_get_field)(vm, ARG(0).l, "path", "Ljava/lang/String;", &pathv);
   dvm_ref file = dvm_new_object(vm, dvm_find_class(vm, "java/io/File"));
   if (!file || !pathv.l) return false;
   dvm_pin(vm, file);
@@ -2759,7 +2759,7 @@ static bool x_new_directory_stream(struct dvm *vm, dvm_ref self, const union dvm
     }
     ok = list_add(vm, entries, &item, 1, &ign);
   }
-  if (ok) (void)dvm_set_field(vm, stream, "entries", "Ljava/util/List;", (union dvm_value) {
+  if (ok) (void)(dvm_set_field)(vm, stream, "entries", "Ljava/util/List;", (union dvm_value) {
     .l = entries
   });
   dvm_unpin(vm, entries);
@@ -2774,12 +2774,12 @@ static bool x_dir_stream(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)nargs;
   union dvm_value l = { 0 };
   if (!strcmp(builtin_name(), "close")) {
-    (void)dvm_set_field(vm, self, "entries", "Ljava/util/List;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, self, "entries", "Ljava/util/List;", (union dvm_value) {
       .l = 0
     });
     RETV();
   }
-  (void)dvm_get_field(vm, self, "entries", "Ljava/util/List;", &l);
+  (void)(dvm_get_field)(vm, self, "entries", "Ljava/util/List;", &l);
   if (!l.l) {
     dvm__throw(vm, "java/lang/IllegalStateException", "Directory stream is closed");
     return false;
@@ -2815,10 +2815,10 @@ static bool x_stats_builder(struct dvm *vm, dvm_ref self, const union dvm_value 
     dvm_ref e = dvm_new_object(vm, dvm__class_by_desc(vm, "Landroid/util/StatsEvent;"));
     if (!e) return false;
     union dvm_value v = { 0 };
-    (void)dvm_get_field(vm, self, "atomId", "I", &v);
-    (void)dvm_set_field(vm, e, "atomId", "I", v);
-    (void)dvm_get_field(vm, self, "values", "Ljava/util/List;", &v);
-    (void)dvm_set_field(vm, e, "values", "Ljava/util/List;", v);
+    (void)(dvm_get_field)(vm, self, "atomId", "I", &v);
+    (void)(dvm_set_field)(vm, e, "atomId", "I", v);
+    (void)(dvm_get_field)(vm, self, "values", "Ljava/util/List;", &v);
+    (void)(dvm_set_field)(vm, e, "values", "Ljava/util/List;", v);
     RETL(e);
   }
   if (!strcmp(n, "setAtomId")) {
@@ -2830,10 +2830,10 @@ static bool x_stats_builder(struct dvm *vm, dvm_ref self, const union dvm_value 
     RETL(self);
   }
   union dvm_value list = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "values", "Ljava/util/List;", &list);
+  (void)(dvm_get_field)(vm, self, "values", "Ljava/util/List;", &list);
   if (!list.l) {
     list.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "values", "Ljava/util/List;", list);
+    (void)(dvm_set_field)(vm, self, "values", "Ljava/util/List;", list);
   }
   const char *sig = builtin_sig();
   union dvm_value item = { 0 };
@@ -2859,7 +2859,7 @@ static bool x_stats_event(struct dvm *vm, dvm_ref self, const union dvm_value *a
 {
   (void)args; (void)nargs;
   const char *n = builtin_name();
-  if (!strcmp(n, "getAtomId")) return dvm_get_field(vm, self, "atomId", "I", out);
+  if (!strcmp(n, "getAtomId")) return (dvm_get_field)(vm, self, "atomId", "I", out);
   if (!strcmp(n, "getNumBytes")) RETI(0);
   if (!strcmp(n, "getBytes")) RETL(dvm_new_array(vm, 'B', "B", 0));
   RETV();   /* release */
@@ -2968,9 +2968,9 @@ static bool x_typed_array_type(struct dvm *vm, dvm_ref self, const union dvm_val
 {
   (void)nargs;
   union dvm_value attrs = { 0 }, names = { 0 }, types = { 0 };
-  (void)dvm_get_field(vm, self, "attrs", "[I", &attrs);
-  (void)dvm_get_field(vm, self, "xmlNames", "[I", &names);
-  (void)dvm_get_field(vm, self, "xmlTypes", "[I", &types);
+  (void)(dvm_get_field)(vm, self, "attrs", "[I", &attrs);
+  (void)(dvm_get_field)(vm, self, "xmlNames", "[I", &names);
+  (void)(dvm_get_field)(vm, self, "xmlTypes", "[I", &types);
   struct dvm_object *ao = attrs.l ? dvm__obj(vm, attrs.l) : NULL, *no = names.l ? dvm__obj(vm, names.l) : NULL,
                     *to = types.l ? dvm__obj(vm, types.l) : NULL;
   if (!ao || ARG(0).i < 0 || (uint32_t)ARG(0).i >= ao->length) {
@@ -3005,8 +3005,8 @@ static bool x_attr_resource_value(struct dvm *vm, dvm_ref self, const union dvm_
     }
   }
   union dvm_value types = { 0 }, data = { 0 };
-  (void)dvm_get_field(vm, self, "attributeTypes", "[I", &types);
-  (void)dvm_get_field(vm, self, "attributeData", "[I", &data);
+  (void)(dvm_get_field)(vm, self, "attributeTypes", "[I", &types);
+  (void)(dvm_get_field)(vm, self, "attributeData", "[I", &data);
   struct dvm_object *to = types.l ? dvm__obj(vm, types.l) : NULL, *dobj = data.l ? dvm__obj(vm, data.l) : NULL;
   if (index < 0 || !to || !dobj || (uint32_t)index >= to->length || (uint32_t)index >= dobj->length) RETI(def);
   /* TYPE_REFERENCE (0x01): the value is a resource id; anything else is not one */
@@ -3030,10 +3030,10 @@ static bool x_res_loader(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)nargs;
   const char *n = builtin_name();
   union dvm_value list = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "providers", "Ljava/util/List;", &list);
+  (void)(dvm_get_field)(vm, self, "providers", "Ljava/util/List;", &list);
   if (!list.l) {
     list.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "providers", "Ljava/util/List;", list);
+    (void)(dvm_set_field)(vm, self, "providers", "Ljava/util/List;", list);
   }
   if (!strcmp(n, "<init>")) RETV();
   if (!strcmp(n, "getProviders")) {
@@ -3060,7 +3060,7 @@ static bool x_res_provider(struct dvm *vm, dvm_ref self, const union dvm_value *
   }
   dvm_ref p = dvm_new_object(vm, dvm__class_by_desc(vm, "Landroid/content/res/loader/ResourcesProvider;"));
   if (!p) return false;
-  (void)dvm_set_field(vm, p, "source", "Landroid/os/ParcelFileDescriptor;", ARG(0));
+  (void)(dvm_set_field)(vm, p, "source", "Landroid/os/ParcelFileDescriptor;", ARG(0));
   RETL(p);
 }
 static bool x_resources_loaders(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
@@ -3068,10 +3068,10 @@ static bool x_resources_loaders(struct dvm *vm, dvm_ref self, const union dvm_va
 {
   (void)nargs; (void)out;
   union dvm_value list = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "loaders", "Ljava/util/List;", &list);
+  (void)(dvm_get_field)(vm, self, "loaders", "Ljava/util/List;", &list);
   if (!list.l) {
     list.l = coll_new_list(vm, "Ljava/util/ArrayList;");
-    (void)dvm_set_field(vm, self, "loaders", "Ljava/util/List;", list);
+    (void)(dvm_set_field)(vm, self, "loaders", "Ljava/util/List;", list);
   }
   struct dvm_object *arr = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
   const bool add = !strcmp(builtin_name(), "addLoaders");
@@ -3149,19 +3149,19 @@ static const struct rt_field rt_scale_fields[] = {
 static float sc_f(struct dvm *vm, dvm_ref s, const char *f)
 {
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, s, f, "F", &v);
+  (void)(dvm_get_field)(vm, s, f, "F", &v);
   return v.f;
 }
 static void sc_set_f(struct dvm *vm, dvm_ref s, const char *f, float v)
 {
-  (void)dvm_set_field(vm, s, f, "F", (union dvm_value) {
+  (void)(dvm_set_field)(vm, s, f, "F", (union dvm_value) {
     .f = v
   });
 }
 static bool sc_notify(struct dvm *vm, dvm_ref self, const char *name, const char *ret, bool *answer)
 {
   union dvm_value l = { 0 }, a = { .l = self }, r = { 0 };
-  (void)dvm_get_field(vm, self, "listener", "Landroid/view/ScaleGestureDetector$OnScaleGestureListener;", &l);
+  (void)(dvm_get_field)(vm, self, "listener", "Landroid/view/ScaleGestureDetector$OnScaleGestureListener;", &l);
   char sig[96];
   snprintf(sig, sizeof sig, "(Landroid/view/ScaleGestureDetector;)%s", ret);
   if (!l.l) return true;
@@ -3178,7 +3178,7 @@ static bool x_scale_detector(struct dvm *vm, dvm_ref self, const union dvm_value
       dvm__throw(vm, "java/lang/NullPointerException", "context or listener");
       return false;
     }
-    (void)dvm_set_field(vm, self, "listener", "Landroid/view/ScaleGestureDetector$OnScaleGestureListener;", ARG(1));
+    (void)(dvm_set_field)(vm, self, "listener", "Landroid/view/ScaleGestureDetector$OnScaleGestureListener;", ARG(1));
     const float d = rt_density();
     rt_set_int(vm, self, "minSpan", (int32_t)(27 * d + 0.5f));   /* 27dp: ViewConfiguration.getScaledMinimumScalingSpan */
     rt_set_int(vm, self, "spanSlop", (int32_t)(2 * 8 * d + 0.5f));   /* twice the 8dp touch slop */
@@ -3196,8 +3196,8 @@ static bool x_scale_detector(struct dvm *vm, dvm_ref self, const union dvm_value
   union dvm_value t = { 0 };
   if (!strcmp(n, "getEventTime") || !strcmp(n, "getTimeDelta")) {
     union dvm_value c = { 0 }, p = { 0 };
-    (void)dvm_get_field(vm, self, "currTime", "J", &c);
-    (void)dvm_get_field(vm, self, "prevTime", "J", &p);
+    (void)(dvm_get_field)(vm, self, "currTime", "J", &c);
+    (void)(dvm_get_field)(vm, self, "prevTime", "J", &p);
     RETJ(!strcmp(n, "getEventTime") ? c.j : c.j - p.j);
   }
   if (strcmp(n, "onTouchEvent")) RETV();   /* quick-scale and stylus switches have no effect on a two-finger scale */
@@ -3206,7 +3206,7 @@ static bool x_scale_detector(struct dvm *vm, dvm_ref self, const union dvm_value
   union dvm_value am = { 0 }, pc = { 0 }, ai = { 0 }, et = { 0 };
   if (!ev || !am_vcall(vm, ev, "getActionMasked", "()I", NULL, 0, &am) || !am_vcall(vm, ev, "getPointerCount", "()I", NULL, 0, &pc) ||
       !am_vcall(vm, ev, "getActionIndex", "()I", NULL, 0, &ai) || !am_vcall(vm, ev, "getEventTime", "()J", NULL, 0, &et)) return false;
-  (void)dvm_set_field(vm, self, "currTime", "J", et);
+  (void)(dvm_set_field)(vm, self, "currTime", "J", et);
   const int action = am.i, count_all = pc.i;
   const bool stream_complete = action == 1 || action == 3;
   if (action == 0 || stream_complete) {
@@ -3255,8 +3255,8 @@ static bool x_scale_detector(struct dvm *vm, dvm_ref self, const union dvm_value
   if (!rt_get_int(vm, self, "inProgress") && count >= 2 && span >= (float)min_span &&
       (was || fabsf(span - sc_f(vm, self, "initialSpan")) > (float)rt_get_int(vm, self, "spanSlop"))) {
     sc_set_f(vm, self, "prevSpan", sc_f(vm, self, "currSpan"));
-    (void)dvm_get_field(vm, self, "currTime", "J", &t);
-    (void)dvm_set_field(vm, self, "prevTime", "J", t);
+    (void)(dvm_get_field)(vm, self, "currTime", "J", &t);
+    (void)(dvm_set_field)(vm, self, "prevTime", "J", t);
     bool begin = false;
     if (!sc_notify(vm, self, "onScaleBegin", "Z", &begin)) return false;
     rt_set_int(vm, self, "inProgress", begin);
@@ -3268,8 +3268,8 @@ static bool x_scale_detector(struct dvm *vm, dvm_ref self, const union dvm_value
       if (!sc_notify(vm, self, "onScale", "Z", &update)) return false;
       if (update) {
         sc_set_f(vm, self, "prevSpan", span);
-        (void)dvm_get_field(vm, self, "currTime", "J", &t);
-        (void)dvm_set_field(vm, self, "prevTime", "J", t);
+        (void)(dvm_get_field)(vm, self, "currTime", "J", &t);
+        (void)(dvm_set_field)(vm, self, "prevTime", "J", t);
       }
     }
   }
@@ -3296,11 +3296,11 @@ static bool x_path_listener(struct dvm *vm, dvm_ref self, const union dvm_value 
   (void)out; (void)nargs;
   dvm_ref animator = ARG(0).l;
   union dvm_value target = { 0 }, frac = { 0 }, prop = { 0 }, conv = { 0 }, measure = { 0 }, len = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, animator, "target", "Ljava/lang/Object;", &target);
-  (void)dvm_get_field(vm, animator, "fraction", "F", &frac);
-  (void)dvm_get_field(vm, self, "property", "Landroid/util/Property;", &prop);
-  (void)dvm_get_field(vm, self, "converter", "Landroid/animation/TypeConverter;", &conv);
-  (void)dvm_get_field(vm, self, "measure", "Landroid/graphics/PathMeasure;", &measure);
+  (void)(dvm_get_field)(vm, animator, "target", "Ljava/lang/Object;", &target);
+  (void)(dvm_get_field)(vm, animator, "fraction", "F", &frac);
+  (void)(dvm_get_field)(vm, self, "property", "Landroid/util/Property;", &prop);
+  (void)(dvm_get_field)(vm, self, "converter", "Landroid/animation/TypeConverter;", &conv);
+  (void)(dvm_get_field)(vm, self, "measure", "Landroid/graphics/PathMeasure;", &measure);
   if (!target.l || !prop.l || !measure.l) RETV();
   if (!am_vcall(vm, measure.l, "getLength", "()F", NULL, 0, &len)) return false;
   dvm_ref pos = dvm_new_array(vm, 'F', "F", 2);
@@ -3347,7 +3347,7 @@ static bool x_animator_of_object(struct dvm *vm, dvm_ref self, const union dvm_v
   if (!ok) return false;
   dvm_pin(vm, animator.l);
   /* the animator only carries progress: the listener walks the path and sets the property */
-  (void)dvm_set_field(vm, animator.l, "property", "Landroid/util/Property;", (union dvm_value) {
+  (void)(dvm_set_field)(vm, animator.l, "property", "Landroid/util/Property;", (union dvm_value) {
     .l = 0
   });
   dvm_ref measure = dvm_new_object(vm, dvm_find_class(vm, "android/graphics/PathMeasure"));
@@ -3356,9 +3356,9 @@ static bool x_animator_of_object(struct dvm *vm, dvm_ref self, const union dvm_v
   ok = measure && listener && am_vcall(vm, measure, "<init>", "(Landroid/graphics/Path;Z)V", pm, 2, &ign);
   if (ok) {
     dvm_pin(vm, listener);
-    (void)dvm_set_field(vm, listener, "property", "Landroid/util/Property;", ARG(1));
-    (void)dvm_set_field(vm, listener, "converter", "Landroid/animation/TypeConverter;", ARG(2));
-    (void)dvm_set_field(vm, listener, "measure", "Landroid/graphics/PathMeasure;", (union dvm_value) {
+    (void)(dvm_set_field)(vm, listener, "property", "Landroid/util/Property;", ARG(1));
+    (void)(dvm_set_field)(vm, listener, "converter", "Landroid/animation/TypeConverter;", ARG(2));
+    (void)(dvm_set_field)(vm, listener, "measure", "Landroid/graphics/PathMeasure;", (union dvm_value) {
       .l = measure
     });
     union dvm_value l = { .l = listener };
@@ -3458,7 +3458,7 @@ static bool x_text_compound_tint(struct dvm *vm, dvm_ref self, const union dvm_v
 {
   (void)nargs; (void)out;
   const bool mode = !strcmp(builtin_name(), "setCompoundDrawableTintMode");
-  (void)dvm_set_field(vm, self, mode ? "compoundTintMode" : "compoundTint",
+  (void)(dvm_set_field)(vm, self, mode ? "compoundTintMode" : "compoundTint",
                       mode ? "Landroid/graphics/PorterDuff$Mode;" : "Landroid/content/res/ColorStateList;", ARG(0));
   static const char *const names[] = { "drawableLeft", "drawableTop", "drawableRight", "drawableBottom",
                                        "drawableStart", "drawableEnd" };
@@ -3492,7 +3492,7 @@ static bool x_text_autosize_presets(struct dvm *vm, dvm_ref self, const union dv
     if (v[i] < lo) lo = v[i];
     if (v[i] > hi) hi = v[i];
   }
-  (void)dvm_set_field(vm, self, "autoSizePresets", "[I", args[0]);
+  (void)(dvm_set_field)(vm, self, "autoSizePresets", "[I", args[0]);
   rt_set_int(vm, self, "autoSizeMin", a->length ? lo : 0);
   rt_set_int(vm, self, "autoSizeMax", a->length ? hi : 0);
   ui_layout_changed();
@@ -3519,10 +3519,10 @@ static bool x_paint_clear_shadow(struct dvm *vm, dvm_ref self, const union dvm_v
 {
   (void)args; (void)nargs; (void)out;
   union dvm_value z = { 0 };
-  (void)dvm_set_field(vm, self, "shadowRadius", "F", z);
-  (void)dvm_set_field(vm, self, "shadowDx", "F", z);
-  (void)dvm_set_field(vm, self, "shadowDy", "F", z);
-  (void)dvm_set_field(vm, self, "shadowColor", "I", z);
+  (void)(dvm_set_field)(vm, self, "shadowRadius", "F", z);
+  (void)(dvm_set_field)(vm, self, "shadowDx", "F", z);
+  (void)(dvm_set_field)(vm, self, "shadowDy", "F", z);
+  (void)(dvm_set_field)(vm, self, "shadowColor", "I", z);
   RETV();
 }
 static const struct rt_method rt_gap_paint2[] = {
@@ -3559,9 +3559,9 @@ static bool x_round_rect_init(struct dvm *vm, dvm_ref self, const union dvm_valu
     dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException", "inner radii array needs 8 values");
     return false;
   }
-  (void)dvm_set_field(vm, self, "outer", "[F", args[0]);
-  (void)dvm_set_field(vm, self, "inset", "Landroid/graphics/RectF;", args[1]);
-  (void)dvm_set_field(vm, self, "inner", "[F", args[2]);
+  (void)(dvm_set_field)(vm, self, "outer", "[F", args[0]);
+  (void)(dvm_set_field)(vm, self, "inset", "Landroid/graphics/RectF;", args[1]);
+  (void)(dvm_set_field)(vm, self, "inner", "[F", args[2]);
   RETV();
 }
 static bool x_rectf_new(struct dvm *vm, float l, float t, float r, float b, dvm_ref *rect)
@@ -3575,11 +3575,11 @@ static bool x_round_rect_draw(struct dvm *vm, dvm_ref self, const union dvm_valu
 {
   (void)nargs;
   union dvm_value w = { 0 }, h = { 0 }, outer = { 0 }, inset = { 0 }, inner = { 0 }, cw = { 0 }, ccw = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "width", "F", &w);
-  (void)dvm_get_field(vm, self, "height", "F", &h);
-  (void)dvm_get_field(vm, self, "outer", "[F", &outer);
-  (void)dvm_get_field(vm, self, "inset", "Landroid/graphics/RectF;", &inset);
-  (void)dvm_get_field(vm, self, "inner", "[F", &inner);
+  (void)(dvm_get_field)(vm, self, "width", "F", &w);
+  (void)(dvm_get_field)(vm, self, "height", "F", &h);
+  (void)(dvm_get_field)(vm, self, "outer", "[F", &outer);
+  (void)(dvm_get_field)(vm, self, "inset", "Landroid/graphics/RectF;", &inset);
+  (void)(dvm_get_field)(vm, self, "inner", "[F", &inner);
   struct dvm_class *dir = dvm_find_class(vm, "android/graphics/Path$Direction");
   if (!dir || !dvm_get_static(vm, dir, "CW", "Landroid/graphics/Path$Direction;", &cw) ||
       !dvm_get_static(vm, dir, "CCW", "Landroid/graphics/Path$Direction;", &ccw)) return false;
@@ -3630,7 +3630,7 @@ static bool x_intent_aux(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   const char *field = strstr(name, "SourceBounds") ? "sourceBounds" : strstr(name, "Selector") ? "selector" : "clipData";
   const char *type = !strcmp(field, "sourceBounds") ? "Landroid/graphics/Rect;"
                      : !strcmp(field, "selector") ? "Landroid/content/Intent;" : "Landroid/content/ClipData;";
-  if (name[0] == 'g') return dvm_get_field(vm, self, field, type, out);
+  if (name[0] == 'g') return (dvm_get_field)(vm, self, field, type, out);
   union dvm_value v = ARG(0);
   if (!strcmp(field, "selector") && v.l) {
     if (v.l == self) {
@@ -3638,7 +3638,7 @@ static bool x_intent_aux(struct dvm *vm, dvm_ref self, const union dvm_value *ar
       return false;
     }
     union dvm_value pkg = { 0 };
-    (void)dvm_get_field(vm, self, "package", "Ljava/lang/String;", &pkg);
+    (void)(dvm_get_field)(vm, self, "package", "Ljava/lang/String;", &pkg);
     if (pkg.l) {
       dvm__throw(vm, "java/lang/IllegalArgumentException", "Can't set selector when package already set to %s",
                  dvm_string_utf8(vm, pkg.l));
@@ -3651,7 +3651,7 @@ static bool x_intent_aux(struct dvm *vm, dvm_ref self, const union dvm_value *ar
     if (!copy || !am_vcall(vm, copy, "<init>", "(Landroid/graphics/Rect;)V", &src, 1, &ign)) return false;
     v.l = copy;
   }
-  (void)dvm_set_field(vm, self, field, type, v);
+  (void)(dvm_set_field)(vm, self, field, type, v);
   RETV();
 }
 static const struct rt_method rt_gap_intent_aux[] = {
@@ -3714,11 +3714,11 @@ static bool x_channel_conversation(struct dvm *vm, dvm_ref self, const union dvm
   (void)nargs;
   const char *name = builtin_name();
   if (!strcmp(name, "getConversationId"))
-    return dvm_get_field(vm, self, "conversationId", "Ljava/lang/String;", out);
+    return (dvm_get_field)(vm, self, "conversationId", "Ljava/lang/String;", out);
   if (!strcmp(name, "getParentChannelId"))
-    return dvm_get_field(vm, self, "parentChannelId", "Ljava/lang/String;", out);
-  (void)dvm_set_field(vm, self, "parentChannelId", "Ljava/lang/String;", ARG(0));
-  (void)dvm_set_field(vm, self, "conversationId", "Ljava/lang/String;", ARG(1));
+    return (dvm_get_field)(vm, self, "parentChannelId", "Ljava/lang/String;", out);
+  (void)(dvm_set_field)(vm, self, "parentChannelId", "Ljava/lang/String;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "conversationId", "Ljava/lang/String;", ARG(1));
   RETV();
 }
 static const struct rt_method rt_gap_channel2[] = {
@@ -3733,8 +3733,8 @@ static bool x_resources_init3(struct dvm *vm, dvm_ref self, const union dvm_valu
                               union dvm_value *out)
 {
   (void)nargs;
-  (void)dvm_set_field(vm, self, "displayMetrics", "Landroid/util/DisplayMetrics;", args[1]);
-  (void)dvm_set_field(vm, self, "configuration", "Landroid/content/res/Configuration;", args[2]);
+  (void)(dvm_set_field)(vm, self, "displayMetrics", "Landroid/util/DisplayMetrics;", args[1]);
+  (void)(dvm_set_field)(vm, self, "configuration", "Landroid/content/res/Configuration;", args[2]);
   RETV();
 }
 static const struct rt_method rt_gap_resources4[] = {
@@ -3775,11 +3775,11 @@ static bool x_atomic_array(struct dvm *vm, dvm_ref self, const union dvm_value *
       if (dst) memcpy(dst->data, src->data, (size_t)src->length * (wide ? 8u : 4u));
     }
     if (!a) return false;
-    (void)dvm_set_field(vm, self, "values", type, (union dvm_value) { .l = a });
+    (void)(dvm_set_field)(vm, self, "values", type, (union dvm_value) { .l = a });
     RETV();
   }
   union dvm_value arr = { 0 };
-  (void)dvm_get_field(vm, self, "values", type, &arr);
+  (void)(dvm_get_field)(vm, self, "values", type, &arr);
   struct dvm_object *o = arr.l ? dvm__obj(vm, arr.l) : NULL;
   if (!o) {
     dvm__throw(vm, "java/lang/NullPointerException", "values");
@@ -3850,13 +3850,13 @@ static bool x_long_adder(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   (void)nargs;
   const char *name = builtin_name();
   union dvm_value sum = { 0 };
-  (void)dvm_get_field(vm, self, "sum", "J", &sum);
+  (void)(dvm_get_field)(vm, self, "sum", "J", &sum);
   if (!strcmp(name, "<init>")) RETV();
   if (!strcmp(name, "add")) sum.j += ARG(0).j;
   else if (!strcmp(name, "increment")) sum.j += 1;
   else if (!strcmp(name, "decrement")) sum.j -= 1;
   else if (!strcmp(name, "reset") || !strcmp(name, "sumThenReset")) {
-    (void)dvm_set_field(vm, self, "sum", "J", (union dvm_value) { .j = 0 });
+    (void)(dvm_set_field)(vm, self, "sum", "J", (union dvm_value) { .j = 0 });
     if (name[0] == 'r') RETV();
     out->j = sum.j;
     return true;
@@ -3869,7 +3869,7 @@ static bool x_long_adder(struct dvm *vm, dvm_ref self, const union dvm_value *ar
     snprintf(b, sizeof b, "%lld", (long long)sum.j);
     RETL(dvm_new_string(vm, b));
   }
-  (void)dvm_set_field(vm, self, "sum", "J", sum);
+  (void)(dvm_set_field)(vm, self, "sum", "J", sum);
   RETV();
 }
 static const struct rt_method rt_long_adder[] = {
@@ -3987,17 +3987,17 @@ static bool x_cf_generate_cert_path(struct dvm *vm, dvm_ref self, const union dv
   dvm_ref path = c ? dvm_new_object(vm, c) : 0;
   if (!path) return false;
   copy.l = list;
-  (void)dvm_set_field(vm, path, "certs", "Ljava/util/List;", copy);
+  (void)(dvm_set_field)(vm, path, "certs", "Ljava/util/List;", copy);
   (void)am_vcall(vm, self, "getType", "()Ljava/lang/String;", NULL, 0, &type);
-  (void)dvm_set_field(vm, path, "type", "Ljava/lang/String;", type);
+  (void)(dvm_set_field)(vm, path, "type", "Ljava/lang/String;", type);
   RETL(path);
 }
 static bool x_cert_path_get(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
 {
   (void)args; (void)nargs;
   union dvm_value v = { 0 };
-  if (!strcmp(dvm__builtin_method()->name, "getType")) (void)dvm_get_field(vm, self, "type", "Ljava/lang/String;", &v);
-  else (void)dvm_get_field(vm, self, "certs", "Ljava/util/List;", &v);
+  if (!strcmp(dvm__builtin_method()->name, "getType")) (void)(dvm_get_field)(vm, self, "type", "Ljava/lang/String;", &v);
+  else (void)(dvm_get_field)(vm, self, "certs", "Ljava/util/List;", &v);
   RETL(v.l);
 }
 static const struct rt_method rt_cert_path[] = {
@@ -4033,7 +4033,7 @@ static bool x_pkix_parameters_init(struct dvm *vm, dvm_ref self, const union dvm
     dvm__throw(vm, "java/security/InvalidAlgorithmParameterException", "the trustAnchors parameter must be non-empty");
     return false;
   }
-  (void)dvm_set_field(vm, self, "anchors", "Ljava/util/Set;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "anchors", "Ljava/util/Set;", ARG(0));
   rt_set_int(vm, self, "revocation", 1);           /* revocation checking is on unless the caller turns it off */
   RETV();
 }
@@ -4043,12 +4043,12 @@ static bool x_pkix_parameters_method(struct dvm *vm, dvm_ref self, const union d
   (void)nargs;
   const char *name = dvm__builtin_method()->name;
   union dvm_value v = { 0 };
-  if (!strcmp(name, "setDate")) { (void)dvm_set_field(vm, self, "date", "Ljava/util/Date;", ARG(0)); RETV(); }
-  if (!strcmp(name, "getDate")) { (void)dvm_get_field(vm, self, "date", "Ljava/util/Date;", &v); RETL(v.l); }
+  if (!strcmp(name, "setDate")) { (void)(dvm_set_field)(vm, self, "date", "Ljava/util/Date;", ARG(0)); RETV(); }
+  if (!strcmp(name, "getDate")) { (void)(dvm_get_field)(vm, self, "date", "Ljava/util/Date;", &v); RETL(v.l); }
   if (!strcmp(name, "setRevocationEnabled")) { rt_set_int(vm, self, "revocation", ARG(0).i); RETV(); }
   if (!strcmp(name, "isRevocationEnabled")) RETI(rt_get_int(vm, self, "revocation"));
-  if (!strcmp(name, "getTrustAnchors")) { (void)dvm_get_field(vm, self, "anchors", "Ljava/util/Set;", &v); RETL(v.l); }
-  if (!strcmp(name, "setTrustAnchors")) { (void)dvm_set_field(vm, self, "anchors", "Ljava/util/Set;", ARG(0)); RETV(); }
+  if (!strcmp(name, "getTrustAnchors")) { (void)(dvm_get_field)(vm, self, "anchors", "Ljava/util/Set;", &v); RETL(v.l); }
+  if (!strcmp(name, "setTrustAnchors")) { (void)(dvm_set_field)(vm, self, "anchors", "Ljava/util/Set;", ARG(0)); RETV(); }
   RETV();                          /* policy and checker settings do not change what the host chain check decides */
 }
 static const struct rt_method rt_pkix_parameters[] = {
@@ -4070,7 +4070,7 @@ static bool x_pkix_result_anchor(struct dvm *vm, dvm_ref self, const union dvm_v
 {
   (void)args; (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "anchor", "Ljava/security/cert/TrustAnchor;", &v);
+  (void)(dvm_get_field)(vm, self, "anchor", "Ljava/security/cert/TrustAnchor;", &v);
   RETL(v.l);
 }
 static const struct rt_method rt_pkix_result[] = {
@@ -4094,7 +4094,7 @@ static bool x_cpv_get_instance(struct dvm *vm, dvm_ref self, const union dvm_val
   struct dvm_class *c = dvm_find_class(vm, "java/security/cert/CertPathValidator");
   dvm_ref v = c ? dvm_new_object(vm, c) : 0;
   if (!v) return false;
-  (void)dvm_set_field(vm, v, "algorithm", "Ljava/lang/String;", ARG(0));
+  (void)(dvm_set_field)(vm, v, "algorithm", "Ljava/lang/String;", ARG(0));
   RETL(v);
 }
 static bool x_cpv_default_type(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
@@ -4107,7 +4107,7 @@ static bool x_cpv_algorithm(struct dvm *vm, dvm_ref self, const union dvm_value 
 {
   (void)args; (void)nargs;
   union dvm_value v = { 0 };
-  (void)dvm_get_field(vm, self, "algorithm", "Ljava/lang/String;", &v);
+  (void)(dvm_get_field)(vm, self, "algorithm", "Ljava/lang/String;", &v);
   RETL(v.l);
 }
 static bool x_cpv_validate(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
@@ -4123,9 +4123,9 @@ static bool x_cpv_validate(struct dvm *vm, dvm_ref self, const union dvm_value *
     return false;
   }
   union dvm_value certs = { 0 }, items = { 0 }, anchors = { 0 }, anchor_items = { 0 }, date = { 0 }, ms = { 0 };
-  (void)dvm_get_field(vm, path, "certs", "Ljava/util/List;", &certs);
-  (void)dvm_get_field(vm, params, "anchors", "Ljava/util/Set;", &anchors);
-  (void)dvm_get_field(vm, params, "date", "Ljava/util/Date;", &date);
+  (void)(dvm_get_field)(vm, path, "certs", "Ljava/util/List;", &certs);
+  (void)(dvm_get_field)(vm, params, "anchors", "Ljava/util/Set;", &anchors);
+  (void)(dvm_get_field)(vm, params, "date", "Ljava/util/Date;", &date);
   if (!am_vcall(vm, certs.l, "toArray", "()[Ljava/lang/Object;", NULL, 0, &items) ||
       !am_vcall(vm, anchors.l, "toArray", "()[Ljava/lang/Object;", NULL, 0, &anchor_items)) return false;
   const uint32_t n = dvm_array_length(vm, items.l), na = dvm_array_length(vm, anchor_items.l);
@@ -4145,7 +4145,7 @@ static bool x_cpv_validate(struct dvm *vm, dvm_ref self, const union dvm_value *
   for (uint32_t i = 0; i < na; ++i) {
     union dvm_value cert = { 0 };
     dvm_ref anchor = ((dvm_ref *)dvm_array_data(vm, anchor_items.l))[i];
-    (void)dvm_get_field(vm, anchor, "cert", "Ljava/security/cert/X509Certificate;", &cert);
+    (void)(dvm_get_field)(vm, anchor, "cert", "Ljava/security/cert/X509Certificate;", &cert);
     if (!cert.l) continue;                           /* key-only anchors carry no certificate to chain to */
     X509 *x = trust_parse_certificate(vm, cert.l);
     if (!x) goto done;
@@ -4184,7 +4184,7 @@ static bool x_cpv_validate(struct dvm *vm, dvm_ref self, const union dvm_value *
   for (uint32_t i = 0, k = 0; i < na && top; ++i) {
     union dvm_value cert = { 0 };
     dvm_ref anchor = ((dvm_ref *)dvm_array_data(vm, anchor_items.l))[i];
-    (void)dvm_get_field(vm, anchor, "cert", "Ljava/security/cert/X509Certificate;", &cert);
+    (void)(dvm_get_field)(vm, anchor, "cert", "Ljava/security/cert/X509Certificate;", &cert);
     if (!cert.l) continue;
     if (!X509_cmp(top, sk_X509_value(roots, (int)k++))) { matched = anchor; break; }
   }
@@ -4192,7 +4192,7 @@ static bool x_cpv_validate(struct dvm *vm, dvm_ref self, const union dvm_value *
   dvm_ref result = rc ? dvm_new_object(vm, rc) : 0;
   if (!result) goto done;
   union dvm_value a = { .l = matched };
-  (void)dvm_set_field(vm, result, "anchor", "Ljava/security/cert/TrustAnchor;", a);
+  (void)(dvm_set_field)(vm, result, "anchor", "Ljava/security/cert/TrustAnchor;", a);
   out->l = result;
   good = true;
 done:
@@ -4227,7 +4227,7 @@ static bool x_context_create_display(struct dvm *vm, dvm_ref self, const union d
   if (!wrapper) return false;
   dvm_pin(vm, wrapper);
   bool ok = am_vcall(vm, wrapper, "<init>", "(Landroid/content/Context;)V", &base, 1, &ign);
-  if (ok) (void)dvm_set_field(vm, wrapper, "display", "Landroid/view/Display;", ARG(0));
+  if (ok) (void)(dvm_set_field)(vm, wrapper, "display", "Landroid/view/Display;", ARG(0));
   dvm_unpin(vm, wrapper);
   if (!ok) return false;
   RETL(wrapper);
@@ -4237,10 +4237,10 @@ static bool x_context_get_display(struct dvm *vm, dvm_ref self, const union dvm_
 {
   (void)args; (void)nargs;
   union dvm_value d = { 0 };
-  (void)dvm_get_field(vm, self, "display", "Landroid/view/Display;", &d);
+  (void)(dvm_get_field)(vm, self, "display", "Landroid/view/Display;", &d);
   if (d.l) RETL(d.l);
   union dvm_value base = { 0 };
-  (void)dvm_get_field(vm, self, "mBase", "Landroid/content/Context;", &base);
+  (void)(dvm_get_field)(vm, self, "mBase", "Landroid/content/Context;", &base);
   if (base.l) return am_vcall(vm, base.l, "getDisplay", "()Landroid/view/Display;", NULL, 0, out);
   /* an application context sees the default display */
   union dvm_value name = { .l = dvm_new_string(vm, "display") }, dm = { 0 }, zero = { .i = 0 };
@@ -4349,7 +4349,7 @@ static bool x_vc_window_slop(struct dvm *vm, dvm_ref self, const union dvm_value
   dvm_pin(vm, dm);
   rt_fill_display_metrics(vm, dm);
   union dvm_value density = { 0 };
-  (void)dvm_get_field(vm, dm, "density", "F", &density);
+  (void)(dvm_get_field)(vm, dm, "density", "F", &density);
   dvm_unpin(vm, dm);
   RETI((int32_t)(16.0f * density.f + 0.5f));
 }
@@ -4390,23 +4390,23 @@ static bool x_pb_config(struct dvm *vm, dvm_ref self, const union dvm_value *arg
   const char *sig = dvm__builtin_method()->sig;
   const bool getter = sig[1] == ')';
   if (!strcmp(name, "redirectErrorStream")) {
-    if (getter) return dvm_get_field(vm, self, "redirectErrorStream", "Z", out);
-    (void)dvm_set_field(vm, self, "redirectErrorStream", "Z", (union dvm_value) { .i = ARG(0).i != 0 });
+    if (getter) return (dvm_get_field)(vm, self, "redirectErrorStream", "Z", out);
+    (void)(dvm_set_field)(vm, self, "redirectErrorStream", "Z", (union dvm_value) { .i = ARG(0).i != 0 });
     RETL(self);
   }
   if (!strcmp(name, "directory")) {
-    if (getter) return dvm_get_field(vm, self, "directory", "Ljava/io/File;", out);
-    (void)dvm_set_field(vm, self, "directory", "Ljava/io/File;", ARG(0));
+    if (getter) return (dvm_get_field)(vm, self, "directory", "Ljava/io/File;", out);
+    (void)(dvm_set_field)(vm, self, "directory", "Ljava/io/File;", ARG(0));
     RETL(self);
   }
   if (!strcmp(name, "environment")) {
     union dvm_value env = { 0 };
-    (void)dvm_get_field(vm, self, "environment", "Ljava/util/Map;", &env);
+    (void)(dvm_get_field)(vm, self, "environment", "Ljava/util/Map;", &env);
     if (!env.l) {
       env.l = dvm_new_object(vm, dvm_find_class(vm, "java/util/HashMap"));
       union dvm_value ign = { 0 };
       if (!env.l || !am_vcall(vm, env.l, "<init>", "()V", NULL, 0, &ign)) return false;
-      (void)dvm_set_field(vm, self, "environment", "Ljava/util/Map;", env);
+      (void)(dvm_set_field)(vm, self, "environment", "Ljava/util/Map;", env);
     }
     RETL(env.l);
   }
@@ -4659,7 +4659,7 @@ static bool x_group_focusable_available(struct dvm *vm, dvm_ref self, const unio
   (void)nargs;
   /* ViewGroup.focusableViewAvailable(v) tells the parent, unless descendants are blocked from focus. */
   union dvm_value parent = { 0 };
-  (void)dvm_get_field(vm, self, "parent", "Landroid/view/ViewParent;", &parent);
+  (void)(dvm_get_field)(vm, self, "parent", "Landroid/view/ViewParent;", &parent);
   if (!parent.l) RETV();
   return am_vcall(vm, parent.l, "focusableViewAvailable", "(Landroid/view/View;)V", args, 1, out);
 }
@@ -4674,13 +4674,13 @@ static bool x_text_cursor_props(struct dvm *vm, dvm_ref self, const union dvm_va
     ui_invalidate();
     RETV();
   }
-  if (!strcmp(name, "getLinkTextColors")) return dvm_get_field(vm, self, "linkTextColors", "Landroid/content/res/ColorStateList;", out);
+  if (!strcmp(name, "getLinkTextColors")) return (dvm_get_field)(vm, self, "linkTextColors", "Landroid/content/res/ColorStateList;", out);
   if (!strcmp(name, "getCurrentLinkTextColor")) RETI(rt_get_int(vm, self, "linkTextColor"));
   /* setLinkTextColor(int) / (ColorStateList) */
   if (builtin_sig()[1] == 'I') {
     rt_set_int(vm, self, "linkTextColor", ARG(0).i);
-    (void)dvm_set_field(vm, self, "linkTextColors", "Landroid/content/res/ColorStateList;", (union dvm_value) { 0 });
-  } else (void)dvm_set_field(vm, self, "linkTextColors", "Landroid/content/res/ColorStateList;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "linkTextColors", "Landroid/content/res/ColorStateList;", (union dvm_value) { 0 });
+  } else (void)(dvm_set_field)(vm, self, "linkTextColors", "Landroid/content/res/ColorStateList;", ARG(0));
   ui_invalidate();
   RETV();
 }
@@ -4748,11 +4748,11 @@ static bool x_permission(struct dvm *vm, dvm_ref self, const union dvm_value *ar
       dvm__throw(vm, "java/lang/IllegalArgumentException", "name can't be empty");
       return false;
     }
-    (void)dvm_set_field(vm, self, "name", "Ljava/lang/String;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "name", "Ljava/lang/String;", ARG(0));
     RETV();
   }
   union dvm_value mine = { 0 };
-  (void)dvm_get_field(vm, self, "name", "Ljava/lang/String;", &mine);
+  (void)(dvm_get_field)(vm, self, "name", "Ljava/lang/String;", &mine);
   const char *n = mine.l ? dvm_string_utf8(vm, mine.l) : "";
   if (!strcmp(name, "getName")) RETL(mine.l);
   if (!strcmp(name, "getActions")) RETL(dvm_new_string(vm, ""));
@@ -4770,7 +4770,7 @@ static bool x_permission(struct dvm *vm, dvm_ref self, const union dvm_value *ar
   /* equals / implies: the same class and name; implies also takes a trailing ".*" or a lone "*" as a wildcard. */
   if (!ARG(0).l || dvm_object_class(vm, ARG(0).l) != dvm_object_class(vm, self)) RETI(0);
   union dvm_value other = { 0 };
-  (void)dvm_get_field(vm, ARG(0).l, "name", "Ljava/lang/String;", &other);
+  (void)(dvm_get_field)(vm, ARG(0).l, "name", "Ljava/lang/String;", &other);
   const char *o = other.l ? dvm_string_utf8(vm, other.l) : "";
   if (!strcmp(name, "equals")) RETI(!strcmp(n, o));
   const size_t len = strlen(n);
@@ -4803,11 +4803,11 @@ static bool x_job_work_item(struct dvm *vm, dvm_ref self, const union dvm_value 
       dvm__throw(vm, "java/lang/NullPointerException", "intent");
       return false;
     }
-    (void)dvm_set_field(vm, self, "intent", "Landroid/content/Intent;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "intent", "Landroid/content/Intent;", ARG(0));
     RETV();
   }
-  if (!strcmp(name, "getIntent")) return dvm_get_field(vm, self, "intent", "Landroid/content/Intent;", out);
-  if (!strcmp(name, "getDeliveryCount")) return dvm_get_field(vm, self, "deliveryCount", "I", out);
+  if (!strcmp(name, "getIntent")) return (dvm_get_field)(vm, self, "intent", "Landroid/content/Intent;", out);
+  if (!strcmp(name, "getDeliveryCount")) return (dvm_get_field)(vm, self, "deliveryCount", "I", out);
   RETI(rt_get_int(vm, self, "workId"));              /* getJobId-style accessors */
 }
 static const struct rt_method rt_job_work_item[] = {
@@ -4904,11 +4904,11 @@ static bool x_message_obtain_copy(struct dvm *vm, dvm_ref self, const union dvm_
   };
   for (size_t i = 0; i < sizeof kCopy / sizeof kCopy[0]; ++i) {
     union dvm_value v = { 0 };
-    (void)dvm_get_field(vm, ARG(0).l, kCopy[i].n, kCopy[i].t, &v);
-    (void)dvm_set_field(vm, m, kCopy[i].n, kCopy[i].t, v);
+    (void)(dvm_get_field)(vm, ARG(0).l, kCopy[i].n, kCopy[i].t, &v);
+    (void)(dvm_set_field)(vm, m, kCopy[i].n, kCopy[i].t, v);
   }
   union dvm_value data = { 0 };
-  (void)dvm_get_field(vm, ARG(0).l, "data", "Landroid/os/Bundle;", &data);
+  (void)(dvm_get_field)(vm, ARG(0).l, "data", "Landroid/os/Bundle;", &data);
   if (data.l) {
     dvm_pin(vm, m);
     dvm_ref copy = dvm_new_object(vm, dvm_find_class(vm, "android/os/Bundle"));
@@ -4916,7 +4916,7 @@ static bool x_message_obtain_copy(struct dvm *vm, dvm_ref self, const union dvm_
     bool ok = copy && am_vcall(vm, copy, "<init>", "(Landroid/os/Bundle;)V", &src, 1, &ign);
     dvm_unpin(vm, m);
     if (!ok) return false;
-    (void)dvm_set_field(vm, m, "data", "Landroid/os/Bundle;", (union dvm_value) { .l = copy });
+    (void)(dvm_set_field)(vm, m, "data", "Landroid/os/Bundle;", (union dvm_value) { .l = copy });
   }
   RETL(m);
 }
@@ -4934,7 +4934,7 @@ static const struct rt_field rt_menu_inflater_fields[] = { { "context", "Landroi
 static bool x_menu_inflater_init(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
 {
   (void)nargs;
-  (void)dvm_set_field(vm, self, "context", "Landroid/content/Context;", ARG(0));
+  (void)(dvm_set_field)(vm, self, "context", "Landroid/content/Context;", ARG(0));
   RETV();
 }
 /* The attributes of one <item>/<group>, read through the framework's own styleable attribute ids. */
@@ -5069,7 +5069,7 @@ static bool x_menu_inflater_inflate(struct dvm *vm, dvm_ref self, const union dv
     return false;
   }
   union dvm_value context = { 0 }, res = { 0 }, parser = { 0 };
-  (void)dvm_get_field(vm, self, "context", "Landroid/content/Context;", &context);
+  (void)(dvm_get_field)(vm, self, "context", "Landroid/content/Context;", &context);
   if (!context.l || !am_vcall(vm, context.l, "getResources", "()Landroid/content/res/Resources;", NULL, 0, &res) ||
       !am_vcall(vm, res.l, "getXml", "(I)Landroid/content/res/XmlResourceParser;", args, 1, &parser) || !parser.l) {
     if (!dvm_exception(vm))
@@ -5104,12 +5104,12 @@ static const char *const rt_iface_xml_serializer[] = { "Lorg/xmlpull/v1/XmlSeria
 static bool xs_put(struct dvm *vm, dvm_ref self, const char *text)
 {
   union dvm_value sb = { 0 }, str = { .l = dvm_new_string(vm, text) }, r = { 0 };
-  (void)dvm_get_field(vm, self, "sb", "Ljava/lang/StringBuilder;", &sb);
+  (void)(dvm_get_field)(vm, self, "sb", "Ljava/lang/StringBuilder;", &sb);
   if (!sb.l) {
     sb.l = dvm_new_object(vm, dvm_find_class(vm, "java/lang/StringBuilder"));
     union dvm_value ign = { 0 };
     if (!sb.l || !am_vcall(vm, sb.l, "<init>", "()V", NULL, 0, &ign)) return false;
-    (void)dvm_set_field(vm, self, "sb", "Ljava/lang/StringBuilder;", sb);
+    (void)(dvm_set_field)(vm, self, "sb", "Ljava/lang/StringBuilder;", sb);
   }
   return str.l && am_vcall(vm, sb.l, "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", &str, 1, &r);
 }
@@ -5142,7 +5142,7 @@ static bool xs_close_tag(struct dvm *vm, dvm_ref self)
 static int xs_depth(struct dvm *vm, dvm_ref self)
 {
   union dvm_value names = { 0 };
-  (void)dvm_get_field(vm, self, "names", "Ljava/util/List;", &names);
+  (void)(dvm_get_field)(vm, self, "names", "Ljava/util/List;", &names);
   struct rt_list *l = names.l ? list_of(vm, names.l) : NULL;
   return l ? (int)l->size : 0;
 }
@@ -5158,8 +5158,8 @@ static bool xs_newline(struct dvm *vm, dvm_ref self, int depth)
 static bool xs_flush(struct dvm *vm, dvm_ref self)
 {
   union dvm_value sb = { 0 }, out = { 0 }, text = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "sb", "Ljava/lang/StringBuilder;", &sb);
-  (void)dvm_get_field(vm, self, "out", "Ljava/lang/Object;", &out);
+  (void)(dvm_get_field)(vm, self, "sb", "Ljava/lang/StringBuilder;", &sb);
+  (void)(dvm_get_field)(vm, self, "out", "Ljava/lang/Object;", &out);
   if (!sb.l || !out.l) return true;
   if (!am_vcall(vm, sb.l, "toString", "()Ljava/lang/String;", NULL, 0, &text)) return false;
   struct dvm_object *so = dvm__obj(vm, text.l);
@@ -5169,7 +5169,7 @@ static bool xs_flush(struct dvm *vm, dvm_ref self)
     (void)am_vcall(vm, out.l, "flush", "()V", NULL, 0, &ign);
   } else {
     union dvm_value enc = { 0 }, bytes = { 0 };
-    (void)dvm_get_field(vm, self, "encoding", "Ljava/lang/String;", &enc);
+    (void)(dvm_get_field)(vm, self, "encoding", "Ljava/lang/String;", &enc);
     if (!enc.l) enc.l = dvm_new_string(vm, "UTF-8");
     union dvm_value a[1] = { enc };
     if (!am_vcall(vm, text.l, "getBytes", "(Ljava/lang/String;)[B", a, 1, &bytes)) return false;
@@ -5186,9 +5186,9 @@ static bool x_xml_serializer(struct dvm *vm, dvm_ref self, const union dvm_value
   const char *sig = dvm__builtin_method()->sig;
   const char *a0 = ARG(0).l && sig[1] == 'L' && !strncmp(sig + 1, "Ljava/lang/String;", 18) ? dvm_string_utf8(vm, ARG(0).l) : NULL;
   if (!strcmp(name, "setOutput")) {
-    (void)dvm_set_field(vm, self, "out", "Ljava/lang/Object;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "out", "Ljava/lang/Object;", ARG(0));
     rt_set_int(vm, self, "isWriter", strstr(sig, "Writer") != NULL);
-    if (nargs > 1) (void)dvm_set_field(vm, self, "encoding", "Ljava/lang/String;", ARG(1));
+    if (nargs > 1) (void)(dvm_set_field)(vm, self, "encoding", "Ljava/lang/String;", ARG(1));
     RETV();
   }
   if (!strcmp(name, "setFeature")) {
@@ -5212,7 +5212,7 @@ static bool x_xml_serializer(struct dvm *vm, dvm_ref self, const union dvm_value
   if (!strcmp(name, "getDepth")) RETI(xs_depth(vm, self));
   if (!strcmp(name, "getName")) {
     union dvm_value names = { 0 };
-    (void)dvm_get_field(vm, self, "names", "Ljava/util/List;", &names);
+    (void)(dvm_get_field)(vm, self, "names", "Ljava/util/List;", &names);
     struct rt_list *l = names.l ? list_of(vm, names.l) : NULL;
     RETL(l && l->size ? l->items[l->size - 1] : 0);
   }
@@ -5220,7 +5220,7 @@ static bool x_xml_serializer(struct dvm *vm, dvm_ref self, const union dvm_value
   if (!strcmp(name, "setPrefix")) RETV();
   if (!strcmp(name, "startDocument")) {
     const char *enc = a0 ? a0 : "UTF-8";
-    if (a0) (void)dvm_set_field(vm, self, "encoding", "Ljava/lang/String;", ARG(0));
+    if (a0) (void)(dvm_set_field)(vm, self, "encoding", "Ljava/lang/String;", ARG(0));
     char b[200];
     snprintf(b, sizeof b, "<?xml version='1.0' encoding='%s'%s ?>", enc,
              nargs > 1 && ARG(1).l ? (rt_get_int(vm, ARG(1).l, "value") ? " standalone='yes'" : " standalone='no'") : "");
@@ -5246,11 +5246,11 @@ static bool x_xml_serializer(struct dvm *vm, dvm_ref self, const union dvm_value
       return false;
     }
     union dvm_value names = { 0 }, item = { .l = ARG(1).l }, ign = { 0 };
-    (void)dvm_get_field(vm, self, "names", "Ljava/util/List;", &names);
+    (void)(dvm_get_field)(vm, self, "names", "Ljava/util/List;", &names);
     if (!names.l) {
       names.l = coll_new_list(vm, "Ljava/util/ArrayList;");
       if (!names.l) return false;
-      (void)dvm_set_field(vm, self, "names", "Ljava/util/List;", names);
+      (void)(dvm_set_field)(vm, self, "names", "Ljava/util/List;", names);
     }
     const int depth = xs_depth(vm, self);
     if (!xs_close_tag(vm, self) || (depth || rt_get_int(vm, self, "lastEnd") ? !xs_newline(vm, self, depth) : false) ||
@@ -5271,7 +5271,7 @@ static bool x_xml_serializer(struct dvm *vm, dvm_ref self, const union dvm_value
   }
   if (!strcmp(name, "endTag")) {
     union dvm_value names = { 0 };
-    (void)dvm_get_field(vm, self, "names", "Ljava/util/List;", &names);
+    (void)(dvm_get_field)(vm, self, "names", "Ljava/util/List;", &names);
     struct rt_list *l = names.l ? list_of(vm, names.l) : NULL;
     if (!l || !l->size) {
       dvm__throw(vm, "java/lang/IllegalArgumentException", "no start tag to end");
@@ -5366,8 +5366,8 @@ static bool x_component_short(struct dvm *vm, dvm_ref self, const union dvm_valu
 {
   (void)args; (void)nargs;
   union dvm_value pkg = { 0 }, cls = { 0 };
-  (void)dvm_get_field(vm, self, "mPackage", "Ljava/lang/String;", &pkg);
-  (void)dvm_get_field(vm, self, "mClass", "Ljava/lang/String;", &cls);
+  (void)(dvm_get_field)(vm, self, "mPackage", "Ljava/lang/String;", &pkg);
+  (void)(dvm_get_field)(vm, self, "mClass", "Ljava/lang/String;", &cls);
   char b[512];
   snprintf(b, sizeof b, "{%s/%s}", pkg.l ? dvm_string_utf8(vm, pkg.l) : "", cls.l ? dvm_string_utf8(vm, cls.l) : "");
   RETL(dvm_new_string(vm, b));
@@ -5468,10 +5468,10 @@ static const struct rt_field rt_pm_flags_fields[] = { { "value", "J" }, F_END };
 static bool x_pm_flags(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
 {
   (void)nargs;
-  if (!strcmp(builtin_name(), "getValue")) return dvm_get_field(vm, self, "value", "J", out);
+  if (!strcmp(builtin_name(), "getValue")) return (dvm_get_field)(vm, self, "value", "J", out);
   dvm_ref f = dvm_new_object(vm, dvm_find_class(vm, "android/content/pm/PackageManager$PackageInfoFlags"));
   if (!f) return false;
-  (void)dvm_set_field(vm, f, "value", "J", ARG(0));
+  (void)(dvm_set_field)(vm, f, "value", "J", ARG(0));
   RETL(f);
 }
 static const struct rt_method rt_pm_flags[] = {
@@ -5526,7 +5526,7 @@ static bool pipe_wait(struct dvm *vm, dvm_ref pipe)
 static bool pipe_ensure(struct dvm *vm, dvm_ref self, int32_t size)
 {
   union dvm_value b = { 0 };
-  (void)dvm_get_field(vm, self, "buf", "[B", &b);
+  (void)(dvm_get_field)(vm, self, "buf", "[B", &b);
   if (b.l) return true;
   if (size <= 0) {
     dvm__throw(vm, "java/lang/IllegalArgumentException", "Pipe Size <= 0");
@@ -5534,7 +5534,7 @@ static bool pipe_ensure(struct dvm *vm, dvm_ref self, int32_t size)
   }
   b.l = dvm_new_array(vm, 'B', "B", (uint32_t)size);
   if (!b.l) return false;
-  (void)dvm_set_field(vm, self, "buf", "[B", b);
+  (void)(dvm_set_field)(vm, self, "buf", "[B", b);
   return true;
 }
 static bool x_piped_in(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs, union dvm_value *out)
@@ -5563,7 +5563,7 @@ static bool x_piped_in(struct dvm *vm, dvm_ref self, const union dvm_value *args
     RETV();
   }
   union dvm_value bufv = { 0 };
-  (void)dvm_get_field(vm, self, "buf", "[B", &bufv);
+  (void)(dvm_get_field)(vm, self, "buf", "[B", &bufv);
   struct dvm_object *b = bufv.l ? dvm__obj(vm, bufv.l) : NULL;
   if (!strcmp(name, "close")) {
     rt_set_int(vm, self, "readerClosed", 1);
@@ -5684,16 +5684,16 @@ static bool x_piped_out(struct dvm *vm, dvm_ref self, const union dvm_value *arg
       }
       RETV();
     }
-    (void)dvm_get_field(vm, self, "sink", "Ljava/io/PipedInputStream;", &sink);
+    (void)(dvm_get_field)(vm, self, "sink", "Ljava/io/PipedInputStream;", &sink);
     if (sink.l) {
       dvm__throw(vm, "java/io/IOException", "Already connected");
       return false;
     }
     if (!am_vcall(vm, ARG(0).l, "connect", "(Ljava/io/PipedOutputStream;)V", &(union dvm_value) { .l = self }, 1, &ign)) return false;
-    (void)dvm_set_field(vm, self, "sink", "Ljava/io/PipedInputStream;", ARG(0));
+    (void)(dvm_set_field)(vm, self, "sink", "Ljava/io/PipedInputStream;", ARG(0));
     RETV();
   }
-  (void)dvm_get_field(vm, self, "sink", "Ljava/io/PipedInputStream;", &sink);
+  (void)(dvm_get_field)(vm, self, "sink", "Ljava/io/PipedInputStream;", &sink);
   if (!strcmp(name, "close")) {
     if (sink.l) return am_vcall(vm, sink.l, "receivedLast", "()V", NULL, 0, out);
     RETV();
@@ -5743,7 +5743,7 @@ static bool x_launcher_icon_size(struct dvm *vm, dvm_ref self, const union dvm_v
   dvm_pin(vm, dm);
   rt_fill_display_metrics(vm, dm);
   union dvm_value density = { 0 };
-  (void)dvm_get_field(vm, dm, "density", "F", &density);
+  (void)(dvm_get_field)(vm, dm, "density", "F", &density);
   dvm_unpin(vm, dm);
   RETI((int32_t)(48.0f * density.f + 0.5f));
 }
@@ -5775,13 +5775,13 @@ static bool x_scrollview_smooth_by(struct dvm *vm, dvm_ref self, const union dvm
   int32_t target = sy + ARG(1).i;
   target = target < 0 ? 0 : target > max ? max : target;
   union dvm_value scroller = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "smoothScroller", "Landroid/widget/OverScroller;", &scroller);
+  (void)(dvm_get_field)(vm, self, "smoothScroller", "Landroid/widget/OverScroller;", &scroller);
   if (!scroller.l) {
     union dvm_value ctx = { 0 };
     scroller.l = dvm_new_object(vm, dvm_find_class(vm, "android/widget/OverScroller"));
     if (!scroller.l || !am_vcall(vm, self, "getContext", "()Landroid/content/Context;", NULL, 0, &ctx) ||
         !am_vcall(vm, scroller.l, "<init>", "(Landroid/content/Context;)V", &ctx, 1, &ign)) return false;
-    (void)dvm_set_field(vm, self, "smoothScroller", "Landroid/widget/OverScroller;", scroller);
+    (void)(dvm_set_field)(vm, self, "smoothScroller", "Landroid/widget/OverScroller;", scroller);
   }
   union dvm_value a[5] = { { .i = sx }, { .i = sy }, { .i = 0 }, { .i = target - sy }, { .i = 250 } };
   if (!am_vcall(vm, scroller.l, "startScroll", "(IIIII)V", a, 5, &ign)) return false;
@@ -5800,7 +5800,7 @@ static bool x_scrollview_compute_scroll(struct dvm *vm, dvm_ref self, const unio
 {
   (void)args; (void)nargs; (void)out;
   union dvm_value scroller = { 0 }, more = { 0 }, x = { 0 }, y = { 0 }, ign = { 0 };
-  (void)dvm_get_field(vm, self, "smoothScroller", "Landroid/widget/OverScroller;", &scroller);
+  (void)(dvm_get_field)(vm, self, "smoothScroller", "Landroid/widget/OverScroller;", &scroller);
   if (!scroller.l || !am_vcall(vm, scroller.l, "computeScrollOffset", "()Z", NULL, 0, &more) || !more.i) RETV();
   if (!am_vcall(vm, scroller.l, "getCurrX", "()I", NULL, 0, &x) || !am_vcall(vm, scroller.l, "getCurrY", "()I", NULL, 0, &y)) return false;
   union dvm_value to[2] = { x, y };
@@ -5822,12 +5822,12 @@ static bool x_drawable_hotspot(struct dvm *vm, dvm_ref self, const union dvm_val
     dvm_ref r = dvm_new_object(vm, dvm_find_class(vm, "android/graphics/Rect"));
     union dvm_value ign = { 0 };
     if (!r || !am_vcall(vm, r, "<init>", "(IIII)V", args, 4, &ign)) return false;
-    (void)dvm_set_field(vm, self, "hotspotBounds", "Landroid/graphics/Rect;", (union dvm_value) { .l = r });
+    (void)(dvm_set_field)(vm, self, "hotspotBounds", "Landroid/graphics/Rect;", (union dvm_value) { .l = r });
     ui_invalidate_view(vm, self, NULL, 0);
     RETV();
   }
   union dvm_value hs = { 0 }, ign = { 0 };           /* getHotspotBounds(Rect out): the hotspot, else the bounds */
-  (void)dvm_get_field(vm, self, "hotspotBounds", "Landroid/graphics/Rect;", &hs);
+  (void)(dvm_get_field)(vm, self, "hotspotBounds", "Landroid/graphics/Rect;", &hs);
   if (!ARG(0).l) {
     dvm__throw(vm, "java/lang/NullPointerException", "outRect");
     return false;
