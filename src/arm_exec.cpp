@@ -17276,6 +17276,11 @@ extern "C" uint32_t arm_exec_input_queue_handle(void) {
  * logical pixels for the cursor and physical ones for the framebuffer.  In
  * every one of those cases a tap landed somewhere other than where it was
  * aimed, so convert instead of assuming. */
+static bool host_window_scales() {
+  const char *mode = lunaria_env("LUNARIA_RESIZE_MODE");
+  return luna_comp_active() && mode && !strcmp(mode, "scale");
+}
+
 static void window_to_surface(double *x, double *y) {
   if (!g_glfw) return;
   int ww = 0, wh = 0;
@@ -17311,8 +17316,7 @@ static void window_to_surface(double *x, double *y) {
             desired_w, desired_h);
   }
   if (sw <= 0 || sh <= 0 || (sw == ww && sh == wh)) return;
-  const char *resize_mode = lunaria_env("LUNARIA_RESIZE_MODE");
-  if (luna_comp_active() && resize_mode && !strcmp(resize_mode, "scale")) {
+  if (host_window_scales()) {
     int vw = ww, vh = wh, vx = 0, vy = 0;
     if ((int64_t)ww * sh > (int64_t)wh * sw) {
       vw = (int)((int64_t)wh * sw / sh);
@@ -17341,20 +17345,9 @@ static void window_to_surface(double *x, double *y) {
  * (arm_exec_take_view_resize). The surface the guest is told about is the
  * window, so the pointer mapping in window_to_surface() becomes the identity
  * again. */
-static void glfw_fb_size_cb(GLFWwindow *window, int w, int h) {
-  if (w <= 0 || h <= 0) return;            /* minimised: nothing to draw to */
-#if defined(__linux__)
-  /* Keep the Wayland EGL wrapper in sync with the resized GLFW surface. */
-  luna_os_native_window(window);
-#endif
-  /* Scaling the host window does not resize the emulated Android display. */
-  const char *resize_mode = lunaria_env("LUNARIA_RESIZE_MODE");
-  if (luna_comp_active() && resize_mode && !strcmp(resize_mode, "scale")) {
-    luna_comp_wake();
-    return;
-  }
+static void apply_display_size(int w, int h) {
   if (w == g_fb_w && h == g_fb_h) return;
-  fprintf(stderr, "[egl] window resized to %dx%d (was %dx%d) — telling the "
+  fprintf(stderr, "[egl] display resized to %dx%d (was %dx%d) — telling the "
                   "guest its surface changed\n", w, h, g_fb_w, g_fb_h);
   g_fb_w = w;
   g_fb_h = h;
@@ -17369,6 +17362,20 @@ static void glfw_fb_size_cb(GLFWwindow *window, int w, int h) {
     g_ctx->mem.write32(g_fake_anw_va + anw_geom_off(L, 0), (uint32_t)(g_anw_buf_w>0 ? g_anw_buf_w : w));
     g_ctx->mem.write32(g_fake_anw_va + anw_geom_off(L, 1), (uint32_t)(g_anw_buf_h>0 ? g_anw_buf_h : h));
   }
+}
+
+static void glfw_fb_size_cb(GLFWwindow *window, int w, int h) {
+  if (w <= 0 || h <= 0) return;            /* minimised: nothing to draw to */
+#if defined(__linux__)
+  /* Keep the Wayland EGL wrapper in sync with the resized GLFW surface. */
+  luna_os_native_window(window);
+#endif
+  /* Scaling the host window does not resize the emulated Android display. */
+  if (host_window_scales()) {
+    luna_comp_wake();
+    return;
+  }
+  apply_display_size(w, h);
 }
 
 static void keymap_release(void);
@@ -67082,17 +67089,18 @@ extern "C" void arm_exec_glfw_poll(void) {
   luna_qfkey_pump_input();
   pinch_poll();
   keymap_apply_pending();
-  if (g_glfw) {
-    const uint64_t requested = g_requested_view_size.exchange(0);
-    if (requested) {
-      const int w = (int)(requested >> 32), h = (int)(uint32_t)requested;
+  const uint64_t requested = g_requested_view_size.exchange(0);
+  if (requested) {
+    const int w = (int)(requested >> 32), h = (int)(uint32_t)requested;
+    if (!g_glfw || host_window_scales()) apply_display_size(w, h);
+    if (g_glfw) {
       glfwSetWindowSize(g_glfw, w, h);
       int fw = 0, fh = 0;
       glfwGetFramebufferSize(g_glfw, &fw, &fh);
       glfw_fb_size_cb(g_glfw, fw, fh);
     }
-    poll_glfw_events();
   }
+  if (g_glfw) poll_glfw_events();
   if (luna_ime_active() || luna_overlay_guest_keys_captured() || luna_overlay_menu_showing())
     keymap_release();
   clipboard_flush_pending();

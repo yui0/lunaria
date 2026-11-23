@@ -171,7 +171,7 @@ HOST_RPATH        = -Wl,-rpath,@loader_path/runtime \
 HOST_TEST_RPATH   = -Wl,-rpath,@loader_path/../.deps/lib
 LUNARIA_LIBDIRS   = -L.
 
-OPENH264_SO       = runtime/libopenh264.dylib
+OPENH264_SO      ?= runtime/libopenh264.dylib
 OPENH264_ARCH    ?= mac-arm64
 OPENH264_URL      = https://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).dylib.bz2
 PTHREAD_SRC       = src/lib/stub.c
@@ -212,10 +212,10 @@ HOST_TEST_RPATH   =
 # bionic shim) instead of the system libc. JVM is linked by its explicit
 # path and SONAME; libdl/libpthread retain the aliases in the source root.
 LUNARIA_LIBDIRS   = -L.
-OPENH264_SO       = runtime/libopenh264.so
+OPENH264_SO      ?= runtime/libopenh264.so
 OPENH264_ARCH    ?= linux64
 OPENH264_ABI      = 7
-OPENH264_URL      = http://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).$(OPENH264_ABI).so.bz2
+OPENH264_URL      = https://ciscobinary.openh264.org/libopenh264-$(OPENH264_VERSION)-$(OPENH264_ARCH).$(OPENH264_ABI).so.bz2
 PTHREAD_SRC       = src/lib/pthread.c
 HOST_BIONIC_LIBC  = runtime/libc.so
 endif
@@ -2251,7 +2251,7 @@ DYNARMIC_INCS = \
 # so a cross compiler (CC=x86_64-linux-gnu-gcc on an arm64 machine) is judged
 # by what it produces and not by the machine it runs on.
 LUNA_TARGET_ARCH ?= $(firstword $(subst -, ,$(shell $(CC) -dumpmachine 2>/dev/null)))
-ifneq (,$(or $(filter Darwin,$(LUNA_OS_NAME)),$(filter arm64 aarch64,$(LUNA_TARGET_ARCH))))
+ifneq (,$(filter arm64 aarch64,$(LUNA_TARGET_ARCH)))
 DYNARMIC_X86 =
 else
 DYNARMIC_X86 = 1
@@ -3529,7 +3529,7 @@ ifeq ($(LUNA_OS_NAME),Darwin)
 dist-stage: macos-deps
 endif
 
-dist-stage:
+dist-stage: $(OPENH264_SO)
 	$(MAKE) -B dist-stage-build \
 	    BUILD_DIR="$(DIST_BUILD_DIR)" \
 	    DYNARMIC_BUILD="$(DIST_DYNARMIC_BUILD)" \
@@ -3540,7 +3540,7 @@ dist-stage:
 	    SANITIZE= \
 	    DYNARMIC_IPO=ON
 
-dist-stage-build: $(LUNARIA_BIN) $(libs) $(OPENH264_SO) dist-luna-browser
+dist-stage-build: $(LUNARIA_BIN) $(libs) dist-luna-browser
 	sh scripts/make-dist.sh "$(DIST_STAGE)" "$(DIST_OS)" "$(DIST_ARCH)" "$(LUNARIA_BIN)" "$(SYSLIB_DIR)" "$(OPENH264_SO)"
 ifeq ($(DIST_OS),windows)
 # Prefer full guest libs (libm/libc/libz + liblunaria_guest). libm/libc come

@@ -536,6 +536,11 @@ static bool avcodec_vp9_ready(void)
   return avcodec_video_ready("vp9");
 }
 
+static bool is_mpeg4_mime(const char *mime)
+{
+  return !strcasecmp(mime, "video/mp4v-es");
+}
+
 static bool is_vp9_mime(const char *mime)
 {
   return !strcasecmp(mime, "video/x-vnd.on2.vp9") ||
@@ -887,7 +892,7 @@ struct lm_codec {
   uint8_t *vpad;           /* input copy with the padding libavcodec reads */
   size_t vpad_cap;
   bool vcsd_pending;       /* csd-0/1 still to go in front of the next AU */
-  bool prepend_csd;        /* H.264 parameter sets belong on the first AU */
+  bool prepend_csd;        /* prefix decoder configuration to the first access unit */
   char mime[48];
 
   /* The codec thread (libavcodec only).  MediaCodec decodes on a thread of
@@ -979,6 +984,7 @@ bool lm_codec_supported(const char *mime)
   if (!strcasecmp(mime, "video/avc"))
     return avcodec_h264_ready() || openh264_ready();
   if (is_vp9_mime(mime)) return avcodec_vp9_ready();
+  if (is_mpeg4_mime(mime)) return avcodec_video_ready("mpeg4");
   if (is_aac_mime(mime)) return avcodec_aac_ready();
   return false;
 }
@@ -1003,9 +1009,8 @@ static struct lm_codec *aac_codec_new(void)
   return c;
 }
 
-/* Opens a libavcodec video decoder into c.  prepend_csd is for H.264, whose
- * parameter sets have to ride on the first access unit.  VP9 frames stand
- * alone; the codec-private bytes are not a picture. */
+/* H.264 and MPEG-4 Visual need their configuration before the first
+ * access unit. VP9 frames do not need a separate configuration prefix. */
 static bool av_video_open(struct lm_codec *c, const char *decoder, bool prepend_csd)
 {
   void *codec = av.find_decoder_by_name(decoder);
@@ -1045,8 +1050,9 @@ struct lm_codec *lm_codec_new(const char *mime)
     return c;
   }
 
-  if (avcodec_h264_ready()) {
-    if (!av_video_open(c, "h264", true)) {
+  const bool mpeg4 = is_mpeg4_mime(mime);
+  if (mpeg4 || avcodec_h264_ready()) {
+    if (!av_video_open(c, mpeg4 ? "mpeg4" : "h264", true)) {
       free(c);
       return NULL;
     }
@@ -2297,7 +2303,7 @@ static void lm_avcc_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len
   tr->csd_len = used;
 }
 
-/* esds → AudioSpecificConfig (the DecoderSpecificInfo, tag 0x05). */
+/* Extract DecoderSpecificInfo (tag 0x05) from an esds box. */
 static void lm_esds_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
 {
   size_t off = 4;                                 /* version + flags */
@@ -2344,8 +2350,9 @@ static void lm_stsd_entry(void *ctx, const char *type, const uint8_t *body,
 {
   struct lm_mp4_track *tr = ctx;
   struct lm_box_walk w = { lm_stsd_child, tr };
-  if (!strcmp(type, "avc1") || !strcmp(type, "avc3")) {
-    snprintf(tr->mime, sizeof tr->mime, "video/avc");
+  const bool mpeg4 = !strcmp(type, "mp4v");
+  if (mpeg4 || !strcmp(type, "avc1") || !strcmp(type, "avc3")) {
+    snprintf(tr->mime, sizeof tr->mime, "%s", mpeg4 ? "video/mp4v-es" : "video/avc");
     if (len >= 32) {
       tr->width  = rd16(body + 24);
       tr->height = rd16(body + 26);

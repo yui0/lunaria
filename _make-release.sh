@@ -4,6 +4,7 @@
 #   ./_make-release.sh [OPTIONS] [TAG]     # TAGを指定 (省略時は YYYY.M.D)
 #   ./_make-release.sh                     # Linux ネイティブ + Linux 対向アーキ (aarch64 ⇄ x86_64) クロス
 #   ./_make-release.sh --native-only       # Linux ネイティブのみ (対向アーキのクロスをしない)
+#   JOBS=1 ./_make-release.sh --native-only --no-upload  # 直列でビルドしてエラーを確認
 #   bash _make-release.sh                  # clone 直後で Permission denied のとき (chmod +x でも可)
 #   ※ Orange Pi 等で panfork Mesa があると amd64 の libegl が multiarch 同居できない。
 #     その場合は .deb を .cross-sysroot-amd64/ に展開してクロスリンクする。
@@ -35,6 +36,8 @@
 #   QBERRYOS_TOKEN      — --sync-os 用 (未設定時は GITHUB_TOKEN)
 #   SYNC_REPO           — --sync-os の同期先 (default: yui0/qBerryOS)
 #   SYNC_TAG_PREFIX     — 同期先でのタグ接頭辞 (default: lunaria-)  例: lunaria-2026.10.9
+#   OPENH264_SO         — ネイティブのみのビルドで、runtime/ 外に置いた取得済みデコーダの絶対パス
+#                         Linux は libopenh264.so、macOS は libopenh264.dylib
 #   WIN_DEPS 他         — scripts/dist-cross-win.sh が参照する変数をそのまま引き継ぐ
 #
 # `sh _make-release.sh` (dash 等) でも動くよう、bash でなければ付け替える。
@@ -72,7 +75,8 @@ done
 TAG="${1:-$(date +%Y.%-m.%-d)}"
 DIST_DATE="$(date +%Y-%m-%d)"   # Makefile の DIST_DATE と同じ書式 (成果物名の予測用)
 HOST_OS="$(uname -s)"
-JOBS="$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+export DYNARMIC_JOBS="${DYNARMIC_JOBS:-$JOBS}"
 
 # ── カラー出力 ─────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -421,6 +425,25 @@ collect() {  # collect <ファイル名>
   success "$1 完成"
 }
 
+build_package() {
+  local name="$1"
+  shift
+  local log="$ARTIFACTS_DIR/$name.log"
+  local status
+  info "ビルドログ: $log"
+  if "$@" >"$log" 2>&1; then
+    return 0
+  else
+    status=$?
+  fi
+  warn "ビルド失敗 ($name, 終了コード $status)"
+  if ! grep -inEm1 -B3 -A6 '(^|[[:space:]])(fatal error:|error:|CMake Error|curl:|Killed|undefined reference|No rule to make target|cannot find -l|No space left on device)' "$log" >&2; then
+    tail -n 20 "$log" >&2
+  fi
+  warn "全ログ: $log"
+  return "$status"
+}
+
 # guest 側 AArch64 libm 等。無くても動く (SVC thunk 経由になるだけ) ので失敗は許容
 build_syslib() { make syslib guestlib || warn "syslib/guestlib をビルドできませんでした。無しで同梱します。"; }
 
@@ -436,7 +459,7 @@ case "$HOST_OS" in
     info "ビルド中: $NAME.tar.gz (ネイティブ) ..."
     build_syslib
     reset_tree
-    make -j"$JOBS" dist DIST_NAME="$NAME" OPENH264_ARCH="$NATIVE_OPENH264"
+    build_package "$NAME" make -j"$JOBS" dist DIST_NAME="$NAME" OPENH264_ARCH="$NATIVE_OPENH264"
     collect "$NAME.tar.gz"
     ;;
   Darwin)
@@ -445,7 +468,7 @@ case "$HOST_OS" in
       info "ビルド中: $NAME.tar.gz ..."
       make macos-deps
       build_syslib
-      make -j"$JOBS" dist DIST_NAME="$NAME"
+      build_package "$NAME" make -j"$JOBS" dist DIST_NAME="$NAME"
       collect "$NAME.tar.gz"
     else
       warn "macOS ホストですが --macos が無いため macOS ビルドをスキップします。"
@@ -486,7 +509,7 @@ if [[ "$HOST_OS" == "Linux" && "$LINUX_CROSS" == "true" ]]; then
   OBJDUMP="$CROSS_TRIPLE-objdump" \
   LIBRARY_PATH="${CROSS_SYSROOT:+$CROSS_SYSROOT/usr/lib/$CROSS_TRIPLE:$CROSS_SYSROOT/lib/$CROSS_TRIPLE:}${LIBRARY_PATH:-}" \
   DIST_LIB_DIRS="$_CROSS_LPATH" \
-  make -j"$JOBS" "${_MAKE_CROSS_ARGS[@]}"
+  build_package "$NAME" make -j"$JOBS" "${_MAKE_CROSS_ARGS[@]}"
   collect "$NAME.tar.gz"
   reset_tree
 fi
@@ -502,7 +525,7 @@ if [[ "$BUILD_WINDOWS" == "true" ]]; then
     info "ビルド中: $NAME.zip (mingw クロス) ..."
     # Guest AArch64 syslib はホスト非依存。先に作って dist-cross-win で再利用する。
     build_syslib
-    make dist-cross-win
+    build_package "$NAME" make dist-cross-win
     collect "$NAME.zip"
   fi
 fi

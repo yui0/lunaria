@@ -225,6 +225,7 @@ static bool http_connection_parameter(struct dvm *vm,dvm_ref self,const union dv
   }
   const char *name=builtin_name();
   bool setter=!strncmp(name,"set",3);
+  const char *field_name=setter || !strncmp(name,"get",3) ? name+3 : NULL;
   const struct {
     const char *name,*key;
     int value;
@@ -234,7 +235,7 @@ static bool http_connection_parameter(struct dvm *vm,dvm_ref self,const union dv
     {"SocketBufferSize","http.socket.buffer-size",-1,false},{"Linger","http.socket.linger",-1,false},
     {"ConnectionTimeout","http.connection.timeout",0,false},{"StaleCheckingEnabled","http.connection.stalecheck",1,true}
   };
-  for(size_t i=0; i<sizeof fields/sizeof fields[0]; ++i)if(!strcmp(name+3,fields[i].name) || (!strcmp(name,"isStaleCheckingEnabled") && i==5)) {
+  for(size_t i=0; i<sizeof fields/sizeof fields[0]; ++i)if((field_name && !strcmp(field_name,fields[i].name)) || (!strcmp(name,"isStaleCheckingEnabled") && i==5)) {
       union dvm_value query[2]= {{.l=dvm_new_string(vm,fields[i].key)},setter ? ARG(1) : (union dvm_value) {
           .i=fields[i].value
         }

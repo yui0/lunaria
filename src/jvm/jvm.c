@@ -2065,13 +2065,8 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v,JNIEnv *env,jmethodID method,const jva
     }
     args=v->promoted;
   }
-#if defined(__APPLE__)
-  /* Darwin defines va_list as a simple char pointer on both supported host
-   * architectures.  Treating it as the Linux AArch64 four-field structure
-   * wrote 32 bytes through an 8-byte field, corrupting the caller's stack;
-   * every Call*MethodA that reached a host stub could damage unrelated JNI
-   * state.  A jvalue is one aligned 8-byte vararg slot, so the cursor begins
-   * directly at the array. */
+#if defined(__APPLE__) && defined(__aarch64__)
+  /* Darwin arm64 uses a pointer to the 8-byte stack vararg slots. */
   v->ap = (va_list)(uintptr_t)args;
 #elif defined(__x86_64__)
   struct {
@@ -2098,7 +2093,7 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v,JNIEnv *env,jmethodID method,const jva
 }
 
 /* Invoke a `T (*)(JNIEnv*, C, va_list)` stub with a jvalue array.  A NULL array
- * means "no arguments".  On Darwin/x86_64 that is a NULL va_list pointer; on
+ * means "no arguments".  On Darwin and x86_64 that is a NULL pointer; on
  * AArch64 Linux (struct va_list) it is a zeroed va_list.  Stubs test this with
  * JVM_VA_HAS_ARGS — synthesising a real empty list would make those tests pass
  * and the stub read past the end of nothing. */
