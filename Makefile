@@ -345,6 +345,27 @@ BUILD_TOOLS_ZIP ?= build-tools_r34-linux.zip
 BUILD_TOOLS_URL ?= https://dl.google.com/android/repository/$(BUILD_TOOLS_ZIP)
 BUILD_TOOLS_CACHE ?= $(BUILD_DIR)/$(BUILD_TOOLS_ZIP)
 
+# Android NDK sysroot (headers + libz.a), fetched on demand when no local NDK
+# is found.  Google only ships an x86_64 NDK, so only the sysroot is extracted
+# and the host clang/lld cross-compile with --target=aarch64-linux-android21.
+NDK_VERSION   ?= r27c
+NDK_ZIP       ?= android-ndk-$(NDK_VERSION)-linux.zip
+NDK_URL       ?= https://dl.google.com/android/repository/$(NDK_ZIP)
+NDK_FETCH_DIR ?= $(CURDIR)/.deps/ndk
+NDK_SYSROOT   := $(NDK_FETCH_DIR)/android-ndk-$(NDK_VERSION)/toolchains/llvm/prebuilt/linux-x86_64/sysroot
+.PHONY: ndk-fetch
+ndk-fetch:
+	@set -e; \
+	if [ -f "$(NDK_SYSROOT)/usr/lib/aarch64-linux-android/libz.a" ]; then exit 0; fi; \
+	mkdir -p "$(NDK_FETCH_DIR)"; \
+	zip="$(NDK_FETCH_DIR)/$(NDK_ZIP)"; \
+	echo "ndk: fetching $(NDK_URL)"; \
+	curl -fL --retry 3 -C - -o "$$zip" "$(NDK_URL)"; \
+	echo "ndk: extracting sysroot"; \
+	unzip -q -o "$$zip" 'android-ndk-$(NDK_VERSION)/toolchains/llvm/prebuilt/linux-x86_64/sysroot/*' -d "$(NDK_FETCH_DIR)"; \
+	rm -f "$$zip"; \
+	test -f "$(NDK_SYSROOT)/usr/lib/aarch64-linux-android/libz.a" || { echo "ndk: sysroot extraction failed" >&2; exit 1; }
+
 syslib: $(SYSLIB_LIBM) $(SYSLIB_LIBC) $(SYSLIB_LIBZ)
 
 # Downloadable without an NDK (build-tools zip). Used by Windows dist when the
@@ -397,23 +418,25 @@ $(SYSLIB_LIBC):
 $(SYSLIB_LIBZ):
 	@mkdir -p $(SYSLIB_DIR)
 	@set -e; \
-	archive=""; compiler=""; \
-	for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
-	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" \
-	            "$$HOME/Library/Android/sdk/ndk" "$$HOME/Android/Sdk/ndk" \
-	            /root/image/android/ndk; do \
+	find_ndk() { \
+	  for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
+	              "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" \
+	              "$$HOME/Library/Android/sdk/ndk" "$$HOME/Android/Sdk/ndk" \
+	              /root/image/android/ndk "$(NDK_FETCH_DIR)"; do \
 	    [ -n "$$root" ] || continue; \
 	    archive=`find "$$root" -path '*/sysroot/usr/lib/aarch64-linux-android/libz.a' 2>/dev/null | head -1`; \
-	    [ -n "$$archive" ] || continue; \
-	    toolroot=$${archive%%/sysroot/usr/lib/aarch64-linux-android/libz.a}; \
-	    compiler="$$toolroot/bin/aarch64-linux-android21-clang"; \
-	    [ -x "$$compiler" ] || compiler="$$toolroot/bin/clang.exe"; \
-	    [ -x "$$compiler" ] && break; \
-	    archive=""; compiler=""; \
-	done; \
+	    [ -n "$$archive" ] && return 0; \
+	  done; archive=""; return 1; \
+	}; \
+	find_ndk || { $(MAKE) --no-print-directory ndk-fetch && find_ndk; } || true; \
 	[ -n "$$archive" ] || { echo "syslib: no Android NDK arm64 libz.a found" >&2; exit 1; }; \
+	sysroot=$${archive%%/usr/lib/aarch64-linux-android/libz.a}; \
+	toolroot=$${sysroot%/sysroot}; \
+	compiler="$$toolroot/bin/aarch64-linux-android21-clang"; \
+	if [ -x "$$compiler" ] && "$$compiler" --version >/dev/null 2>&1; then cc="$$compiler --target=aarch64-linux-android21"; \
+	else cc="clang --target=aarch64-linux-android21 --sysroot=$$sysroot -fuse-ld=lld -nostdlib"; fi; \
 	echo "syslib: linking Android $$archive"; \
-	"$$compiler" --target=aarch64-linux-android21 -shared -Wl,-soname,libz.so -Wl,--whole-archive \
+	$$cc -shared -Wl,-soname,libz.so -Wl,--whole-archive \
 	    "$$archive" -Wl,--no-whole-archive -o $@; \
 	head -c 20 $@ | od -An -tu1 -j18 -N1 | grep -q 183 || \
 	    { echo "syslib: $@ is not AArch64" >&2; rm -f $@; exit 1; }
@@ -432,17 +455,23 @@ $(SYSLIB_GUEST): src/lib/guest.c Makefile
 	@set -e; \
 	compiler="$(GUEST_CC)"; \
 	if [ -z "$$compiler" ]; then \
-	for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
-	            "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" \
-	            "$$HOME/Library/Android/sdk/ndk" "$$HOME/Android/Sdk/ndk" \
-	            /root/image/android/ndk; do \
-	    [ -n "$$root" ] || continue; \
-	    cand=`find "$$root" -name aarch64-linux-android21-clang 2>/dev/null | head -1`; \
-	    [ -n "$$cand" ] || cand=`find "$$root" -path '*/prebuilt/*/bin/clang.exe' 2>/dev/null | head -1`; \
-	    [ -n "$$cand" ] && [ -x "$$cand" ] && { compiler="$$cand"; break; }; \
-	done; fi; \
+	  find_cc() { \
+	    for root in "$$LUNARIA_ANDROID_NDK" "$$ANDROID_NDK_HOME" "$$ANDROID_NDK_ROOT" \
+	                "$$ANDROID_HOME/ndk" "$$ANDROID_SDK_ROOT/ndk" \
+	                "$$HOME/Library/Android/sdk/ndk" "$$HOME/Android/Sdk/ndk" \
+	                /root/image/android/ndk "$(NDK_FETCH_DIR)"; do \
+	      [ -n "$$root" ] || continue; \
+	      cand=`find "$$root" -name aarch64-linux-android21-clang 2>/dev/null | head -1`; \
+	      [ -n "$$cand" ] || cand=`find "$$root" -path '*/prebuilt/*/bin/clang.exe' 2>/dev/null | head -1`; \
+	      if [ -n "$$cand" ] && [ -x "$$cand" ] && "$$cand" --version >/dev/null 2>&1; then compiler="$$cand"; return 0; fi; \
+	      sr=`find "$$root" -type d -path '*/prebuilt/*/sysroot' 2>/dev/null | head -1`; \
+	      if [ -n "$$sr" ] && command -v clang >/dev/null 2>&1; then compiler="clang --sysroot=$$sr -fuse-ld=lld"; return 0; fi; \
+	    done; return 1; \
+	  }; \
+	  find_cc || { $(MAKE) --no-print-directory ndk-fetch && find_cc; } || true; \
+	fi; \
 	[ -n "$$compiler" ] || { echo "guestlib: no Android NDK aarch64 clang found" >&2; exit 1; }; \
-	"$$compiler" --target=aarch64-linux-android21 -std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-free -fno-builtin-calloc -fno-builtin-realloc \
+	$$compiler --target=aarch64-linux-android21 -std=c11 -O2 -fPIC -shared -fno-builtin-malloc -fno-builtin-free -fno-builtin-calloc -fno-builtin-realloc \
 	    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
 	    -fno-stack-protector -mno-outline-atomics -Wall -Wextra -Isrc $(GUEST_CPPFLAGS) $(GUEST_LDFLAGS) \
 	    -nostdlib -Wl,-soname,liblunaria_guest.so -Wl,-Bsymbolic -Wl,--no-undefined \
@@ -543,9 +572,9 @@ guest-log-assert-test: lunaria $(BUILD_DIR)/liblogassert64.so $(BUILD_DIR)/liblo
 	@set -e; for abi in 64 32; do \
 	    output="$(BUILD_DIR)/log-assert$$abi.log"; result=0; \
 	    timeout -k 2s 15s env LUNARIA_MAX_FRAMES=1 ./lunaria "$(BUILD_DIR)/liblogassert$$abi.so" > "$$output" 2>&1 || result=$$?; \
-	    test "$$result" = 1; \
+	    test "$$result" = 134; \
 	    rg -q -F '[android_log p=7 t=assert-test] int=42 str=hello wide=123456789abcdef0 tail=73' "$$output"; \
-	    rg -q -F 'abort() called' "$$output"; \
+	    rg -q '\[abort\] #[0-9]+ pid=[0-9]+ tid=[0-9]+ scheduler_tid=[0-9]+ thread=.* abi=arm(64)? lr=0x[0-9a-f]{16}' "$$output"; \
 	    ! rg -q -F 'FAIL assertion returned' "$$output"; \
 	    echo "ARM$$abi liblog assert varargs and abort: PASS"; \
 	done
@@ -702,8 +731,8 @@ $(BUILD_DIR)/luna_qfkey.o: src/luna_qfkey.c src/luna_qfkey.h src/arm_exec.h
 
 # luna_media_codec.h is declarations plus, under LUNA_MEDIA_CODEC_IMPLEMENTATION,
 # the implementation: this object is the one translation unit that has it.
-$(BUILD_DIR)/luna_media_codec.o: src/luna_media_codec.h src/lunaria_os.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLUNA_MEDIA_CODEC_IMPLEMENTATION -x c -c src/luna_media_codec.h -o $@
+$(BUILD_DIR)/luna_media_codec.o: src/luna_media_codec.h src/lunaria_os.h src/dvm/dvm_media.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLUNA_MEDIA_CODEC_IMPLEMENTATION -DLUNA_MEDIA_CODEC_DECODERS -x c -c src/luna_media_codec.h -o $@
 
 $(BUILD_DIR)/luna_vulkan.o: | $(BUILD_DIR)
 $(BUILD_DIR)/luna_vulkan.o: src/luna_vulkan.c src/luna_vulkan_cmds.h src/arm_exec.h src/luna_boot.h
@@ -794,11 +823,15 @@ $(BUILD_DIR)/execute-fault64.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
 	$(ABI64_ANDROID_CC) -std=c11 -o $@ $<
 $(BUILD_DIR)/execute-fatal64.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
 	$(ABI64_ANDROID_CC) -std=c11 -DGUEST_EXECUTE_FATAL -Wno-unused-function -o $@ $<
+$(BUILD_DIR)/data-fatal64.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
+	$(ABI64_ANDROID_CC) -std=c11 -DGUEST_EXECUTE_FATAL -DGUEST_DATA_FATAL -Wno-unused-function -o $@ $<
+$(BUILD_DIR)/constructor-fatal64.so: test/guest_execute_fault_test.c | $(BUILD_DIR)
+	$(ABI64_ANDROID_CC) -std=c11 -DGUEST_EXECUTE_FATAL -DGUEST_DATA_FATAL -DGUEST_CTOR_FATAL -Wno-unused-function -o $@ $<
 .PHONY: execute-fault-test
-execute-fault-test: lunaria $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fatal32.so $(BUILD_DIR)/execute-fault64.so $(BUILD_DIR)/execute-fatal64.so
+execute-fault-test: lunaria $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fatal32.so $(BUILD_DIR)/execute-fault64.so $(BUILD_DIR)/execute-fatal64.so $(BUILD_DIR)/data-fatal64.so $(BUILD_DIR)/constructor-fatal64.so
 	@python3 test/run_guest_results.py $(BUILD_DIR)/execute-fault32.so $(BUILD_DIR)/execute-fault64.so
-	@for fixture in $(BUILD_DIR)/execute-fatal32.so $(BUILD_DIR)/execute-fatal64.so; do \
-	  python3 -c 'import pathlib,subprocess,sys; p=subprocess.run(["./lunaria",sys.argv[1]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30); out=p.stdout.decode(errors="replace"); pathlib.Path(sys.argv[1]+".out").write_text(out); ok=p.returncode==139 and "Fatal signal 11 (SIGSEGV), code 1, fault addr 0x00000000" in out and "RESULT FAIL" not in out and "retired: NULL" not in out and "host-abort" not in out; print("Unhandled worker execute fault: "+("PASS" if ok else "FAIL")); sys.exit(0 if ok else 1)' "$$fixture" || exit $$?; \
+	@for fixture in $(BUILD_DIR)/execute-fatal32.so $(BUILD_DIR)/execute-fatal64.so $(BUILD_DIR)/data-fatal64.so $(BUILD_DIR)/constructor-fatal64.so; do \
+	  python3 -c 'import pathlib,subprocess,sys; p=subprocess.run(["./lunaria",sys.argv[1]],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=30); out=p.stdout.decode(errors="replace"); pathlib.Path(sys.argv[1]+".out").write_text(out); ok=p.returncode==139 and ("Fatal signal 11 (SIGSEGV), code 1, fault addr 0x00000000" in out or "Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x10000000000000 in tid " in out) and "RESULT FAIL" not in out and "retired: NULL" not in out and "host-abort" not in out; print(pathlib.Path(sys.argv[1]).name+": "+("PASS" if ok else "FAIL")); sys.exit(0 if ok else 1)' "$$fixture" || exit $$?; \
 	done
 
 $(eval $(call GUEST_ABI_TEST,guest-dac,test/guest_dac_test.c,$(ABI32_HFBARE_CC),-std=c11))
@@ -3108,7 +3141,10 @@ $(BUILD_DIR)/kill_process64_%.so: test/kill_process_test.c | $(BUILD_DIR)
 .PHONY: kill-process-test
 $(eval $(call GUEST_ABI_TEST,kill_process_worker,test/kill_process_test.c,$(ABI32_CC),-std=c11 -DKILL_FROM_WORKER))
 
-KILL_PROCESS_FIXTURES += $(BUILD_DIR)/kill_process_worker32.so $(BUILD_DIR)/kill_process_worker64.so
+$(BUILD_DIR)/kill_process_sigterm64.so: test/kill_process_test.c | $(BUILD_DIR)
+	$(ABI64_CC) -std=c11 -DKILL_WITH_SIGTERM -o $@ $<
+
+KILL_PROCESS_FIXTURES += $(BUILD_DIR)/kill_process_worker32.so $(BUILD_DIR)/kill_process_worker64.so $(BUILD_DIR)/kill_process_sigterm64.so
 kill-process-test: lunaria $(KILL_PROCESS_FIXTURES)
 	@python3 test/run_kill_process_test.py $(KILL_PROCESS_FIXTURES)
 
@@ -3739,6 +3775,16 @@ $(BUILD_DIR)/ndk_media_codec32.so: test/ndk_media_codec_test.c src/luna_media_co
 ndk-media-codec-test: lunaria $(BUILD_DIR)/ndk_media_codec64.so $(BUILD_DIR)/ndk_media_codec32.so
 	LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/ndk_media_codec64.so $(BUILD_DIR)/ndk_media_codec32.so
 
+$(BUILD_DIR)/ndk_media_extractor64.so: test/ndk_media_extractor_test.c test/video_fixture.h src/luna_media_codec.h | $(BUILD_DIR)
+	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+$(BUILD_DIR)/ndk_media_extractor32.so: test/ndk_media_extractor_test.c test/video_fixture.h src/luna_media_codec.h | $(BUILD_DIR)
+	clang -target armv7a-linux-gnueabihf -mfloat-abi=softfp -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
+
+.PHONY: ndk-media-extractor-test
+ndk-media-extractor-test: lunaria $(BUILD_DIR)/ndk_media_extractor64.so $(BUILD_DIR)/ndk_media_extractor32.so
+	LUNARIA_PACKAGES=none python3 test/run_guest_results.py $(BUILD_DIR)/ndk_media_extractor64.so $(BUILD_DIR)/ndk_media_extractor32.so
+
 $(BUILD_DIR)/guest_log_buffer64.so: test/guest_log_buffer.c | $(BUILD_DIR)
 	clang -target aarch64-linux-gnu -fPIC -shared -nostdlib -nostdlibinc -ffreestanding -O1 -fuse-ld=lld -Isrc -Wl,--unresolved-symbols=ignore-all -std=c11 -Wall -Wextra -Werror $< -o $@
 
@@ -3754,6 +3800,7 @@ guest-log-buffer-test: lunaria $(BUILD_DIR)/guest_log_buffer64.so $(BUILD_DIR)/g
 	    rg -q -F 'i=42 text=hello wide=123456789abcdef0 real=3.25 tail=73' "$$output"; \
 	    rg -q -F 'b=4 p=6 t=buffer-write] literal %s unchanged' "$$output"; \
 	    rg -q -F 't=write-test] literal %d unchanged' "$$output"; \
+	    rg -q -F 't=dlsym-write] guest logging backend' "$$output"; \
 	    rg -q -F 'i=42 wide=123456789abcdef0 real=3.25 tail=73' "$$output"; \
 	    echo "ARM$$abi liblog buffer/varargs: PASS"; \
 	done
@@ -3844,3 +3891,8 @@ exec-stack-test: lunaria $(BUILD_DIR)/exec-stack-root64/data/local/tmp/stack-pro
 	    grep -q '^exec-stack-image RESULT PASS' $(BUILD_DIR)/exec-stack-driver$$abi.out; \
 	    grep -q 'system returned 5888; RESULT PASS' $(BUILD_DIR)/exec-stack-driver$$abi.out; \
 	done
+
+$(eval $(call GUEST_ABI_TEST,guest-inotify,test/guest_inotify_test.c,$(ABI32_CC),-std=c11))
+.PHONY: guest-inotify-test
+guest-inotify-test: lunaria $(BUILD_DIR)/guest-inotify32.so $(BUILD_DIR)/guest-inotify64.so
+	@python3 test/run_guest_results.py $(BUILD_DIR)/guest-inotify32.so $(BUILD_DIR)/guest-inotify64.so

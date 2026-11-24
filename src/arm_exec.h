@@ -25,6 +25,7 @@ struct luna_a64_resume_state {
   uint64_t v[32][2];
   uint64_t sp, pc, tpidr_el0;
   uint32_t fpcr, fpsr, pstate;
+  uint32_t reserved;
 };
 
 int arm_exec_network_enabled(void);
@@ -977,6 +978,8 @@ int arm64_exec_context_init(struct jvm *jvm);
 int arm64_exec_load_library(const char *path, uint64_t base_addr);
 /* Map a zygote-preloaded runtime image without running it (see arm_exec.cpp). */
 int arm64_exec_map_image(const char *path);
+/* Map the installed AArch64 ELF interpreter and publish its load bias. */
+int arm64_exec_map_interpreter(void);
 
 /* The dynamic linker's DT_NEEDED walk for `path`, before `path` itself is
  * relocated: each dependency is loaded from beside `path` or, for a platform

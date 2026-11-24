@@ -5136,6 +5136,27 @@ static dvm_ref bootstrap_class_loader(struct dvm *vm)
   return vm->bootstrap_class_loader;
 }
 
+dvm_ref dvm__dex_defining_loader(struct dvm *vm, const struct dvm_dex *dex)
+{
+  /* The application's lookup walks its current DexPathList. A DexFile can
+   * be opened by one loader and used in another's search path before it
+   * defines a class. The new class then belongs to the searching loader. */
+  const dvm_ref application = vm->application_class_loader;
+  if (application && dex->defining_loader && dex->java_dex_file) {
+    union dvm_value list = {0}, elements = {0};
+    (dvm_get_field)(vm, application, "pathList", "Ldalvik/system/DexPathList;", &list);
+    (dvm_get_field)(vm, list.l, "dexElements", "[Ldalvik/system/DexPathList$Element;", &elements);
+    const uint32_t count = dvm_array_length(vm, elements.l);
+    const dvm_ref *items = count ? dvm_array_data(vm, elements.l) : NULL;
+    for (uint32_t i = 0; i < count; ++i) {
+      union dvm_value file = {0};
+      (dvm_get_field)(vm, items[i], "dexFile", "Ldalvik/system/DexFile;", &file);
+      if (file.l == dex->java_dex_file) return application;
+    }
+  }
+  return dex->defining_loader;
+}
+
 dvm_ref dvm_get_class_loader(struct dvm *vm, dvm_ref class_object)
 {
   struct dvm_object *co = dvm__obj(vm, class_object);
@@ -30549,6 +30570,16 @@ static bool reader_close(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+static bool reader_read_charbuffer(struct dvm *, dvm_ref,
+                                   const union dvm_value *, int, union dvm_value *);
+static const struct rt_method rt_readable[] = {
+  {"read", "(Ljava/nio/CharBuffer;)I", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT},
+  M_END,
+};
+static const char *const rt_reader_interfaces[] = {
+  "Ljava/lang/Readable;", "Ljava/io/Closeable;", "Ljava/lang/AutoCloseable;", NULL
+};
+
 static const struct rt_method rt_reader[] = {
   /* protected Reader() / Reader(Object lock): the constructors a subclass
    * chains to; the lock is the object itself. */
@@ -30557,6 +30588,7 @@ static const struct rt_method rt_reader[] = {
   M("read", "()I", reader_read),
   M("read", "([C)I", reader_read),
   M("read", "([CII)I", reader_read),
+  M("read", "(Ljava/nio/CharBuffer;)I", reader_read_charbuffer),
   M("skip", "(J)J", reader_skip),
   /* Every byte stream this VM hands out is backed by memory or a file, so a
    * read never blocks. */
@@ -35901,6 +35933,15 @@ struct rt_const {
 };
 
 static const struct rt_const rt_consts[] = {
+  { "Landroid/media/MediaFormat;", "COLOR_RANGE_FULL", 1 },
+  { "Landroid/media/MediaFormat;", "COLOR_RANGE_LIMITED", 2 },
+  { "Landroid/media/MediaFormat;", "COLOR_STANDARD_BT709", 1 },
+  { "Landroid/media/MediaFormat;", "COLOR_STANDARD_BT601_PAL", 2 },
+  { "Landroid/media/MediaFormat;", "COLOR_STANDARD_BT601_NTSC", 4 },
+  { "Landroid/media/MediaFormat;", "COLOR_STANDARD_BT2020", 6 },
+  { "Landroid/media/MediaCodecInfo$CodecCapabilities;", "COLOR_FormatYUV420Planar", 19 },
+  { "Landroid/media/MediaCodecInfo$CodecCapabilities;", "COLOR_FormatYUV420SemiPlanar", 21 },
+  { "Landroid/media/MediaCodecInfo$CodecCapabilities;", "COLOR_QCOM_FormatYUV420SemiPlanar", 0x7fa30c00 },
   { "Landroid/view/OrientationEventListener;", "ORIENTATION_UNKNOWN", -1 },
   {"Landroid/app/Notification;","FLAG_SHOW_LIGHTS",1},
   {"Landroid/app/Notification;","FLAG_ONGOING_EVENT",2},
@@ -39645,6 +39686,31 @@ static bool cb_put_array(struct dvm *vm,dvm_ref self,const union dvm_value *args
 {
   return cb_bulk(vm,self,args,nargs,out,true);
 }
+static bool reader_read_charbuffer(struct dvm *vm, dvm_ref self,
+                                   const union dvm_value *args, int nargs,
+                                   union dvm_value *out)
+{
+  (void)nargs;
+  dvm_ref target = ARG(0).l;
+  if (!target) return sb_fail(vm, "java/lang/NullPointerException");
+  int32_t count = sb_field(vm, target, "count") - sb_field(vm, target, "pos");
+  if (count <= 0) RETI(0);
+  dvm_ref array = dvm_new_array(vm, 'C', "C", (uint32_t)count);
+  if (!array) return false;
+  dvm_pin(vm, array);
+  struct dvm_method *read = dvm_find_method(vm, dvm_object_class(vm, self),
+                                            "read", "([CII)I");
+  union dvm_value a[] = {{.l=array}, {.i=0}, {.i=count}}, got = {0};
+  bool ok = read && dvm_call(vm, read, self, a, 3, &got);
+  if (ok && got.i > 0) {
+    union dvm_value ignored = {0};
+    a[2].i = got.i;
+    ok = cb_put_array(vm, target, a, 3, &ignored);
+  }
+  dvm_unpin(vm, array);
+  if (!ok) return false;
+  RETI(got.i);
+}
 static bool cb_view(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)args;
@@ -40654,6 +40720,35 @@ static bool mf_getObject(struct dvm *vm, dvm_ref self,
   RETL(mf_lookup(vm, self, ARG(0).l));
 }
 
+#define MEDIA_FORMAT_KEYS(X) \
+  X(MIME, "mime") \
+  X(ROTATION, "rotation-degrees") \
+  X(MAX_INPUT_SIZE, "max-input-size") \
+  X(WIDTH, "width") \
+  X(HEIGHT, "height") \
+  X(STRIDE, "stride") \
+  X(SLICE_HEIGHT, "slice-height") \
+  X(COLOR_FORMAT, "color-format") \
+  X(COLOR_STANDARD, "color-standard") \
+  X(COLOR_RANGE, "color-range") \
+  X(COLOR_TRANSFER, "color-transfer") \
+  X(FRAME_RATE, "frame-rate") \
+  X(DURATION, "durationUs") \
+  X(SAMPLE_RATE, "sample-rate") \
+  X(CHANNEL_COUNT, "channel-count")
+#define MEDIA_FORMAT_FIELD(name, value) { "KEY_" #name, "Ljava/lang/String;" },
+static const struct rt_field rt_media_format_sfields[] = {
+  MEDIA_FORMAT_KEYS(MEDIA_FORMAT_FIELD)
+  F_END,
+};
+#undef MEDIA_FORMAT_FIELD
+#define MEDIA_FORMAT_VALUE(name, value) value,
+static const char *const media_format_keys[] = {
+  MEDIA_FORMAT_KEYS(MEDIA_FORMAT_VALUE)
+};
+#undef MEDIA_FORMAT_VALUE
+#undef MEDIA_FORMAT_KEYS
+
 static const struct rt_method rt_media_format[] = {
   M("<init>", "()V", mf_init),
   SM("createAudioFormat", "(Ljava/lang/String;II)Landroid/media/MediaFormat;",
@@ -41497,6 +41592,7 @@ static const struct rt_method rt_surface[] = {
  */
 
 #define LM_AVC_CODEC_NAME "c2.lunaria.avc.decoder"
+#define LM_HEVC_CODEC_NAME "c2.lunaria.hevc.decoder"
 #define LM_VP9_CODEC_NAME "c2.lunaria.vp9.decoder"
 #define LM_AAC_CODEC_NAME "c2.lunaria.aac.decoder"
 
@@ -41505,6 +41601,7 @@ static const struct {
   const char *name, *mime;
 } lm_codecs[] = {
   { LM_AVC_CODEC_NAME, "video/avc" },
+  { LM_HEVC_CODEC_NAME, "video/hevc" },
   { LM_VP9_CODEC_NAME, "video/x-vnd.on2.vp9" },
   { LM_AAC_CODEC_NAME, "audio/mp4a-latm" },
 };
@@ -41536,6 +41633,8 @@ struct rt_codec {
   unsigned state;
   bool input_owned[MEDIA_IN_BUFS],output_owned[MEDIA_OUT_BUFS];
   dvm_ref output_images[MEDIA_OUT_BUFS],output_buffers[MEDIA_OUT_BUFS];
+  int legacy_capacity, legacy_pending, legacy_size, legacy_flags;
+  int64_t legacy_pts;
   bool input_eos,surface_output;
   struct dvm *vm;
   dvm_ref self;
@@ -41565,17 +41664,17 @@ static void codec_close_outputs(struct rt_codec *codec)
   for (int i=0;i<MEDIA_OUT_BUFS;++i) codec_close_output(codec,i);
 }
 
-static void codec_close_inputs(struct dvm *vm,dvm_ref self)
+static void codec_close_buffer_array(struct dvm *vm,dvm_ref self,const char *field)
 {
   union dvm_value buffers={0};
-  (void)(dvm_get_field)(vm,self,"inbufs","[Ljava/nio/ByteBuffer;",&buffers);
+  (void)(dvm_get_field)(vm,self,field,"[Ljava/nio/ByteBuffer;",&buffers);
   dvm_ref *items=buffers.l ? dvm_array_data(vm,buffers.l) : NULL;
   for (uint32_t i=0;items && i<dvm_array_length(vm,buffers.l);++i) {
     media_release_buffer(vm,items[i]);
     dvm_unpin(vm,items[i]);
   }
   if (buffers.l) dvm_unpin(vm,buffers.l);
-  (void)(dvm_set_field)(vm,self,"inbufs","[Ljava/nio/ByteBuffer;",(union dvm_value){0});
+  (void)(dvm_set_field)(vm,self,field,"[Ljava/nio/ByteBuffer;",(union dvm_value){0});
 }
 
 static void codec_unregister(struct rt_codec *codec)
@@ -41647,7 +41746,8 @@ static void codec_destroy(void *data)
   if(!codec) return;
   codec_unregister(codec);
   codec_close_outputs(codec);
-  codec_close_inputs(codec->vm,codec->self);
+  codec_close_buffer_array(codec->vm,codec->self,"inbufs");
+  codec_close_buffer_array(codec->vm,codec->self,"outbufs");
   lm_codec_free(codec->backend);
   free(codec);
 }
@@ -41710,8 +41810,11 @@ static dvm_ref codec_buffers(struct dvm *vm, dvm_ref self, const char *field,
   if (!arr) return 0;
   dvm_pin(vm, arr);
   dvm_ref *slots = dvm_array_data(vm, arr);
-  for (int32_t i = 0; slots && i < count; ++i)
+  for (int32_t i = 0; slots && i < count; ++i) {
     slots[i] = media_new_bytebuffer(vm, bytes);
+    if (slots[i] && !strcmp(field, "outbufs"))
+      (void)(dvm_set_field)(vm, slots[i], "readOnly", "Z", (union dvm_value){.i=1});
+  }
   union dvm_value nv = { .l = arr };
   (void)(dvm_set_field)(vm, self, field, "[Ljava/nio/ByteBuffer;", nv);
   return arr;
@@ -41879,7 +41982,9 @@ static void codec_discard_configuration(struct dvm *vm,dvm_ref self,struct rt_co
   codec_unregister(codec);
   codec_cancel_events(vm,self,codec);
   codec_close_outputs(codec);
-  codec_close_inputs(vm,self);
+  codec_close_buffer_array(vm,self,"inbufs");
+  codec_close_buffer_array(vm,self,"outbufs");
+  codec->legacy_capacity=codec->legacy_pending=0;
   lm_codec_free(codec->backend);
   codec->backend=NULL;
   memset(codec->input_owned,0,sizeof codec->input_owned);
@@ -41951,6 +42056,7 @@ static bool mc_flush(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   codec_cancel_events(vm,self,codec);
   codec_close_outputs(codec);
   lm_codec_flush(codec->backend);
+  codec->legacy_pending=0;
   memset(codec->input_owned,0,sizeof codec->input_owned);
   memset(codec->output_owned,0,sizeof codec->output_owned);
   codec->input_eos=false;
@@ -42107,6 +42213,23 @@ static void mc_release_idle_infos(struct dvm *vm,dvm_ref current)
   }
 }
 
+static bool codec_copy_legacy_output(struct dvm *vm, struct rt_codec *codec,
+                                      dvm_ref buffers, int idx)
+{
+  dvm_ref bb = codec_buffer_at(vm, buffers, idx);
+  struct dvm_object *bytes = bb ? stream_buf(vm, bb) : NULL;
+  size_t size = 0;
+  const uint8_t *src = lm_codec_output_buffer(codec->backend, idx, &size);
+  if (!bytes || !bytes->data || size > bytes->length || (size && !src)) {
+    dvm__throw(vm, "java/lang/OutOfMemoryError", "codec output buffer");
+    return false;
+  }
+  if (size) memcpy(bytes->data, src, size);
+  stream_set_field(vm, bb, "pos", 0);
+  stream_set_field(vm, bb, "count", (int32_t)size);
+  return true;
+}
+
 static bool mc_dequeueOutput(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
@@ -42122,7 +42245,34 @@ static bool mc_dequeueOutput(struct dvm *vm, dvm_ref self,
   struct lm_codec *k = codec_of(vm, self);
   int64_t pts = 0;
   int size = 0, flags = 0;
-  int idx = lm_codec_dequeue_output(k, &pts, &size, &flags);
+  int idx;
+  if (codec->legacy_pending) {
+    idx = codec->legacy_pending - 1;
+    size = codec->legacy_size;
+    flags = codec->legacy_flags;
+    pts = codec->legacy_pts;
+  } else {
+    idx = lm_codec_dequeue_output(k, &pts, &size, &flags);
+  }
+  if (idx >= 0 && idx < MEDIA_OUT_BUFS && codec->legacy_capacity) {
+    if (size > codec->legacy_capacity) {
+      codec_close_buffer_array(vm, self, "outbufs");
+      codec->legacy_capacity = size;
+      codec->legacy_pending = idx + 1;
+      codec->legacy_size = size;
+      codec->legacy_flags = flags;
+      codec->legacy_pts = pts;
+      RETI(LM_INFO_OUTPUT_BUFFERS_CHANGED);
+    }
+    dvm_ref buffers = codec_buffers(vm, self, "outbufs", MEDIA_OUT_BUFS,
+                                    codec->legacy_capacity);
+    if (!codec_copy_legacy_output(vm, codec, buffers, idx)) {
+      lm_codec_release_output(k, idx, false, NULL);
+      codec->legacy_pending = 0;
+      return false;
+    }
+  }
+  codec->legacy_pending = 0;
   if(idx>=0 && idx<MEDIA_OUT_BUFS) codec->output_owned[idx]=true;
 
   dvm_ref info = ARG(0).l;
@@ -42195,6 +42345,12 @@ static bool mc_getOutputFormat(struct dvm *vm, dvm_ref self,
   /* COLOR_FormatYUV420Planar: what the decoder actually produces, and what a
    * caller reading the output buffer directly would find there. */
   MF_PUT_INT("color-format", 19);
+  if (w > 0 && h > 0) {
+    int standard, range;
+    lm_codec_output_color(k, &standard, &range);
+    MF_PUT_INT("color-standard", standard);
+    MF_PUT_INT("color-range", range);
+  }
   MF_PUT_INT("crop-left", 0);
   MF_PUT_INT("crop-top", 0);
   MF_PUT_INT("crop-right", w > 0 ? w - 1 : 0);
@@ -42465,7 +42621,39 @@ static bool mc_getOutputBuffers(struct dvm *vm, dvm_ref self,
     dvm__throw(vm,"java/lang/IllegalStateException","getOutputBuffers in asynchronous mode");
     return false;
   }
-  RETL(dvm_new_array(vm, 'L', "Ljava/nio/ByteBuffer;", MEDIA_OUT_BUFS));
+  if (codec->surface_output)
+    RETL(dvm_new_array(vm, 'L', "Ljava/nio/ByteBuffer;", MEDIA_OUT_BUFS));
+  union dvm_value cached = {0};
+  (void)(dvm_get_field)(vm, self, "outbufs", "[Ljava/nio/ByteBuffer;", &cached);
+  if (cached.l) RETL(cached.l);
+  if (!codec->legacy_capacity) {
+    union dvm_value format = {0};
+    (void)(dvm_get_field)(vm, self, "format", "Landroid/media/MediaFormat;", &format);
+    const int w = box_get(vm, mf_lookup(vm, format.l, dvm_new_string(vm, "width"))).i;
+    const int h = box_get(vm, mf_lookup(vm, format.l, dvm_new_string(vm, "height"))).i;
+    /* The decoder produces packed I420, with rounded-up chroma planes. */
+    codec->legacy_capacity = w > 0 && w <= 8192 && h > 0 && h <= 8192 ?
+      w * h + 2 * ((w + 1) / 2) * ((h + 1) / 2) : MEDIA_IN_CAP;
+    for (int i = 0; i < MEDIA_OUT_BUFS; ++i) {
+      if (!codec->output_owned[i]) continue;
+      size_t size = 0;
+      (void)lm_codec_output_buffer(codec->backend, i, &size);
+      if (size > (size_t)codec->legacy_capacity)
+        codec->legacy_capacity = (int)size;
+    }
+  }
+  dvm_ref buffers = codec_buffers(vm, self, "outbufs", MEDIA_OUT_BUFS,
+                                  codec->legacy_capacity);
+  for (int i = 0; i < MEDIA_OUT_BUFS; ++i) {
+    dvm_ref bb = codec_buffer_at(vm, buffers, i);
+    if (!bb) {
+      dvm__throw(vm, "java/lang/OutOfMemoryError", "codec output buffers");
+      return false;
+    }
+    if (codec->output_owned[i] && !codec_copy_legacy_output(vm, codec, buffers, i))
+      return false;
+  }
+  RETL(buffers);
 }
 
 static bool mc_release_output(struct dvm *vm, dvm_ref self, int32_t idx,
@@ -42920,6 +43108,7 @@ static const struct rt_field rt_mediacodec_fields[] = {
   { "surface", "Landroid/view/Surface;" },
   { "format", "Landroid/media/MediaFormat;" },
   { "inbufs", "[Ljava/nio/ByteBuffer;" },
+  { "outbufs", "[Ljava/nio/ByteBuffer;" },
   { "callback", "Landroid/media/MediaCodec$Callback;" },
   { "callbackLooper", "Landroid/os/Looper;" },
   { "frameListener", "Landroid/media/MediaCodec$OnFrameRenderedListener;" },
@@ -43101,6 +43290,7 @@ static bool mci_getSupportedTypes(struct dvm *vm, dvm_ref self,
 static bool mci_set_profile_levels(struct dvm *vm, dvm_ref caps, const char *mime)
 {
   static const int32_t avc_profiles[] = { 1, 2, 8 };           /* Baseline, Main, High */
+  static const int32_t hevc_profiles[] = { 1 };               /* HEVCProfileMain */
   static const int32_t vp9_profiles[] = { 1, 4 };              /* Profile0, Profile2 */
   static const int32_t aac_profiles[] = { 2, 5, 29 };          /* LC, HE, HE-PS */
   const int32_t *profiles;
@@ -43110,6 +43300,10 @@ static bool mci_set_profile_levels(struct dvm *vm, dvm_ref caps, const char *mim
     profiles = avc_profiles;
     nprofiles = 3;
     top_level = 0x10000;  /* AVCLevel52 */
+  } else if (!strcmp(mime, "video/hevc")) {
+    profiles = hevc_profiles;
+    nprofiles = 1;
+    top_level = 0x400;   /* HEVCMainTierLevel4 */
   } else if (!strcmp(mime, "video/x-vnd.on2.vp9")) {
     profiles = vp9_profiles;
     nprofiles = 2;
@@ -43612,8 +43806,7 @@ static bool cc_getVideoCapabilities(struct dvm *vm, dvm_ref self,
   (void)(dvm_get_field)(vm, self, "mime", "Ljava/lang/String;", &mime);
   const char *m = mime.l ? dvm_string_utf8(vm, mime.l) : NULL;
   if (!m || !lm_codec_supported(m) ||
-      (strcmp(m, "video/avc") && strcmp(m, "video/x-vnd.on2.vp9") &&
-       strcmp(m, "video/vp9")))
+      strncmp(m, "video/", 6))
     RETL(0);
   struct dvm_class *c = dvm__class_by_desc(
                           vm, "Landroid/media/MediaCodecInfo$VideoCapabilities;");
@@ -45025,6 +45218,9 @@ static bool mextractor_setDataSourceFD(struct dvm *vm, dvm_ref self,
   int fd = player_fd_of(vm, ARG(0).l);
   int64_t off = nargs > 1 ? args[1].j : 0;
   int64_t len = nargs > 2 ? args[2].j : 0;
+  if (getenv("LUNARIA_TRACE_MEDIA"))
+    fprintf(stderr, "[media] MediaExtractor.setDataSource: fd=%d offset=%lld length=%lld\n",
+            fd, (long long)off, (long long)len);
   struct lm_mp4 *old = extractor_of(vm, self);
   if (old) lm_mp4_free(old);
   struct lm_mp4 *m = lm_mp4_open(fd, off, len);
@@ -50014,6 +50210,16 @@ static dvm_ref parcel_fd_adopt(struct dvm *vm,int fd)
   });
   return r;
 }
+static bool parcel_fd_adopt_fd(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs,
+                               union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  dvm_ref result = parcel_fd_adopt(vm, ARG(0).i);
+  if (!result) return false;
+  RETL(result);
+}
 static bool parcel_fd_write(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
 static bool parcel_fd_describe(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
@@ -50128,6 +50334,7 @@ static const struct rt_field rt_parcel_fd_sfields[] = { { "CREATOR", "Landroid/o
 static const struct rt_field rt_parcel_fd_fields[] = { { "fd", "I" }, {"fileDescriptor","Ljava/io/FileDescriptor;"}, F_END };
 static const struct rt_method rt_parcel_fd[] = {
   SM("open", "(Ljava/io/File;I)Landroid/os/ParcelFileDescriptor;", parcel_fd_open),
+  SM("adoptFd", "(I)Landroid/os/ParcelFileDescriptor;", parcel_fd_adopt_fd),
   M("getFileDescriptor","()Ljava/io/FileDescriptor;",parcel_fd_get_file),
   M("getFd", "()I", parcel_fd_get), M("close", "()V", parcel_fd_close),
   M("writeToParcel", "(Landroid/os/Parcel;I)V", parcel_fd_write),
@@ -54317,15 +54524,8 @@ enum { SCAN_SPACE, SCAN_WHOLE, SCAN_LINE, SCAN_CHAR };   /* SCAN_CHAR: one liter
 static bool scanner_set_text(struct dvm *vm, dvm_ref self, const char *bytes,
                              size_t n)
 {
-  char *copy = malloc(n + 1);
-  if (!copy) {
-    dvm__throw(vm, "java/lang/OutOfMemoryError", "Scanner");
-    return false;
-  }
-  memcpy(copy, bytes, n);
-  copy[n] = '\0';
-  dvm_ref text = dvm_new_string(vm, copy);
-  free(copy);
+  dvm_ref text = dvm_new_string_n(vm, bytes, n);
+  if (!text) return false;
   (void)(dvm_set_field)(vm, self, "text", "Ljava/lang/String;",
   (union dvm_value) {
     .l = text
@@ -54378,6 +54578,67 @@ static bool scanner_init_stream(struct dvm *vm, dvm_ref self,
   }
   bool ok = scanner_set_text(vm, self, all ? all : "", len);
   free(all);
+  return ok;
+}
+
+static bool scanner_init_readable(struct dvm *vm, dvm_ref self,
+                                  const union dvm_value *args, int nargs,
+                                  union dvm_value *out)
+{
+  (void)nargs;
+  (void)out;
+  dvm_ref source = ARG(0).l;
+  if (!source) return sb_fail(vm, "java/lang/NullPointerException");
+  struct dvm_method *read = dvm_find_method(vm, dvm_object_class(vm, source),
+                                            "read", "(Ljava/nio/CharBuffer;)I");
+  if (!read) return sb_fail(vm, "java/lang/AbstractMethodError");
+  enum { CHUNK = 4096 };
+  union dvm_value capacity = {.i=CHUNK}, buffer = {0};
+  if (!cb_allocate(vm, 0, &capacity, 1, &buffer)) return false;
+  dvm_pin(vm, buffer.l);
+
+  uint16_t *units = NULL;
+  size_t used = 0, allocated = 0;
+  bool ok = false;
+  for (;;) {
+    stream_set_field(vm, buffer.l, "pos", 0);
+    stream_set_field(vm, buffer.l, "count", CHUNK);
+    union dvm_value got = {0};
+    if (!dvm_call(vm, read, source, &buffer, 1, &got)) break;
+    if (got.i == -1) {
+      char *text = malloc(used * 3 + 1);
+      if (text) {
+        size_t bytes = jcs_utf16_to_wtf8(units, used, text);
+        ok = scanner_set_text(vm, self, text, bytes);
+        free(text);
+      } else {
+        sb_fail(vm, "java/lang/OutOfMemoryError");
+      }
+      break;
+    }
+    if (got.i < 0 || got.i > CHUNK || got.i != sb_field(vm, buffer.l, "pos")) {
+      sb_fail(vm, "java/lang/IllegalStateException");
+      break;
+    }
+    if (used + (size_t)got.i > allocated) {
+      if (allocated > (SIZE_MAX - 1) / 6) {
+        sb_fail(vm, "java/lang/OutOfMemoryError");
+        break;
+      }
+      size_t next = allocated ? allocated * 2 : CHUNK;
+      uint16_t *grown = realloc(units, next * sizeof *units);
+      if (!grown) {
+        sb_fail(vm, "java/lang/OutOfMemoryError");
+        break;
+      }
+      units = grown;
+      allocated = next;
+    }
+    if (got.i) memcpy(units + used, cb_data(vm, buffer.l), (size_t)got.i * sizeof *units);
+    used += (size_t)got.i;
+  }
+  free(units);
+  dvm_unpin(vm, buffer.l);
   return ok;
 }
 
@@ -54575,6 +54836,7 @@ static bool scanner_next_int(struct dvm *vm, dvm_ref self,
 }
 
 static const struct rt_method rt_scanner[] = {
+  M("<init>", "(Ljava/lang/Readable;)V", scanner_init_readable),
   M("<init>", "(Ljava/io/InputStream;)V", scanner_init_stream),
   M("<init>", "(Ljava/io/InputStream;Ljava/lang/String;)V", scanner_init_stream),
   M("<init>", "(Ljava/lang/String;)V", scanner_init_string),
@@ -58425,6 +58687,38 @@ static dvm_ref pm_application_info(struct dvm *vm,
   return ai;
 }
 
+void dvm_package_info_add_permissions(struct dvm *vm, dvm_ref pi,
+                                      const char *package, uint32_t flags)
+{
+  if (!(flags & 0x00001000u /* PackageManager.GET_PERMISSIONS */)) return;
+  const char *self = getenv("ANDROID_PACKAGE_NAME");
+  const char *encoded_permissions = self && !strcmp(self, package)
+                                    ? getenv("ANDROID_REQUESTED_PERMISSIONS") : NULL;
+  if (encoded_permissions && *encoded_permissions) {
+    char *copy = strdup(encoded_permissions);
+    uint32_t count = 1;
+    for (const char *p = encoded_permissions; *p; ++p)
+      if (*p == ',') ++count;
+    dvm_ref names = dvm_new_array(vm, 'L', "Ljava/lang/String;", count);
+    dvm_ref grants = dvm_new_array(vm, 'I', NULL, count);
+    dvm_ref *name_slots = names ? dvm_array_data(vm, names) : NULL;
+    int32_t *flag_slots = grants ? dvm_array_data(vm, grants) : NULL;
+    uint32_t i = 0;
+    char *save = NULL;
+    for (char *name = copy ? strtok_r(copy, ",", &save) : NULL;
+         name && i < count; name = strtok_r(NULL, ",", &save), ++i) {
+      if (name_slots) name_slots[i] = dvm_new_string(vm, name);
+      if (flag_slots) flag_slots[i] = 2; /* REQUESTED_PERMISSION_GRANTED */
+    }
+    free(copy);
+    union dvm_value perms = { .l = names };
+    (void)(dvm_set_field)(vm, pi, "requestedPermissions",
+                        "[Ljava/lang/String;", perms);
+    perms.l = grants;
+    (void)(dvm_set_field)(vm, pi, "requestedPermissionsFlags", "[I", perms);
+  }
+}
+
 static dvm_ref pm_package_info(struct dvm *vm,
                                const struct lunaria_android_package *record,
                                uint32_t query_flags)
@@ -58455,31 +58749,7 @@ static dvm_ref pm_package_info(struct dvm *vm,
     vm, pi, query_flags,
     self && !strcmp(self, record->name) ? NULL : record->source_dir);
 
-  const char *encoded_permissions = self && !strcmp(self, record->name)
-                                    ? getenv("ANDROID_REQUESTED_PERMISSIONS") : NULL;
-  if (encoded_permissions && *encoded_permissions) {
-    char *copy = strdup(encoded_permissions);
-    uint32_t count = 1;
-    for (const char *p = encoded_permissions; *p; ++p)
-      if (*p == ',') ++count;
-    dvm_ref names = dvm_new_array(vm, 'L', "Ljava/lang/String;", count);
-    dvm_ref flags = dvm_new_array(vm, 'I', NULL, count);
-    dvm_ref *name_slots = names ? dvm_array_data(vm, names) : NULL;
-    int32_t *flag_slots = flags ? dvm_array_data(vm, flags) : NULL;
-    uint32_t i = 0;
-    char *save = NULL;
-    for (char *name = copy ? strtok_r(copy, ",", &save) : NULL;
-         name && i < count; name = strtok_r(NULL, ",", &save), ++i) {
-      if (name_slots) name_slots[i] = dvm_new_string(vm, name);
-      if (flag_slots) flag_slots[i] = 2; /* REQUESTED_PERMISSION_GRANTED */
-    }
-    free(copy);
-    union dvm_value perms = { .l = names };
-    (void)(dvm_set_field)(vm, pi, "requestedPermissions",
-                        "[Ljava/lang/String;", perms);
-    perms.l = flags;
-    (void)(dvm_set_field)(vm, pi, "requestedPermissionsFlags", "[I", perms);
-  }
+  dvm_package_info_add_permissions(vm, pi, record->name, query_flags);
   return pi;
 }
 
@@ -84333,6 +84603,10 @@ static bool audiotrack_release(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+/* Provided by the guest execution engine (arm_exec.cpp). */
+bool dvm_host_can_defer_sleep(void);
+void dvm_host_defer_sleep(uint64_t ns);
+
 static bool audiotrack_write(struct dvm *vm, dvm_ref self,
                              const union dvm_value *args, int nargs,
                              union dvm_value *out)
@@ -84378,6 +84652,17 @@ static bool audiotrack_write(struct dvm *vm, dvm_ref self,
     if (!n && luna_at_space(track)) break; /* allocation failed, not backpressure */
     if (written==frames || (nargs>3 && ARG(3).i==1)) break;
     if (!rt_get_int(vm,self,"mPlaying") || dvm_is_stopping(vm)) break;
+    /* A guest thread does not wait for the output with its engine: it hands
+     * the rest over and sleeps, parked, for as long as the output needs. */
+    if (dvm_host_can_defer_sleep()) {
+      uint64_t drain_ns=0;
+      unsigned m=luna_at_write_ahead(track,pcm+(size_t)written*channels,frames-written,&drain_ns);
+      if (m) {
+        written+=m;
+        dvm_host_defer_sleep(drain_ns);
+        break;
+      }
+    }
     unsigned armd=arm_lock_unlock_all();
     unsigned gild=dvm_gil_unlock_all(vm);
     luna_at_wait_space(track);
@@ -96331,6 +96616,10 @@ static const struct rt_method rt_dialog_click_listener[] = {
 static const struct rt_method rt_dialog_cancel_listener[] = {
   { "onCancel", "(Landroid/content/DialogInterface;)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT }, M_END
 };
+static const struct rt_method rt_dialog_key_listener[] = {
+  { "onKey", "(Landroid/content/DialogInterface;ILandroid/view/KeyEvent;)Z",
+    NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT }, M_END
+};
 static const struct rt_method rt_checked_change_listener[] = {
   { "onCheckedChanged", "(Landroid/widget/CompoundButton;Z)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT }, M_END
 };
@@ -97379,6 +97668,9 @@ static const struct rt_class rt_classes[] = {
   { .desc="Landroid/content/DialogInterface$OnCancelListener;", .super="Ljava/lang/Object;",
     .methods=rt_dialog_cancel_listener, .is_interface=true
   },
+  { .desc="Landroid/content/DialogInterface$OnKeyListener;", .super="Ljava/lang/Object;",
+    .methods=rt_dialog_key_listener, .is_interface=true
+  },
   { .desc="Landroid/widget/RadioGroup$OnCheckedChangeListener;", .super="Ljava/lang/Object;",
     .methods=rt_radio_group_listener, .is_interface=true
   },
@@ -97644,7 +97936,7 @@ static const struct rt_class rt_classes[] = {
   { "Ldalvik/system/DexPathList$Element;", "Ljava/lang/Object;", NULL,
     rt_dex_element_fields, NULL
   },
-  { "Ldalvik/system/DexPathList$NativeLibraryElement;", "Ljava/lang/Object;", NULL,
+  { "Ldalvik/system/DexPathList$NativeLibraryElement;", "Ljava/lang/Object;", rt_native_element,
     rt_native_element_fields, NULL
   },
   { "Ldalvik/system/BaseDexClassLoader;", "Ljava/lang/ClassLoader;",
@@ -97818,7 +98110,7 @@ static const struct rt_class rt_classes[] = {
     "<E:Ljava/lang/Object;>Ljava/lang/Object;Ljava/util/Collection<TE;>;"
   },
   { "Landroid/media/MediaFormat;", "Ljava/lang/Object;",
-    rt_media_format, NULL, NULL
+    rt_media_format, NULL, NULL, rt_media_format_sfields
   },
   { "Landroid/media/MediaCodec;", "Ljava/lang/Object;",
     rt_mediacodec, rt_mediacodec_fields, NULL
@@ -98448,8 +98740,9 @@ static const struct rt_class rt_classes[] = {
   },
   /* The reading half.  The buffer/lookahead fields live on Reader so both
    * concrete classes get them, the same way the byte streams share theirs. */
+  { "Ljava/lang/Readable;", "Ljava/lang/Object;", rt_readable, NULL, NULL, NULL, true },
   { "Ljava/io/Reader;", "Ljava/lang/Object;", rt_reader,
-    rt_reader_fields, rt_iface_closeable
+    rt_reader_fields, rt_reader_interfaces
   },
   { "Ljava/io/InputStreamReader;", "Ljava/io/Reader;",
     rt_input_stream_reader, NULL, NULL
@@ -100642,6 +100935,13 @@ struct dvm_class *dvm_runtime_define(struct dvm *vm, const char *desc)
   if (!strcmp(desc, "Landroid/app/Notification;") && c->sslots) {
     for (int i = 0; i < c->nsfields && notification_extras_keys[i].name; ++i) {
       c->sslots[i].l = dvm_new_string(vm, notification_extras_keys[i].value);
+      if (c->sslots[i].l) dvm_pin(vm, c->sslots[i].l);
+      c->sfields[i].access |= DEX_ACC_PUBLIC | DEX_ACC_FINAL;
+    }
+  }
+  if (!strcmp(desc, "Landroid/media/MediaFormat;") && c->sslots) {
+    for (int i = 0; i < c->nsfields; ++i) {
+      c->sslots[i].l = dvm_new_string(vm, media_format_keys[i]);
       if (c->sslots[i].l) dvm_pin(vm, c->sslots[i].l);
       c->sfields[i].access |= DEX_ACC_PUBLIC | DEX_ACC_FINAL;
     }

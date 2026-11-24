@@ -45,6 +45,7 @@ extern char **environ;
 #define APK_MAX_MANIFEST (16u*1024u*1024u)
 static int android_system_fonts(const char *root);
 static int android_system_bin(const char *root);
+static int copy_system_image(const char *src, const char *dst);
 static int apk_error(const char *format, ...)
 {
   va_list ap;
@@ -2096,11 +2097,21 @@ static int android_system_bin(const char *root)
   if (path_join(dir, sizeof dir, root, "system/bin") || mkdirs(dir) ||
       path_join(usr, sizeof usr, root, "system/usr/share") || mkdirs(usr))
     return -1;
-  if (path_join(file, sizeof file, dir, "app_process64") || write_elf_stub(file, true, false)) return -1;
+  if (path_join(file, sizeof file, dir, "app_process64")) return -1;
+  const char *sys = getenv("LUNARIA_SYSLIB_DIR");
+  char image[PATH_MAX];
+  luna_file_info info;
+  if (sys && *sys && path_join(image, sizeof image, sys, "android/system/bin/app_process64"))
+    return -1;
+  if (sys && *sys && !luna_file_infoat(LUNA_AT_FDCWD, image, &info, 0)) {
+    if (copy_system_image(image, file))
+      return apk_error("cannot install %s: %s", file, strerror(errno));
+  } else if (write_elf_stub(file, true, false)) {
+    return -1;
+  }
   if (path_join(file, sizeof file, dir, "app_process32") || write_elf_stub(file, false, false)) return -1;
   /* /system/bin/app_process is the link to the 64-bit zygote binary on a 64-bit device. */
   if (path_join(file, sizeof file, dir, "app_process")) return -1;
-  luna_file_info info;
   if (luna_file_infoat(LUNA_AT_FDCWD, file, &info, LUNA_AT_NOFOLLOW) &&
       luna_symlink_create("app_process64", file))
     return apk_error("cannot link %s: %s", file, strerror(errno));
@@ -2133,7 +2144,7 @@ static int copy_system_image(const char *src, const char *dst)
   if (!ok) luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0);
   return ok ? 0 : -1;
 }
-/* Copy <sys>/android/apex/<module>/<subdir>/ (and its bionic/ directory) into the device's
+/* Copy <sys>/android/apex/<module>/<subdir>/ recursively into the device's
  * /apex/<module>/<subdir>/.  Returns 0 when copied, 1 when there is no such image, -1 on error. */
 static int install_android_apex_dir(const char *from, const char *to)
 {
@@ -2179,6 +2190,7 @@ static int android_system_libs(const char *root)
     {"libc.so", "libc-pure.so", true}, {"libm.so", "libm.so", true},
     {"libdl.so", "libdl.so", true}, {"liblog.so", "liblog.so", false},
     {"libz.so", "libz.so", false}, {"libstdc++.so", "libstdc++.so", false},
+    {"libc++.so", "libc++.so", false},
   };
   const char *sys = getenv("LUNARIA_SYSLIB_DIR");
   const bool runtime_apex = lunaria_sdk_int() >= 29;
@@ -2194,13 +2206,21 @@ static int android_system_libs(const char *root)
       luna_file_info info;
       const bool in_apex = runtime_apex && libs[i].bionic;
       if (path_join(dst, sizeof dst, in_apex ? apex : dir, libs[i].name)) return -1;
+      bool have_image = false;
+      if (d == 0 && sys && *sys) {
+        int n = snprintf(src, sizeof src, "%s/android/system/lib64/%s", sys, libs[i].name);
+        have_image = !libs[i].bionic && n >= 0 && (size_t)n < sizeof src &&
+          !luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0);
+        if (!have_image)
+          have_image = !path_join(src, sizeof src, sys, libs[i].backing) &&
+            !luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0);
+      }
       /* The platform's own libc/libm/libdl are installed below from the real image. */
       if (in_apex && d == 0 && have_android_apex(sys, "com.android.runtime")) {
         /* fall through to the /system link only */
       } else
       /* The 64-bit images are the ones the runtime has. */
-      if (d == 0 && sys && *sys && libs[i].backing && !path_join(src, sizeof src, sys, libs[i].backing) &&
-          !luna_file_infoat(LUNA_AT_FDCWD, src, &info, 0)) {
+      if (have_image) {
         /* A link from an earlier launch has to go before the copy is written. */
         if (!luna_file_infoat(LUNA_AT_FDCWD, dst, &info, LUNA_AT_NOFOLLOW) && (info.mode & 0170000) == 0120000 &&
             luna_file_unlinkat(LUNA_AT_FDCWD, dst, 0)) return -1;
@@ -2227,6 +2247,21 @@ static int android_system_libs(const char *root)
  * shipped, so a process that reads /apex/<module>/lib64 sees the files of the platform it is told
  * it runs on, not placeholders. */
   if (sys && *sys && install_android_apex(root, sys, "com.android.runtime", "lib64") == -1) return -1;
+  if (runtime_apex && sys && *sys &&
+      install_android_apex(root, sys, "com.android.runtime", "bin") == -1) return -1;
+  if (runtime_apex) {
+    static const char target[] = "/apex/com.android.runtime/bin/linker64";
+    char image[PATH_MAX], link[PATH_MAX];
+    luna_file_info info;
+    if (path_join(image, sizeof image, root, target + 1) ||
+        path_join(link, sizeof link, root, "system/bin/linker64")) return -1;
+    if (!luna_file_infoat(LUNA_AT_FDCWD, image, &info, 0)) {
+      if (luna_symlink_create(target, link) && errno != EEXIST)
+        return apk_error("cannot link %s: %s", link, strerror(errno));
+    } else if (errno != ENOENT) {
+      return apk_error("cannot inspect %s: %s", image, strerror(errno));
+    }
+  }
   if (sys && *sys && install_android_apex(root, sys, "com.android.art", "lib64") == -1) return -1;
   if (sys && *sys && lunaria_sdk_int() >= 31 && !have_android_apex(sys, "com.android.art")) {
     static const char *const art[] = {

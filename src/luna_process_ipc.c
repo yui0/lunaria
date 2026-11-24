@@ -43,6 +43,7 @@ static int snapshot_copy_range(int source, int snapshot,
   const size_t size = range->size;
   int error = 0;
   unsigned char bytes[65536];
+  static const unsigned char zero[sizeof bytes];
   for (size_t offset = 0; !error && offset < size;) {
     size_t length = size - offset;
     if (length > sizeof bytes) length = sizeof bytes;
@@ -51,6 +52,12 @@ static int snapshot_copy_range(int source, int snapshot,
     if (received <= 0) {
       error = received < 0 ? errno : EIO;
       break;
+    }
+    /* The guest reserves large anonymous heaps and thread stacks. Leave
+     * all-zero chunks as holes instead of allocating duplicate shmem pages. */
+    if (memcmp(bytes, zero, (size_t)received) == 0) {
+      offset += (size_t)received;
+      continue;
     }
     for (size_t written = 0; written < (size_t)received;) {
       ssize_t count = pwrite64(snapshot, bytes + written, (size_t)received - written,
@@ -91,6 +98,8 @@ int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
   int error = snapshot < 0 ? errno : 0;
   for (size_t i = 0; !error && i < count; ++i)
     error = snapshot_copy_range(source, snapshot, &ranges[i]);
+  if (!error && ftruncate64(snapshot, (off64_t)end) < 0)
+    error = errno;
   if (!error && fcntl(snapshot, F_ADD_SEALS,
                        F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) < 0)
     error = errno;
@@ -103,18 +112,20 @@ int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
 int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
                                 size_t count, const int *fds, size_t fd_count)
 {
-  if (!maps || !count || !fds || !fd_count) return -EINVAL;
+  if (!maps || !count || (fd_count && !fds)) return -EINVAL;
   const long page_size = sysconf(_SC_PAGESIZE);
   if (page_size <= 0) return -ENOSYS;
   uint64_t end = 0;
   for (size_t i = 0; i < count; ++i) {
     const struct luna_process_memory_mapping *map = &maps[i];
+    const bool anonymous = map->descriptor_index == LUNA_PROCESS_ANONYMOUS_MAPPING;
     if (!map->address || !map->size || map->address < end ||
         map->address > UINTPTR_MAX || map->size > UINTPTR_MAX - map->address ||
         map->file_offset > INT64_MAX ||
         ((map->address | map->size | map->file_offset) % (uint64_t)page_size) ||
         (map->protection & ~(LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC)) ||
-        map->descriptor_index >= fd_count) return -EINVAL;
+        (anonymous ? map->file_offset || map->shared
+                   : map->descriptor_index >= fd_count)) return -EINVAL;
     end = map->address + map->size;
   }
 
@@ -126,10 +137,13 @@ int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
     if (map->protection & LUNA_PROT_READ) protection |= PROT_READ;
     if (map->protection & LUNA_PROT_WRITE) protection |= PROT_WRITE;
     if (map->protection & LUNA_PROT_EXEC) protection |= PROT_EXEC;
-    const int flags = (map->shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED_NOREPLACE;
+    const bool anonymous = map->descriptor_index == LUNA_PROCESS_ANONYMOUS_MAPPING;
+    int flags = (map->shared ? MAP_SHARED : MAP_PRIVATE) | MAP_FIXED_NOREPLACE;
+    if (anonymous) flags |= MAP_ANONYMOUS | MAP_NORESERVE;
     void *wanted = (void *)(uintptr_t)map->address;
     void *mapped = mmap64(wanted, (size_t)map->size, protection, flags,
-                          fds[map->descriptor_index], (off64_t)map->file_offset);
+                          anonymous ? -1 : fds[map->descriptor_index],
+                          (off64_t)map->file_offset);
     if (mapped == wanted) continue;
     error = mapped == MAP_FAILED ? errno : EEXIST;
     if (mapped != MAP_FAILED) munmap(mapped, (size_t)map->size);
@@ -140,6 +154,105 @@ int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
     const struct luna_process_memory_mapping *map = &maps[--restored];
     munmap((void *)(uintptr_t)map->address, (size_t)map->size);
   }
+  return -error;
+}
+
+void luna_process_dispose_memory(struct luna_process_memory_image *image)
+{
+  for (size_t i = 0; i < image->fd_count; ++i)
+    if (image->fds[i] >= 0) close(image->fds[i]);
+  free(image->maps);
+  memset(image, 0, sizeof *image);
+}
+
+int luna_process_capture_memory(const struct luna_guest_mapping *maps, size_t count,
+                                uint64_t arena_begin, uint64_t arena_end,
+                                struct luna_process_memory_image *image)
+{
+  if (!image) return -EINVAL;
+  memset(image, 0, sizeof *image);
+  const long page = sysconf(_SC_PAGESIZE);
+  if (page != 4096) return -ENOSYS;
+  if ((!maps && count) || !arena_begin || arena_begin >= arena_end ||
+      ((arena_begin | arena_end) & 4095u) || arena_end > UINTPTR_MAX ||
+      count >= LUNA_PROCESS_MESSAGE_MAX / (2 * sizeof *image->maps))
+    return -EINVAL;
+  image->maps = calloc(2 * count + 1, sizeof *image->maps);
+  struct luna_process_memory_range *ranges = calloc(count ? count : 1, sizeof *ranges);
+  if (!image->maps || !ranges) {
+    free(ranges);
+    luna_process_dispose_memory(image);
+    return -ENOMEM;
+  }
+  unsigned handles[LUNA_PROCESS_FD_MAX] = {0};
+  uint32_t snapshot_index = LUNA_PROCESS_ANONYMOUS_MAPPING;
+  size_t range_count = 0;
+  uint64_t cursor = arena_begin, last = 0, offset = 0;
+  const uint32_t rw = LUNA_PROT_READ | LUNA_PROT_WRITE;
+  int error = 0;
+  for (size_t i = 0; i <= count; ++i) {
+    const struct luna_guest_mapping *m = i < count ? &maps[i] : NULL;
+    const uint64_t lo = m ? m->lo : arena_end;
+    if (m && (!lo || lo < last || m->hi <= lo || m->hi > UINTPTR_MAX ||
+              ((lo | m->hi) & 4095u) ||
+              (lo < arena_end && m->hi > arena_begin &&
+               (lo < arena_begin || m->hi > arena_end)))) {
+      error = EINVAL;
+      break;
+    }
+    if (lo > cursor && cursor < arena_end) {
+      const uint64_t next = lo < arena_end ? lo : arena_end;
+      image->maps[image->count++] = (struct luna_process_memory_mapping){
+        cursor, next - cursor, 0, rw, LUNA_PROCESS_ANONYMOUS_MAPPING, false
+      };
+      cursor = next;
+    }
+    if (!m) break;
+    last = m->hi;
+    if (lo >= arena_begin && lo < arena_end) cursor = last;
+    const uint64_t size = last - lo;
+    uint32_t descriptor = 0;
+    uint64_t file_offset = offset;
+    if (m->shared) {
+      if (!m->backing_handle) { error = ENOTSUP; break; }
+      while (descriptor < image->fd_count && handles[descriptor] != m->backing_handle)
+        ++descriptor;
+      file_offset = m->backing_offset;
+    } else if (snapshot_index != LUNA_PROCESS_ANONYMOUS_MAPPING) {
+      descriptor = snapshot_index;
+    } else {
+      descriptor = (uint32_t)image->fd_count;
+    }
+    if (descriptor == image->fd_count) {
+      if (descriptor == LUNA_PROCESS_FD_MAX) { error = EMFILE; break; }
+      int fd = -1;
+      if (m->shared) {
+        fd = fcntl((int)(m->backing_handle - 1), F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) { error = errno; break; }
+        handles[descriptor] = m->backing_handle;
+      } else snapshot_index = descriptor;
+      image->fds[image->fd_count++] = fd;
+    }
+    if (!m->shared) {
+      if (size > (uint64_t)INT64_MAX - offset) { error = EOVERFLOW; break; }
+      ranges[range_count++] = (struct luna_process_memory_range){
+        (void *)(uintptr_t)lo, (size_t)size, offset
+      };
+      offset += size;
+    }
+    image->maps[image->count++] = (struct luna_process_memory_mapping){
+      lo, size, file_offset, lo >= arena_begin && lo < arena_end ? rw : m->prot,
+      descriptor, m->shared
+    };
+  }
+  if (!error && range_count) {
+    const int fd = luna_process_snapshot_memory(ranges, range_count);
+    if (fd < 0) error = -fd;
+    else image->fds[snapshot_index] = fd;
+  }
+  free(ranges);
+  if (!error) return 0;
+  luna_process_dispose_memory(image);
   return -error;
 }
 
@@ -1128,6 +1241,7 @@ void luna_process_pool_close(struct luna_process_pool *pool)
 #else
 /* No fork-only or shared-address-space substitute on unsupported hosts. */
 #include <errno.h>
+#include <string.h>
 #ifdef _WIN32
 #include <io.h>
 #define ipc_close _close
@@ -1150,6 +1264,21 @@ int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
   (void)fds;
   (void)fd_count;
   return -ENOSYS;
+}
+int luna_process_capture_memory(const struct luna_guest_mapping *maps, size_t count,
+                                uint64_t arena_begin, uint64_t arena_end,
+                                struct luna_process_memory_image *image)
+{
+  (void)maps;
+  (void)count;
+  (void)arena_begin;
+  (void)arena_end;
+  if (image) memset(image, 0, sizeof *image);
+  return -ENOSYS;
+}
+void luna_process_dispose_memory(struct luna_process_memory_image *image)
+{
+  (void)image;
 }
 struct luna_process_channel *luna_process_channel_open(int fd)
 {

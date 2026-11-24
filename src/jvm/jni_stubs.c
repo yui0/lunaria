@@ -162,7 +162,12 @@ java_lang_ClassLoader_findLibrary(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
   if (!JVM_VA_HAS_ARGS(args)) return NULL;
-  const char *libname = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
+  jvalue argument = { .l = va_arg(args, jstring) }, result = {0};
+  if (dvm_jni_invoke(env, "java/lang/ClassLoader", "findLibrary",
+                     "(Ljava/lang/String;)Ljava/lang/String;", object, false,
+                     NULL, &argument, &result))
+    return result.l;
+  const char *libname = (*env)->GetStringUTFChars(env, argument.l, NULL);
   const char *libdir = arm_exec_get_main_lib_dir();
   char lib[4096];
   lib[0] = '\0';
@@ -1862,22 +1867,22 @@ android_app_Activity_getIntent(JNIEnv *env, jobject object, va_list args)
   return jvm_cached_object(env, &sv, "android/content/Intent");
 }
 
-/* Context.getObbDir() → a File stub (no OBB, but a valid object). */
 jobject
 android_content_Context_getObbDir(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
+  (void)args;
   static jobject sv;
-  return jvm_cached_object(env, &sv, "java/io/File");
+  static struct cached_file_spec spec = {"ANDROID_EXTERNAL_OBB_DIR", NULL, "/tmp/lunaria-obb", false};
+  return jvm_cached_object_init(env, &sv, "java/io/File", cached_file_initialize, &spec);
 }
 
-/* Context.getObbDirs() → an empty File[] (this is a mono APK, no expansion
- * files).  The caller expects an array object, not a scalar. */
 jobjectArray
 android_content_Context_getObbDirs(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
-  return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/io/File"), NULL);
+  jobject dir = android_content_Context_getObbDir(env, object, args);
+  return (*env)->NewObjectArray(env, 1, (*env)->FindClass(env, "java/io/File"), dir);
 }
 
 /* File.getAbsolutePath() → stored path for this File object. */

@@ -561,10 +561,11 @@ inline A64Mapping a64_mapping_slice(A64Mapping mapping, GuestVA lo, GuestVA hi) 
 }
 
 // Drop [lo,hi) from the table, splitting/trimming entries as needed.
-inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release,
+inline bool a64_map_remove(GuestVA lo, GuestVA hi, bool release,
                            bool keep_backing = false) {
   a64_loaded_regions_unmap(lo, hi);
   std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  bool removed_exec = false;
   const GuestVA page = a64_host_page_size();
   std::vector<std::pair<GuestVA, GuestVA>> released;
   for (size_t i = 0; i < g_a64_maps.size();) {
@@ -573,6 +574,7 @@ inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release,
       ++i;
       continue;
     }
+    removed_exec |= (m.prot & 4u) != 0;
     GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
     if (release && m.owned) {
       if (page <= 4096u)
@@ -617,10 +619,11 @@ inline void a64_map_remove(GuestVA lo, GuestVA hi, bool release,
   }
   g_a64_unmap_gen.fetch_add(1, std::memory_order_release);
   a64_maps_bump();
+  return removed_exec;
 }
 
 // Record a guest mprotect over [lo,hi).
-inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
+inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot, bool *code_changed) {
   if ((lo & 4095u) || hi <= lo) {
     errno = EINVAL;
     return -1;
@@ -644,6 +647,7 @@ inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot) {
   for (size_t i = 0; i < g_a64_maps.size(); ++i) {
     A64Mapping &m = g_a64_maps[i];
     if (m.hi <= lo || m.lo >= hi || m.prot == prot) continue;
+    *code_changed |= ((m.prot ^ prot) & 4u) != 0;
     GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
     if (m.lo == clo && m.hi == chi) {
       m.prot = prot;
@@ -801,27 +805,36 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
   if (hint && !a64_is_guest_va(hint) && hint >= A64_GUEST_SIZE &&
       !(hint & 4095ull) && hint + len <= 0x0010000000000000ull)
     want = (void *)hint;
+  const bool shared = (map_flags & LUNA_MAP_SHARED) != 0;
+  /* Retain the backing before mmap can replace an existing range. The
+   * mapping must remain reproducible after the guest closes its fd. */
+  const int backing = shared ? luna_fd_dup(fd, 0, 1) : -1;
+  if (shared && backing < 0) return 0;
   /* Native MAP_FIXED performs replacement after validating the request.
    * Removing the old mapping first would also remove it on EACCES/error. */
   void *p = luna_os_map_file_flags(want, (size_t)len, host_prot, map_flags, fd, (uint64_t)off);
   if (!a64_va_usable(p, len) || (fixed && want && p != want)) {
     void *bad = p;
     if (fixed) {
+      const int error = p ? EEXIST : errno;
       if (bad) luna_os_release(bad, (size_t)len);
+      if (backing >= 0) luna_fd_close(backing);
+      errno = error;
       return 0;
     }
     int retry = map_flags & ~(LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE);
     p = luna_os_map_file_flags(nullptr, (size_t)len, host_prot, retry, fd, (uint64_t)off);
+    const int error = p ? ENOMEM : errno;
     if (bad && bad != p) luna_os_release(bad, (size_t)len);
     if (!a64_va_usable(p, len)) {
       if (p) luna_os_release(p, (size_t)len);
+      if (backing >= 0) luna_fd_close(backing);
+      errno = error;
       return 0;
     }
   }
   if (fixed && !(map_flags & LUNA_MAP_NOREPLACE))
     a64_map_remove((GuestVA)p, (GuestVA)p + len, /*release=*/false);
-  const bool shared = (map_flags & LUNA_MAP_SHARED) != 0;
-  const int backing = shared ? luna_fd_dup(fd, 0, 1) : -1;
   a64_map_insert((GuestVA)p, (GuestVA)p + len, prot, /*owned=*/true,
                  /*file_backed=*/true, shared,
                  backing < 0 ? 0u : (unsigned)backing + 1u, (uint64_t)off);
@@ -957,6 +970,7 @@ struct LoadedRegion {
   uint32_t lo, hi;
   uint32_t flags;
   uint64_t file_off;
+  uint32_t file_hi; /* full pages beyond this boundary are anonymous BSS */
   std::string path;
   /* Captured while the loader still owns the fd.  A mapped ELF may be
    * unlinked later; Linux keeps its inode in maps and suffixes the name with
@@ -1414,7 +1428,13 @@ inline uint32_t cb_stack_base(int slot) {
  * compares over 33 cache lines on every STXR, and UE4 takes a reservation on
  * every refcount.  One id per host thread that can run guest code is both the
  * architecturally right model and two orders of magnitude cheaper. */
-constexpr int      A64_ENGINE_MAX = 8;
+/* Pooled engines plus the ones host threads that are not in the pool build for
+ * themselves (callbacks nest one JIT per depth).  With the pump and its
+ * workers taking up to 8 of them, a cap of 8 left the pump itself without an
+ * engine once the others had been built, and a guest thread that owns GL (which
+ * can only run there) was then never scheduled again.  Each needs an
+ * exclusive-monitor id, so this stays within EXCL_PE_MAX. */
+constexpr int      A64_ENGINE_MAX = 12;
 constexpr int      EXCL_PE_MAX    = 14;  /* host threads that run guest code */
 enum : size_t {
   EXCL_ID_MAIN  = 0,

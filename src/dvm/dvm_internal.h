@@ -216,6 +216,7 @@ struct dvm_object {
 struct dvm_dex {
   struct dex_file file;
   dvm_ref defining_loader; /* null for the application class path */
+  dvm_ref java_dex_file;   /* pinned DexFile backing the published path element */
   /* Per-index resolution caches.  A dex index is only meaningful inside its
    * own file, so the caches live here rather than in the VM. */
   struct dvm_class **type_cache;
@@ -228,6 +229,7 @@ struct dvm_dex {
   struct dvm_field *field_miss;
   dvm_ref *string_cache;
 };
+dvm_ref dvm__dex_defining_loader(struct dvm *vm, const struct dvm_dex *dex);
 
 struct dvm_attached_thread {
   uint64_t token;
@@ -525,21 +527,21 @@ struct dvm_method *dvm__find_method_ic(struct dvm *vm, struct dvm_class *cls,
 #if defined(__GNUC__) && !defined(__cplusplus) && !defined(DVM_NO_CALLSITE_CACHE)
 #define DVM_LITERAL2(a, b) (__builtin_constant_p(a) && __builtin_constant_p(b))
 #define dvm_get_field(vm, obj, name, type, out) \
-   ((void)(DVM_LITERAL2(name, type) \
-    ? ({ static struct dvm_field_ic ic_; dvm__get_field_ic((vm), (obj), NULL, (name), (type), (out), &ic_); (void)0; }) \
-    : ((void)(dvm_get_field)((vm), (obj), (name), (type), (out)), 0)))
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__get_field_ic((vm), (obj), NULL, (name), (type), (out), &ic_); }) \
+    : (dvm_get_field)((vm), (obj), (name), (type), (out)))
 #define dvm_set_field(vm, obj, name, type, val) \
-   ((void)(DVM_LITERAL2(name, type) \
-    ? ({ static struct dvm_field_ic ic_; dvm__set_field_ic((vm), (obj), NULL, (name), (type), (val), &ic_); (void)0; }) \
-    : ((void)(dvm_set_field)((vm), (obj), (name), (type), (val)), 0)))
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__set_field_ic((vm), (obj), NULL, (name), (type), (val), &ic_); }) \
+    : (dvm_set_field)((vm), (obj), (name), (type), (val)))
 #define dvm__get_field_from(vm, obj, owner, name, type, out) \
-   ((void)(DVM_LITERAL2(name, type) \
-    ? ({ static struct dvm_field_ic ic_; dvm__get_field_ic((vm), (obj), (owner), (name), (type), (out), &ic_); (void)0; }) \
-    : ((void)(dvm__get_field_from)((vm), (obj), (owner), (name), (type), (out)), 0)))
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__get_field_ic((vm), (obj), (owner), (name), (type), (out), &ic_); }) \
+    : (dvm__get_field_from)((vm), (obj), (owner), (name), (type), (out)))
 #define dvm__set_field_from(vm, obj, owner, name, type, val) \
-   ((void)(DVM_LITERAL2(name, type) \
-    ? ({ static struct dvm_field_ic ic_; dvm__set_field_ic((vm), (obj), (owner), (name), (type), (val), &ic_); (void)0; }) \
-    : ((void)(dvm__set_field_from)((vm), (obj), (owner), (name), (type), (val)), 0)))
+   (DVM_LITERAL2(name, type) \
+    ? ({ static struct dvm_field_ic ic_; dvm__set_field_ic((vm), (obj), (owner), (name), (type), (val), &ic_); }) \
+    : (dvm__set_field_from)((vm), (obj), (owner), (name), (type), (val)))
 #define dvm_find_class(vm, name) \
    (__builtin_constant_p(name) \
     ? ({ static _Atomic uint64_t ic_; dvm__find_class_ic((vm), (name), &ic_); }) \

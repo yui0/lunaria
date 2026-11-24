@@ -372,7 +372,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
 
     const auto wrapped_fn = read_fallbacks[ordered][FastmemFallbackSizeIndex(bitsize)][vaddr.getIdx()][value_idx];
 
-    EmitExclusiveLock(code, conf, tmp, tmp2.cvt32());
+    EmitExclusiveLock(code, conf, tmp, tmp2.cvt32(), vaddr);
 
     code.mov(code.byte[r15 + offsetof(AxxJitState, exclusive_state)], u8(1));
     code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id)));
@@ -412,7 +412,7 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
     code.mov(tmp, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id)));
     EmitWriteMemoryMov<bitsize>(code, tmp, value_idx, false);
 
-    EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32());
+    EmitExclusiveUnlock(code, conf, tmp, tmp2.cvt32(), vaddr);
 
     if constexpr (bitsize == 128) {
         ctx.reg_alloc.DefineValue(inst, Xbyak::Xmm{value_idx});
@@ -456,7 +456,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
     const auto wrapped_fn = exclusive_write_fallbacks[ordered][FastmemFallbackSizeIndex(bitsize)][vaddr.getIdx()][value.getIdx()];
 
-    EmitExclusiveLock(code, conf, tmp, eax);
+    EmitExclusiveLock(code, conf, tmp, eax, vaddr);
 
     SharedLabel end = GenSharedLabel();
 
@@ -552,7 +552,7 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
 
     code.L(*end);
 
-    EmitExclusiveUnlock(code, conf, tmp, eax);
+    EmitExclusiveUnlock(code, conf, tmp, eax, vaddr);
 
     ctx.reg_alloc.DefineValue(inst, status);
 

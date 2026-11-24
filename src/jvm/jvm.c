@@ -2597,21 +2597,26 @@ JNIEnv_GetStaticMethodID(JNIEnv* p0, jclass klass, const char* name, const char*
 }
 
 static jfieldID
-jvm_make_fieldid(struct jvm *jvm, const jclass klass, const char *name, const char *sig)
+jvm_make_fieldid(struct jvm *jvm, jclass klass, const char *name, const char *sig, bool statics)
 {
+  const char *class_name = klass ? jvm_get_class_name(jvm, klass) : NULL;
+  if (dvm_jni_field_signature_mismatch(class_name, name, sig, statics)) {
+    jvm_throw_new(jvm, "java/lang/NoSuchFieldError", name);
+    return NULL;
+  }
   return (jfieldID)jvm_make_method(jvm, klass, name, sig);
 }
 
 static jfieldID
 JNIEnv_GetFieldID(JNIEnv* p0, jclass klass, const char* name, const char* sig)
 {
-  return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
+  return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig, false);
 }
 
 static jfieldID
 JNIEnv_GetStaticFieldID(JNIEnv* p0, jclass klass, const char* name, const char* sig)
 {
-  return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig);
+  return jvm_make_fieldid(jnienv_get_jvm(p0), klass, name, sig, true);
 }
 
 jstring jvm_new_string_wtf8(struct jvm *jvm, const char *text, size_t bytes)

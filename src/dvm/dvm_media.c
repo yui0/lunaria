@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 struct liq_image {
@@ -414,6 +415,8 @@ static struct {
   /* video: optional — a libavcodec without them still decodes AAC */
   int (*decode_video2)(void *, void *, int *, const void *);
   int64_t (*frame_best_effort_ts)(const void *);
+  int (*frame_colorspace)(const void *);
+  int (*frame_color_range)(const void *);
   void (*flush_buffers)(void *);
 } av;
 
@@ -493,6 +496,8 @@ static bool avcodec_ready(void)
 #undef AV_SYM
   *(void **)&av.decode_video2 = luna_os_library_symbol(c, "avcodec_decode_video2");
   *(void **)&av.frame_best_effort_ts = luna_os_library_symbol(u, "av_frame_get_best_effort_timestamp");
+  *(void **)&av.frame_colorspace = luna_os_library_symbol(u, "av_frame_get_colorspace");
+  *(void **)&av.frame_color_range = luna_os_library_symbol(u, "av_frame_get_color_range");
   *(void **)&av.flush_buffers = luna_os_library_symbol(c, "avcodec_flush_buffers");
 
   if (!avcodec_probe_layout()) {
@@ -935,6 +940,7 @@ struct lm_codec {
   int ncsd;
 
   int width, height;
+  int color_matrix, color_range;
   bool announced_format;   /* the one INFO_OUTPUT_FORMAT_CHANGED was handed out */
   bool got_eos;            /* an input buffer carried END_OF_STREAM */
   bool sent_eos;
@@ -983,6 +989,7 @@ bool lm_codec_supported(const char *mime)
   if (!mime) return false;
   if (!strcasecmp(mime, "video/avc"))
     return avcodec_h264_ready() || openh264_ready();
+  if (!strcasecmp(mime, "video/hevc")) return avcodec_video_ready("hevc");
   if (is_vp9_mime(mime)) return avcodec_vp9_ready();
   if (is_mpeg4_mime(mime)) return avcodec_video_ready("mpeg4");
   if (is_aac_mime(mime)) return avcodec_aac_ready();
@@ -1009,7 +1016,7 @@ static struct lm_codec *aac_codec_new(void)
   return c;
 }
 
-/* H.264 and MPEG-4 Visual need their configuration before the first
+/* AVC, HEVC and MPEG-4 Visual need their configuration before the first
  * access unit. VP9 frames do not need a separate configuration prefix. */
 static bool av_video_open(struct lm_codec *c, const char *decoder, bool prepend_csd)
 {
@@ -1050,9 +1057,12 @@ struct lm_codec *lm_codec_new(const char *mime)
     return c;
   }
 
-  const bool mpeg4 = is_mpeg4_mime(mime);
-  if (mpeg4 || avcodec_h264_ready()) {
-    if (!av_video_open(c, mpeg4 ? "mpeg4" : "h264", true)) {
+  const char *decoder = NULL;
+  if (is_mpeg4_mime(mime)) decoder = "mpeg4";
+  else if (!strcasecmp(mime, "video/hevc")) decoder = "hevc";
+  else if (avcodec_h264_ready()) decoder = "h264";
+  if (decoder) {
+    if (!av_video_open(c, decoder, true)) {
       free(c);
       return NULL;
     }
@@ -1276,6 +1286,9 @@ static bool avcodec_keep_frame(struct lm_codec *c)
     return false;
   }
   c->produced_picture = true;
+  c->color_matrix = av.frame_colorspace ? av.frame_colorspace(c->vframe) : 2;
+  c->color_range = av.frame_color_range ? av.frame_color_range(c->vframe) : 0;
+  if (!c->color_range && fmt == AV_PIX_FMT_YUVJ420P) c->color_range = 2;
   int stride[3] = { ls[0], ls[1], ls[2] };
   return keep_picture(c, planes, stride, w, h, av.frame_best_effort_ts(c->vframe));
 }
@@ -1800,16 +1813,42 @@ void lm_codec_flush(struct lm_codec *c)
   if (c->vctx) pthread_mutex_unlock(&c->mu);
 }
 
+/* Caller holds the decoder mutex for threaded codecs. */
+static int codec_input_credit(const struct lm_codec *c)
+{
+  int credit = c->vctx ? -c->pending_decodes : 0;
+  for (int i = 0; i < LM_OUT_BUFS; ++i)
+    if (!c->out[i].busy && !c->out[i].ready) ++credit;
+  for (int i = 0; i < LM_IN_BUFS; ++i)
+    if (c->in[i].queued && (!c->vctx || !c->in[i].submitted)) --credit;
+  return credit;
+}
+
+bool lm_codec_dequeue_ready(struct lm_codec *c, bool output)
+{
+  if (!c || !c->started) return true;
+  if (c->vctx) pthread_mutex_lock(&c->mu);
+  bool ready = c->error != 0;
+  if (output) {
+    ready |= !c->announced_format && (c->video ? c->width : c->rate) > 0;
+    ready |= c->got_eos && !c->sent_eos &&
+             (!c->vctx || (!c->pending_decodes && c->drained));
+    for (int i = 0; !ready && i < LM_OUT_BUFS; ++i)
+      ready = c->out[i].ready && !c->out[i].busy;
+  } else if (codec_input_credit(c) > 0) {
+    for (int i = 0; !ready && i < LM_IN_BUFS; ++i)
+      ready = !c->in[i].queued;
+  }
+  if (c->vctx) pthread_mutex_unlock(&c->mu);
+  return ready;
+}
+
 int lm_codec_dequeue_input(struct lm_codec *c)
 {
   if (!c || !c->started) return -1;
   if (c->vctx) {
     pthread_mutex_lock(&c->mu);
-    int free_out = -c->pending_decodes;
-    for(int i=0; i<LM_IN_BUFS; ++i)
-      if(c->in[i].queued && !c->in[i].submitted) --free_out;
-    for (int i = 0; i < LM_OUT_BUFS; ++i)
-      if (!c->out[i].busy && !c->out[i].ready) free_out++;
+    int free_out = codec_input_credit(c);
     int got = -1;
     if (free_out > 0)
       for (int i = 0; i < LM_IN_BUFS && got < 0; ++i) {
@@ -1828,11 +1867,7 @@ int lm_codec_dequeue_input(struct lm_codec *c)
   }
   /* Back-pressure: with every output slot spoken for there is nowhere to put
    * the next picture, so the input side has to wait. */
-  int free_out = 0;
-  for (int i = 0; i < LM_OUT_BUFS; ++i)
-    if (!c->out[i].busy && !c->out[i].ready) free_out++;
-  for(int i=0; i<LM_IN_BUFS; ++i) if(c->in[i].queued) --free_out;
-  if (!free_out) return -1;
+  if (codec_input_credit(c) <= 0) return -1;
 
   for (int i = 0; i < LM_IN_BUFS; ++i) {
     if (c->in[i].queued) continue;
@@ -1972,6 +2007,30 @@ void lm_codec_output_size(const struct lm_codec *c, int *w, int *h)
 {
   if (w) *w = c ? c->width : 0;
   if (h) *h = c ? c->height : 0;
+}
+
+/* Translate libavutil's matrix and range to MediaFormat values. When the
+ * stream does not specify a matrix, use Android's size-based defaults. */
+void lm_codec_output_color(struct lm_codec *c, int *standard, int *range)
+{
+  if (c->vctx) pthread_mutex_lock(&c->mu);
+  int matrix = c->color_matrix, av_range = c->color_range;
+  int w = c->width, h = c->height;
+  if (c->vctx) pthread_mutex_unlock(&c->mu);
+
+  *range = av_range == 2 ? 1 : 2; /* JPEG/full, MPEG/limited or unspecified */
+  switch (matrix) {
+  case 1: *standard = 1; return; /* BT.709 */
+  case 5: *standard = 2; return; /* BT.470BG / BT.601 625 */
+  case 6: *standard = 4; return; /* SMPTE 170M / BT.601 525 */
+  case 9:
+  case 10: *standard = 6; return; /* BT.2020 */
+  }
+  int major = w > h ? w : h;
+  int minor = w > h ? h : w;
+  *standard = major >= 3840 || (int64_t)w * h >= 3840 * 1634 ? 6 :
+              major <= 720 && minor <= 480 ? 4 :
+              major <= 720 && minor <= 576 ? 2 : 1;
 }
 
 const uint8_t *lm_codec_output_buffer(struct lm_codec *c, int idx, size_t *len)
@@ -2186,7 +2245,7 @@ struct lm_mp4_track {
   int      rate, channels;
   uint8_t *csd;
   size_t   csd_len;
-  int      nal_len;                 /* AVC length-prefix width, 0 = not AVC */
+  int      nal_len;                 /* AVC/HEVC length-prefix width */
   struct lm_mp4_sample *s;
   int      ns;
 };
@@ -2194,6 +2253,10 @@ struct lm_mp4_track {
 struct lm_mp4 {
   int      fd;                      /* our own dup() */
   int64_t  base;
+  int64_t  length;
+  lm_media_read_at reader;
+  void *reader_context;
+  void (*reader_destroy)(void *);
   struct lm_mp4_track t[LM_MP4_MAX_TRACKS];
   int      nt;
   uint8_t *buf;                     /* the sample handed to the last caller */
@@ -2303,6 +2366,41 @@ static void lm_avcc_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len
   tr->csd_len = used;
 }
 
+static void lm_hvcc_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
+{
+  if (len < 23 || p[0] != 1) return;
+  /* Each array carries two bytes of length per NAL. Converting to
+   * four-byte start codes grows the data by at most the input length. */
+  if (len > SIZE_MAX / 2) return;
+  uint8_t *out = malloc(len * 2);
+  if (!out) return;
+  size_t off = 23, used = 0;
+  for (unsigned array = 0; array < p[22]; ++array) {
+    if (len - off < 3) goto invalid;
+    unsigned count = rd16(p + off + 1);
+    off += 3;
+    for (unsigned i = 0; i < count; ++i) {
+      if (len - off < 2) goto invalid;
+      size_t n = rd16(p + off);
+      off += 2;
+      if (n < 2 || n > len - off) goto invalid;
+      memcpy(out + used, "\0\0\0\1", 4);
+      memcpy(out + used + 4, p + off, n);
+      used += 4 + n;
+      off += n;
+    }
+  }
+  if (off != len || !used) goto invalid;
+  free(tr->csd);
+  tr->csd = out;
+  tr->csd_len = used;
+  tr->nal_len = (p[21] & 3) + 1;
+  return;
+
+invalid:
+  free(out);
+}
+
 /* Extract DecoderSpecificInfo (tag 0x05) from an esds box. */
 static void lm_esds_to_csd(struct lm_mp4_track *tr, const uint8_t *p, size_t len)
 {
@@ -2342,6 +2440,7 @@ static void lm_stsd_child(void *ctx, const char *type, const uint8_t *body,
 {
   struct lm_mp4_track *tr = ctx;
   if (!strcmp(type, "avcC")) lm_avcc_to_csd(tr, body, len);
+  else if (!strcmp(type, "hvcC")) lm_hvcc_to_csd(tr, body, len);
   else if (!strcmp(type, "esds")) lm_esds_to_csd(tr, body, len);
 }
 
@@ -2351,19 +2450,15 @@ static void lm_stsd_entry(void *ctx, const char *type, const uint8_t *body,
   struct lm_mp4_track *tr = ctx;
   struct lm_box_walk w = { lm_stsd_child, tr };
   const bool mpeg4 = !strcmp(type, "mp4v");
-  if (mpeg4 || !strcmp(type, "avc1") || !strcmp(type, "avc3")) {
-    snprintf(tr->mime, sizeof tr->mime, "%s", mpeg4 ? "video/mp4v-es" : "video/avc");
+  const bool hevc = !strcmp(type, "hvc1") || !strcmp(type, "hev1");
+  if (mpeg4 || hevc || !strcmp(type, "avc1") || !strcmp(type, "avc3")) {
+    snprintf(tr->mime, sizeof tr->mime, "%s",
+             mpeg4 ? "video/mp4v-es" : hevc ? "video/hevc" : "video/avc");
     if (len >= 32) {
       tr->width  = rd16(body + 24);
       tr->height = rd16(body + 26);
     }
     if (len > 78) lm_box_children(body + 78, len - 78, &w);
-  } else if (!strcmp(type, "hvc1") || !strcmp(type, "hev1")) {
-    snprintf(tr->mime, sizeof tr->mime, "video/hevc");
-    if (len >= 32) {
-      tr->width  = rd16(body + 24);
-      tr->height = rd16(body + 26);
-    }
   } else if (!strcmp(type, "mp4a")) {
     snprintf(tr->mime, sizeof tr->mime, "audio/mp4a-latm");
     if (len >= 28) {
@@ -2439,12 +2534,16 @@ static void lm_stbl_build(struct lm_stbl *st)
            rd32(st->stsc + (entry + 1) * 12) <= chunk + 1)
       ++entry;
     uint32_t per = rd32(st->stsc + entry * 12 + 4);
-    int64_t off = st->co64 ? (int64_t)rd64(st->stco + chunk * 8)
-                  : (int64_t)rd32(st->stco + chunk * 4);
+    uint64_t off = st->co64 ? rd64(st->stco + chunk * 8)
+                   : rd32(st->stco + chunk * 4);
     for (uint32_t k = 0; k < per && sample < n; ++k) {
       uint32_t size = st->stsz_fixed ? st->stsz_fixed
                       : rd32(st->stsz + sample * 4);
-      s[sample].offset = off;
+      if (off > INT64_MAX) {
+        free(s);
+        return;
+      }
+      s[sample].offset = (int64_t)off;
       s[sample].size   = size;
       off += size;
       ++sample;
@@ -2561,42 +2660,45 @@ static void lm_moov_child(void *ctx, const char *type, const uint8_t *body,
   }
 }
 
-static bool lm_read_at(int fd, int64_t off, void *dst, size_t len)
+static bool lm_read_at(struct lm_mp4 *m, int64_t off, void *dst, size_t len)
 {
   size_t done = 0;
   while (done < len) {
-    ssize_t n = luna_file_pread(fd, (char *)dst + done, len - done, off + (int64_t)done);
-    if (n <= 0) return false;
+    int64_t n = m->reader ?
+      m->reader(m->reader_context, off + (int64_t)done, (char *)dst + done, len - done) :
+      luna_file_pread(m->fd, (char *)dst + done, len - done, off + (int64_t)done);
+    if (n <= 0 || (uint64_t)n > len - done) return false;
     done += (size_t)n;
   }
   return true;
 }
 
-struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length)
+static bool lm_mp4_parse(struct lm_mp4 *m)
 {
-  if (fd < 0) return NULL;
-  int64_t end = length > 0 ? offset + length : INT64_MAX;
+  const int64_t offset = m->base;
+  const int64_t end = offset + m->length;
 
   /* Find moov by walking the top-level boxes; mdat is skipped, not read. */
   uint8_t *moov = NULL;
   size_t moov_len = 0;
-  for (int64_t pos = offset; pos + 8 <= end; ) {
+  for (int64_t pos = offset; end - pos >= 8; ) {
     uint8_t hdr[16];
-    if (!lm_read_at(fd, pos, hdr, 8)) break;
+    if (!lm_read_at(m, pos, hdr, 8)) break;
     uint64_t size = rd32(hdr);
     size_t hlen = 8;
     if (size == 1) {
-      if (!lm_read_at(fd, pos, hdr, 16)) break;
+      if (end - pos < 16 || !lm_read_at(m, pos, hdr, 16)) break;
       size = rd64(hdr + 8);
       hlen = 16;
     }
-    if (size < hlen) break;
+    else if (!size) size = (uint64_t)(end - pos);
+    if (size < hlen || size > (uint64_t)(end - pos)) break;
     if (!memcmp(hdr + 4, "moov", 4)) {
+      if (size - hlen > 64u * 1024u * 1024u) break;
       moov_len = (size_t)(size - hlen);
-      if (moov_len > 64u * 1024u * 1024u) break;
       moov = malloc(moov_len ? moov_len : 1);
       if (!moov) break;
-      if (!lm_read_at(fd, pos + (int64_t)hlen, moov, moov_len)) {
+      if (!lm_read_at(m, pos + (int64_t)hlen, moov, moov_len)) {
         free(moov);
         moov = NULL;
       }
@@ -2606,24 +2708,14 @@ struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length)
   }
   if (!moov) {
     if (trace_media()) fprintf(stderr, "[media] mp4: no moov box\n");
-    return NULL;
+    return false;
   }
 
-  struct lm_mp4 *m = calloc(1, sizeof *m);
-  if (!m) {
-    free(moov);
-    return NULL;
-  }
-  m->fd = dup(fd);
-  m->base = offset;
   struct lm_box_walk w = { lm_moov_child, m };
   lm_box_children(moov, moov_len, &w);
   free(moov);
 
-  if (!m->nt) {
-    lm_mp4_free(m);
-    return NULL;
-  }
+  if (!m->nt) return false;
   if (trace_media()) {
     fprintf(stderr, "[media] mp4: %d track(s)\n", m->nt);
     for (int i = 0; i < m->nt; ++i)
@@ -2631,7 +2723,25 @@ struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length)
               i, m->t[i].mime, m->t[i].width, m->t[i].height, m->t[i].ns,
               (long long)m->t[i].duration_us, m->t[i].csd_len);
   }
-  return m;
+  return true;
+}
+
+struct lm_mp4 *lm_mp4_open(int fd, int64_t offset, int64_t length)
+{
+  struct stat info;
+  if (fd < 0 || offset < 0 || fstat(fd, &info) || offset >= info.st_size)
+    return NULL;
+  int64_t available = (int64_t)info.st_size - offset;
+  if (length <= 0 || length > available) length = available;
+
+  struct lm_mp4 *m = calloc(1, sizeof *m);
+  if (!m) return NULL;
+  m->fd = dup(fd);
+  m->base = offset;
+  m->length = length;
+  if (m->fd >= 0 && lm_mp4_parse(m)) return m;
+  lm_mp4_free(m);
+  return NULL;
 }
 
 void lm_mp4_free(struct lm_mp4 *m)
@@ -2642,6 +2752,7 @@ void lm_mp4_free(struct lm_mp4 *m)
     free(m->t[i].s);
   }
   if (m->fd >= 0) close(m->fd);
+  if (m->reader_destroy) m->reader_destroy(m->reader_context);
   free(m->buf);
   free(m);
 }
@@ -2701,6 +2812,8 @@ const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
   const struct lm_mp4_track *tr = track_of(m, t);
   if (!tr || i < 0 || i >= tr->ns) return NULL;
   const struct lm_mp4_sample *s = &tr->s[i];
+  if (s->offset < 0 || s->offset > m->length ||
+      s->size > (uint64_t)(m->length - s->offset)) return NULL;
   if (pts_us) *pts_us = s->pts_us;
   if (sync) *sync = s->sync;
 
@@ -2714,9 +2827,9 @@ const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
   /* stco/co64 count from the start of the MP4, not of the file holding it:
    * a movie inside an OBB zip is handed over as (fd, offset, length), the
    * same DataSource window stagefright reads through. */
-  if (!lm_read_at(m->fd, m->base + s->offset, m->buf, need)) return NULL;
+  if (!lm_read_at(m, m->base + s->offset, m->buf, need)) return NULL;
 
-  /* AVC in MP4 prefixes each NAL with its length; a decoder wants Annex-B
+  /* AVC and HEVC in MP4 prefix each NAL with its length. A decoder wants Annex-B
    * start codes.  The 4-byte case is a rewrite in place; narrower prefixes
    * change the size, so those are expanded into the same buffer only when it
    * is big enough to hold the growth. */
@@ -2883,7 +2996,7 @@ unsigned luna_at_space(struct luna_audio_track *t)
 {
   if (!t) return 0;
   pthread_mutex_lock(&tracks_mutex);
-  unsigned n=t->pcm.count==LUNA_PCM_BUFFERS ? 0 : t->capacity-t->queued;
+  unsigned n=t->pcm.count==LUNA_PCM_BUFFERS || t->queued>=t->capacity ? 0 : t->capacity-t->queued;
   pthread_mutex_unlock(&tracks_mutex);
   return n;
 }
@@ -2891,7 +3004,7 @@ unsigned luna_at_write(struct luna_audio_track *t, const int16_t *data, unsigned
 {
   if (!t || !data || !frames) return 0;
   pthread_mutex_lock(&tracks_mutex);
-  unsigned n=t->capacity-t->queued;
+  unsigned n=t->queued>=t->capacity ? 0 : t->capacity-t->queued;
   if (getenv("LUNARIA_TRACE_AUDIO_CLOCK")) {
     static uint64_t asked, took, calls, last_ns;
     const uint64_t now=now_ns();
@@ -2932,6 +3045,34 @@ unsigned luna_at_write(struct luna_audio_track *t, const int16_t *data, unsigned
     }
   } else n=0;
   pthread_mutex_unlock(&tracks_mutex);
+  return n;
+}
+/* Accept the whole write at once, even past the track's capacity, and say how
+ * long the output needs to drain the overflow.  A writer that can park (a guest
+ * thread: see dvm_host_defer_sleep) sleeps that long after the call returns
+ * instead of holding its execution engine in a condition wait: the thread is
+ * paced exactly as a blocking write paces it, and the engine runs something
+ * else meanwhile.  Returns the frames accepted: all of them, or 0 when every
+ * PCM buffer slot is in use. */
+unsigned luna_at_write_ahead(struct luna_audio_track *t, const int16_t *data,
+                             unsigned frames, uint64_t *drain_ns)
+{
+  if (drain_ns) *drain_ns=0;
+  if (!t || !data || !frames) return 0;
+  const unsigned bytes=frames*t->pcm.channels*(unsigned)sizeof(int16_t);
+  int16_t *copy=malloc(bytes);
+  if (!copy) return 0;
+  memcpy(copy,data,bytes);
+  pthread_mutex_lock(&tracks_mutex);
+  unsigned n=0;
+  if (t->pcm.count<LUNA_PCM_BUFFERS && !luna_pcm_enqueue(&t->pcm,copy,bytes)) {
+    t->queued+=frames;
+    n=frames;
+    if (drain_ns && t->queued>t->capacity && t->pcm.rate)
+      *drain_ns=(uint64_t)(t->queued-t->capacity)*1000000000ull/t->pcm.rate;
+  }
+  pthread_mutex_unlock(&tracks_mutex);
+  if (!n) free(copy);
   return n;
 }
 uint64_t luna_at_played(struct luna_audio_track *t)
@@ -3028,7 +3169,7 @@ void luna_at_wait_space(struct luna_audio_track *t)
   if (!t) return;
   enum { POLL_NS=10000000, STALL_NS=30000000 };
   pthread_mutex_lock(&tracks_mutex);
-  while (t->playing && (t->queued==t->capacity || t->pcm.count==LUNA_PCM_BUFFERS)) {
+  while (t->playing && (t->queued>=t->capacity || t->pcm.count==LUNA_PCM_BUFFERS)) {
     struct timespec until;
     clock_gettime(CLOCK_REALTIME,&until);
     until.tv_nsec+=POLL_NS;
@@ -3045,4 +3186,131 @@ void luna_at_wait_space(struct luna_audio_track *t)
     if (frames) advance_locked(t,(unsigned)frames,t->pcm.rate,t->pcm.channels);
   }
   pthread_mutex_unlock(&tracks_mutex);
+}
+
+struct lm_extractor {
+  struct lm_mp4 *movie;
+  int cursor[LM_MP4_MAX_TRACKS];
+  unsigned selected;
+};
+
+struct lm_extractor *lm_extractor_new(void)
+{
+  return calloc(1, sizeof(struct lm_extractor));
+}
+
+void lm_extractor_free(struct lm_extractor *e)
+{
+  if (!e) return;
+  lm_mp4_free(e->movie);
+  free(e);
+}
+
+bool lm_extractor_open_fd(struct lm_extractor *e, int fd, int64_t offset, int64_t length)
+{
+  if (!e || e->movie || length <= 0) return false;
+  e->movie = lm_mp4_open(fd, offset, length);
+  return e->movie != NULL;
+}
+
+bool lm_extractor_open_reader(struct lm_extractor *e, int64_t size, lm_media_read_at read,
+                              void *context, void (*destroy)(void *))
+{
+  if (!e || e->movie || size <= 0 || !read) return false;
+  struct lm_mp4 *m = calloc(1, sizeof *m);
+  if (!m) return false;
+  m->fd = -1;
+  m->length = size;
+  m->reader = read;
+  m->reader_context = context;
+  if (!lm_mp4_parse(m)) {
+    lm_mp4_free(m);
+    return false;
+  }
+  m->reader_destroy = destroy;
+  e->movie = m;
+  return true;
+}
+
+const struct lm_mp4 *lm_extractor_movie(const struct lm_extractor *e)
+{
+  return e ? e->movie : NULL;
+}
+
+bool lm_extractor_select(struct lm_extractor *e, size_t track, bool selected)
+{
+  if (!e || track >= (size_t)lm_mp4_tracks(e->movie)) return false;
+  unsigned bit = 1u << track;
+  if (selected) e->selected |= bit;
+  else {
+    e->selected &= ~bit;
+    e->cursor[track] = 0;
+  }
+  return true;
+}
+
+int lm_extractor_track(const struct lm_extractor *e)
+{
+  int track = -1;
+  int64_t time = INT64_MAX;
+  for (int t = 0; e && t < lm_mp4_tracks(e->movie); ++t) {
+    if (!(e->selected & (1u << t))) continue;
+    const struct lm_mp4_track *tr = &e->movie->t[t];
+    if (e->cursor[t] >= tr->ns) continue;
+    int64_t pts = tr->s[e->cursor[t]].pts_us;
+    if (track < 0 || pts < time) {
+      track = t;
+      time = pts;
+    }
+  }
+  return track;
+}
+
+int64_t lm_extractor_time(const struct lm_extractor *e)
+{
+  int t = lm_extractor_track(e);
+  return t < 0 ? -1 : e->movie->t[t].s[e->cursor[t]].pts_us;
+}
+
+int lm_extractor_flags(const struct lm_extractor *e)
+{
+  int t = lm_extractor_track(e);
+  return t < 0 ? -1 : e->movie->t[t].s[e->cursor[t]].sync;
+}
+
+const uint8_t *lm_extractor_sample(struct lm_extractor *e, size_t *length)
+{
+  int t = lm_extractor_track(e);
+  return t < 0 ? NULL : lm_mp4_sample(e->movie, t, e->cursor[t], length, NULL, NULL);
+}
+
+bool lm_extractor_advance(struct lm_extractor *e)
+{
+  int t = lm_extractor_track(e);
+  if (t < 0) return false;
+  ++e->cursor[t];
+  return lm_extractor_track(e) >= 0;
+}
+
+bool lm_extractor_seek(struct lm_extractor *e, int64_t time, unsigned mode)
+{
+  if (!e || !e->movie || time < 0 || mode > 2) return false;
+  for (int t = 0; t < e->movie->nt; ++t) {
+    if (!(e->selected & (1u << t))) continue;
+    const struct lm_mp4_track *tr = &e->movie->t[t];
+    int prev = -1, next = -1;
+    for (int i = 0; i < tr->ns; ++i) {
+      if (!tr->s[i].sync) continue;
+      int64_t pts = tr->s[i].pts_us;
+      if (pts <= time && (prev < 0 || pts > tr->s[prev].pts_us)) prev = i;
+      if (pts >= time && (next < 0 || pts < tr->s[next].pts_us)) next = i;
+    }
+    int sample = mode == 0 ? prev : next;
+    if (mode == 2 && prev >= 0 && (next < 0 ||
+        (uint64_t)time - (uint64_t)tr->s[prev].pts_us <= (uint64_t)(tr->s[next].pts_us - time)))
+      sample = prev;
+    if (mode == 0 && sample < 0) sample = next;
+    e->cursor[t] = sample < 0 ? tr->ns : sample;
+  }
+  return true;
 }
