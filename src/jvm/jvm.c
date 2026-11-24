@@ -2065,8 +2065,8 @@ jvm_va_from_jvalues(struct jvm_va_wrap *v,JNIEnv *env,jmethodID method,const jva
     }
     args=v->promoted;
   }
-#if defined(__APPLE__) && defined(__aarch64__)
-  /* Darwin arm64 uses a pointer to the 8-byte stack vararg slots. */
+#if (defined(__APPLE__) && defined(__aarch64__)) || defined(_WIN32)
+  /* Darwin arm64 and Windows x64 use a pointer to the 8-byte stack vararg slots. */
   v->ap = (va_list)(uintptr_t)args;
 #elif defined(__x86_64__)
   struct {

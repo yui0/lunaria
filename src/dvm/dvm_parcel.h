@@ -224,6 +224,37 @@ static int parcel_take_fd(struct dvm *vm,struct rt_parcel *p)
   if(fd<0)dvm__throw(vm,"java/io/IOException","dup: %s",strerror(errno));
   return fd;
 }
+static bool parcel_write_file_descriptor(struct dvm *vm,dvm_ref self,
+                                        const union dvm_value *args,int nargs,
+                                        union dvm_value *out)
+{
+  struct rt_parcel *p=parcel_of(vm,self);
+  if(!p)return false;
+  if(!ARG(0).l) {
+    dvm__throw(vm,"java/lang/NullPointerException","file descriptor");
+    return false;
+  }
+  union dvm_value fd={.i=-1};
+  (void)dvm_get_field(vm,ARG(0).l,"descriptor","I",&fd);
+  if(!parcel_put_fd(vm,p,fd.i))return false;
+  RETV();
+}
+
+static bool parcel_read_file_descriptor(struct dvm *vm,dvm_ref self,
+                                       const union dvm_value *args,int nargs,
+                                       union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct rt_parcel *p=parcel_of(vm,self);
+  if(!p)return false;
+  int fd=parcel_take_fd(vm,p);
+  if(fd<0)return false;
+  dvm_ref descriptor=parcel_fd_adopt(vm,fd);
+  if(!descriptor)return false;
+  RETL(descriptor);
+}
+
 static bool parcel_fd_write(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)nargs;
@@ -2064,6 +2095,8 @@ static const struct rt_method rt_parcel_methods[] = {
   M("readHashMap", "(Ljava/lang/ClassLoader;)Ljava/util/HashMap;", parcel_readHashMap),
   M("writeList", "(Ljava/util/List;)V", parcel_writeList),
   M("readArrayList", "(Ljava/lang/ClassLoader;)Ljava/util/ArrayList;", parcel_readArrayList),
+  M("writeFileDescriptor", "(Ljava/io/FileDescriptor;)V", parcel_write_file_descriptor),
+  M("readFileDescriptor", "()Landroid/os/ParcelFileDescriptor;", parcel_read_file_descriptor),
   M("writeStrongBinder", "(Landroid/os/IBinder;)V", parcel_writeStrongBinder),
   M("writeStrongInterface", "(Landroid/os/IInterface;)V", parcel_writeStrongInterface),
   M("readStrongBinder", "()Landroid/os/IBinder;", parcel_readStrongBinder),
@@ -2122,7 +2155,7 @@ int dvm_service_pack(struct dvm *vm,uint32_t intent,int operation,void **bytes,s
 {
   *bytes=NULL;
   *size=0;
-  if(!intent || (operation<1 || operation>4))return -EINVAL;
+  if(!intent || (operation<1 || operation>5))return -EINVAL;
   union dvm_value parcel= {0},value= {0},ignored= {0};
   if(!parcel_obtain(vm,0,NULL,0,&parcel))return -ENOMEM;
   dvm_pin(vm,parcel.l);
@@ -2235,7 +2268,7 @@ int dvm_service_unpack(struct dvm *vm,const void *bytes,size_t size,int *operati
   if(ok) {
     ok=parcel_take_i32(p)==0x3156534c;
     op=parcel_take_i32(p);
-    ok=ok && (op>=1 && op<=4);
+    ok=ok && (op>=1 && op<=5);
   }
   dvm_ref result=ok ? dvm_new_object(vm,dvm_find_class(vm,"android/content/Intent")) : 0;
   if(result)dvm_pin(vm,result);
@@ -2447,8 +2480,11 @@ int dvm_service_dispatch(struct dvm *vm,const void *bytes,size_t size)
     bool found=pm_resolveService(vm,0,args,2,&resolved) && resolved.l &&
                svc_process_is_current(vm,resolved.l);
     if(found) {
-      bool ok=op==1 ? ctx_startService(vm,0,args,1,&result) : ctx_stopService(vm,0,args,1,&result);
-      status=ok && !dvm_exception(vm) ? (result.l ? 1 : 0) : -EIO;
+      if(op==5)status=svc_unbind_for_peer(vm,intent);
+      else if(op==1 || op==2) {
+        bool ok=op==1 ? ctx_startService(vm,0,args,1,&result) : ctx_stopService(vm,0,args,1,&result);
+        status=ok && !dvm_exception(vm) ? (result.l ? 1 : 0) : -EIO;
+      } else status=-EINVAL;
     } else status=dvm_exception(vm) ? -EIO : -ENOENT;
     dvm_unpin(vm,intent);
   }
@@ -2473,6 +2509,7 @@ void dvm_service_set_submit(struct dvm *vm,int (*submit)(void *,const char *,con
 /* Parent side of a bind that has been answered: connect the ServiceConnection. */
 static void binder_bind_connected(struct dvm *vm, struct binder_pending *e, const uint8_t *payload, size_t size)
 {
+  if(!svc_conn_find(e->connection))return;
   char cls[256] = "", desc[256] = "";
   if (size >= 4) {
     uint32_t n = bget(payload);

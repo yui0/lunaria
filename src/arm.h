@@ -738,6 +738,33 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
     return 0;
   }
 #endif
+#ifdef _WIN32
+  /* VirtualAlloc cannot replace part of a committed allocation. Guest allocators
+   * reserve an arena and then MAP_FIXED over a slice. Reuse the backing only
+   * when the guest owns the entire slice and every mapping is anonymous. */
+  if (fixed && !image_fixed && !shared) {
+    const GuestVA lo = (GuestVA)want, hi = lo + len;
+    GuestVA cursor = lo;
+    {
+      std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+      while (cursor < hi) {
+        const A64Mapping *mapping = a64_find_locked(cursor);
+        if (!mapping || !mapping->owned || mapping->file_backed || mapping->shared) break;
+        cursor = std::min(hi, mapping->hi);
+      }
+    }
+    if (cursor == hi) {
+      if (luna_os_protect(want, (size_t)len, LUNA_PROT_READ | LUNA_PROT_WRITE)) {
+        errno = EACCES;
+        return 0;
+      }
+      memset(want, 0, (size_t)len);
+      a64_map_remove(lo, hi, /*release=*/false);
+      a64_map_insert(lo, hi, prot, /*owned=*/true);
+      return lo;
+    }
+  }
+#endif
   int backing = -1;
 #ifdef __linux__
   if (shared) {

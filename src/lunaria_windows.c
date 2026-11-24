@@ -40,6 +40,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <windns.h>
 
 size_t luna_os_stack_remaining(void)
 {
@@ -804,23 +805,6 @@ int luna_os_symbol_is_function(void *address)
          p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
 }
 
-/* An eventfd stands in as a loopback socket pair: the emulator selects on
- * these alongside real sockets, and Winsock's select accepts nothing else.
- * The counter lives on the reader side, so a drain reports the total the way
- * eventfd does rather than one byte per signal. */
-#define LUNA_EVENT_MAX 64
-static struct {
-  SOCKET rd, wr;
-  uint64_t count;
-} g_events[LUNA_EVENT_MAX];
-
-static int luna_event_slot(int fd)
-{
-  for (int i = 0; i < LUNA_EVENT_MAX; ++i)
-    if (g_events[i].rd && (int)g_events[i].rd == fd) return i;
-  return -1;
-}
-
 /* These platforms have no native timerfd. Keep unsupported operations
  * explicit until their descriptor adapter implements timer notifications. */
 int luna_os_timer_open(int clock_id, int flags)
@@ -845,109 +829,6 @@ int luna_os_timer_get(int fd, luna_os_timer_spec *value)
   (void)fd;
   (void)value;
   errno = ENOSYS;
-  return -1;
-}
-
-int luna_os_event_open(unsigned initval, int nonblock)
-{
-  SOCKET listener = INVALID_SOCKET, rd = INVALID_SOCKET, wr = INVALID_SOCKET;
-  struct sockaddr_in addr;
-  int len = (int)sizeof addr;
-  int slot = -1;
-
-  for (int i = 0; i < LUNA_EVENT_MAX; ++i)
-    if (!g_events[i].rd) {
-      slot = i;
-      break;
-    }
-  if (slot < 0) return -1;
-
-  listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (listener == INVALID_SOCKET) return -1;
-  memset(&addr, 0, sizeof addr);
-  addr.sin_family = AF_INET;
-  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  addr.sin_port = 0;
-  if (bind(listener, (struct sockaddr *)&addr, sizeof addr) ||
-      listen(listener, 1) ||
-      getsockname(listener, (struct sockaddr *)&addr, &len))
-    goto fail;
-  wr = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (wr == INVALID_SOCKET) goto fail;
-  if (connect(wr, (struct sockaddr *)&addr, sizeof addr)) goto fail;
-  rd = accept(listener, NULL, NULL);
-  if (rd == INVALID_SOCKET) goto fail;
-  closesocket(listener);
-
-  if (nonblock) {
-    u_long on = 1;
-    ioctlsocket(rd, FIONBIO, &on);
-  }
-  g_events[slot].rd = rd;
-  g_events[slot].wr = wr;
-  g_events[slot].count = 0;
-  if (initval) luna_os_event_signal((int)rd, initval);
-  return (int)rd;
-
-fail:
-  if (listener != INVALID_SOCKET) closesocket(listener);
-  if (wr != INVALID_SOCKET) closesocket(wr);
-  if (rd != INVALID_SOCKET) closesocket(rd);
-  return -1;
-}
-
-int luna_os_event_signal(int fd, uint64_t count)
-{
-  int i = luna_event_slot(fd);
-  char b = 1;
-  if (i < 0 || !count) return i < 0 ? -1 : 0;
-  g_events[i].count += count;
-  /* One byte is enough to make the descriptor readable; the amount lives in
-   * the counter, exactly as eventfd keeps it in the kernel object. */
-  return send(g_events[i].wr, &b, 1, 0) == 1 ? 0 : -1;
-}
-
-int luna_os_event_drain(int fd, uint64_t *out)
-{
-  int i = luna_event_slot(fd);
-  char b[64];
-  if (i < 0) return -1;
-  while (recv(g_events[i].rd, b, (int)sizeof b, 0) > 0) { }
-  if (!g_events[i].count) {
-    WSASetLastError(WSAEWOULDBLOCK);
-    return -1;
-  }
-  if (out) *out = g_events[i].count;
-  g_events[i].count = 0;
-  return 0;
-}
-
-int luna_os_poll_create(int cloexec)
-{
-  (void)cloexec;
-  WSASetLastError(WSAEOPNOTSUPP);
-  return -1;
-}
-
-int luna_os_poll_ctl(int pollfd, int op, int fd,
-                     const luna_os_poll_event *event)
-{
-  (void)pollfd;
-  (void)op;
-  (void)fd;
-  (void)event;
-  WSASetLastError(WSAEOPNOTSUPP);
-  return -1;
-}
-
-int luna_os_poll_wait(int pollfd, luna_os_poll_event *events,
-                      int max_events, int timeout_ms)
-{
-  (void)pollfd;
-  (void)events;
-  (void)max_events;
-  (void)timeout_ms;
-  WSASetLastError(WSAEOPNOTSUPP);
   return -1;
 }
 
@@ -3013,9 +2894,20 @@ int luna_file_memstream_finish(luna_file_memstream *writer,
   return 0;
 }
 /* Winsock descriptors and I/O. */
+enum win_fd_kind { WIN_FD_SOCKET, WIN_FD_EVENT, WIN_FD_EPOLL };
+struct win_epoll;
 struct socket_state {
   unsigned references;
+  char *bound_unix_path, *peer_unix_path;
+  int pending_right_plus_one;
   int nonblock, append;
+  void (*on_close)(void *);
+  void *close_data;
+  enum win_fd_kind kind;
+  SOCKET watch_socket;
+  uint64_t identity, read_epoch, write_epoch;
+  uint64_t event_count;
+  struct win_epoll *poller;
 };
 struct socket_fd {
   int fd;
@@ -3024,6 +2916,10 @@ struct socket_fd {
   struct socket_fd *next;
 };
 static struct socket_fd *sockets;
+static CONDITION_VARIABLE descriptor_changed = CONDITION_VARIABLE_INIT;
+static uint64_t descriptor_identity;
+static void win_epoll_free(struct win_epoll *poller);
+static void win_epoll_forget_locked(struct socket_state *description);
 static INIT_ONCE startup_once = INIT_ONCE_STATIC_INIT;
 static int startup_error;
 
@@ -3118,18 +3014,22 @@ int luna_socket_startup(void)
   }
   return 0;
 }
-static SOCKET lookup(int fd)
+static struct socket_fd *socket_find_locked(int fd)
 {
-  SOCKET result = INVALID_SOCKET;
-  AcquireSRWLockShared(&socket_lock);
   for (struct socket_fd *p = sockets; p; p = p->next)
-    if (p->fd == fd) {
-      result = p->socket;
-      break;
-    }
+    if (p->fd == fd) return p;
+  return NULL;
+}
+static SOCKET lookup_kind(int fd, enum win_fd_kind *kind)
+{
+  AcquireSRWLockShared(&socket_lock);
+  const struct socket_fd *entry = socket_find_locked(fd);
+  const SOCKET result = entry ? entry->socket : INVALID_SOCKET;
+  if (kind) *kind = entry ? entry->state->kind : WIN_FD_SOCKET;
   ReleaseSRWLockShared(&socket_lock);
   return result;
 }
+static SOCKET lookup(int fd) { return lookup_kind(fd, NULL); }
 intptr_t luna_socket_native(int fd)
 {
   SOCKET socket = lookup(fd);
@@ -3139,45 +3039,136 @@ intptr_t luna_socket_native(int fd)
   }
   return (intptr_t)socket;
 }
-static int wrap(SOCKET socket)
+int luna_socket_on_last_close(int fd, void (*callback)(void *), void *data)
 {
-  if (socket == INVALID_SOCKET) return failed();
+  int error = ENOTSOCK;
+  AcquireSRWLockExclusive(&socket_lock);
+  for (struct socket_fd *record = sockets; record; record = record->next) {
+    if (record->fd != fd) continue;
+    if (!callback || record->state->on_close) {
+      error = EINVAL;
+    } else {
+      record->state->on_close = callback;
+      record->state->close_data = data;
+      error = 0;
+    }
+    break;
+  }
+  ReleaseSRWLockExclusive(&socket_lock);
+  if (!error) return 0;
+  errno = error;
+  return -1;
+}
+
+/* The callback may close other descriptors. Run it after releasing socket_lock. */
+static void socket_state_destroy(struct socket_state *state)
+{
+  if (!state) return;
+  if (state->on_close) state->on_close(state->close_data);
+  if (state->pending_right_plus_one) luna_fd_close(state->pending_right_plus_one - 1);
+  if (state->bound_unix_path) {
+    luna_file_unlink(state->bound_unix_path);
+    free(state->bound_unix_path);
+  }
+  free(state->peer_unix_path);
+  win_epoll_free(state->poller);
+  free(state);
+}
+
+/* Called after a descriptor has been unlinked, with socket_lock held. */
+static struct socket_state *socket_unref_locked(struct socket_fd *record)
+{
+  struct socket_state *state = record->state;
+  WakeAllConditionVariable(&descriptor_changed);
+  if (!--state->references) {
+    win_epoll_forget_locked(state);
+    return state;
+  }
+  if (state->kind == WIN_FD_SOCKET && state->watch_socket == record->socket) {
+    for (struct socket_fd *alias = sockets; alias; alias = alias->next)
+      if (alias->state == state) {
+        state->watch_socket = alias->socket;
+        break;
+      }
+  }
+  return NULL;
+}
+
+static int wrap_descriptor(SOCKET socket, enum win_fd_kind kind, int nonblock,
+                           uint64_t event_count, struct win_epoll *poller)
+{
   struct socket_fd *record = calloc(1, sizeof *record);
   if (!record) {
-    closesocket(socket);
+    if (socket != INVALID_SOCKET) closesocket(socket);
     errno = ENOMEM;
     return -1;
   }
   record->state = calloc(1, sizeof *record->state);
   if (!record->state) {
     free(record);
-    closesocket(socket);
+    if (socket != INVALID_SOCKET) closesocket(socket);
     errno = ENOMEM;
     return -1;
   }
-  record->state->references = 1;
   int fd = _open("NUL", _O_RDWR | _O_BINARY | _O_NOINHERIT);
   if (fd < 0) {
     int error = errno;
     free(record->state);
     free(record);
-    closesocket(socket);
+    if (socket != INVALID_SOCKET) closesocket(socket);
     errno = error;
     return -1;
   }
   record->fd = fd;
   record->socket = socket;
   AcquireSRWLockExclusive(&socket_lock);
+  *record->state = (struct socket_state){
+    .references = 1, .kind = kind, .nonblock = !!nonblock, .watch_socket = socket,
+    .identity = ++descriptor_identity, .event_count = event_count, .poller = poller,
+  };
   record->next = sockets;
   sockets = record;
   ReleaseSRWLockExclusive(&socket_lock);
   return fd;
 }
+static int wrap(SOCKET socket)
+{
+  return socket == INVALID_SOCKET ? failed() : wrap_descriptor(socket, WIN_FD_SOCKET, 0, 0, NULL);
+}
+#include "lunaria_windows_poll.h"
+
+int luna_win_ipc_import_socket(WSAPROTOCOL_INFOW *protocol, int nonblocking)
+{
+  if (luna_socket_startup()) return -1;
+  int fd = wrap(WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+                          protocol, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT));
+  if (fd < 0) return -1;
+  if (luna_fd_nonblock(fd, nonblocking)) {
+    int error = errno;
+    luna_fd_close(fd);
+    errno = error;
+    return -1;
+  }
+  return fd;
+}
+
 int luna_socket_open(int family, int type, int protocol)
 {
   if (luna_socket_startup()) return -1;
-  return wrap(WSASocketW(family, type, protocol, NULL, 0,
-                         WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT));
+  SOCKET sock = WSASocketW(family, type, protocol, NULL, 0,
+                           WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+  if (sock == INVALID_SOCKET) return failed();
+  if (family == AF_INET6 && (type == SOCK_STREAM || type == SOCK_DGRAM)) {
+    /* Android accepts IPv4-mapped destinations unless the app sets V6ONLY. */
+    DWORD ipv6_only = 0;
+    if (setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&ipv6_only, sizeof ipv6_only)) {
+      int error = WSAGetLastError();
+      closesocket(sock);
+      errno = socket_errno(error);
+      return -1;
+    }
+  }
+  return wrap(sock);
 }
 int luna_socket_pair(int family, int type, int protocol, int pair[2])
 {
@@ -3216,7 +3207,10 @@ int luna_socket_pair(int family, int type, int protocol, int pair[2])
     a = luna_socket_open(AF_INET, SOCK_DGRAM, 0);
     b = luna_socket_open(AF_INET, SOCK_DGRAM, 0);
     peer = address;
+    const BOOL exclusive = TRUE;
     if (a < 0 || b < 0 ||
+        luna_socket_set_option(a, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &exclusive, sizeof exclusive) ||
+        luna_socket_set_option(b, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, &exclusive, sizeof exclusive) ||
         luna_socket_bind(a, (struct sockaddr *)&address, length) ||
         luna_socket_bind(b, (struct sockaddr *)&peer, length) ||
         luna_socket_name(a, (struct sockaddr *)&address, &length) ||
@@ -3242,7 +3236,13 @@ int luna_socket_accept(int fd, struct sockaddr *address, socklen_t *length)
   SOCKET socket = (SOCKET)luna_socket_native(fd);
   if (socket == INVALID_SOCKET) return -1;
   SOCKET client = accept(socket, address, length);
-  if (client == INVALID_SOCKET) return failed();
+  if (client == INVALID_SOCKET) {
+    int error = WSAGetLastError();
+    if (error == WSAEWOULDBLOCK) win_socket_epoch(fd, socket, false);
+    errno = socket_errno(error);
+    return -1;
+  }
+  win_socket_epoch(fd, socket, false);
   /* POSIX accept does not inherit the listener's nonblocking flag. */
   u_long zero = 0;
   if (ioctlsocket(client, FIONBIO, &zero)) {
@@ -3256,7 +3256,21 @@ int luna_socket_accept(int fd, struct sockaddr *address, socklen_t *length)
     errno = EIO;
     return -1;
   }
-  return wrap(client);
+  int child_fd = wrap(client);
+  if (child_fd >= 0) {
+    struct sockaddr_un peer = {0};
+    int size = sizeof peer;
+    if (!getpeername(client, (struct sockaddr *)&peer, &size) &&
+        peer.sun_family == AF_UNIX && peer.sun_path[0]) {
+      peer.sun_path[sizeof peer.sun_path - 1] = 0;
+      AcquireSRWLockExclusive(&socket_lock);
+      struct socket_fd *child = socket_find_locked(child_fd);
+      if (child) child->state->peer_unix_path = _strdup(peer.sun_path);
+      WakeAllConditionVariable(&descriptor_changed);
+      ReleaseSRWLockExclusive(&socket_lock);
+    }
+  }
+  return child_fd;
 }
 #define SOCKET_CALL(expression) do { \
    SOCKET socket = (SOCKET)luna_socket_native(fd); \
@@ -3265,6 +3279,22 @@ int luna_socket_accept(int fd, struct sockaddr *address, socklen_t *length)
 } while (0)
 int luna_socket_bind(int fd, const struct sockaddr *a, socklen_t n) {
   SOCKET_CALL(bind(socket,a,n));
+}
+/* Only names allocated by the runtime are removed on close. */
+int luna_local_bind(int fd, const struct sockaddr_un *name)
+{
+  char *path = _strdup(name->sun_path);
+  if (!path) { errno = ENOMEM; return -1; }
+  if (luna_socket_bind(fd,(const struct sockaddr *)name,sizeof *name)) {
+    free(path);
+    return -1;
+  }
+  AcquireSRWLockExclusive(&socket_lock);
+  struct socket_fd *entry = socket_find_locked(fd);
+  if (entry) entry->state->bound_unix_path = path;
+  else free(path);
+  ReleaseSRWLockExclusive(&socket_lock);
+  return 0;
 }
 int luna_socket_listen(int fd, int backlog) {
   SOCKET_CALL(listen(socket,backlog));
@@ -3282,9 +3312,27 @@ int luna_socket_connect(int fd, const struct sockaddr *a, socklen_t n)
 {
   SOCKET socket = (SOCKET)luna_socket_native(fd);
   if (socket == INVALID_SOCKET) return -1;
+  if (a && a->sa_family == AF_UNIX) {
+    struct sockaddr_un name = {0};
+    int size = sizeof name;
+    if (getsockname(socket, (struct sockaddr *)&name, &size) || !name.sun_path[0]) {
+      static LONG serial;
+      char tmp[MAX_PATH];
+      name.sun_family = AF_UNIX;
+      DWORD used = GetTempPathA(sizeof tmp,tmp);
+      if (!used || used >= sizeof tmp ||
+          snprintf(name.sun_path, sizeof name.sun_path, "%sluna-c-%lx-%lx", tmp,
+                   GetCurrentProcessId(), (unsigned long)InterlockedIncrement(&serial)) >= (int)sizeof name.sun_path) {
+        errno = ENAMETOOLONG;
+        return -1;
+      }
+      if (luna_local_bind(fd, &name)) return -1;
+    }
+  }
   int result = connect(socket, a, n);
   if (result == SOCKET_ERROR) {
     int error = WSAGetLastError();
+    if (error == WSAEWOULDBLOCK) win_socket_epoch(fd, socket, true);
     errno = error == WSAEWOULDBLOCK ? EINPROGRESS : socket_errno(error);
     return -1;
   }
@@ -3293,17 +3341,19 @@ int luna_socket_connect(int fd, const struct sockaddr *a, socklen_t n)
 int luna_socket_nonblock(int fd, int enabled)
 {
   AcquireSRWLockExclusive(&socket_lock);
-  struct socket_fd *record = sockets;
-  while (record && record->fd != fd) record = record->next;
+  struct socket_fd *record = socket_find_locked(fd);
   if (!record) {
     ReleaseSRWLockExclusive(&socket_lock);
     errno = ENOTSOCK;
     return -1;
   }
   u_long mode = !!enabled;
-  int result = ioctlsocket(record->socket, FIONBIO, &mode);
+  int result = record->state->kind == WIN_FD_SOCKET ? ioctlsocket(record->socket, FIONBIO, &mode) : 0;
   int error = result ? WSAGetLastError() : 0;
-  if (!result) record->state->nonblock = !!enabled;
+  if (!result) {
+    record->state->nonblock = !!enabled;
+    if (record->state->kind == WIN_FD_EVENT) WakeAllConditionVariable(&descriptor_changed);
+  }
   ReleaseSRWLockExclusive(&socket_lock);
   if (result) {
     errno = socket_errno(error);
@@ -3327,7 +3377,9 @@ int luna_socket_get_nonblock(int fd)
 /* File descriptors include CRT files, named pipes and registered sockets. */
 int luna_fd_get_nonblock(int fd)
 {
-  if (lookup(fd) != INVALID_SOCKET) return luna_socket_get_nonblock(fd);
+  enum win_fd_kind kind;
+  if (lookup_kind(fd, &kind) != INVALID_SOCKET || kind != WIN_FD_SOCKET)
+    return luna_socket_get_nonblock(fd);
   intptr_t native = file_descriptor_handle(fd);
   if (native == -1) {
     errno = EBADF;
@@ -3342,7 +3394,9 @@ int luna_fd_get_nonblock(int fd)
 }
 int luna_fd_nonblock(int fd, int enabled)
 {
-  if (lookup(fd) != INVALID_SOCKET) return luna_socket_nonblock(fd, enabled);
+  enum win_fd_kind kind;
+  if (lookup_kind(fd, &kind) != INVALID_SOCKET || kind != WIN_FD_SOCKET)
+    return luna_socket_nonblock(fd, enabled);
   intptr_t native = file_descriptor_handle(fd);
   if (native == -1) {
     errno = EBADF;
@@ -3395,11 +3449,12 @@ int luna_fd_set_status(int fd, int flags)
   for (struct socket_fd *p = sockets; p; p = p->next) {
     if (p->fd != fd) continue;
     u_long mode = !!(flags & LUNA_FILE_NONBLOCK);
-    int result = ioctlsocket(p->socket, FIONBIO, &mode);
+    int result = p->state->kind == WIN_FD_SOCKET ? ioctlsocket(p->socket, FIONBIO, &mode) : 0;
     int error = result ? socket_errno(WSAGetLastError()) : 0;
     if (!result) {
       p->state->nonblock = mode;
       p->state->append = !!(flags & _O_APPEND);
+      if (p->state->kind == WIN_FD_EVENT) WakeAllConditionVariable(&descriptor_changed);
     }
     ReleaseSRWLockExclusive(&socket_lock);
     if (error) {
@@ -3547,13 +3602,23 @@ int luna_socket_available(int fd, int *bytes)
   *bytes = count > INT_MAX ? INT_MAX : (int)count;
   return 0;
 }
+static ptrdiff_t win_socket_io_result(int fd, SOCKET socket, bool writing, int flags,
+                                     int requested, int result)
+{
+  const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
+  win_socket_io_completed(fd, socket, writing, !writing && (flags & MSG_PEEK),
+                          (size_t)requested, result < 0 ? 0 : (size_t)result, error);
+  if (error) errno = socket_errno(error);
+  return result;
+}
+
 ptrdiff_t luna_socket_recv(int fd, void *buffer, size_t length, int flags)
 {
   SOCKET socket = (SOCKET)luna_socket_native(fd);
   if (socket == INVALID_SOCKET) return -1;
   int n = length > INT_MAX ? INT_MAX : (int)length;
   int result = recv(socket,buffer,n,flags);
-  return result == SOCKET_ERROR ? failed() : result;
+  return win_socket_io_result(fd, socket, false, flags, n, result);
 }
 ptrdiff_t luna_socket_send(int fd, const void *buffer, size_t length, int flags)
 {
@@ -3561,7 +3626,7 @@ ptrdiff_t luna_socket_send(int fd, const void *buffer, size_t length, int flags)
   if (socket == INVALID_SOCKET) return -1;
   int n = length > INT_MAX ? INT_MAX : (int)length;
   int result = send(socket,buffer,n,flags);
-  return result == SOCKET_ERROR ? failed() : result;
+  return win_socket_io_result(fd, socket, true, flags, n, result);
 }
 ptrdiff_t luna_socket_recvfrom(int fd, void *buffer, size_t length, int flags, struct sockaddr *address, socklen_t *address_length)
 {
@@ -3569,7 +3634,7 @@ ptrdiff_t luna_socket_recvfrom(int fd, void *buffer, size_t length, int flags, s
   if (socket == INVALID_SOCKET) return -1;
   int n = length > INT_MAX ? INT_MAX : (int)length;
   int result = recvfrom(socket,buffer,n,flags,address,address_length);
-  return result == SOCKET_ERROR ? failed() : result;
+  return win_socket_io_result(fd, socket, false, flags, n, result);
 }
 ptrdiff_t luna_socket_sendto(int fd, const void *buffer, size_t length, int flags, const struct sockaddr *address, socklen_t address_length)
 {
@@ -3577,7 +3642,7 @@ ptrdiff_t luna_socket_sendto(int fd, const void *buffer, size_t length, int flag
   if (socket == INVALID_SOCKET) return -1;
   int n = length > INT_MAX ? INT_MAX : (int)length;
   int result = sendto(socket,buffer,n,flags,address,address_length);
-  return result == SOCKET_ERROR ? failed() : result;
+  return win_socket_io_result(fd, socket, true, flags, n, result);
 }
 static WSABUF *message_buffers(const struct msghdr *message)
 {
@@ -3606,6 +3671,86 @@ static WSABUF *message_buffers(const struct msghdr *message)
   }
   return buffers;
 }
+/* Android numbers IPv4 IP_PKTINFO as 8 and places the interface index
+ * before two IPv4 addresses. Winsock supplies one address followed by the
+ * index. The guest's 32-bit cmsghdr has already been widened by arm_exec. */
+struct android_pktinfo4 {
+  uint32_t ifindex;
+  IN_ADDR local, destination;
+};
+
+/* Winsock reports the packet destination. For group traffic Android also
+ * supplies an address on the receiving interface that can source a reply. */
+static IN_ADDR packet_local_address(const IN_PKTINFO *packet, DWORD flags)
+{
+  if (!(flags & (MSG_BCAST | MSG_MCAST))) return packet->ipi_addr;
+  IN_ADDR local = {0};
+  MIB_UNICASTIPADDRESS_TABLE *table;
+  if (!GetUnicastIpAddressTable(AF_INET, &table)) {
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+      const MIB_UNICASTIPADDRESS_ROW *row = &table->Table[i];
+      if (row->InterfaceIndex == packet->ipi_ifindex && !row->SkipAsSource &&
+          row->DadState == IpDadStatePreferred) {
+        local = row->Address.Ipv4.sin_addr;
+        break;
+      }
+    }
+    FreeMibTable(table);
+  }
+  return local;
+}
+
+static int convert_controls(const void *source, size_t length, void *target,
+                            size_t capacity, bool to_windows, DWORD flags, size_t *used)
+{
+  const unsigned char *input = source;
+  unsigned char *output = target;
+  *used = 0;
+  while (length >= LUNA_CMSG_LEN(0)) {
+    luna_cmsghdr header;
+    memcpy(&header, input, sizeof header);
+    if (header.cmsg_len < LUNA_CMSG_LEN(0) || header.cmsg_len > length)
+      return to_windows ? EINVAL : EMSGSIZE;
+    size_t step = LUNA_CMSG_ALIGN(header.cmsg_len);
+    size_t bytes = header.cmsg_len - LUNA_CMSG_LEN(0);
+    const void *payload = input + LUNA_CMSG_LEN(0);
+    IN_PKTINFO native = {0};
+    struct android_pktinfo4 guest = {0};
+    if (header.cmsg_level == IPPROTO_IP && header.cmsg_type == (to_windows ? 8 : IP_PKTINFO)) {
+      if (to_windows) {
+        if (bytes < sizeof guest) return EINVAL;
+        memcpy(&guest, payload, sizeof guest);
+        native.ipi_ifindex = guest.ifindex;
+        native.ipi_addr = guest.local;
+        header.cmsg_type = IP_PKTINFO;
+        payload = &native;
+        bytes = sizeof native;
+      } else {
+        if (bytes < sizeof native) return EMSGSIZE;
+        memcpy(&native, payload, sizeof native);
+        guest.ifindex = native.ipi_ifindex;
+        guest.destination = native.ipi_addr;
+        guest.local = packet_local_address(&native, flags);
+        header.cmsg_type = 8;
+        payload = &guest;
+        bytes = sizeof guest;
+      }
+    }
+    header.cmsg_len = LUNA_CMSG_LEN(bytes);
+    if (header.cmsg_len > capacity - *used) return EMSGSIZE;
+    size_t space = LUNA_CMSG_SPACE(bytes);
+    if (space > capacity - *used) space = capacity - *used;
+    memcpy(output + *used, &header, sizeof header);
+    memcpy(output + *used + LUNA_CMSG_LEN(0), payload, bytes);
+    memset(output + *used + header.cmsg_len, 0, space - header.cmsg_len);
+    *used += space;
+    if (step >= length) break;
+    input += step;
+    length -= step;
+  }
+  return 0;
+}
+
 static ptrdiff_t socket_message(int fd, struct msghdr *message, int flags, int sending)
 {
   SOCKET socket = (SOCKET)luna_socket_native(fd);
@@ -3622,7 +3767,7 @@ static ptrdiff_t socket_message(int fd, struct msghdr *message, int flags, int s
   DWORD capacity = 0;
   for (DWORD i = 0; i < count; ++i) capacity += buffers[i].len;
   DWORD native_flags = (DWORD)flags;
-  int result, type, type_length = sizeof type;
+  int result, error, type, type_length = sizeof type;
   if (getsockopt(socket, SOL_SOCKET, SO_TYPE, (char *)&type, &type_length)) {
     int error = WSAGetLastError();
     free(buffers);
@@ -3635,26 +3780,51 @@ static ptrdiff_t socket_message(int fd, struct msghdr *message, int flags, int s
     native.namelen = message->msg_namelen;
     native.lpBuffers = buffers;
     native.dwBufferCount = count;
-    native.Control.buf = message->msg_control;
+    native.Control.buf = calloc(1, message->msg_controllen);
+    if (!native.Control.buf) {
+      free(buffers);
+      errno = ENOMEM;
+      return -1;
+    }
     native.Control.len = (ULONG)message->msg_controllen;
     native.dwFlags = native_flags;
     DWORD size = 0;
     if (sending) {
+      size_t used;
+      int conversion = convert_controls(message->msg_control, message->msg_controllen,
+                                        native.Control.buf, native.Control.len, true, 0, &used);
+      if (conversion) {
+        free(native.Control.buf);
+        free(buffers);
+        errno = conversion;
+        return -1;
+      }
+      native.Control.len = (ULONG)used;
       GUID id = WSAID_WSASENDMSG;
       LPFN_WSASENDMSG send_message = NULL;
       result = WSAIoctl(socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof id,
                         &send_message, sizeof send_message, &size, NULL, NULL);
       if (!result) result = send_message(socket, &native, native_flags, &transferred, NULL, NULL);
+      error = result ? WSAGetLastError() : 0;
     } else {
       GUID id = WSAID_WSARECVMSG;
       LPFN_WSARECVMSG receive_message = NULL;
       result = WSAIoctl(socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof id,
                         &receive_message, sizeof receive_message, &size, NULL, NULL);
       if (!result) result = receive_message(socket, &native, &transferred, NULL, NULL);
-      message->msg_namelen = native.namelen;
-      message->msg_controllen = native.Control.len;
-      native_flags = native.dwFlags;
+      error = result ? WSAGetLastError() : 0;
+      if (!error || error == WSAEMSGSIZE) {
+        size_t used;
+        native_flags = native.dwFlags;
+        size_t available = native.Control.len < message->msg_controllen
+                           ? native.Control.len : message->msg_controllen;
+        if (convert_controls(native.Control.buf, available, message->msg_control,
+                             message->msg_controllen, false, native_flags, &used)) native_flags |= MSG_CTRUNC;
+        message->msg_namelen = native.namelen;
+        message->msg_controllen = used;
+      }
     }
+    free(native.Control.buf);
   } else if (sending) {
     if (message->msg_controllen) {
       free(buffers);
@@ -3665,15 +3835,16 @@ static ptrdiff_t socket_message(int fd, struct msghdr *message, int flags, int s
              ? WSASendTo(socket, buffers, count, &transferred, native_flags,
                          message->msg_name, message->msg_namelen, NULL, NULL)
              : WSASend(socket, buffers, count, &transferred, native_flags, NULL, NULL);
+    error = result ? WSAGetLastError() : 0;
   } else {
     result = message->msg_name
              ? WSARecvFrom(socket, buffers, count, &transferred, &native_flags,
                            message->msg_name, &message->msg_namelen, NULL, NULL)
              : WSARecv(socket, buffers, count, &transferred, &native_flags, NULL, NULL);
+    error = result ? WSAGetLastError() : 0;
     message->msg_controllen = 0;
     if (type == SOCK_STREAM) message->msg_namelen = 0;
   }
-  int error = result ? WSAGetLastError() : 0;
   free(buffers);
   if (!sending) {
     message->msg_flags = (int)(native_flags & (MSG_TRUNC | MSG_CTRUNC | MSG_OOB | MSG_BCAST | MSG_MCAST));
@@ -3681,9 +3852,12 @@ static ptrdiff_t socket_message(int fd, struct msghdr *message, int flags, int s
       /* Winsock fills all receive buffers on datagram truncation, but its
        * byte-count output need not be set when it returns SOCKET_ERROR. */
       message->msg_flags |= MSG_TRUNC;
+      win_socket_io_completed(fd, socket, false, !!(flags & MSG_PEEK), capacity, capacity, 0);
       return capacity;
     }
   }
+  win_socket_io_completed(fd, socket, sending, !sending && (flags & MSG_PEEK),
+                          capacity, transferred, error);
   if (error) {
     errno = socket_errno(error);
     return -1;
@@ -3697,7 +3871,52 @@ ptrdiff_t luna_socket_sendmsg(int fd, const struct msghdr *message, int flags)
     return -1;
   }
   struct msghdr copy = *message;
+  if (message->msg_controllen >= LUNA_CMSG_LEN(sizeof(int)) && message->msg_control &&
+      message->msg_iovlen == 1 && message->msg_iov && message->msg_iov[0].iov_len == 1) {
+    luna_cmsghdr *c = message->msg_control;
+    if (c->cmsg_level == 1 && c->cmsg_type == 1 && c->cmsg_len == LUNA_CMSG_LEN(sizeof(int))) {
+      int transfer;
+      memcpy(&transfer, LUNA_CMSG_DATA(c), sizeof transfer);
+      return luna_local_send_right(fd, transfer, *(unsigned char *)message->msg_iov[0].iov_base) ? -1 : 1;
+    }
+  }
   return socket_message(fd, &copy, flags, 1);
+}
+/* Windows AF_UNIX has no SCM_RIGHTS. A Java LocalSocket's first write can
+ * attach one duplicate to its accepted in-process peer. Only the payload
+ * byte travels over the stream, never a host descriptor number. */
+int luna_local_send_right(int fd, int transfer, unsigned char byte)
+{
+  int copy = luna_fd_dup(transfer, 0, 0);
+  if (copy < 0) return -1;
+  int error = EPIPE;
+  ULONGLONG deadline = GetTickCount64() + 2500;
+  AcquireSRWLockExclusive(&socket_lock);
+  for (;;) {
+    struct socket_fd *client = socket_find_locked(fd);
+    if (!client || !client->state->bound_unix_path) break;
+    struct socket_fd *server = sockets;
+    while (server && (!server->state->peer_unix_path ||
+           strcmp(server->state->peer_unix_path, client->state->bound_unix_path))) server = server->next;
+    if (server) {
+      if (server->state->pending_right_plus_one) { error = EBUSY; break; }
+      if (send(client->socket, (const char *)&byte, 1, 0) != 1) {
+        error = socket_errno(WSAGetLastError());
+        break;
+      }
+      server->state->pending_right_plus_one = copy + 1;
+      copy = -1;
+      break;
+    }
+    ULONGLONG now = GetTickCount64();
+    if (now >= deadline) { error = ETIMEDOUT; break; }
+    SleepConditionVariableSRW(&descriptor_changed, &socket_lock, (DWORD)(deadline - now), 0);
+  }
+  ReleaseSRWLockExclusive(&socket_lock);
+  if (copy < 0) return 0;
+  luna_fd_close(copy);
+  errno = error;
+  return -1;
 }
 ptrdiff_t luna_socket_recvmsg(int fd, struct msghdr *message, int flags)
 {
@@ -3705,7 +3924,31 @@ ptrdiff_t luna_socket_recvmsg(int fd, struct msghdr *message, int flags)
     errno = EFAULT;
     return -1;
   }
-  return socket_message(fd, message, flags, 0);
+  size_t capacity = message->msg_controllen;
+  ptrdiff_t n = socket_message(fd, message, flags, 0);
+  if (n <= 0) return n;
+  int right = -1;
+  AcquireSRWLockExclusive(&socket_lock);
+  struct socket_fd *entry = socket_find_locked(fd);
+  if (entry && entry->state->pending_right_plus_one && !(flags & MSG_PEEK)) {
+    right = entry->state->pending_right_plus_one - 1;
+    entry->state->pending_right_plus_one = 0;
+  }
+  ReleaseSRWLockExclusive(&socket_lock);
+  if (right >= 0) {
+    if (capacity >= LUNA_CMSG_LEN(sizeof right) && message->msg_control) {
+      luna_cmsghdr *c = message->msg_control;
+      c->cmsg_len = LUNA_CMSG_LEN(sizeof right);
+      c->cmsg_level = 1; /* Android SOL_SOCKET */
+      c->cmsg_type = 1;  /* Android SCM_RIGHTS */
+      memcpy(LUNA_CMSG_DATA(c), &right, sizeof right);
+      message->msg_controllen = capacity < LUNA_CMSG_SPACE(sizeof right) ? capacity : LUNA_CMSG_SPACE(sizeof right);
+    } else {
+      message->msg_flags |= MSG_CTRUNC;
+      luna_fd_close(right);
+    }
+  }
+  return n;
 }
 ptrdiff_t luna_fd_writev(int fd, const struct iovec *vectors, int count)
 {
@@ -3850,6 +4093,7 @@ static int fd_duplicate(int fd, int target, int minimum, int close_on_exec)
   struct socket_fd *source = sockets;
   while (source && source->fd != fd) source = source->next;
   struct socket_fd *copy = NULL;
+  struct socket_state *replaced_state = NULL;
   struct native_pipe_endpoint *pipe_copy = NULL;
   SOCKET duplicated = INVALID_SOCKET;
   struct file_description_state *file_copy = NULL;
@@ -3860,16 +4104,18 @@ static int fd_duplicate(int fd, int target, int minimum, int close_on_exec)
       error = ENOMEM;
       goto done;
     }
-    WSAPROTOCOL_INFOW protocol;
-    if (WSADuplicateSocketW(source->socket, GetCurrentProcessId(), &protocol)) {
-      error = socket_errno(WSAGetLastError());
-      goto done;
-    }
-    duplicated = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
-                            &protocol, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
-    if (duplicated == INVALID_SOCKET) {
-      error = socket_errno(WSAGetLastError());
-      goto done;
+    if (source->state->kind == WIN_FD_SOCKET) {
+      WSAPROTOCOL_INFOW protocol;
+      if (WSADuplicateSocketW(source->socket, GetCurrentProcessId(), &protocol)) {
+        error = socket_errno(WSAGetLastError());
+        goto done;
+      }
+      duplicated = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO,
+                              &protocol, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+      if (duplicated == INVALID_SOCKET) {
+        error = socket_errno(WSAGetLastError());
+        goto done;
+      }
     }
   } else if (GetFileType((HANDLE)source_handle) == FILE_TYPE_PIPE) {
     pipe_copy = calloc(1, sizeof *pipe_copy);
@@ -3898,8 +4144,8 @@ static int fd_duplicate(int fd, int target, int minimum, int close_on_exec)
     if (*at) {
       struct socket_fd *old = *at;
       *at = old->next;
-      closesocket(old->socket);
-      if (!--old->state->references) free(old->state);
+      if (old->socket != INVALID_SOCKET) closesocket(old->socket);
+      replaced_state = socket_unref_locked(old);
       free(old);
     }
   } else {
@@ -3949,6 +4195,7 @@ done:
   free(copy);
   free(pipe_copy);
   ReleaseSRWLockExclusive(&socket_lock);
+  socket_state_destroy(replaced_state);
   if (error) errno = error;
   return result;
 }
@@ -4030,8 +4277,14 @@ static short pipe_poll(HANDLE handle, short events)
 }
 ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
 {
-  SOCKET socket = lookup(fd);
+  enum win_fd_kind kind;
+  SOCKET socket = lookup_kind(fd, &kind);
   unsigned int n = length > INT_MAX ? INT_MAX : (unsigned int)length;
+  if (kind == WIN_FD_EVENT) return win_event_fd_io(fd, buffer, length, false);
+  if (kind == WIN_FD_EPOLL) {
+    errno = EINVAL;
+    return -1;
+  }
   if (socket == INVALID_SOCKET) {
     intptr_t handle = file_descriptor_handle(fd);
     if (handle == -1) {
@@ -4042,12 +4295,18 @@ ptrdiff_t luna_fd_read(int fd, void *buffer, size_t length)
     return _read(fd, buffer, n);
   }
   int result = recv(socket, buffer, (int)n, 0);
-  return result == SOCKET_ERROR ? failed() : result;
+  return win_socket_io_result(fd, socket, false, 0, (int)n, result);
 }
 ptrdiff_t luna_fd_write(int fd, const void *buffer, size_t length)
 {
-  SOCKET socket = lookup(fd);
+  enum win_fd_kind kind;
+  SOCKET socket = lookup_kind(fd, &kind);
   unsigned int n = length > INT_MAX ? INT_MAX : (unsigned int)length;
+  if (kind == WIN_FD_EVENT) return win_event_fd_io(fd, (void *)buffer, length, true);
+  if (kind == WIN_FD_EPOLL) {
+    errno = EINVAL;
+    return -1;
+  }
   if (socket == INVALID_SOCKET) {
     intptr_t handle = file_descriptor_handle(fd);
     if (handle == -1) {
@@ -4058,7 +4317,7 @@ ptrdiff_t luna_fd_write(int fd, const void *buffer, size_t length)
     return _write(fd, buffer, n);
   }
   int result = send(socket, buffer, (int)n, 0);
-  return result == SOCKET_ERROR ? failed() : result;
+  return win_socket_io_result(fd, socket, true, 0, (int)n, result);
 }
 int luna_fd_close(int fd)
 {
@@ -4079,17 +4338,20 @@ int luna_fd_close(int fd)
     ReleaseSRWLockExclusive(&socket_lock);
     return result;
   }
-  if (closesocket(record->socket)) {
+  if (record->socket != INVALID_SOCKET && closesocket(record->socket)) {
     int error = WSAGetLastError();
     ReleaseSRWLockExclusive(&socket_lock);
     errno = socket_errno(error);
     return -1;
   }
   *link = record->next;
-  if (!--record->state->references) free(record->state);
+  struct socket_state *state = socket_unref_locked(record);
   int closed = _close(fd);
+  int saved = errno;
   ReleaseSRWLockExclusive(&socket_lock);
   free(record);
+  socket_state_destroy(state);
+  if (closed < 0) errno = saved;
   return closed;
 }
 int luna_socket_dns(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **out)
@@ -4097,6 +4359,112 @@ int luna_socket_dns(const char *node, const char *service, const struct addrinfo
   if (luna_socket_startup()) return EAI_FAIL;
   return getaddrinfo(node, service, hints, out);
 }
+
+/* Version 1 of the DnsQueryRaw ABI is absent from older MinGW headers.
+ * Load the entry points dynamically so Windows builds without them still run. */
+struct luna_dns_raw_result {
+  ULONG version;
+  DNS_STATUS status;
+  ULONG64 options, raw_options, flags;
+  ULONG size;
+  BYTE *packet;
+};
+struct luna_dns_raw_request {
+  ULONG version, result_version, packet_size;
+  BYTE *packet;
+  wchar_t *name;
+  USHORT type;
+  ULONG64 options;
+  ULONG interface_index;
+  void (CALLBACK *complete)(void *, struct luna_dns_raw_result *);
+  void *context;
+  ULONG64 raw_options;
+  ULONG server_count;
+  void *servers;
+  ULONG protocol;
+  union { SOCKADDR_INET address; char reserved[32]; } source;
+};
+struct luna_dns_raw_cancel { char reserved[32]; };
+struct luna_dns_raw_wait {
+  HANDLE event;
+  struct luna_dns_raw_result *result;
+};
+static DNS_STATUS (WINAPI *dns_query_raw)(struct luna_dns_raw_request *, struct luna_dns_raw_cancel *);
+static void (WINAPI *dns_free_raw)(struct luna_dns_raw_result *);
+
+static BOOL CALLBACK luna_dns_raw_init(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+  (void)once;
+  (void)parameter;
+  (void)context;
+  HMODULE library = LoadLibraryExW(L"dnsapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!library) return TRUE;
+  FARPROC query = GetProcAddress(library, "DnsQueryRaw");
+  FARPROC release = GetProcAddress(library, "DnsQueryRawResultFree");
+  if (query && release) {
+    dns_query_raw = (void *)query;
+    dns_free_raw = (void *)release;
+  } else {
+    FreeLibrary(library);
+  }
+  return TRUE;
+}
+
+static void CALLBACK luna_dns_raw_complete(void *opaque, struct luna_dns_raw_result *result)
+{
+  struct luna_dns_raw_wait *wait = opaque;
+  wait->result = result;
+  SetEvent(wait->event);
+}
+
+int luna_socket_dns_packet(const char *name, uint16_t type, void *answer, size_t capacity, int *error)
+{
+  static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
+  *error = EAI_FAIL;
+  if (!InitOnceExecuteOnce(&once, luna_dns_raw_init, NULL, NULL) || !dns_query_raw)
+    return -1;
+  wchar_t wide[1024];
+  if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, name, -1, wide, 1024)) {
+    *error = EAI_NONAME;
+    return -1;
+  }
+  struct luna_dns_raw_wait wait = {CreateEventW(NULL, FALSE, FALSE, NULL), NULL};
+  if (!wait.event) return -1;
+  struct luna_dns_raw_cancel cancel = {0};
+  struct luna_dns_raw_request request = {
+    .version = 1, .result_version = 1, .name = wide, .type = type,
+    .options = DNS_QUERY_NO_HOSTS_FILE | DNS_QUERY_NO_MULTICAST,
+    .complete = luna_dns_raw_complete, .context = &wait,
+    .protocol = 2, /* DNS_PROTOCOL_TCP preserves the complete answer. */
+  };
+  DNS_STATUS status = dns_query_raw(&request, &cancel);
+  if (status == DNS_REQUEST_PENDING) {
+    WaitForSingleObject(wait.event, INFINITE);
+    status = wait.result ? wait.result->status : ERROR_GEN_FAILURE;
+  }
+  CloseHandle(wait.event);
+
+  int length = -1;
+  if (status == ERROR_SUCCESS && wait.result && wait.result->packet &&
+      wait.result->size >= 14 && wait.result->size <= 65537u) {
+    const BYTE *packet = wait.result->packet;
+    uint32_t wire_length = ((uint32_t)packet[0] << 8) | packet[1];
+    if (wire_length == wait.result->size - 2) {
+      length = (int)wire_length;
+      memcpy(answer, packet + 2, capacity < wire_length ? capacity : wire_length);
+      *error = 0;
+    }
+  } else if (status == DNS_ERROR_RCODE_NAME_ERROR || status == DNS_ERROR_INVALID_NAME) {
+    *error = EAI_NONAME;
+  } else if (status == DNS_INFO_NO_RECORDS) {
+    *error = EAI_NODATA;
+  } else if (status == DNS_ERROR_RCODE_SERVER_FAILURE || status == ERROR_TIMEOUT) {
+    *error = EAI_AGAIN;
+  }
+  if (wait.result) dns_free_raw(wait.result);
+  return length;
+}
+
 int luna_socket_poll(struct pollfd *fds, size_t count, int timeout_ms)
 {
   if (count > ULONG_MAX || count > SIZE_MAX / sizeof(WSAPOLLFD)) {
@@ -4124,7 +4492,21 @@ rescan:
   for (size_t i = 0; i < count; ++i) {
     fds[i].revents = 0;
     if ((intptr_t)fds[i].fd < 0) continue;
-    SOCKET socket = lookup((int)fds[i].fd);
+    AcquireSRWLockShared(&socket_lock);
+    const struct socket_fd *record = socket_find_locked((int)fds[i].fd);
+    const SOCKET socket = record ? record->socket : INVALID_SOCKET;
+    if (record && record->state->kind != WIN_FD_SOCKET) {
+      if (record->state->kind == WIN_FD_EVENT) {
+        const uint32_t bits = win_event_ready(record->state);
+        if (bits & WIN_EPOLL_READ) fds[i].revents |= fds[i].events & POLLIN;
+        if (bits & WIN_EPOLL_WRITE) fds[i].revents |= fds[i].events & POLLOUT;
+        has_pipes = 1; /* Synthetic readiness changes independently of WSAPoll. */
+      } else fds[i].revents = POLLERR;
+      if (fds[i].revents) ++ready;
+      ReleaseSRWLockShared(&socket_lock);
+      continue;
+    }
+    ReleaseSRWLockShared(&socket_lock);
     if (socket != INVALID_SOCKET) {
       indices[used] = i;
       native[used].fd = socket;

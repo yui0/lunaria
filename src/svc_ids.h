@@ -2083,6 +2083,7 @@ enum SvcId : uint32_t {
   SVC_LOADER_EXPORTED_NAMESPACE,
   /* getopt(3) for processes whose libc is the host's (A32): the BSD algorithm bionic ships. */
   SVC_GETOPT,
+  SVC_NET_RES_SEARCH,
   SVC_EXTRACTOR_NEW,
   SVC_EXTRACTOR_DELETE,
   SVC_EXTRACTOR_FD,

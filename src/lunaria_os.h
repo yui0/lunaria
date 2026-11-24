@@ -182,7 +182,11 @@ void luna_gl_inspect_draw(uint64_t frame);
  * File and socket descriptors consequently cannot collide. Unwrap only for
  * external socket APIs such as OpenSSL's socket BIO. */
 int luna_socket_startup(void);
+int luna_local_bind(int fd, const struct sockaddr_un *name);
+int luna_local_send_right(int fd, int transfer, unsigned char byte);
 intptr_t luna_socket_native(int fd);
+int luna_win_ipc_import_socket(WSAPROTOCOL_INFOW *protocol,int nonblocking);
+int luna_socket_on_last_close(int fd, void (*callback)(void *), void *data);
 int luna_socket_open(int family, int type, int protocol);
 int luna_socket_pair(int family, int type, int protocol, int pair[2]);
 int luna_socket_accept(int fd, struct sockaddr *address, socklen_t *length);
@@ -198,6 +202,8 @@ int luna_socket_nonblock(int fd, int enabled);
 int luna_socket_get_nonblock(int fd);
 int luna_socket_poll(struct pollfd *fds, size_t count, int timeout_ms);
 int luna_socket_dns(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **out);
+/* Returns the DNS wire length, copying at most capacity bytes, or -1 with a resolver error. */
+int luna_socket_dns_packet(const char *name, uint16_t type, void *answer, size_t capacity, int *error);
 int luna_socket_available(int fd, int *bytes);
 ptrdiff_t luna_socket_recv(int fd, void *buffer, size_t length, int flags);
 ptrdiff_t luna_socket_send(int fd, const void *buffer, size_t length, int flags);
@@ -2419,6 +2425,10 @@ typedef void (*luna_process_message_fn)(void *,const void *,size_t);
 typedef void (*luna_process_reply_fn)(void *,const char *,uint32_t,const void *,size_t);
 /* Takes ownership of fd. The endpoint is nonblocking and close-on-exec. */
 struct luna_process_channel *luna_process_channel_open(int fd);
+#ifdef _WIN32
+/* Consume the inherited native control pipe before any guest code can run. */
+int luna_process_win_prepare_child(void);
+#endif
 int luna_process_channel_send(struct luna_process_channel *,const void *,size_t);
 /* Queued sends own CLOEXEC duplicates. Received FDs are borrowed until the
  * channel/pool callback returns; duplicate any FD that must outlive it. */
@@ -2455,6 +2465,8 @@ int luna_process_pool_publish_fds(struct luna_process_pool *,uint32_t,const void
 int luna_process_pool_send(struct luna_process_pool *,const char *process,
                            const void *,size_t,uint32_t *guest_pid);
 int luna_process_pool_send_fds(struct luna_process_pool *,const char *,const void *,size_t,uint32_t *,const int *,size_t);
+/* Send to a named process only if it is already running. */
+int luna_process_pool_send_existing(struct luna_process_pool *,const char *,const void *,size_t);
 /* A reply callback may enqueue another message, including to another VM.
  * -EPIPE reports a closed channel; the corresponding death notice becomes
  * available once the child is reaped. Other VMs' replies are still delivered. */

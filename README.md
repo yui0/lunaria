@@ -718,6 +718,17 @@ Lunaria is **research software under active development**, with known API gaps, 
 - **Apple Silicon macOS:** `make dist-mac` builds a package, but the window may stay black even while frames render. Cross Worlds 5.04.12 reached the opening movie, 3D intro and terms dialog.
 - **Windows:** `make dist` and `make dist-cross-win` (rebuilt 2026-11-09) produce the ZIP. Extracted builds pass ARM32/ARM64 ABI and EGL/GLES initialization under Wine; display and audio on native Windows are unverified.
 
+On Windows, Android apps that use `VpnService` can create a host tunnel. Place the
+official x86-64 Wintun library at `runtime/wintun.dll` beside the extracted
+executable's other runtime files. In an elevated PowerShell session, set
+`$env:LUNARIA_HOST_VPN = '1'` before launching Lunaria with the APK. Android
+supplies the addresses, MTU, routes and DNS servers. A default IPv4 route is
+installed as two /1 routes so that protected sockets can still use the original
+interface. Closing the last tunnel descriptor releases the adapter and removes its
+routes. Windows host routing supports one active Lunaria tunnel and does not
+support Android per-application inclusion or exclusion lists. The host tunnel is
+disabled unless explicitly enabled for the launch.
+
 Release builds use `-O3`, `-DNDEBUG` and LTO; dynarmic is built separately in Release with IPO and without `-march=native`.
 
 **Contributions and reproducible reports are welcome.** Please include the title, engine version, guest ABI, last working screen, logs and, if possible, a captured frame.
