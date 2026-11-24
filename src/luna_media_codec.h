@@ -192,6 +192,11 @@ extern const char *AMEDIAFORMAT_KEY_YEAR;
 struct lmc_codec;
 struct lmc_buffer_info { int32_t offset,size; int64_t time_us; uint32_t flags; };
 struct lmc_codec *lmc_encoder(const char *,const struct luna_mf_allocator *);
+struct lm_sink;
+struct lmc_codec *lmc_decoder(const char *,const struct luna_mf_allocator *);
+struct lmc_codec *lmc_create_by_name(const char *,const struct luna_mf_allocator *);
+int lmc_configure_surface(struct lmc_codec *,AMediaFormat *,struct lm_sink *,unsigned flags);
+int lmc_release_output_at(struct lmc_codec *,size_t,int64_t timestamp_ns);
 void lmc_delete(struct lmc_codec *);
 int lmc_configure(struct lmc_codec *,AMediaFormat *,unsigned flags);
 int lmc_start(struct lmc_codec *);
@@ -232,6 +237,12 @@ int luna_aac_encode(struct luna_aac *,const int16_t *,int samples,
 #ifndef LUNA_MEDIA_CODEC_IMPLEMENTED
 #define LUNA_MEDIA_CODEC_IMPLEMENTED
 #include "lunaria_os.h"
+#ifdef LUNA_MEDIA_CODEC_DECODERS
+#include "dvm/dvm_media.h"
+#define LMC_DECODER(...) __VA_ARGS__
+#else
+#define LMC_DECODER(...)
+#endif
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
@@ -239,6 +250,7 @@ int luna_aac_encode(struct luna_aac *,const int16_t *,int samples,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 /* ---- FDK AAC encoder ---------------------------------------------------- */
 /* Public FDK AAC C ABI. No private codec structures or versioned field offsets.
@@ -888,7 +900,7 @@ const char *luna_media_format_key(const char *name)
 enum { OK=0,UNKNOWN=-10000,UNSUPPORTED=-10002,INVALID_OBJECT=-10003,
        INVALID_PARAMETER=-10004,INVALID_OPERATION=-38,CODEC_TRY_AGAIN=-1,FORMAT_CHANGED=-2 };
 enum { FREE,DEQUEUED,QUEUED,READY };
-enum { SLOTS=4,CONFIG=2,EOS=4 };
+enum { SLOTS=4,DECODER_SLOTS=6,CONFIG=2,EOS=4 };
 struct codec_buffer {
   void *data;
   uintptr_t address;
@@ -900,6 +912,9 @@ struct codec_buffer {
 struct lmc_codec {
   struct luna_mf_allocator memory;
   struct luna_aac *aac;
+  LMC_DECODER(struct lm_codec *decoder;
+              struct lm_sink *surface;
+              char mime[48];)
   AMediaFormat *format;
   int rate,channels,bitrate,profile;
   size_t input_capacity;
@@ -907,7 +922,7 @@ struct lmc_codec {
   int error;
   int64_t base_time;
   uint64_t output_samples;
-  struct codec_buffer input[SLOTS],output[SLOTS];
+  struct codec_buffer input[DECODER_SLOTS],output[DECODER_SLOTS];
   unsigned pending[SLOTS],head,count,ready[SLOTS],out_head,out_count;
 };
 static void *host_alloc(void *ctx,size_t size,uintptr_t *address)
@@ -923,9 +938,39 @@ struct lmc_codec *lmc_encoder(const char *mime,const struct luna_mf_allocator *m
   if (c) c->memory=memory ? *memory : host;
   return c;
 }
+#ifdef LUNA_MEDIA_CODEC_DECODERS
+struct lmc_codec *lmc_decoder(const char *mime,const struct luna_mf_allocator *memory)
+{
+  if (!mime || (memory && (!memory->allocate || !memory->release))) return NULL;
+  struct lm_codec *decoder=lm_codec_new(mime);
+  if (!decoder) return NULL;
+  struct lmc_codec *c=calloc(1,sizeof *c);
+  if (!c) { lm_codec_free(decoder); return NULL; }
+  const struct luna_mf_allocator host={NULL,host_alloc,host_free};
+  c->memory=memory ? *memory : host;
+  c->decoder=decoder;
+  snprintf(c->mime,sizeof c->mime,"%s",mime);
+  return c;
+}
+
+struct lmc_codec *lmc_create_by_name(const char *name,const struct luna_mf_allocator *memory)
+{
+  if (!name) return NULL;
+  static const struct { const char *name,*mime; } codecs[] = {
+    {"c2.lunaria.avc.decoder","video/avc"},
+    {"c2.lunaria.hevc.decoder","video/hevc"},
+    {"c2.lunaria.vp9.decoder","video/x-vnd.on2.vp9"},
+    {"c2.lunaria.aac.decoder","audio/mp4a-latm"},
+  };
+  for (size_t i=0;i<sizeof codecs/sizeof *codecs;++i)
+    if (!strcmp(name,codecs[i].name)) return lmc_decoder(codecs[i].mime,memory);
+  return NULL;
+}
+#endif
+
 static void release_buffers(struct lmc_codec *c)
 {
-  for (int i=0;i<SLOTS;++i) {
+  for (int i=0;i<DECODER_SLOTS;++i) {
     struct codec_buffer *buffers[]={&c->input[i],&c->output[i]};
     for (unsigned j=0;j<2;++j) {
       struct codec_buffer *b=buffers[j];
@@ -938,12 +983,39 @@ static void release_buffers(struct lmc_codec *c)
 void lmc_delete(struct lmc_codec *c)
 {
   if (!c) return;
+  LMC_DECODER(lm_codec_free(c->decoder); lm_sink_free(c->surface);)
   release_buffers(c); luna_aac_free(c->aac); AMediaFormat_delete(c->format); free(c);
 }
+#ifdef LUNA_MEDIA_CODEC_DECODERS
+int lmc_configure_surface(struct lmc_codec *c,AMediaFormat *format,struct lm_sink *sink,unsigned flags)
+{
+  if (!c) return INVALID_OBJECT;
+  if (!c->decoder) return sink ? UNSUPPORTED : lmc_configure(c,format,flags);
+  if (c->configured || c->started) return INVALID_OPERATION;
+  const char *mime=NULL;
+  if (flags || !format || !AMediaFormat_getString(format,"mime",&mime) ||
+      strcasecmp(mime,c->mime) || (sink && !lm_codec_is_video(c->decoder)))
+    return INVALID_PARAMETER;
+  AMediaFormat *copy=luna_media_format_new(&c->memory);
+  if (!copy) return UNKNOWN;
+  if (AMediaFormat_copy(copy,format) != OK) { AMediaFormat_delete(copy); return UNKNOWN; }
+  void *bytes;
+  size_t size;
+  if (AMediaFormat_getBuffer(format,"csd-0",&bytes,&size)) lm_codec_add_csd(c->decoder,bytes,size);
+  if (AMediaFormat_getBuffer(format,"csd-1",&bytes,&size)) lm_codec_add_csd(c->decoder,bytes,size);
+  c->format=copy;
+  c->surface=sink;
+  lm_sink_ref(sink);
+  c->configured=true;
+  return OK;
+}
+#endif
+
 int lmc_configure(struct lmc_codec *c,AMediaFormat *format,unsigned flags)
 {
   if (!c) return INVALID_OBJECT;
   if (c->started) return INVALID_OPERATION;
+  LMC_DECODER(if (c->decoder) return lmc_configure_surface(c,format,NULL,flags);)
   if (!format || flags!=1) return INVALID_PARAMETER;
   int32_t rate,channels,bitrate,profile=2,encoding=2,capacity=4096;
   const char *mime=NULL;
@@ -976,6 +1048,10 @@ int lmc_start(struct lmc_codec *c)
 {
   if (!c) return INVALID_OBJECT;
   if (!c->configured || c->started) return INVALID_OPERATION;
+  LMC_DECODER(if (c->decoder) {
+    c->started=lm_codec_start(c->decoder);
+    return c->started ? OK : UNKNOWN;
+  })
   if (!c->aac) c->aac=luna_aac_new(c->rate,c->channels,c->bitrate,c->profile);
   if (!c->aac) return UNKNOWN;
   for (int i=0;i<SLOTS;++i) {
@@ -996,12 +1072,35 @@ int lmc_stop(struct lmc_codec *c)
 {
   if (!c) return INVALID_OBJECT;
   if (!c->started) return INVALID_OPERATION;
+  LMC_DECODER(if (c->decoder) {
+    struct lm_codec *replacement=lm_codec_new(c->mime);
+    if (!replacement) return UNKNOWN;
+    lm_codec_free(c->decoder);
+    c->decoder=replacement;
+    lm_sink_free(c->surface);
+    c->surface=NULL;
+    AMediaFormat_delete(c->format);
+    c->format=NULL;
+    release_buffers(c);
+    c->started=c->configured=c->eos=false;
+    return OK;
+  })
   release_buffers(c); luna_aac_free(c->aac); c->aac=NULL;
   c->started=false; c->configured=false;
   return OK;
 }
 /* Android does not define encoder flush support. Reject without losing data. */
-int lmc_flush(struct lmc_codec *c) { return c ? INVALID_OPERATION : INVALID_OBJECT; }
+int lmc_flush(struct lmc_codec *c)
+{
+  if (!c) return INVALID_OBJECT;
+  LMC_DECODER(if (c->decoder && c->started) {
+    lm_codec_flush(c->decoder);
+    release_buffers(c);
+    c->eos=false;
+    return OK;
+  })
+  return INVALID_OPERATION;
+}
 static void ready(struct lmc_codec *c,unsigned index,size_t size,int64_t pts,unsigned flags)
 {
   struct codec_buffer *out=&c->output[index];
@@ -1053,6 +1152,14 @@ int lmc_dequeue_input(struct lmc_codec *c)
 {
   if (!c) return INVALID_OBJECT;
   if (!c->started) return INVALID_OPERATION;
+  LMC_DECODER(if (c->decoder) {
+    int error=lm_codec_error(c->decoder);
+    if (error) return error;
+    if (c->eos) return CODEC_TRY_AGAIN;
+    int index=lm_codec_dequeue_input(c->decoder);
+    if (index>=0) c->input[index].state=DEQUEUED;
+    return index;
+  })
   pump(c);
   if (c->error) return c->error;
   if (!c->eos) for (int i=0;i<SLOTS;++i) if (c->input[i].state==FREE) {
@@ -1063,6 +1170,7 @@ int lmc_dequeue_input(struct lmc_codec *c)
 bool lmc_input_ready(struct lmc_codec *c)
 {
   if (!c || !c->started) return true;
+  LMC_DECODER(if (c->decoder) return !c->eos && lm_codec_dequeue_ready(c->decoder,false);)
   pump(c);
   if (c->error) return true;
   if (!c->eos) for (int i=0;i<SLOTS;++i) if (c->input[i].state==FREE) return true;
@@ -1071,6 +1179,7 @@ bool lmc_input_ready(struct lmc_codec *c)
 bool lmc_output_ready(struct lmc_codec *c)
 {
   if (!c || !c->started) return true;
+  LMC_DECODER(if (c->decoder) return lm_codec_dequeue_ready(c->decoder,true);)
   pump(c);
   return c->error || c->changed || c->out_count;
 }
@@ -1078,6 +1187,20 @@ void *lmc_input(struct lmc_codec *c,size_t idx,size_t *size,uintptr_t *address)
 {
   if (size) *size=0;
   if (address) *address=0;
+  LMC_DECODER(if (c && c->decoder) {
+    if (!c->started || idx>=DECODER_SLOTS || c->input[idx].state!=DEQUEUED) return NULL;
+    struct codec_buffer *b=&c->input[idx];
+    if (!b->data) {
+      size_t capacity=0;
+      if (!lm_codec_input_buffer(c->decoder,(int)idx,&capacity)) return NULL;
+      b->data=c->memory.allocate(c->memory.context,capacity,&b->address);
+      if (!b->data) return NULL;
+      b->capacity=capacity;
+    }
+    if (size) *size=b->capacity;
+    if (address) *address=b->address;
+    return b->data;
+  })
   if (!c || !c->started || idx>=SLOTS || c->input[idx].state!=DEQUEUED) return NULL;
   if (size) *size=c->input[idx].capacity;
   if (address) *address=c->input[idx].address;
@@ -1087,6 +1210,20 @@ int lmc_queue_input(struct lmc_codec *c,size_t idx,size_t offset,size_t bytes,in
 {
   if (!c) return INVALID_OBJECT;
   if (!c->started || c->eos) return INVALID_OPERATION;
+  LMC_DECODER(if (c->decoder) {
+    if (idx>=DECODER_SLOTS || c->input[idx].state!=DEQUEUED || flags&~(unsigned)(EOS|CONFIG|1) ||
+        offset>c->input[idx].capacity || bytes>c->input[idx].capacity-offset)
+      return INVALID_PARAMETER;
+    if (bytes) {
+      uint8_t *dst=lm_codec_input_buffer(c->decoder,(int)idx,NULL);
+      if (!dst || !c->input[idx].data) return INVALID_PARAMETER;
+      memcpy(dst,(const uint8_t *)c->input[idx].data+offset,bytes);
+    }
+    if (!lm_codec_queue_input(c->decoder,(int)idx,0,(int)bytes,pts,(int)flags)) return UNKNOWN;
+    c->input[idx].state=FREE;
+    c->eos=(flags&EOS)!=0;
+    return OK;
+  })
   if (idx>=SLOTS || c->input[idx].state!=DEQUEUED || flags&~(unsigned)(EOS|CONFIG) ||
       offset>c->input[idx].capacity || bytes>c->input[idx].capacity-offset ||
       offset%sizeof(int16_t) || bytes%(sizeof(int16_t)*(unsigned)c->channels)) return INVALID_PARAMETER;
@@ -1102,6 +1239,20 @@ int lmc_dequeue_output(struct lmc_codec *c,struct lmc_buffer_info *info)
   if (!c) return INVALID_OBJECT;
   if (!c->started) return INVALID_OPERATION;
   if (!info) return INVALID_PARAMETER;
+  LMC_DECODER(if (c->decoder) {
+    int error=lm_codec_error(c->decoder);
+    if (error) return error;
+    int size=0,flags=0;
+    int slot=lm_codec_dequeue_output(c->decoder,&info->time_us,&size,&flags);
+    if (slot>=0) {
+      c->output[slot].state=DEQUEUED;
+      c->output[slot].size=0;
+      info->offset=0;
+      info->size=size;
+      info->flags=(uint32_t)flags;
+    }
+    return slot;
+  })
   pump(c);
   if (c->error) return c->error;
   if (c->changed) { c->changed=false; return FORMAT_CHANGED; }
@@ -1115,6 +1266,27 @@ void *lmc_output(struct lmc_codec *c,size_t idx,size_t *size,uintptr_t *address)
 {
   if (size) *size=0;
   if (address) *address=0;
+  LMC_DECODER(if (c && c->decoder) {
+    if (!c->started || c->surface || idx>=DECODER_SLOTS || c->output[idx].state!=DEQUEUED) return NULL;
+    struct codec_buffer *b=&c->output[idx];
+    size_t length=0;
+    const uint8_t *bytes=lm_codec_output_buffer(c->decoder,(int)idx,&length);
+    if (!bytes && length) return NULL;
+    if (!b->data || b->capacity<length) {
+      uintptr_t addr=0;
+      void *data=c->memory.allocate(c->memory.context,length ? length : 1,&addr);
+      if (!data) return NULL;
+      if (b->data) c->memory.release(c->memory.context,b->data,b->address);
+      b->data=data;
+      b->address=addr;
+      b->capacity=length;
+    }
+    if (!b->size && length) memcpy(b->data,bytes,length);
+    b->size=length;
+    if (size) *size=length;
+    if (address) *address=b->address;
+    return b->data;
+  })
   if (!c || !c->started || idx>=SLOTS || c->output[idx].state!=DEQUEUED) return NULL;
   if (size) *size=c->output[idx].size;
   if (address) *address=c->output[idx].address;
@@ -1124,17 +1296,60 @@ int lmc_release_output(struct lmc_codec *c,size_t idx,bool render)
 {
   if (!c) return INVALID_OBJECT;
   if (!c->started) return INVALID_OPERATION;
+  LMC_DECODER(if (c->decoder) {
+    if (idx>=DECODER_SLOTS || c->output[idx].state!=DEQUEUED) return INVALID_PARAMETER;
+    lm_codec_release_output(c->decoder,(int)idx,render,c->surface);
+    c->output[idx].state=FREE;
+    return OK;
+  })
   if (idx>=SLOTS || c->output[idx].state!=DEQUEUED || render) return INVALID_PARAMETER;
   c->output[idx].state=FREE; pump(c);
   return OK;
 }
+#ifdef LUNA_MEDIA_CODEC_DECODERS
+int lmc_release_output_at(struct lmc_codec *c,size_t idx,int64_t timestamp_ns)
+{
+  if (!c) return INVALID_OBJECT;
+  if (!c->started || !c->decoder) return INVALID_OPERATION;
+  if (idx>=DECODER_SLOTS || c->output[idx].state!=DEQUEUED) return INVALID_PARAMETER;
+  lm_codec_release_output_at(c->decoder,(int)idx,c->surface,timestamp_ns);
+  c->output[idx].state=FREE;
+  return OK;
+}
+#endif
+
 AMediaFormat *lmc_output_format(struct lmc_codec *c)
 {
   if (!c || !c->started) return NULL;
   AMediaFormat *copy=luna_media_format_new(&c->memory);
   if (copy) AMediaFormat_copy(copy,c->format);
+  LMC_DECODER(if (copy && c->decoder) {
+    int w=0,h=0;
+    lm_codec_output_size(c->decoder,&w,&h);
+    if (lm_codec_is_video(c->decoder)) {
+      if (w>0 && h>0) {
+        int standard,range;
+        lm_codec_output_color(c->decoder,&standard,&range);
+        AMediaFormat_setInt32(copy,"width",w);
+        AMediaFormat_setInt32(copy,"height",h);
+        AMediaFormat_setInt32(copy,"stride",w);
+        AMediaFormat_setInt32(copy,"slice-height",h);
+        AMediaFormat_setInt32(copy,"color-standard",standard);
+        AMediaFormat_setInt32(copy,"color-range",range);
+        AMediaFormat_setInt32(copy,"color-format",19);
+      }
+    } else {
+      int rate=0,channels=0;
+      lm_codec_audio_format(c->decoder,&rate,&channels);
+      AMediaFormat_setString(copy,"mime","audio/raw");
+      if (rate) AMediaFormat_setInt32(copy,"sample-rate",rate);
+      if (channels) AMediaFormat_setInt32(copy,"channel-count",channels);
+      AMediaFormat_setInt32(copy,"pcm-encoding",2);
+    }
+  })
   return copy;
 }
 
+#undef LMC_DECODER
 #endif /* LUNA_MEDIA_CODEC_IMPLEMENTED */
 #endif /* LUNA_MEDIA_CODEC_IMPLEMENTATION */

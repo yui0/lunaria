@@ -343,9 +343,36 @@ const void* EmitWriteMemoryMov(BlockOfCode& code, const Xbyak::RegExp& addr, int
     return fastmem_location;
 }
 
+// With Unsafe_IgnoreGlobalMonitor the one process-wide monitor spin lock is
+// replaced by one lock per 16-byte granule of address, hashed into a small
+// table.  The lock still makes "record the reservation and read the value" and
+// "check the reservation, end the others', and store" each atomic with respect
+// to every other exclusive access of the same address, which is what the
+// architecture's monitor guarantees; only unrelated addresses no longer queue
+// behind each other.  Dropping the lock outright left a window in which a
+// store-exclusive of an unchanged value, racing a load-exclusive, did not end
+// the other reservation, and a guest that relies on that (a lock-free list
+// head popped by LL/SC) lost updates.
+struct ExclusiveStripe {
+    alignas(64) volatile int lock;
+};
+inline ExclusiveStripe g_exclusive_stripes[256];
+
 template<typename UserConfig>
-void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp) {
+void EmitExclusiveStripePointer(BlockOfCode& code, Xbyak::Reg64 vaddr, Xbyak::Reg64 pointer, Xbyak::Reg64 base) {
+    code.mov(pointer, vaddr);
+    code.shr(pointer, 4);
+    code.and_(pointer, 0xFF);
+    code.shl(pointer, 6);
+    code.mov(base, mcl::bit_cast<u64>(&g_exclusive_stripes[0]));
+    code.add(pointer, base);
+}
+
+template<typename UserConfig>
+void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp, Xbyak::Reg64 vaddr) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
+        EmitExclusiveStripePointer<UserConfig>(code, vaddr, pointer, Xbyak::Reg64{tmp.getIdx()});
+        EmitSpinLockLock(code, pointer, tmp);
         return;
     }
 
@@ -354,8 +381,11 @@ void EmitExclusiveLock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 p
 }
 
 template<typename UserConfig>
-void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp) {
+void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 pointer, Xbyak::Reg32 tmp, Xbyak::Reg64 vaddr) {
     if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
+        EmitExclusiveStripePointer<UserConfig>(code, vaddr, pointer, Xbyak::Reg64{tmp.getIdx()});
+        // x86 stores are released in order: a plain store is the unlock.
+        code.mov(code.dword[pointer], 0);
         return;
     }
 
@@ -365,10 +395,12 @@ void EmitExclusiveUnlock(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64
 
 template<typename UserConfig>
 void EmitExclusiveTestAndClear(BlockOfCode& code, const UserConfig& conf, Xbyak::Reg64 vaddr, Xbyak::Reg64 pointer, Xbyak::Reg64 tmp) {
-    if (conf.HasOptimization(OptimizationFlag::Unsafe_IgnoreGlobalMonitor)) {
-        return;
-    }
-
+    // Unsafe_IgnoreGlobalMonitor drops the spin lock only.  A store-exclusive
+    // still ends every other processor's reservation of the address, as it does
+    // on hardware: without that a load-exclusive/store-exclusive pair becomes a
+    // plain compare-and-swap and succeeds after another thread changed the word
+    // and changed it back (ABA), which lock-free lists and event objects rely on
+    // the store-exclusive to refuse.
     code.mov(tmp, 0xDEAD'DEAD'DEAD'DEAD);
     const size_t processor_count = GetExclusiveMonitorProcessorCount(conf.global_monitor);
     for (size_t processor_index = 0; processor_index < processor_count; processor_index++) {

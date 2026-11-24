@@ -2390,10 +2390,24 @@ struct luna_process_memory_mapping {
   uint32_t protection, descriptor_index;
   bool shared;
 };
+#define LUNA_PROCESS_ANONYMOUS_MAPPING UINT32_MAX
 /* Restore sorted, disjoint mappings into free native address ranges.
+ * LUNA_PROCESS_ANONYMOUS_MAPPING reserves zero-filled private pages
+ * without a descriptor. Its file offset must be zero.
  * Return 0 or a negative errno. The caller retains all descriptors. */
 int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
                                 size_t count, const int *fds, size_t fd_count);
+struct luna_process_memory_image {
+  struct luna_process_memory_mapping *maps;
+  size_t count, fd_count;
+  int fds[LUNA_PROCESS_FD_MAX];
+};
+/* The caller keeps the identity arena and its mappings stable during capture.
+ * The image owns its mapping table and descriptors until disposed. */
+int luna_process_capture_memory(const struct luna_guest_mapping *maps, size_t count,
+                                uint64_t arena_begin, uint64_t arena_end,
+                                struct luna_process_memory_image *image);
+void luna_process_dispose_memory(struct luna_process_memory_image *image);
 /* Device process inventory, published by the framework rather than inferred
  * from installed packages. The registry is private to the emulated image. */
 struct luna_process_info {

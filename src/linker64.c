@@ -47,6 +47,7 @@ struct ln64_module {
   const Elf64_Sym *symtab;
   const char      *strtab;
   uint64_t         strsz;
+  uint32_t         strtab_off;
   uint32_t init_fn, init_array;
   bool init_called;
   unsigned char java_load_state;
@@ -409,6 +410,7 @@ struct ln64_module *ln64_add_elf(const char *path, uint32_t load_bias,
   m->symbolic = (flags & DF_SYMBOLIC) != 0;
   m->symtab = host(symtab_off, elf32 ? sizeof(Elf32_Sym) : sizeof(Elf64_Sym));
   m->strtab = host(strtab_off, 1);
+  m->strtab_off = strtab_off;
   m->soname = (soname_off && m->strtab) ? m->strtab + soname_off
               : basename_of(m->path);
 
@@ -520,6 +522,41 @@ void ln64_remove(struct ln64_module *module)
 }
 
 /* ----------------------------------------------------------------- lookup */
+
+static bool symbol_covers(const Elf64_Sym *s, uint64_t address)
+{
+  const unsigned type = ELF64_ST_TYPE(s->st_info);
+  const uint64_t start = s->st_value;
+  return s->st_shndx != SHN_UNDEF && type != STT_TLS &&
+    address >= start && address - start < s->st_size;
+}
+
+bool ln64_symbol_at_address(const struct ln64_module *m, uint32_t addr,
+                            uint32_t *name, uint32_t *value)
+{
+  if (!m || addr < m->bias) return false;
+  uint64_t relative = addr - m->bias;
+  const uint32_t buckets = m->gnu_bucket ? m->gnu_nbucket : 1;
+  for (uint32_t i = 0; i < buckets; ++i) {
+    uint32_t n = m->gnu_bucket ? m->gnu_bucket[i] : 0;
+    if (m->gnu_bucket && (!n || n < m->gnu_symoffset)) continue;
+    for (; m->gnu_bucket || n < m->nchain; ++n) {
+      if (m->nchain && n >= m->nchain) break;
+      Elf64_Sym converted;
+      const Elf64_Sym *sym = symbol_at(m, n, &converted);
+      uint64_t search = relative;
+      if (m->elf32 && ELF64_ST_TYPE(sym->st_info) == STT_FUNC)
+        search = (search & ~UINT64_C(1)) | (sym->st_value & 1u);
+      if (sym->st_name && sym->st_name < m->strsz && symbol_covers(sym, search)) {
+        *name = m->strtab_off + sym->st_name;
+        *value = m->bias + (uint32_t)sym->st_value;
+        return true;
+      }
+      if (m->gnu_bucket && (m->gnu_chain[n - m->gnu_symoffset] & 1u)) break;
+    }
+  }
+  return false;
+}
 
 static bool take(const struct ln64_module *m, const Elf64_Sym *s,
                  const char *name, struct ln64_sym *out)

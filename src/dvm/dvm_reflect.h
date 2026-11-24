@@ -5087,6 +5087,10 @@ static bool dex_path_list_build(struct dvm *vm, dvm_ref loader,
       struct dex_file *dex = &vm->dexes[j]->file;
       if (!dex->path || strncmp(dex->path, origins[i], length) ||
           (dex->path[length] && dex->path[length] != '!')) continue;
+      if (!vm->dexes[j]->java_dex_file) {
+        vm->dexes[j]->java_dex_file = dexfile;
+        dvm_pin(vm, dexfile);
+      }
       for (uint32_t k = 0; k < dex->class_defs_size; ++k) {
         struct dex_class_def def;
         if (!dex_class_def(dex, k, &def)) goto failed;
@@ -5212,15 +5216,15 @@ static bool dexcl_find_library(struct dvm *vm, dvm_ref self,
     return false;
   }
   if(strchr(name,'/'))RETL(0);
-  union dvm_value path_list= {0},elements= {0},file= {0},path= {0};
+  union dvm_value path_list= {0},elements= {0};
   (void)(dvm_get_field)(vm,self,"pathList","Ldalvik/system/DexPathList;",&path_list);
   (void)(dvm_get_field)(vm,path_list.l,"nativeLibraryPathElements","[Ldalvik/system/DexPathList$NativeLibraryElement;",&elements);
   uint32_t count=dvm_array_length(vm,elements.l);
   for(uint32_t i=0; i<count; ++i) {
+    union dvm_value file = {0};
     dvm_ref element=((dvm_ref *)dvm_array_data(vm,elements.l))[i];
     (void)(dvm_get_field)(vm,element,"path","Ljava/io/File;",&file);
-    (void)(dvm_get_field)(vm,file.l,"path","Ljava/lang/String;",&path);
-    const char *directory=dvm_string_utf8(vm,path.l);
+    const char *directory=file_path(vm,file.l);
     if(!directory)continue;
     char guest[DVM_PATH_MAX],host[DVM_PATH_MAX];
     int n=snprintf(guest,sizeof guest,"%s/lib%s.so",directory,name);
@@ -5245,6 +5249,18 @@ static const struct rt_field rt_dex_element_fields[] = {
 };
 static const struct rt_field rt_native_element_fields[] = {
   {"path","Ljava/io/File;"},{"zipDir","Ljava/lang/String;"},F_END
+};
+static bool dex_native_element_init(struct dvm *vm, dvm_ref self,
+                                    const union dvm_value *args, int nargs,
+                                    union dvm_value *out)
+{
+  (void)nargs;
+  if (!(dvm_set_field)(vm, self, "path", "Ljava/io/File;", ARG(0))) return false;
+  RETV();
+}
+static const struct rt_method rt_native_element[] = {
+  M("<init>", "(Ljava/io/File;)V", dex_native_element_init),
+  M_END
 };
 /* Android 12 DexPathList.makeDexElements: preserve path order, retain
  * resource directories/archives, and collect only DEX I/O failures. */

@@ -166,6 +166,7 @@ void lm_codec_flush(struct lm_codec *c);
 
 /* -1 when every input buffer is still queued. */
 int lm_codec_dequeue_input(struct lm_codec *c);
+bool lm_codec_dequeue_ready(struct lm_codec *c, bool output);
 /* The bytes behind input buffer `idx`, and its capacity. */
 uint8_t *lm_codec_input_buffer(struct lm_codec *c, int idx, size_t *cap);
 /* Hands the buffer to the decoder.  Decoding happens here, so that
@@ -178,6 +179,7 @@ int lm_codec_dequeue_output(struct lm_codec *c, int64_t *pts_us, int *size,
                             int *flags);
 /* Decoded picture size, valid once the first frame has been decoded. */
 void lm_codec_output_size(const struct lm_codec *c, int *w, int *h);
+void lm_codec_output_color(struct lm_codec *c, int *standard, int *range);
 /* Raw output bytes for a codec configured without a surface. */
 const uint8_t *lm_codec_output_buffer(struct lm_codec *c, int idx, size_t *len);
 /* Frees the buffer, and when `render` is set pushes it to `sink` (which may be
@@ -254,6 +256,24 @@ const uint8_t *lm_mp4_sample(struct lm_mp4 *m, int t, int i, size_t *len,
 /* Index of the last sync sample at or before `us` — where a seek lands. */
 int lm_mp4_sync_sample_at(const struct lm_mp4 *m, int t, int64_t us);
 
+/* MP4 MediaExtractor cursor. Track samples retain decode order within each track. */
+struct lm_extractor;
+struct lm_extractor *lm_extractor_new(void);
+void lm_extractor_free(struct lm_extractor *e);
+bool lm_extractor_open_fd(struct lm_extractor *e, int fd, int64_t offset, int64_t length);
+typedef int64_t (*lm_media_read_at)(void *context, int64_t offset, void *buffer, size_t count);
+/* The extractor owns context only after a successful open. */
+bool lm_extractor_open_reader(struct lm_extractor *e, int64_t size, lm_media_read_at read,
+                              void *context, void (*destroy)(void *));
+const struct lm_mp4 *lm_extractor_movie(const struct lm_extractor *e);
+bool lm_extractor_select(struct lm_extractor *e, size_t track, bool selected);
+bool lm_extractor_seek(struct lm_extractor *e, int64_t time, unsigned mode);
+int lm_extractor_track(const struct lm_extractor *e);
+int64_t lm_extractor_time(const struct lm_extractor *e);
+int lm_extractor_flags(const struct lm_extractor *e);
+const uint8_t *lm_extractor_sample(struct lm_extractor *e, size_t *length);
+bool lm_extractor_advance(struct lm_extractor *e);
+
 /* Owned PCM queues shared by Java AudioTrack and the output mixer. */
 struct luna_audio_track;
 struct luna_audio_track *luna_at_create(unsigned rate, unsigned channels, unsigned capacity);
@@ -264,6 +284,7 @@ void luna_at_volume(struct luna_audio_track *track, float volume);
 unsigned luna_at_write(struct luna_audio_track *track, const int16_t *pcm, unsigned frames);
 void luna_at_wait_space(struct luna_audio_track *track);
 unsigned luna_at_space(struct luna_audio_track *track);
+unsigned luna_at_write_ahead(struct luna_audio_track *track, const int16_t *pcm, unsigned frames, uint64_t *drain_ns);
 uint64_t luna_at_played(struct luna_audio_track *track);
 int luna_at_active(void);
 unsigned luna_at_mix(int32_t *mix, unsigned frames, unsigned rate, unsigned channels);

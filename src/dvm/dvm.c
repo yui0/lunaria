@@ -877,6 +877,7 @@ static bool class_load_from_dex(struct dvm *vm, struct dvm_class *c,
   if (!dex_class_def(d, class_def_idx, &cd)) return false;
 
   c->dex = d;
+  c->defining_loader = dvm__dex_defining_loader(vm, dd);
   c->class_def_idx = class_def_idx;
   c->access = cd.access_flags;
   c->is_interface = (cd.access_flags & DEX_ACC_INTERFACE) != 0;

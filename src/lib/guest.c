@@ -724,6 +724,29 @@ __asm__(".text\n"
 #define FUTEX_WAIT_PRIVATE 128
 #define FUTEX_WAKE_PRIVATE 129
 
+/* FUTEX_WAKE for a word the caller has just changed.  The emulator keeps one
+ * counter per hash bucket of the futex words somebody is (or is about to be)
+ * waiting on, in a page the guest can read (FUTEX_TAB_VA in arm_exec.cpp).  A
+ * zero means that no thread can be asleep on the word, and the answer to the
+ * wake is already known: no system call, no trip out of the JIT.  The waiter
+ * is counted before it compares the word and the waker reads the counter after
+ * it changed the word, with a full fence between, so one of the two always
+ * sees the other.  A non-zero counter only says "maybe": the real call
+ * decides. */
+/* Guest addresses of the emulator's own pages carry the identity window's base
+ * (A64_GUEST_BASE in arm.h) in front of the offset FUTEX_TAB_VA names. */
+#define LUNARIA_FUTEX_TAB ((const volatile uint32_t *)(0x700000000000ull + 0x0E310000ull))
+#define LUNARIA_FUTEX_TAB_N 4096u
+static inline long raw_futex_wake(uint32_t *addr, uint32_t n)
+{
+#ifndef LUNARIA_FUTEX_NO_ELIDE
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (LUNARIA_FUTEX_TAB[((uintptr_t)addr >> 2) & (LUNARIA_FUTEX_TAB_N - 1u)] == 0u)
+    return 0;
+#endif
+  return raw_futex(addr, FUTEX_WAKE_PRIVATE, n);
+}
+
 /* bionic's normal mutex: fast path one compare-and-swap, a waiter sleeps in
  * the kernel until the holder's unlock wakes it. */
 static inline void heap_lock(struct lh_ctl *c)
@@ -742,7 +765,7 @@ static inline void heap_unlock(struct lh_ctl *c)
 {
   c->owner = 0;
   if (__atomic_exchange_n(&c->state, 0u, 5) == 2u)
-    raw_futex(&c->state, FUTEX_WAKE_PRIVATE, 1u);
+    raw_futex_wake(&c->state, 1u);
 }
 
 static inline int heap_get(struct lh_heap *h)
@@ -1067,7 +1090,7 @@ static int cond_wake(struct lunaria_cond *c, uint32_t n)
    * therefore finds the word changed and refuses to sleep. */
   cond_bump(c);
   if (__atomic_load_n(&c->waiters, __ATOMIC_SEQ_CST) != 0u)
-    raw_futex(&c->state, FUTEX_WAKE_PRIVATE, n);
+    raw_futex_wake(&c->state, n);
   return 0;
 }
 
@@ -1472,7 +1495,7 @@ void __cxa_guard_release(uint64_t *guard)
 {
   uint32_t *g = (uint32_t *)guard;
   if (__atomic_exchange_n(g, 1u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
-    raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
+    raw_futex_wake(g, 0x7fffffff);
 }
 
 __attribute__((visibility("default")))
@@ -1480,7 +1503,7 @@ void __cxa_guard_abort(uint64_t *guard)
 {
   uint32_t *g = (uint32_t *)guard;
   if (__atomic_exchange_n(g, 0u, __ATOMIC_RELEASE) == GUARD_BUSY_WAIT)
-    raw_futex(g, FUTEX_WAKE_PRIVATE, 0x7fffffff);
+    raw_futex_wake(g, 0x7fffffff);
 }
 
 /* ---- dlopen, android_dlopen_ext -------------------------------------------
@@ -1494,15 +1517,15 @@ void __cxa_guard_abort(uint64_t *guard)
  * emulator's dlopen service. */
 extern void *lunaria_host_dlopen(const char *file, int flags);
 
-__attribute__((noinline))
-static void *lunaria_loader_dlopen(const char *file, int flags, const void *caller)
+__attribute__((noinline, visibility("default")))
+void *__loader_dlopen(const char *file, int flags, const void *caller)
 {
   (void)caller;
   return lunaria_host_dlopen(file, flags);
 }
 
-__attribute__((noinline))
-static void *lunaria_loader_android_dlopen_ext(const char *file, int flags,
+__attribute__((noinline, visibility("default")))
+void *__loader_android_dlopen_ext(const char *file, int flags,
     const void *extinfo, const void *caller)
 {
   (void)extinfo;
@@ -1513,7 +1536,7 @@ static void *lunaria_loader_android_dlopen_ext(const char *file, int flags,
 __attribute__((visibility("default")))
 void *dlopen(const char *file, int flags)
 {
-  void *handle = lunaria_loader_dlopen(file, flags, __builtin_return_address(0));
+  void *handle = __loader_dlopen(file, flags, __builtin_return_address(0));
   __asm__ volatile("" ::: "memory");   /* a call, never a tail jump */
   return handle;
 }
@@ -1521,7 +1544,7 @@ void *dlopen(const char *file, int flags)
 __attribute__((visibility("default")))
 void *android_dlopen_ext(const char *file, int flags, const void *extinfo)
 {
-  void *handle = lunaria_loader_android_dlopen_ext(file, flags, extinfo,
+  void *handle = __loader_android_dlopen_ext(file, flags, extinfo,
                  __builtin_return_address(0));
   __asm__ volatile("" ::: "memory");
   return handle;

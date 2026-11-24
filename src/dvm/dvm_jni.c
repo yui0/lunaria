@@ -1599,6 +1599,8 @@ static bool hook_call_external_inner(void *user, struct dvm *vm, const char *cla
     (void)(dvm_set_field)(vm, pi, "versionCode", "I", v);
     v.l = vname ? dvm_new_string(vm, vname) : 0;
     (void)(dvm_set_field)(vm, pi, "versionName", "Ljava/lang/String;", v);
+    dvm_package_info_add_permissions(vm, pi, record.name,
+                                      nargs > 1 ? (uint32_t)args[1].i : 0);
     (void)dvm_package_info_add_signatures(
       vm, pi, nargs > 1 ? (uint32_t)args[1].i : 0,
       self_pkg && !strcmp(self_pkg, record.name) ? NULL : record.source_dir);
@@ -2767,6 +2769,33 @@ bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
   bool r = dvm_jni_field_locked(env, obj, field, set, bits);
   dvm_gil_leave_to_guest(vm, cookie);
   return r;
+}
+
+bool dvm_jni_field_signature_mismatch(const char *class_name, const char *name,
+                                      const char *type, bool statics)
+{
+  struct dvm *vm = vm_get();
+  if (!vm || dvm_jni_mode() == DVM_JNI_OFF || !class_name || !name || !type)
+    return false;
+  const unsigned cookie = dvm_gil_enter_from_guest(vm);
+  struct dvm_class *cls = dvm_find_class(vm, class_name);
+  bool named = false, match = false;
+  for (struct dvm_class *c = cls; c && !match; c = c->super) {
+    for (int is_static = 0; is_static <= 1 && !match; ++is_static) {
+      const struct dvm_field *fields = is_static ? c->sfields : c->ifields;
+      const int n = is_static ? c->nsfields : c->nifields;
+      for (int i = 0; i < n; ++i) {
+        if (!fields[i].name || strcmp(fields[i].name, name)) continue;
+        named = true;
+        if (is_static == statics && fields[i].type && !strcmp(fields[i].type, type)) {
+          match = true;
+          break;
+        }
+      }
+    }
+  }
+  dvm_gil_leave_to_guest(vm, cookie);
+  return named && !match;
 }
 
 bool dvm_jni_static_field_locked(JNIEnv *env, jclass cls_ref, jfieldID field, bool set,

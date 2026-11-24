@@ -235,6 +235,25 @@ static const char *a64_syslib_dir(void)
   return dir;
 }
 
+/* Resolve the same platform images that APK installation exposes. */
+static bool a64_platform_image_path(char *path, size_t size, const char *sys,
+                                     const char *name)
+{
+  const bool bionic = !strcmp(name, "libc.so") || !strcmp(name, "libm.so") ||
+                      !strcmp(name, "libdl.so");
+  if (!bionic || lunaria_sdk_int() >= 29) {
+    const char *dir = bionic ? "apex/com.android.runtime/lib64/bionic" : "system/lib64";
+    int n = snprintf(path, size, "%s/android/%s/%s", sys, dir, name);
+    if (n >= 0 && (size_t)n < size && arm64_elf_is_arm64(path)) return true;
+  }
+  if (!strcmp(name, "libc.so")) {
+    int n = snprintf(path, size, "%s/libc-pure.so", sys);
+    if (n >= 0 && (size_t)n < size && arm64_elf_is_arm64(path)) return true;
+  }
+  int n = snprintf(path, size, "%s/%s", sys, name);
+  return n >= 0 && (size_t)n < size && arm64_elf_is_arm64(path);
+}
+
 /* Platform libraries every Android process sees before any app DSO loads.
  *
  * The ELF-on-the-command-line path used to do this; the APK-process path
@@ -244,6 +263,8 @@ static const char *a64_syslib_dir(void)
  * A device does not have two linkers — preload once, for every entry. */
 static void a64_preload_platform_libs(void)
 {
+  if (arm64_exec_map_interpreter() < 0)
+    warnx("failed to map the Android ELF interpreter");
   const char *sys = a64_syslib_dir();
   char libpath[PATH_MAX];
   struct stat stbuf;
@@ -253,34 +274,10 @@ static void a64_preload_platform_libs(void)
   /* libc as a pure-code provider only — see the comment at the ELF-path
    * call site.  Full ctor/TLS bootstrap is still the emulator's job. */
   {
-    int have_pure = 0;
-    if ((size_t)snprintf(libpath, sizeof libpath,
-                         "%s/libc-pure.so", sys) < sizeof libpath &&
-        stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
-      have_pure = 1;
-    else if ((size_t)snprintf(libpath, sizeof libpath,
-                              "%s/libc.so", sys) < sizeof libpath &&
-             stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath))
-      have_pure = 1; /* legacy syslib layout */
-    if (have_pure) {
+    if (a64_platform_image_path(libpath, sizeof libpath, sys, "libc.so")) {
       printf("preloading arm64 pure-code library: %s\n", libpath);
       if (arm64_exec_load_library(libpath, 0) < 0)
         warnx("failed to load pure-code library %s", libpath);
-    }
-  }
-
-  /* The platform libraries a process reads out of /proc/self/maps and the ELF files on disk
-   * (the dynamic linker's front end libdl, liblog, libstdc++): present, with their real
-   * code, when the platform's own images were installed beside the runtime. */
-  {
-    static const char *const platform[] = {"libdl.so", "liblog.so", "libstdc++.so", NULL};
-    for (const char *const *lib = platform; *lib; ++lib) {
-      if ((size_t)snprintf(libpath, sizeof libpath, "%s/%s", sys, *lib) < sizeof libpath &&
-          stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
-        printf("preloading arm64 platform image: %s\n", libpath);
-        if (arm64_exec_load_library(libpath, 0) < 0)
-          warnx("failed to load platform image %s", libpath);
-      }
     }
   }
 
@@ -294,6 +291,20 @@ static void a64_preload_platform_libs(void)
       printf("preloading arm64 guest libc: %s\n", libpath);
       if (arm64_exec_load_library(libpath, 0) < 0)
         warnx("failed to load guest libc %s", libpath);
+    }
+  }
+
+  /* The platform libraries a process reads out of /proc/self/maps and the ELF files on disk
+   * (the dynamic linker's front end libdl, liblog, libstdc++): present, with their real
+   * code, when the platform's own images were installed beside the runtime. */
+  {
+    static const char *const platform[] = {"libdl.so", "liblog.so", "libstdc++.so", NULL};
+    for (const char *const *lib = platform; *lib; ++lib) {
+      if (a64_platform_image_path(libpath, sizeof libpath, sys, *lib)) {
+        printf("preloading arm64 platform image: %s\n", libpath);
+        if (arm64_exec_load_library(libpath, 0) < 0)
+          warnx("failed to load platform image %s", libpath);
+      }
     }
   }
 
@@ -368,9 +379,7 @@ static bool elf_preload_needed(const char *path, const char *dir,
       const char *sys = elf64 ? a64_syslib_dir() : NULL;
       if (sys) {
         char cand[PATH_MAX];
-        if ((size_t)snprintf(cand, sizeof cand, "%s/%s", sys, needed[i])
-            < sizeof cand &&
-            stat(cand, &st) == 0 && elf_matches(cand, elf64)) {
+        if (a64_platform_image_path(cand, sizeof cand, sys, needed[i])) {
           printf("preloading arm64 platform library: %s\n", cand);
           if (arm_exec_link_library(cand) < 0)
             warnx("failed to load platform library %s", cand);

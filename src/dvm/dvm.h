@@ -424,6 +424,8 @@ struct dvm *dvm_current(void);
  * running app, whose APK is ANDROID_APK_FILE); a package whose APK is not a
  * signed archive carries no signatures, as on a device.  This is shared by the bytecode PackageManager paths in
  * dvm_runtime.c and dvm_jni.c. */
+void dvm_package_info_add_permissions(struct dvm *vm, dvm_ref package_info,
+                                      const char *package, uint32_t flags);
 bool dvm_package_info_add_signatures(struct dvm *vm, dvm_ref package_info,
                                      uint32_t flags, const char *source_dir);
 
@@ -896,6 +898,9 @@ unsigned dvm_jni_dex_epoch(void);
  * field is not one the VM owns; the caller then keeps its own handling. */
 bool dvm_jni_field(JNIEnv *env, jobject obj, jfieldID field, bool set,
                    uint64_t *bits);
+/* True when a known field has a different descriptor or storage class. */
+bool dvm_jni_field_signature_mismatch(const char *class_name, const char *name,
+                                      const char *type, bool statics);
 
 /* The same for a *static* field.  The dex owns these too: GameActivity's
  * <clinit> fills ANDROID_BUILD_VERSION from Build.VERSION.SDK_INT, and native

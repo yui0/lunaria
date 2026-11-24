@@ -1598,6 +1598,9 @@ bool luna_overlay_guest_window_up(void)
 void luna_overlay_set_native_input_focus(bool focused)
 {
   pthread_mutex_lock(&g_doc_lock);
+  if (g_native_input_focus != focused)
+    fprintf(stderr, "[input] native input focus %s (guest window %s)\n",
+            focused ? "gained" : "lost", g_html ? "up" : "down");
   g_native_input_focus = focused;
   pthread_mutex_unlock(&g_doc_lock);
 }
