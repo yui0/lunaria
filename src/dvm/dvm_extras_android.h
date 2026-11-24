@@ -2898,7 +2898,14 @@ static const struct rt_field rt_notification_fields[] = {
   { "group", "Ljava/lang/String;" }, { "sortKey", "Ljava/lang/String;" },
   { "channelId", "Ljava/lang/String;" }, { "category", "Ljava/lang/String;" },
   { "tickerText", "Ljava/lang/CharSequence;" }, { "contentIntent", "Landroid/app/PendingIntent;" },
-  { "deleteIntent", "Landroid/app/PendingIntent;" }, F_END
+  { "deleteIntent", "Landroid/app/PendingIntent;" },
+  { "icon", "I" },
+  { "iconLevel", "I" },
+  { "contentView", "Landroid/widget/RemoteViews;" },
+  { "fullScreenIntent", "Landroid/app/PendingIntent;" },
+  { "publicVersion", "Landroid/app/Notification;" },
+  { "actions", "[Landroid/app/Notification$Action;" },
+  F_END
 };
 
 /* The Builder keeps exactly the fields a Notification has, so build() copies
@@ -2908,7 +2915,13 @@ static const struct rt_field rt_notification_fields[] = {
    X("group", "Ljava/lang/String;") X("sortKey", "Ljava/lang/String;") \
    X("channelId", "Ljava/lang/String;") X("category", "Ljava/lang/String;") \
    X("tickerText", "Ljava/lang/CharSequence;") X("contentIntent", "Landroid/app/PendingIntent;") \
-   X("deleteIntent", "Landroid/app/PendingIntent;")
+   X("deleteIntent", "Landroid/app/PendingIntent;") \
+   X("icon", "I") \
+   X("iconLevel", "I") \
+   X("contentView", "Landroid/widget/RemoteViews;") \
+   X("fullScreenIntent", "Landroid/app/PendingIntent;") \
+   X("publicVersion", "Landroid/app/Notification;") \
+   X("actions", "[Landroid/app/Notification$Action;")
 
 static dvm_ref notification_extras(struct dvm *vm, dvm_ref obj)
 {
@@ -3026,6 +3039,12 @@ NB_SET(nb_set_content_intent, "contentIntent", "Landroid/app/PendingIntent;")
 NB_SET(nb_set_delete_intent, "deleteIntent", "Landroid/app/PendingIntent;")
 NB_SET(nb_set_defaults, "defaults", "I")
 NB_SET(nb_set_priority, "priority", "I")
+NB_SET(nb_set_content, "contentView", "Landroid/widget/RemoteViews;")
+NB_SET(nb_set_public_version, "publicVersion", "Landroid/app/Notification;")
+NB_EXTRA(nb_set_info, "android.infoText", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
+NB_EXTRA(nb_set_chronometer, "android.showChronometer", "putBoolean", "(Ljava/lang/String;Z)V")
+NB_EXTRA(nb_set_history, "android.remoteInputHistory", "putCharSequenceArray", "(Ljava/lang/String;[Ljava/lang/CharSequence;)V")
+
 NB_EXTRA(nb_set_title, "android.title", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
 NB_EXTRA(nb_set_text, "android.text", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
 NB_EXTRA(nb_set_sub_text, "android.subText", "putCharSequence", "(Ljava/lang/String;Ljava/lang/CharSequence;)V")
@@ -3050,6 +3069,24 @@ NB_FLAG(nb_set_auto_cancel, 0x10)
 NB_FLAG(nb_set_ongoing, 0x2)
 NB_FLAG(nb_set_only_alert_once, 0x8)
 NB_FLAG(nb_set_group_summary, 0x200)
+NB_FLAG(nb_set_local_only, 0x100)
+
+static bool nb_small_icon(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  (void)dvm_set_field(vm, self, "icon", "I", ARG(0));
+  if (nargs > 1) (void)dvm_set_field(vm, self, "iconLevel", "I", ARG(1));
+  RETL(self);
+}
+
+static bool nb_full_screen(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                           int nargs, union dvm_value *out)
+{
+  (void)dvm_set_field(vm, self, "fullScreenIntent", "Landroid/app/PendingIntent;", ARG(0));
+  (void)nb_flag(vm, self, 0x80, ARG(1).i != 0);
+  RETL(self);
+}
+
 
 /* Settings with no visible effect on this device are accepted and chained. */
 static bool nb_ignore(struct dvm *vm, dvm_ref self, const union dvm_value *args,
@@ -3124,6 +3161,68 @@ static bool nb_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
   RETL(n);
 }
 
+static const struct rt_field notification_action_fields[] = {
+  { "icon", "I" }, { "title", "Ljava/lang/CharSequence;" },
+  { "actionIntent", "Landroid/app/PendingIntent;" }, { "extras", "Landroid/os/Bundle;" },
+  { "allowGeneratedReplies", "Z" }, { "semanticAction", "I" }, F_END
+};
+
+static bool action_init(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                        int nargs, union dvm_value *out)
+{
+  (void)dvm_set_field(vm, self, "icon", "I", ARG(0));
+  (void)dvm_set_field(vm, self, "title", "Ljava/lang/CharSequence;", ARG(1));
+  (void)dvm_set_field(vm, self, "actionIntent", "Landroid/app/PendingIntent;", ARG(2));
+  (void)dvm_set_field(vm, self, "allowGeneratedReplies", "Z", (union dvm_value){ .i = 1 });
+  (void)notification_extras(vm, self);
+  RETV();
+}
+NB_SET(action_set_replies, "allowGeneratedReplies", "Z")
+NB_SET(action_set_semantic, "semanticAction", "I")
+static bool action_build(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                         int nargs, union dvm_value *out)
+{
+  dvm_ref action = dvm_new_object(vm, dvm__class_by_desc(vm, "Landroid/app/Notification$Action;"));
+  if (!action) return false;
+  for (size_t i = 0; notification_action_fields[i].name; ++i) {
+    const struct rt_field *field = &notification_action_fields[i];
+    union dvm_value value = {0};
+    if (!strcmp(field->name, "extras")) continue;
+    if (!(dvm_get_field)(vm, self, field->name, field->type, &value) ||
+        !(dvm_set_field)(vm, action, field->name, field->type, value)) return false;
+  }
+  union dvm_value extras = { .l = notification_extras(vm, self) }, ignored = {0};
+  if (!nb_set_extras(vm, action, &extras, 1, &ignored)) return false;
+  RETL(action);
+}
+static const struct rt_method notification_action_builder[] = {
+  M("<init>", "(ILjava/lang/CharSequence;Landroid/app/PendingIntent;)V", action_init),
+  M("addExtras", "(Landroid/os/Bundle;)Landroid/app/Notification$Action$Builder;", nb_set_extras),
+  M("setAllowGeneratedReplies", "(Z)Landroid/app/Notification$Action$Builder;", action_set_replies),
+  M("setSemanticAction", "(I)Landroid/app/Notification$Action$Builder;", action_set_semantic),
+  M("build", "()Landroid/app/Notification$Action;", action_build), M_END
+};
+static const struct rt_method notification_action[] = {
+  M("<init>", "(ILjava/lang/CharSequence;Landroid/app/PendingIntent;)V", action_init),
+  M("getExtras", "()Landroid/os/Bundle;", nb_get_extras), M_END
+};
+
+static bool nb_add_action(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                          int nargs, union dvm_value *out)
+{
+  const char *type = "[Landroid/app/Notification$Action;";
+  union dvm_value old = {0};
+  (void)dvm_get_field(vm, self, "actions", type, &old);
+  uint32_t count = old.l ? dvm_array_length(vm, old.l) : 0;
+  dvm_ref list = dvm_new_array(vm, 'L', type + 1, count + 1);
+  if (!list) return false;
+  dvm_ref *items = dvm_array_data(vm, list);
+  if (count) memcpy(items, dvm_array_data(vm, old.l), count * sizeof(*items));
+  items[count] = ARG(0).l;
+  (void)dvm_set_field(vm, self, "actions", type, (union dvm_value){ .l = list });
+  RETL(self);
+}
+
 static const struct rt_method rt_notification_builder[] = {
   M("<init>", "(Landroid/content/Context;)V", nb_init),
   M("<init>", "(Landroid/content/Context;Ljava/lang/String;)V", nb_init),
@@ -3150,8 +3249,23 @@ static const struct rt_method rt_notification_builder[] = {
   M("setExtras", "(Landroid/os/Bundle;)Landroid/app/Notification$Builder;", nb_set_extras),
   M("addExtras", "(Landroid/os/Bundle;)Landroid/app/Notification$Builder;", nb_set_extras),
   M("getExtras", "()Landroid/os/Bundle;", nb_get_extras),
+  M("setSmallIcon", "(I)Landroid/app/Notification$Builder;", nb_small_icon),
+  M("setSmallIcon", "(II)Landroid/app/Notification$Builder;", nb_small_icon),
+  M("setContent", "(Landroid/widget/RemoteViews;)Landroid/app/Notification$Builder;", nb_set_content),
+  M("setTicker", "(Ljava/lang/CharSequence;Landroid/widget/RemoteViews;)Landroid/app/Notification$Builder;", nb_set_ticker),
+  M("setContentInfo", "(Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;", nb_set_info),
+  M("setFullScreenIntent", "(Landroid/app/PendingIntent;Z)Landroid/app/Notification$Builder;", nb_full_screen),
+  M("setUsesChronometer", "(Z)Landroid/app/Notification$Builder;", nb_set_chronometer),
+  M("setLocalOnly", "(Z)Landroid/app/Notification$Builder;", nb_set_local_only),
+  M("setPublicVersion", "(Landroid/app/Notification;)Landroid/app/Notification$Builder;", nb_set_public_version),
+  M("setRemoteInputHistory", "([Ljava/lang/CharSequence;)Landroid/app/Notification$Builder;", nb_set_history),
+  M("addAction", "(Landroid/app/Notification$Action;)Landroid/app/Notification$Builder;", nb_add_action),
   /* Presentation-only settings: nothing on this device draws a status bar. */
-  M("setSmallIcon", "(I)Landroid/app/Notification$Builder;", nb_ignore),
+  M("setSound", "(Landroid/net/Uri;Landroid/media/AudioAttributes;)Landroid/app/Notification$Builder;", nb_ignore),
+  M("setSound", "(Landroid/net/Uri;I)Landroid/app/Notification$Builder;", nb_ignore),
+  M("setBadgeIconType", "(I)Landroid/app/Notification$Builder;", nb_ignore),
+  M("setShortcutId", "(Ljava/lang/String;)Landroid/app/Notification$Builder;", nb_ignore),
+  M("setGroupAlertBehavior", "(I)Landroid/app/Notification$Builder;", nb_ignore),
   M("setLargeIcon", "(Landroid/graphics/Bitmap;)Landroid/app/Notification$Builder;", nb_ignore),
   M("setColor", "(I)Landroid/app/Notification$Builder;", nb_ignore),
   M("setVisibility", "(I)Landroid/app/Notification$Builder;", nb_ignore),

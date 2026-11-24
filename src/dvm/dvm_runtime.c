@@ -34,6 +34,9 @@
 #include "jvm/jvm.h"
 #include "luna_boot.h"
 #include "lunaria_os.h"
+#ifdef _WIN32
+#include "lunaria_vpn.h"
+#endif
 #include "luna_google.h"
 #ifdef __APPLE__
 #define DVM_OPTIONAL_SYMBOL __attribute__((weak_import))
@@ -20786,13 +20789,65 @@ static bool arrays_binarySearch_object(struct dvm *vm, dvm_ref self,
   RETI(-before - 1);
 }
 
+/* JDK binarySearch on a sorted half-open range.  The miss value is
+ * -(insertion point) - 1, which is what go.Seq.RefMap complements to get the
+ * index it then shifts with System.arraycopy. */
+static int32_t arrays_bsearch_signed(const void *data, bool wide,
+                                     int32_t from, int32_t to, int64_t key)
+{
+  int32_t low = from;
+  int32_t high = to - 1;
+  while (low <= high) {
+    int32_t mid = (int32_t)(((uint32_t)low + (uint32_t)high) >> 1);
+    int64_t mid_val = wide ? ((const int64_t *)data)[mid]
+                           : (int64_t)((const int32_t *)data)[mid];
+    if (mid_val < key) low = mid + 1;
+    else if (mid_val > key) high = mid - 1;
+    else return mid;
+  }
+  return -low - 1;
+}
+
 static bool arrays_binarySearch_prim(struct dvm *vm, dvm_ref self,
                                      const union dvm_value *args, int nargs,
                                      union dvm_value *out)
 {
   (void)self;
-  (void)nargs;
   struct dvm_object *a = ARG(0).l ? dvm__obj(vm, ARG(0).l) : NULL;
+  /* binarySearch(a, fromIndex, toIndex, key).  go.Seq.RefMap stores a sorted
+   * prefix of length `next` and leaves the tail zero-filled.  Searching the
+   * whole array answers 0 for a missing key 0, because that is the padding.
+   * RefMap then treats the miss as a hit and refuses the next distinct put. */
+  if (nargs >= 4) {
+    if (!a || a->kind != DVM_OBJ_ARRAY) {
+      dvm__throw(vm, "java/lang/NullPointerException", "Arrays.binarySearch");
+      return false;
+    }
+    if (a->elem_kind != 'I' && a->elem_kind != 'J') {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "Arrays.binarySearch range");
+      return false;
+    }
+    bool wide = a->elem_kind == 'J';
+    int32_t from = ARG(1).i;
+    int32_t to = ARG(2).i;
+    int64_t key = wide ? ARG(3).j : (int64_t)ARG(3).i;
+    if (from > to) {
+      dvm__throw(vm, "java/lang/IllegalArgumentException",
+                 "Arrays.binarySearch fromIndex > toIndex");
+      return false;
+    }
+    if (from < 0 || to > (int32_t)a->length) {
+      dvm__throw(vm, "java/lang/ArrayIndexOutOfBoundsException",
+                 "Arrays.binarySearch range");
+      return false;
+    }
+    if (to > from && !a->data) {
+      dvm__throw(vm, "java/lang/NullPointerException", "Arrays.binarySearch");
+      return false;
+    }
+    RETI(arrays_bsearch_signed(a->data, wide, from, to, key));
+  }
   if (!a || a->kind != DVM_OBJ_ARRAY || !a->data) RETI(-1);
   bool wide = a->elem_kind == 'J';
   int64_t key = wide ? ARG(1).j : (int64_t)ARG(1).i;
@@ -21067,7 +21122,9 @@ static const struct rt_method rt_arrays[] = {
   SM("binarySearch", "([Ljava/lang/Object;Ljava/lang/Object;)I",
   arrays_binarySearch_object),
   SM("binarySearch", "([II)I", arrays_binarySearch_prim),
+  SM("binarySearch", "([IIII)I", arrays_binarySearch_prim),
   SM("binarySearch", "([JJ)I", arrays_binarySearch_prim),
+  SM("binarySearch", "([JIIJ)I", arrays_binarySearch_prim),
   SM("hashCode", "([B)I", arrays_hashCode),
   SM("hashCode", "([I)I", arrays_hashCode),
   SM("hashCode", "([J)I", arrays_hashCode),
@@ -26146,17 +26203,60 @@ static bool process_stream(struct dvm *vm, dvm_ref self, const union dvm_value *
   RETL(v.l);
 }
 
+static bool process_child_status(struct dvm *vm, dvm_ref self, const union dvm_value *args,
+                                 int nargs, union dvm_value *out)
+{
+  (void)args; (void)nargs;
+  const bool wait = !strcmp(builtin_name(),"waitFor");
+  const bool destroy = !strcmp(builtin_name(),"destroy");
+  const bool alive = !strcmp(builtin_name(),"isAlive");
+  for (;;) {
+    union dvm_value tid = {0}, status = {0}, busy = {0};
+    dvm_get_field(vm,self,"childTid","I",&tid);
+    if (!tid.i) {
+      dvm_get_field(vm,self,"exitCode","I",&status);
+      RETI(alive || destroy ? 0 : status.i);
+    }
+    dvm_get_field(vm,self,"checkingChild","Z",&busy);
+    if (!busy.i) {
+      dvm_set_field(vm,self,"checkingChild","Z",(union dvm_value){.i=1});
+      unsigned depth = dvm_gil_unlock_all(vm);
+      int rc = arm_exec_java_child(tid.i,destroy);
+      dvm_gil_relock(vm,depth);
+      dvm_set_field(vm,self,"checkingChild","Z",(union dvm_value){.i=0});
+      if (rc != -1) {
+        status.i = rc < 0 ? 127 : rc;
+        dvm_set_field(vm,self,"exitCode","I",status);
+        dvm_set_field(vm,self,"childTid","I",(union dvm_value){.i=0});
+        RETI(alive || destroy ? 0 : status.i);
+      }
+      if (destroy || alive) RETI(alive);
+      if (!wait) {
+        dvm__throw(vm,"java/lang/IllegalThreadStateException","Process is running");
+        return false;
+      }
+    }
+    if (dvm_is_stopping(vm) || (wait && dvm__thread_take_interrupt(vm))) {
+      dvm__throw(vm,"java/lang/InterruptedException","Process wait interrupted");
+      return false;
+    }
+    unsigned depth = dvm_gil_unlock_all(vm);
+    usleep(20000);
+    dvm_gil_relock(vm,depth);
+  }
+}
 static const struct rt_method rt_exec_process[] = {
   M("getInputStream", "()Ljava/io/InputStream;", process_stream),
   M("getErrorStream", "()Ljava/io/InputStream;", process_stream),
-  M("waitFor", "()I", ret_zero),
-  M("exitValue", "()I", ret_zero),
-  M("isAlive", "()Z", ret_false),
-  M("destroy", "()V", nop_void),
+  M("waitFor", "()I", process_child_status),
+  M("exitValue", "()I", process_child_status),
+  M("isAlive", "()Z", process_child_status),
+  M("destroy", "()V", process_child_status),
   M_END,
 };
 static const struct rt_field rt_exec_process_fields[] = {
-  { "stdout", "Ljava/io/InputStream;" }, { "stderr", "Ljava/io/InputStream;" }, F_END
+  { "stdout", "Ljava/io/InputStream;" }, { "stderr", "Ljava/io/InputStream;" },
+  { "childTid", "I" }, { "exitCode", "I" }, { "checkingChild", "Z" }, F_END
 };
 
 /* java.util.zip.ZipFile / ZipEntry.  Zip decoding stays in the package/file
@@ -50015,6 +50115,14 @@ static dvm_ref parcel_fd_adopt(struct dvm *vm,int fd)
   return r;
 }
 static bool parcel_fd_write(struct dvm *,dvm_ref,const union dvm_value *,int,union dvm_value *);
+static bool parcel_fd_adopt_java(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
+{
+  (void)self;
+  if (ARG(0).i < 0) { dvm__throw(vm,"java/lang/IllegalArgumentException","Negative descriptor"); return false; }
+  dvm_ref descriptor = parcel_fd_adopt(vm,ARG(0).i);
+  if (!descriptor) return false;
+  RETL(descriptor);
+}
 static bool parcel_fd_describe(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
 {
   (void)vm;
@@ -50124,12 +50232,31 @@ static bool parcel_fd_close(struct dvm *vm, dvm_ref self,
   RETV();
 }
 
+static bool parcel_fd_detach(struct dvm *vm, dvm_ref self,
+                             const union dvm_value *args, int nargs, union dvm_value *out)
+{
+  (void)args;
+  (void)nargs;
+  struct dvm_object *object = dvm__obj(vm, self);
+  struct parcel_fd_owner *owner = object && object->data_destroy == parcel_fd_destroy ? object->data : NULL;
+  if (!owner || owner->fd < 0) {
+    dvm__throw(vm, "java/lang/IllegalStateException", "Already closed");
+    return false;
+  }
+  int fd = owner->fd;
+  owner->fd = -1;
+  if (!parcel_fd_close(vm, self, NULL, 0, out)) return false;
+  RETI(fd);
+}
+
 static const struct rt_field rt_parcel_fd_sfields[] = { { "CREATOR", "Landroid/os/Parcelable$Creator;" }, F_END };
 static const struct rt_field rt_parcel_fd_fields[] = { { "fd", "I" }, {"fileDescriptor","Ljava/io/FileDescriptor;"}, F_END };
 static const struct rt_method rt_parcel_fd[] = {
+  SM("adoptFd", "(I)Landroid/os/ParcelFileDescriptor;", parcel_fd_adopt_java),
   SM("open", "(Ljava/io/File;I)Landroid/os/ParcelFileDescriptor;", parcel_fd_open),
   M("getFileDescriptor","()Ljava/io/FileDescriptor;",parcel_fd_get_file),
   M("getFd", "()I", parcel_fd_get), M("close", "()V", parcel_fd_close),
+  M("detachFd", "()I", parcel_fd_detach),
   M("writeToParcel", "(Landroid/os/Parcel;I)V", parcel_fd_write),
   M("describeContents", "()I", parcel_fd_describe), M_END,
 };
@@ -83806,8 +83933,7 @@ static const struct rt_method rt_adapter_view[]= {
   M("getSelectedItemPosition","()I",adapter_view_selected_position),
   M("getSelectedItemId","()J",adapter_view_selected_id),M_END
 };
-static const struct rt_method rt_abs_list_view[]= {ADAPTER_VIEW_CTORS,M_END};
-static const struct rt_method rt_list_view[]= {
+static const struct rt_method rt_abs_list_view[]= {
   ADAPTER_VIEW_CTORS,
   M("setAdapter","(Landroid/widget/ListAdapter;)V",list_view_set_adapter),
   M("getAdapter","()Landroid/widget/ListAdapter;",list_view_get_adapter),
@@ -83815,15 +83941,60 @@ static const struct rt_method rt_list_view[]= {
   M("getCount","()I",list_view_count),
   M("onTouchEvent","(Landroid/view/MotionEvent;)Z",list_view_touch),
   M("getFirstVisiblePosition","()I",list_view_first),M("getLastVisiblePosition","()I",list_view_last),
+  M("onMeasure","(II)V",widget_on_measure),M("onLayout","(ZIIII)V",list_view_on_layout),M_END
+};
+static const struct rt_method rt_list_view[]= {
+  ADAPTER_VIEW_CTORS,
   M("setDivider","(Landroid/graphics/drawable/Drawable;)V",list_view_set_divider),
   M("getDivider","()Landroid/graphics/drawable/Drawable;",list_view_get_divider),
   M("setDividerHeight","(I)V",list_view_set_divider_height),
   M("getDividerHeight","()I",list_view_get_divider_height),
   M("setHeaderDividersEnabled","(Z)V",list_view_set_header_dividers),
-  M("setFooterDividersEnabled","(Z)V",list_view_set_footer_dividers),
-  M("onMeasure","(II)V",widget_on_measure),M("onLayout","(ZIIII)V",list_view_on_layout),M_END
+  M("setFooterDividersEnabled","(Z)V",list_view_set_footer_dividers),M_END
 };
 #undef ADAPTER_VIEW_CTORS
+
+static bool grid_view_init(struct dvm *vm, dvm_ref self,
+                           const union dvm_value *args, int nargs, union dvm_value *out)
+{
+  if (!adapter_view_init(vm, self, args, nargs, out)) return false;
+  rt_set_int(vm, self, "stretchMode", 2); /* STRETCH_COLUMN_WIDTH */
+  rt_set_int(vm, self, "requestedNumColumns", 1);
+  RETV();
+}
+
+static bool grid_view_geometry(struct dvm *vm, dvm_ref self,
+                               const union dvm_value *args, int nargs, union dvm_value *out)
+{
+  const char *property = builtin_name() + 3;
+  const char *field;
+  if (!strcmp(property, "NumColumns")) field = nargs ? "requestedNumColumns" : "numColumns";
+  else if (!strcmp(property, "ColumnWidth")) field = nargs ? "requestedColumnWidth" : "columnWidth";
+  else if (!strcmp(property, "HorizontalSpacing")) field = nargs ? "requestedHorizontalSpacing" : "horizontalSpacing";
+  else if (!strcmp(property, "RequestedColumnWidth")) field = "requestedColumnWidth";
+  else if (!strcmp(property, "RequestedHorizontalSpacing")) field = "requestedHorizontalSpacing";
+  else if (!strcmp(property, "VerticalSpacing")) field = "verticalSpacing";
+  else field = "stretchMode";
+  if (!nargs) RETI(ui_int(vm, self, field));
+  if (ui_int(vm, self, field) == ARG(0).i) RETV();
+  rt_set_int(vm, self, field, ARG(0).i);
+  return list_view_request(vm, self);
+}
+
+static const struct rt_method rt_grid_view[]= {
+  M("<init>","(Landroid/content/Context;)V",grid_view_init),
+  M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;)V",grid_view_init),
+  M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;I)V",grid_view_init),
+  M("<init>","(Landroid/content/Context;Landroid/util/AttributeSet;II)V",grid_view_init),
+  M("setNumColumns","(I)V",grid_view_geometry), M("getNumColumns","()I",grid_view_geometry),
+  M("setColumnWidth","(I)V",grid_view_geometry), M("getColumnWidth","()I",grid_view_geometry),
+  M("getRequestedColumnWidth","()I",grid_view_geometry),
+  M("setHorizontalSpacing","(I)V",grid_view_geometry), M("getHorizontalSpacing","()I",grid_view_geometry),
+  M("getRequestedHorizontalSpacing","()I",grid_view_geometry),
+  M("setVerticalSpacing","(I)V",grid_view_geometry), M("getVerticalSpacing","()I",grid_view_geometry),
+  M("setStretchMode","(I)V",grid_view_geometry), M("getStretchMode","()I",grid_view_geometry),
+  M_END,
+};
 
 /* android.widget.Spinner: an adapter, a listener and the selected index. */
 static const struct rt_field rt_spinner_fields[] = {
@@ -96331,6 +96502,31 @@ static const struct rt_method rt_dialog_click_listener[] = {
 static const struct rt_method rt_dialog_cancel_listener[] = {
   { "onCancel", "(Landroid/content/DialogInterface;)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT }, M_END
 };
+static const char *const rt_simple_gesture_interfaces[] = {
+  "Landroid/view/GestureDetector$OnGestureListener;",
+  "Landroid/view/GestureDetector$OnDoubleTapListener;",
+  "Landroid/view/GestureDetector$OnContextClickListener;",
+  NULL,
+};
+static const struct rt_method rt_on_gesture_listener[] = {
+  { "onDown", "(Landroid/view/MotionEvent;)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onShowPress", "(Landroid/view/MotionEvent;)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onSingleTapUp", "(Landroid/view/MotionEvent;)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onScroll", "(Landroid/view/MotionEvent;Landroid/view/MotionEvent;FF)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onLongPress", "(Landroid/view/MotionEvent;)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onFling", "(Landroid/view/MotionEvent;Landroid/view/MotionEvent;FF)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  M_END,
+};
+static const struct rt_method rt_on_double_tap_listener[] = {
+  { "onSingleTapConfirmed", "(Landroid/view/MotionEvent;)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onDoubleTap", "(Landroid/view/MotionEvent;)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  { "onDoubleTapEvent", "(Landroid/view/MotionEvent;)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  M_END,
+};
+static const struct rt_method rt_on_context_click_listener[] = {
+  { "onContextClick", "(Landroid/view/MotionEvent;)Z", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT },
+  M_END,
+};
 static const struct rt_method rt_checked_change_listener[] = {
   { "onCheckedChanged", "(Landroid/widget/CompoundButton;Z)V", NULL, DEX_ACC_PUBLIC | DEX_ACC_ABSTRACT }, M_END
 };
@@ -96842,6 +97038,10 @@ static const char *const rt_iface_delayed[]= {"Ljava/lang/Comparable;",NULL};
 static const char *const rt_iface_runnable_scheduled[]= {"Ljava/util/concurrent/RunnableFuture;","Ljava/util/concurrent/ScheduledFuture;",NULL};
 
 #include "dvm_extras_java.h"
+#ifdef _WIN32
+#include "dvm_vpn_windows.h"
+#include "dvm_local_socket_windows.h"
+#endif
 #include "dvm_extras_view.h"
 #include "dvm_extras_gfx.h"
 #include "dvm_extras_android.h"
@@ -97458,7 +97658,18 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/graphics/BitmapShader;", "Landroid/graphics/Shader;", rt_bitmap_shader, rt_bitmap_shader_fields, NULL },
   { "Landroid/graphics/Shader$TileMode;", "Ljava/lang/Enum;", rt_shader_tile, NULL, NULL,rt_shader_tile_fields },
   { "Landroid/view/View$AccessibilityDelegate;", "Ljava/lang/Object;", rt_empty_ctor, NULL, NULL },
-  { "Landroid/view/GestureDetector$SimpleOnGestureListener;", "Ljava/lang/Object;", rt_empty_ctor, NULL, NULL },
+  { .desc="Landroid/view/GestureDetector$OnGestureListener;", .super="Ljava/lang/Object;",
+    .methods=rt_on_gesture_listener, .is_interface=true
+  },
+  { .desc="Landroid/view/GestureDetector$OnDoubleTapListener;", .super="Ljava/lang/Object;",
+    .methods=rt_on_double_tap_listener, .is_interface=true
+  },
+  { .desc="Landroid/view/GestureDetector$OnContextClickListener;", .super="Ljava/lang/Object;",
+    .methods=rt_on_context_click_listener, .is_interface=true
+  },
+  { "Landroid/view/GestureDetector$SimpleOnGestureListener;", "Ljava/lang/Object;",
+    rt_empty_ctor, NULL, rt_simple_gesture_interfaces
+  },
   { "Ljava/util/concurrent/ExecutionException;", "Ljava/lang/Exception;", rt_throwable_ctors, NULL, NULL },
   { "Ljava/lang/AssertionError;", "Ljava/lang/Error;", rt_assertion_error, NULL, NULL },
   { "Ljava/nio/file/CopyOption;", "Ljava/lang/Object;", NULL, NULL, NULL },
@@ -98563,10 +98774,13 @@ static const struct rt_class rt_classes[] = {
     rt_adapter_view, rt_adapter_view_fields, NULL
   },
   { "Landroid/widget/AbsListView;", "Landroid/widget/AdapterView;",
-    rt_abs_list_view, NULL, NULL
+    rt_abs_list_view, rt_abs_list_view_fields, NULL
   },
   { "Landroid/widget/ListView;", "Landroid/widget/AbsListView;",
     rt_list_view, rt_list_view_fields, NULL
+  },
+  { "Landroid/widget/GridView;", "Landroid/widget/AbsListView;",
+    rt_grid_view, rt_grid_view_fields, NULL
   },
   { "Landroid/widget/AbsListView$LayoutParams;", "Landroid/view/ViewGroup$LayoutParams;", rt_abs_list_params, rt_abs_list_params_fields, NULL },
   { "Llunaria/widget/ListDataSetObserver;", "Landroid/database/DataSetObserver;", rt_list_observer, rt_list_observer_fields, NULL },
@@ -100293,6 +100507,13 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/app/Service;", "Landroid/content/ContextWrapper;", rt_service,
     rt_service_fields, NULL
   },
+#ifdef _WIN32
+  { "Landroid/net/VpnService;", "Landroid/app/Service;", rt_vpn_service, NULL, NULL },
+  { "Landroid/net/LocalSocket;", "Ljava/lang/Object;", rt_local_socket, NULL, rt_iface_closeable },
+  { "Landroid/net/LocalSocketAddress;", "Ljava/lang/Object;", rt_local_address, rt_local_addr_fields, NULL },
+  { "Landroid/net/LocalSocketImpl$SocketOutputStream;", "Ljava/io/OutputStream;", rt_local_out, rt_local_out_fields, NULL },
+  { "Landroid/net/VpnService$Builder;", "Ljava/lang/Object;", rt_vpn_builder, NULL, NULL },
+#endif
   { "Landroid/os/IBinder;", "Ljava/lang/Object;", NULL, NULL, NULL },
   { .desc="Landroid/content/ServiceConnection;", .super="Ljava/lang/Object;",
     .methods=rt_service_connection, .is_interface=true
@@ -100476,6 +100697,10 @@ static const struct rt_class rt_classes[] = {
   { "Landroid/app/Notification$Builder;", "Ljava/lang/Object;",
     rt_notification_builder, rt_notification_fields, NULL
   },
+  { "Landroid/app/Notification$Action;", "Ljava/lang/Object;",
+    notification_action, notification_action_fields, NULL },
+  { "Landroid/app/Notification$Action$Builder;", "Ljava/lang/Object;",
+    notification_action_builder, notification_action_fields, NULL },
   { "Landroid/app/Notification$Style;", "Ljava/lang/Object;", NULL, NULL, NULL },
   { "Landroid/app/Notification$BigTextStyle;", "Landroid/app/Notification$Style;",
     rt_big_text_style, rt_big_text_style_fields, NULL

@@ -9267,6 +9267,9 @@ struct svc_conn {
   dvm_ref conn;
   struct svc_rec *svc;   /* NULL when nothing is bound through it */
   dvm_ref intent;        /* the Intent it bound with (pinned while bound) */
+  char *remote_process;
+  void *remote_unbind;
+  size_t remote_unbind_size;
   struct svc_conn *next;
 };
 
@@ -9495,6 +9498,32 @@ static bool svc_bind_for_peer(struct dvm *vm, dvm_ref intent, dvm_ref *binder, c
   return true;
 }
 
+static bool svc_unbind_for_peer(struct dvm *vm,dvm_ref intent)
+{
+  struct dvm_class *cls=svc_resolve(vm,intent);
+  struct svc_rec *r=cls ? svc_find(cls) : NULL;
+  if(!r || r->bindings<=0)return false;
+  for(int i=0; i<r->nbinds; ++i) {
+    if(r->binds[i].count<=0 || !intent_filter_same(vm,r->binds[i].intent,intent))continue;
+    svc_unbind_entry(vm,r,intent);
+    if(--r->bindings==0)svc_bring_down_if_needed(vm,r);
+    return true;
+  }
+  return false;
+}
+
+static void svc_remote_unbind(struct dvm *vm,struct svc_conn *conn)
+{
+  if(conn->remote_process && vm->service_submit)
+    (void)vm->service_submit(vm->service_submit_user,conn->remote_process,
+                             conn->remote_unbind,conn->remote_unbind_size);
+  free(conn->remote_process);
+  free(conn->remote_unbind);
+  conn->remote_process=NULL;
+  conn->remote_unbind=NULL;
+  conn->remote_unbind_size=0;
+}
+
 /* The packages the installation runs as component hosts: LUNARIA_SERVICE_HOSTS,
  * separated by ',' ';' or ' ' (default the Play Store, Play services and the
  * Google Services Framework).  Copies the next name after *cursor into `name`
@@ -9676,16 +9705,31 @@ static bool ctx_bindService(struct dvm *vm, dvm_ref self,
      * connection callback to the app's main thread: the request goes out now,
      * not as work for a main Looper that may be busy (an Activity still
      * starting up waits for exactly this). */
-    const int rc = dvm_binder_remote_bind(vm, remote, intent, conn);
-    if (rc < 0) {
-      fprintf(stderr, "[binder] bindService into %s failed: %s\n", remote, strerror(-rc));
-      luna_overlay_google_service(remote, false);
-      free(remote);
-      RETI(0);
+    char *process=NULL;
+    const char *owner=getenv("ANDROID_PACKAGE_NAME");
+    if(vm->service_submit && owner && !strcmp(remote,owner))
+      (void)svc_resolve_mode(vm,intent,true,&process);
+    void *unbind=NULL;
+    size_t unbind_size=0;
+    int rc=process ? dvm_service_pack(vm,intent,5,&unbind,&unbind_size) : 0;
+    bool same=!rc && process && c->remote_process && !strcmp(process,c->remote_process) &&
+      unbind_size==c->remote_unbind_size && !memcmp(unbind,c->remote_unbind,unbind_size);
+    if(!rc && !same)rc=dvm_binder_remote_bind(vm,remote,intent,conn);
+    if(!rc && !same) {
+      svc_remote_unbind(vm,c);
+      c->remote_process=process;
+      c->remote_unbind=unbind;
+      c->remote_unbind_size=unbind_size;
+      process=NULL;
+      unbind=NULL;
     }
-    luna_overlay_google_service(remote, true);
+    if(rc<0)fprintf(stderr,"[binder] bindService into %s failed: %s\n",remote,strerror(-rc));
+    luna_overlay_google_service(remote, rc >= 0);
     free(remote);
-    RETI(1);
+    free(process);
+    free(unbind);
+    if(vm->exception)return false;
+    RETI(rc>=0);
   }
   free(remote);
   if (!in_peer && !svc_resolve(vm, intent)) {
@@ -9750,6 +9794,7 @@ static bool ctx_unbindService(struct dvm *vm, dvm_ref self,
   *pp = c->next;
   struct svc_rec *r = c->svc;
   dvm_ref bound_intent = c->intent;
+  svc_remote_unbind(vm,c);
   dvm_unpin(vm, c->conn);
   free(c);
   if (r) {
@@ -9807,9 +9852,25 @@ static bool ctx_stopService(struct dvm *vm, dvm_ref self,
 {
   (void)self;
   (void)nargs;
-  struct dvm_class *cls = svc_resolve(vm, ARG(0).l);
-  if (vm->exception) return false;
-  struct svc_rec *r = cls ? svc_find(cls) : NULL;
+  dvm_ref intent=ARG(0).l;
+  char *process=NULL;
+  struct dvm_class *cls=svc_resolve_mode(vm,intent,vm->service_submit!=NULL,&process);
+  if(!cls || vm->exception) {
+    free(process);
+    if(vm->exception)return false;
+    RETI(0);
+  }
+  if(process) {
+    void *bytes=NULL;
+    size_t size=0;
+    int rc=dvm_service_pack(vm,intent,2,&bytes,&size);
+    if(!rc)rc=vm->service_submit(vm->service_submit_user,process,bytes,size);
+    free(bytes);
+    free(process);
+    if(vm->exception)return false;
+    RETI(rc==0);
+  }
+  struct svc_rec *r=svc_find(cls);
   if (!r || !r->started) RETI(0);
   r->started = false;
   svc_bring_down_if_needed(vm, r);
@@ -10676,6 +10737,19 @@ static bool act_startActivityForResult(struct dvm *vm, dvm_ref self,
   (void)nargs;
   /* A negative request code is startActivity(): no result is delivered. */
   const int32_t code = args[1].i;
+#ifdef _WIN32
+  union dvm_value action = {0};
+  (void)dvm_get_field(vm, ARG(0).l, "action", "Ljava/lang/String;", &action);
+  const char *name = action.l ? dvm_string_utf8(vm, action.l) : NULL;
+  if (name && !strcmp(name, LUNA_VPN_CONSENT_ACTION)) {
+    fprintf(stderr, "[vpn] Windows host VPN is disabled for this launch\n");
+    if (code >= 0) {
+      union dvm_value result[] = {{.i=code}, {.i=0}, {.l=0}};
+      act_call(vm, self, "onActivityResult", "(IILandroid/content/Intent;)V", result, 3);
+    }
+    RETV();
+  }
+#endif
   if (!act_start_common(vm, self, ARG(0).l, true, code >= 0, code))
     return false;
   RETV();
@@ -17443,7 +17517,7 @@ static void ui_measure_dispatch(struct dvm *vm, dvm_ref view, struct ui_ms ws,
     ui_measure_linear(vm, view, ws, hs, n, depth);
   else if (ui_is_a(vm, view, "android/widget/RelativeLayout"))
     ui_measure_relative(vm, view, ws, hs, n, depth);
-  else if (ui_is_a(vm, view, "android/widget/ListView")) {
+  else if (ui_is_a(vm, view, "android/widget/AbsListView")) {
     list_view_measure(vm,view,ws,hs,depth);
   } else if (group || ui_is_frame_like(vm, view))
     ui_measure_frame(vm, view, ws, hs, n, depth);
@@ -17733,7 +17807,7 @@ static void ui_layout(struct dvm *vm, dvm_ref view, unsigned depth)
   if (ui_is_a(vm, view, "android/widget/LinearLayout"))
     ui_layout_linear(vm, view, n);
   else if (ui_is_a(vm, view, "android/widget/RelativeLayout") ||
-           ui_is_a(vm, view, "android/widget/ListView"))
+           ui_is_a(vm, view, "android/widget/AbsListView"))
     ;
   else
     ui_layout_frame(vm, view, n);
@@ -17869,7 +17943,7 @@ static bool widget_on_layout(struct dvm *vm, dvm_ref self,
   if (ui_is_a(vm, self, "android/widget/LinearLayout"))
     ui_layout_linear(vm, self, n);
   else if (!ui_is_a(vm, self, "android/widget/RelativeLayout") &&
-           !ui_is_a(vm, self, "android/widget/ListView"))
+           !ui_is_a(vm, self, "android/widget/AbsListView"))
     ui_layout_frame(vm, self, n);   /* a RelativeLayout's rules placed its children in measure */
   dvm_ref kids[UI_MAX_KIDS];
   uint32_t count = ui_children(vm, self, kids, UI_MAX_KIDS);
@@ -18770,7 +18844,7 @@ static void ui_dispatch_click(struct dvm *vm, dvm_ref clicked)
     fprintf(stderr, "\n");
     return;
   }
-  if(ui_is_a(vm,target,"android/widget/ListView")) {
+  if(ui_is_a(vm,target,"android/widget/AbsListView")) {
     if(!list_view_tap(vm,target,clicked))ui_report_exception(vm,"performItemClick");
     return;
   }
@@ -19282,17 +19356,26 @@ static const struct rt_method rt_html[]= {
 };
 
 /* ======== merged from dvm_list_view.h ======== */
-/* MPL-2.0. Adapter-owned ListView rows and viewport measurement. */
-static const struct rt_field rt_list_view_fields[]= {
+/* MPL-2.0. Adapter-owned rows and viewport measurement. */
+static const struct rt_field rt_abs_list_view_fields[]= {
   {"listAdapter","Landroid/widget/ListAdapter;"},
   {"listObserver","Landroid/database/DataSetObserver;"},
   {"itemCount","I"},{"firstPosition","I"},{"dataGeneration","I"},
   {"listTouchRow","Landroid/view/View;"},{"listTouchX","F"},{"listTouchY","F"},
+  F_END
+};
+static const struct rt_field rt_list_view_fields[]= {
   {"divider","Landroid/graphics/drawable/Drawable;"},{"dividerHeight","I"},
   {"headerDividers","Z"},{"footerDividers","Z"},F_END
 };
+static const struct rt_field rt_grid_view_fields[]= {
+  {"requestedNumColumns","I"},{"numColumns","I"},
+  {"requestedColumnWidth","I"},{"columnWidth","I"},
+  {"requestedHorizontalSpacing","I"},{"horizontalSpacing","I"},
+  {"verticalSpacing","I"},{"stretchMode","I"},F_END
+};
 static const struct rt_field rt_list_observer_fields[]= {
-  {"owner","Landroid/widget/ListView;"},F_END
+  {"owner","Landroid/widget/AbsListView;"},F_END
 };
 static const struct rt_field rt_abs_list_params_fields[]= {
   {"viewType","I"},{"itemId","J"},{"isEnabled","Z"},F_END
@@ -19380,7 +19463,7 @@ static bool list_view_observed(struct dvm *vm,dvm_ref self,const union dvm_value
   (void)args;
   (void)nargs;
   (void)out;
-  dvm_ref owner=ui_obj(vm,self,"owner","Landroid/widget/ListView;");
+  dvm_ref owner=ui_obj(vm,self,"owner","Landroid/widget/AbsListView;");
   if(!owner)return true;
   dvm_ref adapter=ui_obj(vm,owner,"listAdapter","Landroid/widget/ListAdapter;");
   union dvm_value count= {0};
@@ -19410,7 +19493,7 @@ static bool list_view_set_adapter(struct dvm *vm,dvm_ref self,const union dvm_va
   union dvm_value a= {.l=observer},ignored= {0};
   if(old && observer && !am_vcall(vm,old,"unregisterDataSetObserver",
                                   "(Landroid/database/DataSetObserver;)V",&a,1,&ignored))return false;
-  if(observer)(void)(dvm_set_field)(vm,observer,"owner","Landroid/widget/ListView;",(union dvm_value) {
+  if(observer)(void)(dvm_set_field)(vm,observer,"owner","Landroid/widget/AbsListView;",(union dvm_value) {
     0
   });
   (void)(dvm_set_field)(vm,self,"listObserver","Landroid/database/DataSetObserver;",(union dvm_value) {
@@ -19433,7 +19516,7 @@ static bool list_view_set_adapter(struct dvm *vm,dvm_ref self,const union dvm_va
     rt_set_int(vm,self,"itemCount",count.i);
     observer=dvm_new_object(vm,dvm_find_class(vm,"lunaria/widget/ListDataSetObserver"));
     if(!observer)return false;
-    (void)(dvm_set_field)(vm,observer,"owner","Landroid/widget/ListView;",(union dvm_value) {
+    (void)(dvm_set_field)(vm,observer,"owner","Landroid/widget/AbsListView;",(union dvm_value) {
       .l=self
     });
     (void)(dvm_set_field)(vm,self,"listObserver","Landroid/database/DataSetObserver;",(union dvm_value) {
@@ -19474,6 +19557,60 @@ static bool list_view_last(struct dvm *vm,dvm_ref self,const union dvm_value *ar
   RETI(ui_int(vm,self,"firstPosition")+(l ? (int32_t)l->size : 0)-1);
 }
 
+struct list_cell_layout {
+  struct ui_ms width_spec;
+  int columns, width_padding, column_spacing, column_inset, row_spacing;
+};
+static struct list_cell_layout list_cell_layout(struct dvm *vm, dvm_ref self,
+                                                struct ui_ms ws, const int32_t pad[4])
+{
+  struct list_cell_layout cells = { .width_spec = ws,
+    .columns = 1, .width_padding = pad[0] + pad[2] };
+  if (!ui_is_a(vm, self, "android/widget/GridView")) return cells;
+
+  int columns = ui_int(vm, self, "requestedNumColumns");
+  int width = ui_int(vm, self, "requestedColumnWidth");
+  int gap = ui_int(vm, self, "requestedHorizontalSpacing");
+  int row_gap = ui_int(vm, self, "verticalSpacing");
+  int stretch = ui_int(vm, self, "stretchMode");
+  if (width < 0) width = 0;
+  if (gap < 0) gap = 0;
+  if (row_gap < 0) row_gap = 0;
+  int64_t space = (int64_t)ws.size - cells.width_padding;
+  if (space < 0) space = 0;
+  if (columns == -1)
+    columns = width && ws.mode != UI_MS_UNSPEC
+      ? (int)((space + gap) / ((int64_t)width + gap)) : 2;
+  if (columns < 1) columns = 1;
+
+  int64_t leftover = space - (int64_t)columns * width - (int64_t)(columns - 1) * gap;
+  int inset = 0;
+  if (ws.mode != UI_MS_UNSPEC) {
+    if (stretch == 2 || !width) {
+      int64_t cell_width = (space - (int64_t)(columns - 1) * gap) / columns;
+      width = cell_width > 0 ? (int)cell_width : 0;
+    } else if (stretch == 1 && columns > 1) {
+      int64_t spacing = gap + leftover / (columns - 1);
+      gap = spacing > 0 ? (int)spacing : 0;
+    } else if (stretch == 3) {
+      int64_t spacing = (space - (int64_t)columns * width) / ((int64_t)columns + 1);
+      inset = gap = spacing > 0 ? (int)spacing : 0;
+    }
+  }
+
+  rt_set_int(vm, self, "numColumns", columns);
+  rt_set_int(vm, self, "columnWidth", width);
+  rt_set_int(vm, self, "horizontalSpacing", gap);
+  cells.width_spec = width > 0 || ws.mode != UI_MS_UNSPEC
+    ? ui_ms_make(UI_MS_EXACT, width) : ws;
+  cells.columns = columns;
+  cells.width_padding = 0;
+  cells.column_spacing = gap;
+  cells.column_inset = inset;
+  cells.row_spacing = row_gap;
+  return cells;
+}
+
 struct list_recycle_row {
   dvm_ref view;
   int type;
@@ -19505,9 +19642,14 @@ static void list_view_layout_rows(struct dvm *vm,dvm_ref self,struct ui_ms ws,
   int32_t pad[4];
   ui_pad(vm,self,pad);
   int64_t total=(int64_t)pad[1]+pad[3];
-  int32_t widest=0;
+  const struct list_cell_layout cells=list_cell_layout(vm,self,ws,pad);
+  int32_t widest=0, row_height=0;
+  int column=0;
   for(int position=first; good && adapter && position<count; ++position) {
-    if(position>first && (hs.mode==UI_MS_UNSPEC || total>=hs.size))break;
+    if (position>first && column==0) {
+      if (hs.mode==UI_MS_UNSPEC || total+cells.row_spacing>=hs.size) break;
+      total+=cells.row_spacing;
+    }
     union dvm_value index= {.i=position},type= {0},id= {0},enabled= {0},row= {0};
     good=am_vcall(vm,adapter,"getItemViewType","(I)I",&index,1,&type);
     dvm_ref convert=0;
@@ -19563,7 +19705,7 @@ static void list_view_layout_rows(struct dvm *vm,dvm_ref self,struct ui_ms ws,
     if(!good)break;
     struct ui_lp layout;
     ui_read_lp(vm,row.l,&layout);
-    ui_measure(vm,row.l,ui_child_spec(ws,pad[0]+pad[2],layout.w),
+    ui_measure(vm,row.l,ui_child_spec(cells.width_spec,cells.width_padding,layout.w),
                layout.h>0 ? ui_ms_make(UI_MS_EXACT,layout.h) : ui_ms_make(UI_MS_UNSPEC,0),depth+1);
     if(dvm_exception(vm)) {
       good=false;
@@ -19571,16 +19713,23 @@ static void list_view_layout_rows(struct dvm *vm,dvm_ref self,struct ui_ms ws,
     }
     struct ui_node *node=ui_node(vm,row.l);
     if(node) {
-      node->x=pad[0];
+      int64_t x=(int64_t)pad[0]+cells.column_inset+
+        column*((int64_t)cells.width_spec.size+cells.column_spacing);
+      int64_t right=x-pad[0]+node->w;
+      node->x=x>INT32_MAX ? INT32_MAX : (int32_t)x;
       node->y=(int32_t)(total-pad[3]);
-      total+=node->h;
-      if(node->w>widest)widest=node->w;
+      if(node->h>row_height)row_height=node->h;
+      if(right>widest)widest=right>INT32_MAX ? INT32_MAX : (int32_t)right;
     }
-    if(total>INT32_MAX) {
-      total=INT32_MAX;
-      break;
+    if(++column==cells.columns) {
+      total+=row_height;
+      row_height=0;
+      column=0;
+      if(total>=INT32_MAX)break;
     }
   }
+  total+=row_height;
+  if(total>INT32_MAX)total=INT32_MAX;
   /* Detached rows not selected by the adapter leave the window. Keep their
    * roots alive across guest callbacks and release all pins on every path. */
   dvm_ref exception=dvm_exception(vm);
@@ -19596,7 +19745,8 @@ static void list_view_layout_rows(struct dvm *vm,dvm_ref self,struct ui_ms ws,
   free(pool);
   struct ui_node *node=ui_node(vm,self);
   if(node) {
-    node->w=ui_resolve(widest+pad[0]+pad[2],ws);
+    int64_t used_width=(int64_t)widest+pad[0]+pad[2];
+    node->w=ui_resolve(used_width>INT32_MAX ? INT32_MAX : (int32_t)used_width,ws);
     node->h=ui_resolve((int32_t)total,hs);
   }
 }
@@ -19614,11 +19764,16 @@ static void list_view_measure(struct dvm *vm,dvm_ref self,struct ui_ms ws,
   if(adapter && !am_vcall(vm,adapter,"getCount","()I",NULL,0,&count))return;
   if(generation!=ui_int(vm,self,"dataGeneration"))return;
   rt_set_int(vm,self,"itemCount",count.i);
-  int32_t width=ws.size,height=hs.size,sample_width=0;
+  const struct list_cell_layout cells=list_cell_layout(vm,self,ws,pad);
+  int32_t width=ws.size,height=hs.size,sample_width=0,row_height=0;
   int64_t total=(int64_t)pad[1]+pad[3];
+  int column=0;
   if(adapter && (hs.mode!=UI_MS_EXACT || ws.mode==UI_MS_UNSPEC)) {
     for(int i=0; i<count.i; ++i) {
-      if(i && (hs.mode!=UI_MS_ATMOST || total>=hs.size))break;
+      if (i && column==0) {
+        if (hs.mode!=UI_MS_ATMOST || total+cells.row_spacing>=hs.size) break;
+        total+=cells.row_spacing;
+      }
       union dvm_value args[3]= { {.i=i},{0},{.l=self} },row= {0};
       if(!am_vcall(vm,adapter,"getView","(ILandroid/view/View;Landroid/view/ViewGroup;)Landroid/view/View;",args,3,&row))return;
       if(generation!=ui_int(vm,self,"dataGeneration"))return;
@@ -19628,21 +19783,29 @@ static void list_view_measure(struct dvm *vm,dvm_ref self,struct ui_ms ws,
       }
       struct ui_lp lp;
       ui_read_lp(vm,row.l,&lp);
-      ui_measure(vm,row.l,ui_child_spec(ws,pad[0]+pad[2],lp.w),
+      ui_measure(vm,row.l,ui_child_spec(cells.width_spec,cells.width_padding,lp.w),
                  lp.h>0 ? ui_ms_make(UI_MS_EXACT,lp.h) : ui_ms_make(UI_MS_UNSPEC,0),depth+1);
       if(dvm_exception(vm))return;
       struct ui_node *child=ui_node(vm,row.l);
       if(child) {
-        if(!i)sample_width=child->w;
-        total+=child->h;
+        if(i<cells.columns && child->w>sample_width)sample_width=child->w;
+        if(child->h>row_height)row_height=child->h;
       }
-      if(total>=INT32_MAX) {
-        total=INT32_MAX;
-        break;
+      if(++column==cells.columns) {
+        total+=row_height;
+        row_height=0;
+        column=0;
+        if(total>=INT32_MAX)break;
       }
     }
   }
-  if(ws.mode==UI_MS_UNSPEC)width=sample_width+pad[0]+pad[2];
+  total+=row_height;
+  if(total>INT32_MAX)total=INT32_MAX;
+  if(ws.mode==UI_MS_UNSPEC) {
+    int64_t desired=(int64_t)sample_width*cells.columns+
+      (int64_t)(cells.columns-1)*cells.column_spacing+pad[0]+pad[2];
+    width=desired>INT32_MAX ? INT32_MAX : (int32_t)desired;
+  }
   if(hs.mode!=UI_MS_EXACT)height=ui_resolve((int32_t)total,hs);
   struct ui_node *node=ui_node(vm,self);
   if(node) {

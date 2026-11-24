@@ -888,6 +888,36 @@ static bool x_pb_start(struct dvm *vm, dvm_ref self, const union dvm_value *args
   if (!argv) return false;
   l = list_of(vm, command.l);
   for (uint32_t i = 0; i < l->size; ++i) ((dvm_ref *)dvm_array_data(vm, argv))[i] = l->items[i];
+  const char *program = dvm_string_utf8(vm, l->items[0]);
+  if (program && !strncmp(program, "/data/app/", 10)) {
+    if (l->size > 4096) { dvm__throw(vm,"java/io/IOException","Argument list too long"); return false; }
+    uint32_t count = l->size;
+    char **words = calloc(count, sizeof *words);
+    union dvm_value directory = {0};
+    dvm_get_field(vm,self,"directory","Ljava/io/File;",&directory);
+    const char *path = directory.l ? file_path(vm,directory.l) : NULL;
+    char *cwd = path ? strdup(path) : NULL;
+    bool valid = words && (!path || cwd);
+    for (uint32_t i = 0; valid && i < count; ++i) {
+      const char *word = dvm_string_utf8(vm, l->items[i]);
+      valid = word && (words[i] = strdup(word));
+    }
+    dvm_ref process = valid ? process_new(vm, "") : 0;
+    if (process) dvm_pin(vm,process);
+    unsigned depth = dvm_gil_unlock_all(vm);
+    int tid = process ? arm_exec_java_spawn((const char *const *)words, (int)count, cwd) : -1;
+    for (uint32_t i = 0; words && i < count; ++i) free(words[i]);
+    free(words);
+    free(cwd);
+    dvm_gil_relock(vm,depth);
+    if (process) dvm_unpin(vm,process);
+    if (tid < 0) {
+      dvm__throw(vm,"java/io/IOException","Could not start packaged ARM64 executable");
+      return false;
+    }
+    dvm_set_field(vm,process,"childTid","I",(union dvm_value){.i=tid});
+    RETL(process);
+  }
   const union dvm_value one = { .l = argv };
   return runtime_exec(vm, 0, &one, 1, out);
 }

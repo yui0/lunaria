@@ -736,7 +736,7 @@ $(BUILD_DIR)/luna_ime.o: src/luna_ime.c src/luna_boot.h $(LUNA_UI_DIR)/luna-ui.h
 $(BUILD_DIR)/luna_input.o: src/luna_input.c src/luna_boot.h | $(BUILD_DIR)
 	$(CC) -std=c11 $(OPTFLAGS) -fPIC $(CPPFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/loader.o: src/luna_boot.h
+$(BUILD_DIR)/loader.o: src/luna_boot.h src/lunaria_vpn.h
 
 # The window's compositor (luna_boot.h): in libjvm.so beside the
 # overlay it draws, so both sides reach one instance of it.
@@ -756,6 +756,9 @@ $(BUILD_DIR)/lunaria_os.o: | $(BUILD_DIR)
 $(BUILD_DIR)/lunaria_os.o: $(LUNA_OS_SRC) src/lunaria_os.h src/alsa.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 	    -c $(LUNA_OS_SRC) -o $@
+ifneq (,$(filter src/lunaria_windows.c,$(LUNA_OS_SRC)))
+$(BUILD_DIR)/lunaria_os.o: src/lunaria_windows_poll.h
+endif
 
 $(BUILD_DIR)/lunaria_file.o: src/lunaria_file.c src/lunaria_file.h src/lunaria_os.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -c src/lunaria_file.c -o $@
@@ -846,7 +849,7 @@ $(BUILD_DIR)/wdl_%.o: src/linker/%.c src/linker/linker.h src/lunaria_os.h | $(BU
 	$(CC) $(CFLAGS) $(CPPFLAGS) -D_GNU_SOURCE -DLINKER_DEBUG=1 -DRUNTIMEPATH='"runtime"' \
 	    -Wno-pedantic -Wno-pointer-to-int-cast -Wno-int-to-pointer-cast -Wno-incompatible-pointer-types \
 	    -c $< -o $@
-WINDOWS_JVM_SRC = src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC)
+WINDOWS_JVM_SRC = src/jvm/jvm.c src/jvm/jni_stubs.c src/jvm/packages.c $(DVM_SRC) src/lunaria_vpn_windows.c
 WINDOWS_JVM_UI = $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o $(BUILD_DIR)/luna_ime.o $(BUILD_DIR)/luna_compositor.o $(BUILD_DIR)/luna_input.o
 WINDOWS_JVM_OBJS = $(foreach s,$(WINDOWS_JVM_SRC),$(BUILD_DIR)/wj_$(subst /,_,$(patsubst %.c,%.o,$(s))))
 define WINDOWS_JVM_COMPILE
@@ -854,6 +857,7 @@ $(BUILD_DIR)/wj_$(subst /,_,$(patsubst %.c,%.o,$(1))): $(1) $$(DVM_HDR) src/jvm/
 	$$(CC) $$(CFLAGS) $$(CPPFLAGS) -D_GNU_SOURCE -Wno-pedantic -c $(1) -o $$@
 endef
 $(foreach s,$(WINDOWS_JVM_SRC),$(eval $(call WINDOWS_JVM_COMPILE,$(s))))
+$(BUILD_DIR)/wj_src_luna_process_ipc.o: src/luna_process_ipc_windows.h src/lunaria_os.h src/luna_google.h
 HOST_DL_LIBS = $(WINDOWS_DL_OBJS)
 HOST_JVM_LIB = $(WINDOWS_JVM_OBJS) $(WINDOWS_JVM_UI)
 $(HOST_EXPORT): scripts/windows-exports.py $(LUNARIA_OBJECTS) $(HOST_DL_LIBS) $(HOST_JVM_LIB) $(WINDOWS_STUB_OBJECTS)

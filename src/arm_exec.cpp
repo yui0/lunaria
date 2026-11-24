@@ -1816,6 +1816,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"setegid",                 SVC_SETGID},
   {"setreuid",                SVC_SETREUID},
   {"setregid",                SVC_SETREGID},
+  {"setgroups",               SVC_RETM1_EPERM}, /* app processes have no CAP_SETGID */
   {"sync",                    SVC_RET0},
   {"raise",                   SVC_RAISE},
   {"kill",                    SVC_KILL},
@@ -2050,6 +2051,9 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
   {"mkstemps",                SVC_MKSTEMPS},
   {"mkdtemp",                 SVC_MKDTEMP},
   {"getaddrinfo",             SVC_NET_GETADDRINFO},
+#ifdef _WIN32
+  {"res_search",              SVC_NET_RES_SEARCH},
+#endif
   {"android_getaddrinfofornet", SVC_NET_GETADDRINFOFORNET},
   {"gethostbyname",           SVC_NET_GETHOSTBYNAME},
   {"gethostbyname2",          SVC_NET_GETHOSTBYNAME},
@@ -7108,6 +7112,26 @@ static uint32_t g_main_pgid = GUEST_PPID;
 static uint32_t g_main_sid = GUEST_PPID;
 /* Set once, before creating TLS, threads, /proc records or JIT stubs. The
  * process broker reserves 4096 consecutive IDs for each independent VM. */
+/* liblog is a separate destination from a guest's fd 2. Go on Android
+ * redirects fd 2 into a pipe and sends each line it reads to liblog. */
+static FILE *arm_android_log_stream()
+{
+  static FILE *stream = []() -> FILE * {
+    int fd = luna_fd_dup(fileno(stderr), 3, 1);
+    if (fd >= 0) {
+      FILE *file = fdopen(fd, "w");
+      if (file) return file;
+      luna_fd_close(fd);
+    }
+#ifdef _WIN32
+    return fopen("NUL", "w");
+#else
+    return fopen("/dev/null", "w");
+#endif
+  }();
+  return stream;
+}
+
 static int guest_process_identity_init(void)
 {
   const char *base = getenv("LUNARIA_GUEST_TID_BASE");
@@ -11871,9 +11895,59 @@ static void alarm_check(ArmExecCtx &ctx) {
     fprintf(stderr, "[alarm] expired: SIGALRM to tid=%u\n", g_alarm_tid);
   guest_raise_signal(ctx, g_alarm_tid, GUEST_SIGALRM);
 }
+#ifdef _WIN32
+struct GuestSignalFd { uint32_t pid; uint64_t mask; int reader, writer; };
+static std::mutex signal_fd_lock;
+static std::vector<GuestSignalFd *> signal_fds;
+static void guest_signal_fd_close(void *p)
+{
+  auto *s = static_cast<GuestSignalFd *>(p);
+  {
+    std::lock_guard<std::mutex> guard(signal_fd_lock);
+    signal_fds.erase(std::remove(signal_fds.begin(),signal_fds.end(),s),signal_fds.end());
+  }
+  luna_fd_close(s->writer);
+  delete s;
+}
+static int guest_signal_fd_open(int fd, uint64_t mask, int flags)
+{
+  if (flags & ~(0x800|0x80000)) { errno=EINVAL; return -1; }
+  if (fd != -1) {
+    std::lock_guard<std::mutex> guard(signal_fd_lock);
+    for(auto *s : signal_fds) if(s->reader == fd && s->pid == guest_pid()) { s->mask=mask; return fd; }
+    errno=EINVAL; return -1;
+  }
+  int pair[2];
+  if (luna_socket_pair(AF_UNIX,SOCK_DGRAM,0,pair)) return -1;
+  auto *s = new GuestSignalFd{guest_pid(),mask,pair[0],pair[1]};
+  if (luna_fd_nonblock(pair[1],1) || luna_fd_nonblock(pair[0],!!(flags&0x800)) ||
+      luna_socket_on_last_close(pair[0],guest_signal_fd_close,s)) {
+    int e=errno; luna_fd_close(pair[0]); luna_fd_close(pair[1]); delete s; errno=e; return -1;
+  }
+  std::lock_guard<std::mutex> guard(signal_fd_lock);
+  signal_fds.push_back(s);
+  return pair[0];
+}
+static bool guest_signal_fd_deliver(uint32_t pid, int sig)
+{
+  std::lock_guard<std::mutex> guard(signal_fd_lock);
+  for(auto *s : signal_fds) if (s->pid == pid && (s->mask & (UINT64_C(1) << (sig-1)))) {
+    uint32_t info[32] = {};
+    info[0] = sig;
+    info[3] = guest_pid();
+    info[4] = arm_exec_guest_uid();
+    if(luna_socket_send(s->writer,info,sizeof info,0) == sizeof info) return true;
+  }
+  return false;
+}
+#endif
 static void guest_raise_signal(ArmExecCtx &ctx, uint32_t tid, int sig) {
   if (sig <= 0 || sig > 64) return;
   ArmThread *target = arm_thread_by_tid(tid);
+#ifdef _WIN32
+  if ((signal_mask_load(tid) & (UINT64_C(1) << (sig-1))) &&
+      guest_signal_fd_deliver(target ? target->process_pid : GUEST_TID_BASE,sig)) return;
+#endif
   if (!target) {
     /* The main thread: 0 internally (legacy TLS alias 1). */
     if (tid == 0 || tid == 1)
@@ -22819,6 +22893,26 @@ extern "C" void arm_exec_note_destructive(const char *what, const char *host_pat
  * chdir, a handful over a run), which is what makes the read side a plain
  * load. */
 static std::atomic<const char *> g_guest_cwd{"/"};
+static std::mutex child_directory_lock;
+static std::map<uint32_t,const char *> child_directories;
+static std::atomic<bool> have_child_directories{false};
+static std::set<std::string> exec_directories;
+static const char *guest_working_directory()
+{
+  if (g_current_tid && have_child_directories.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> guard(child_directory_lock);
+    auto it = child_directories.find(guest_pid());
+    if (it != child_directories.end()) return it->second;
+  }
+  return g_guest_cwd.load(std::memory_order_acquire);
+}
+static void set_guest_directory(const char *cwd)
+{
+  std::lock_guard<std::mutex> guard(child_directory_lock);
+  auto it = child_directories.find(guest_pid());
+  if (it != child_directories.end()) it->second = cwd;
+  else g_guest_cwd.store(cwd, std::memory_order_release);
+}
 
 /* Collapse "//", "." and ".." in an absolute guest path, in place. */
 static void guest_path_normalize(char *p) {
@@ -22895,7 +22989,7 @@ static void guest_abs_path(const char *path, char *out, size_t outsz) {
   if (path[0] == '/') {
     snprintf(out, outsz, "%s", path);
   } else {
-    const char *cwd = g_guest_cwd.load(std::memory_order_acquire);
+    const char *cwd = guest_working_directory();
     snprintf(out, outsz, "%s%s%s", cwd,
              cwd[0] && cwd[strlen(cwd) - 1] == '/' ? "" : "/", path);
   }
@@ -23461,7 +23555,7 @@ static ptrdiff_t synth_proc_readlink(const char *path, char *out, size_t cap)
     snprintf(text, sizeof text, "%s", g_guest_proc_arm64
              ? "/system/bin/app_process64" : "/system/bin/app_process32");
   } else if (!strcmp(tail, "cwd")) {
-    snprintf(text, sizeof text, "%s", g_guest_cwd.load(std::memory_order_acquire));
+    snprintf(text, sizeof text, "%s", guest_working_directory());
   } else if (!strcmp(tail, "root")) {
     snprintf(text, sizeof text, "/");
   } else if (!strncmp(tail, "fd/", 3) && tail[3]) {
@@ -23592,7 +23686,7 @@ static const char *map_guest_path(const char *path,char *buf,size_t capacity)
   if (apk_path_locate(path,apk_host,sizeof apk_host,&apk_inner)) return guest_path_result(map_guest_path_raw(path,buf,capacity),buf,capacity);
   char absolute[PATH_MAX],resolved[PATH_MAX];
   if (path[0]=='/') snprintf(absolute,sizeof absolute,"%s",path);
-  else snprintf(absolute,sizeof absolute,"%s/%s",g_guest_cwd.load(std::memory_order_acquire),path);
+  else snprintf(absolute,sizeof absolute,"%s/%s",guest_working_directory(),path);
   /* procfs components belong to the virtual namespace, not the host
    * symlink walker (which cannot resolve the guest's self or PID entries). */
   if (path_under(absolute,"/proc",5)) {
@@ -23658,7 +23752,7 @@ extern "C" const char *arm_exec_canonical_guest_path(const char *path,char *buf,
   (void)map_guest_path("/",initialized,sizeof initialized);
   char absolute[PATH_MAX];
   int n=path[0]=='/' ? snprintf(absolute,sizeof absolute,"%s",path) :
-        snprintf(absolute,sizeof absolute,"%s/%s",g_guest_cwd.load(std::memory_order_acquire),path);
+        snprintf(absolute,sizeof absolute,"%s/%s",guest_working_directory(),path);
   if(n<0 || (size_t)n>=sizeof absolute) {
     errno=ENAMETOOLONG;
     return nullptr;
@@ -23709,7 +23803,7 @@ extern "C" const char *arm_exec_map_guest_path(const char *path, char *buf,
  * Defined next to the ELF loader further down; declared here because the
  * device shell, system() and execve() all reach it before that point. */
 static int guest_program_spawn(const std::vector<std::string> &words,
-                               uint32_t parent_tid, uint32_t *child_tid);
+                               uint32_t parent_tid, uint32_t *child_tid, const char *cwd = nullptr);
 static bool guest_program_become(const std::vector<std::string> &words);
 
 /* "The answer is not ready": the calling guest thread has been parked on a
@@ -26618,7 +26712,7 @@ static void wapi_trace_caller(ArmExecCtx &ctx, std::array<uint64_t,16> &regs,
 // Guest networking: host O_NONBLOCK + slice wait; marshal pointer-width structs.
 namespace guest_net {
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 static int guest_family_to_host(int family) {
   switch (family) {
   case 1:
@@ -26884,7 +26978,36 @@ static void fixup_host_sockaddr_for_guest(void *vp, socklen_t alen) {
   std::memcpy(vp, &guest_family, sizeof guest_family);
 }
 #elif defined(_WIN32)
-static void map_unix_socket_path(struct sockaddr_storage &, socklen_t &) {}
+static void map_unix_socket_path(struct sockaddr_storage &ss, socklen_t &length) {
+  if (ss.ss_family != AF_UNIX) return;
+  auto &un = reinterpret_cast<sockaddr_un &>(ss);
+  size_t head = offsetof(sockaddr_un, sun_path);
+  if (length <= head) return;
+  size_t n = std::min<size_t>(sizeof un.sun_path, length - head);
+  std::string name;
+  if (!un.sun_path[0]) name.assign(un.sun_path, n);
+  else {
+    char full[PATH_MAX];
+    std::string path(un.sun_path, strnlen(un.sun_path, n));
+    if (path[0] != '/') path = std::string(guest_working_directory()) + "/" + path;
+    if (path.size() >= sizeof full) { ss.ss_family = AF_UNSPEC; return; }
+    memcpy(full, path.c_str(), path.size() + 1);
+    guest_path_normalize(full);
+    name = full;
+  }
+  const char *root = lunaria_env("LUNARIA_DATA_ROOT");
+  if (root) { name += '\0'; name += root; }
+  uint64_t hash = UINT64_C(14695981039346656037);
+  for (unsigned char ch : name) hash = (hash ^ ch) * UINT64_C(1099511628211);
+  char dir[MAX_PATH];
+  DWORD used = GetTempPathA(sizeof dir, dir);
+  if (!used || used >= sizeof dir || snprintf(un.sun_path, sizeof un.sun_path,
+      "%slunaria-s-%016llx", dir, (unsigned long long)hash) >= (int)sizeof un.sun_path) {
+    ss.ss_family = AF_UNSPEC;
+    return;
+  }
+  length = sizeof un;
+}
 static void clear_stale_unix_socket(const struct sockaddr_storage &, socklen_t) {}
 static void fixup_guest_sockaddr(struct sockaddr_storage &ss, socklen_t length) {
   if (length < 2) return;
@@ -26955,6 +27078,10 @@ static int fixup_guest_sockopt_level(int guest_level) {
   return guest_level == 1 /* Linux SOL_SOCKET */ ? SOL_SOCKET : guest_level;
 }
 static int fixup_guest_sockopt_name(int guest_level, int guest_name) {
+#ifdef _WIN32
+  if (guest_level == IPPROTO_IP && guest_name == 8 /* Android IP_PKTINFO */) return IP_PKTINFO;
+  if (guest_level == IPPROTO_IPV6 && guest_name == 26) return IPV6_V6ONLY;
+#endif
   if (guest_level != 1 /* Linux SOL_SOCKET */) return guest_name;
   switch (guest_name) {
   case 1:
@@ -27442,60 +27569,53 @@ struct FdWaitSelectCtx {
   int nfds;
   GuestVA rp, wp, ep;
 };
-static int fd_wait_select_ready(void *vp) {
-  auto *c = static_cast<FdWaitSelectCtx *>(vp);
-  fd_set r2, w2, e2;
-  fd_set r_in, w_in, e_in;
-  auto load = [c](GuestVA p, fd_set &s) {
-    FD_ZERO(&s);
-    if (p) std::memcpy(&s, c->ctx->mem.ptr(p), sizeof(fd_set));
-  };
-  load(c->rp, r2);
-  load(c->wp, w2);
-  load(c->ep, e2);
-  r_in = r2;
-  w_in = w2;
-  e_in = e2;   /* the guest's own request, for the check below */
-  struct timeval z {
-    0, 0
-  };
-  int rc = ::select(c->nfds, c->rp ? &r2 : nullptr, c->wp ? &w2 : nullptr,
-                    c->ep ? &e2 : nullptr, &z);
-  /* This is the check that runs every scheduler pass for a parked
-   * select() — see fd_wait_poll_ready and SockState::sync_connect_failed
-   * just above for why a real select() alone would never wake this
-   * thread up for a socket whose connect() already failed. */
-  for (int fd = 0; fd < c->nfds; ++fd) {
-    const SockState *s = state(fd);
-    if (!s || !s->sync_connect_failed) continue;
-    if (c->rp && FD_ISSET(fd, &r_in) && !FD_ISSET(fd, &r2)) {
-      FD_SET(fd, &r2);
-      ++rc;
-    }
-    if (c->wp && FD_ISSET(fd, &w_in) && !FD_ISSET(fd, &w2)) {
-      FD_SET(fd, &w2);
-      ++rc;
-    }
-    if (c->ep && FD_ISSET(fd, &e_in) && !FD_ISSET(fd, &e2)) {
-      FD_SET(fd, &e2);
-      ++rc;
-    }
-  }
-  if (rc > 0) {
-    if (c->rp) std::memcpy(c->ctx->mem.ptr(c->rp), &r2, sizeof(fd_set));
-    if (c->wp) std::memcpy(c->ctx->mem.ptr(c->wp), &w2, sizeof(fd_set));
-    if (c->ep) std::memcpy(c->ctx->mem.ptr(c->ep), &e2, sizeof(fd_set));
-  }
-  return rc;
+static short guest_select_events(const FdWaitSelectCtx &c, int fd)
+{
+  auto wants = [&](GuestVA p) { return p && (c.ctx->mem.ptr(p)[fd / 8] & (1u << (fd % 8))); };
+  return (wants(c.rp) ? POLLIN : 0) | (wants(c.wp) ? POLLOUT : 0) | (wants(c.ep) ? POLLPRI : 0);
 }
-static int fd_wait_select_expire(void *vp) {
-  auto *c = static_cast<FdWaitSelectCtx *>(vp);
-  fd_set z;
-  FD_ZERO(&z);
-  if (c->rp) std::memcpy(c->ctx->mem.ptr(c->rp), &z, sizeof(fd_set));
-  if (c->wp) std::memcpy(c->ctx->mem.ptr(c->wp), &z, sizeof(fd_set));
-  if (c->ep) std::memcpy(c->ctx->mem.ptr(c->ep), &z, sizeof(fd_set));
+static int fd_wait_select_expire(void *vp)
+{
+  auto &c = *static_cast<FdWaitSelectCtx *>(vp);
+  unsigned word = c.ctx->is_arm64 ? 8 : 4;
+  size_t bytes = (c.nfds + word * 8 - 1) / (word * 8) * word;
+  for (GuestVA p : {c.rp,c.wp,c.ep}) if (p) memset(c.ctx->mem.ptr(p),0,bytes);
   return 0;
+}
+static int fd_wait_select_ready(void *vp)
+{
+  auto &c = *static_cast<FdWaitSelectCtx *>(vp);
+  struct pollfd fds[1024];
+  int n = 0;
+  for (int fd = 0; fd < c.nfds; ++fd) {
+    short events = guest_select_events(c,fd);
+    if (events) fds[n++] = luna_pollfd_make(fd,events);
+  }
+  if (!n) return 0;
+  int rc = luna_socket_poll(fds,n,0);
+  if (rc < 0) return -1;
+  for (int i = 0; i < n; ++i) {
+    if (fds[i].revents & POLLNVAL) { errno = EBADF; return -1; }
+    const SockState *state_ptr = state((int)fds[i].fd);
+    if (state_ptr && state_ptr->sync_connect_failed) fds[i].revents |= POLLERR;
+  }
+  unsigned char ready[3][128] = {};
+  int count = 0;
+  for (int i = 0; i < n; ++i) {
+    int fd = (int)fds[i].fd;
+    short re = fds[i].revents, requested = fds[i].events;
+    short matched[] = {short((requested & POLLIN) && (re & (POLLIN|POLLERR|POLLHUP))),
+                       short((requested & POLLOUT) && (re & (POLLOUT|POLLERR))),
+                       short((requested & POLLPRI) && (re & POLLPRI))};
+    for (int j=0;j<3;++j) if (matched[j]) { ready[j][fd/8] |= 1u << (fd % 8); ++count; }
+  }
+  if (count) {
+    unsigned word = c.ctx->is_arm64 ? 8 : 4;
+    size_t bytes = (c.nfds + word*8 - 1)/(word*8)*word;
+    GuestVA dst[] = {c.rp,c.wp,c.ep};
+    for(int j=0;j<3;++j) if(dst[j]) memcpy(c.ctx->mem.ptr(dst[j]),ready[j],bytes);
+  }
+  return count;
 }
 static void fd_wait_free_select(void *vp) {
   delete static_cast<FdWaitSelectCtx *>(vp);
@@ -28081,13 +28201,8 @@ static void fd_deadline_republish(void)
       if (!fd_monitor_append(&fds, &count, &capacity, &p, 1)) collected = false;
     } else if (w.ready == guest_net::fd_wait_select_ready) {
       const guest_net::FdWaitSelectCtx *c = (const guest_net::FdWaitSelectCtx *)w.ctx;
-      const fd_set *r = c->rp ? (const fd_set *)c->ctx->mem.ptr(c->rp) : NULL;
-      const fd_set *v = c->wp ? (const fd_set *)c->ctx->mem.ptr(c->wp) : NULL;
-      const fd_set *e = c->ep ? (const fd_set *)c->ctx->mem.ptr(c->ep) : NULL;
-      for (int fd = 0; fd < c->nfds && fd < FD_SETSIZE; ++fd) {
-        short events = (r && FD_ISSET(fd, r) ? POLLIN : 0) |
-                       (v && FD_ISSET(fd, v) ? POLLOUT : 0) |
-                       (e && FD_ISSET(fd, e) ? POLLPRI : 0);
+      for (int fd = 0; fd < c->nfds; ++fd) {
+        short events = guest_net::guest_select_events(*c,fd);
         if (!events) continue;
         struct pollfd p = luna_pollfd_make(fd, events);
         if (!fd_monitor_append(&fds, &count, &capacity, &p, 1)) collected = false;
@@ -32779,6 +32894,24 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
         ret64((uint64_t)-(int64_t)e);
       }
     };
+    /* Go issues socket syscalls directly. Use the same descriptor and
+     * sockaddr translations as a guest calling bionic's socket functions. */
+    if (nr == (ctx.is_arm64 ? 200u : 282u)) {
+      raw_via_libc(SVC_NET_BIND);
+      break;
+    }
+    if (nr == (ctx.is_arm64 ? 201u : 284u)) {
+      raw_via_libc(SVC_NET_LISTEN);
+      break;
+    }
+    if (nr == (ctx.is_arm64 ? 204u : 286u)) {
+      raw_via_libc(SVC_NET_GETSOCKNAME);
+      break;
+    }
+    if (nr == (ctx.is_arm64 ? 205u : 287u)) {
+      raw_via_libc(SVC_NET_GETPEERNAME);
+      break;
+    }
     if (nr == (ctx.is_arm64 ? 50u : 133u)) {
       raw_via_libc(SVC_FCHDIR);
       break;
@@ -33369,8 +33502,8 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
                    ss && ss->peer[0] ? ss->peer : "",
                    (unsigned long long)lr);
           w.fds = desc;
-          fprintf(stderr, "[fd-park] tid=%u raw read%s\n",
-                  g_current_tid, desc);
+          if (guest_net::trace())
+            fprintf(stderr, "[fd-park] tid=%u raw read%s\n", g_current_tid, desc);
           guest_net::g_fd_waits[g_current_tid] = std::move(w);
           for (auto &t : g_threads)
             if (t.id == g_current_tid) {
@@ -34267,7 +34400,16 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
         hm.msg_name = &ss;
         hm.msg_namelen = namelen;
       }
+#ifdef _WIN32
+      const GuestVA control = guest_net::get_ptr(ctx, mh + 4 * W);
+      const size_t control_capacity = ctx.mem.read64(mh + 5 * W);
+#endif
       auto once = [&]() -> ssize_t {
+#ifdef _WIN32
+        hm.msg_control = control ? ctx.mem.ptr(control) : nullptr;
+        hm.msg_controllen = control_capacity;
+#endif
+        hm.msg_namelen = hm.msg_name ? namelen : 0;
         return nr == 211 ? ::luna_android_socket_sendmsg(fd, &hm, flags) : ::luna_android_socket_recvmsg(fd, &hm, flags);
       };
       ssize_t n = once();
@@ -34312,8 +34454,10 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
         memcpy(ctx.mem.ptr(name_va), &ss,
                hm.msg_namelen < namelen ? hm.msg_namelen : namelen);
         ctx.mem.write32(mh + W, hm.msg_namelen);
-        ctx.mem.write32(mh + 4 * W, 0);
-        ctx.mem.write32(mh + 6 * W, (uint32_t)(hm.msg_flags & ~LUNA_ANDROID_MSG_CTRUNC));
+      }
+      if (nr == 212) {
+        ctx.mem.write64(mh + 5 * W, hm.msg_controllen);
+        ctx.mem.write32(mh + 6 * W, (uint32_t)hm.msg_flags);
       }
       ret64((uint64_t)n);
       break;
@@ -35482,8 +35626,8 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
                         "r1=0x%08" PRIx64 " lr=0x%08x tid=%u (#%u)\n",
                 nr, r0, r1, lr, g_current_tid, raw_ctr);
       ++raw_ctr;
-      if (ctx.is_arm64) ret64((uint64_t)-(int64_t)ENOSYS);
-      else              ret32((uint32_t)-(int32_t)ENOSYS);
+      if (ctx.is_arm64) ret64((uint64_t)guest_syscall_errno(ENOSYS));
+      else              ret32((uint32_t)guest_syscall_errno(ENOSYS));
       break;
     }
     }
@@ -37883,7 +38027,7 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
       ArmVarArgs ap = make_arm_varargs(ctx, regs, 3, 13, false);
       message = arm_vformat(ctx, fmt, ap);
     }
-    luna_log_assert_write(condition, tag, fmt ? message.c_str() : NULL);
+    luna_log_assert_to(arm_android_log_stream(), condition, tag, fmt ? message.c_str() : NULL);
     dispatch_svc_general(ctx, SVC_ABORT, regs);
     break;
   }
@@ -37895,10 +38039,12 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     ArmVarArgs ap=make_arm_varargs(ctx,regs,shift+3,13,false);
     std::string s=arm_vformat(ctx,fmt,ap);
     if (s.size()>1023) s.resize(1023); /* Android LOG_BUF_SIZE includes NUL. */
-    if (shift) fprintf(stderr,"[android_log b=%d p=%d t=%s lr=0x%08x] %s\n",
+    FILE *log = arm_android_log_stream();
+    if (shift) fprintf(log,"[android_log b=%d p=%d t=%s lr=0x%08x] %s\n",
                        (int32_t)r0,(int32_t)r1,tag ? tag : "?",lr,s.c_str());
-    else fprintf(stderr,"[android_log p=%d t=%s lr=0x%08x] %s\n",
+    else fprintf(log,"[android_log p=%d t=%s lr=0x%08x] %s\n",
                  (int32_t)r0,tag ? tag : "?",lr,s.c_str());
+    fflush(log);
     wapi_trace_caller(ctx,regs,s.c_str());
     ret32(1);
     break;
@@ -37908,10 +38054,12 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     const unsigned shift=svc_no==SVC_LOG_BUF_WRITE ? 1u : 0u;
     const char *tag=ctx.mem.cstr(argp_n(shift+1));
     const char *msg=ctx.mem.cstr(argp_n(shift+2));
-    if (shift) fprintf(stderr,"[android_log b=%d p=%d t=%s] %s\n",
+    FILE *log = arm_android_log_stream();
+    if (shift) fprintf(log,"[android_log b=%d p=%d t=%s] %s\n",
                        (int32_t)r0,(int32_t)r1,tag ? tag : "?",msg ? msg : "");
-    else fprintf(stderr,"[android_log p=%d t=%s] %s\n",
+    else fprintf(log,"[android_log p=%d t=%s] %s\n",
                  (int32_t)r0,tag ? tag : "?",msg ? msg : "");
+    fflush(log);
     wapi_trace_caller(ctx,regs,msg ? msg : "");
     ret32(1);
     break;
@@ -43598,8 +43746,8 @@ aaudio_write_retry:
     int fd = (int)(int32_t)arg32(0);
     GuestVA set_va = argp(1);
     size_t setsize = (size_t)arg32(2);
-    if (set_va && setsize >= sizeof(fd_set) && fd >= 0 && fd < FD_SETSIZE)
-      FD_SET(fd, (fd_set *)ctx.mem.ptr(set_va));
+    if (set_va && setsize >= 128 && fd >= 0 && fd < 1024)
+      ctx.mem.ptr(set_va)[fd / 8] |= 1u << (fd % 8);
     ret32(0u);
     break;
   }
@@ -43608,8 +43756,8 @@ aaudio_write_retry:
     GuestVA set_va = argp(1);
     size_t setsize = (size_t)arg32(2);
     int v = 0;
-    if (set_va && setsize >= sizeof(fd_set) && fd >= 0 && fd < FD_SETSIZE)
-      v = FD_ISSET(fd, (fd_set *)ctx.mem.ptr(set_va)) ? 1 : 0;
+    if (set_va && setsize >= 128 && fd >= 0 && fd < 1024)
+      v = (ctx.mem.ptr(set_va)[fd / 8] >> (fd % 8)) & 1;
     ret32((uint32_t)v);
     break;
   }
@@ -43617,19 +43765,15 @@ aaudio_write_retry:
     int fd = (int)(int32_t)arg32(0);
     GuestVA set_va = argp(1);
     size_t setsize = (size_t)arg32(2);
-    if (set_va && setsize >= sizeof(fd_set) && fd >= 0 && fd < FD_SETSIZE)
-      FD_CLR(fd, (fd_set *)ctx.mem.ptr(set_va));
+    if (set_va && setsize >= 128 && fd >= 0 && fd < 1024)
+      ctx.mem.ptr(set_va)[fd / 8] &= ~(1u << (fd % 8));
     ret32(0u);
     break;
   }
   case SVC_FD_ZERO_CHK: {
     GuestVA set_va = argp(0);
     size_t setsize = (size_t)arg32(1);
-    if (set_va && setsize >= sizeof(fd_set)) {
-      fd_set z;
-      FD_ZERO(&z);
-      std::memcpy(ctx.mem.ptr(set_va), &z, sizeof(z));
-    }
+    if (set_va && setsize >= 128) memset(ctx.mem.ptr(set_va),0,128);
     ret32(0u);
     break;
   }
@@ -44006,8 +44150,42 @@ aaudio_write_retry:
         }
         std::memcpy(&ss, ctx.mem.ptr(sa), alen);
         fixup_guest_sockaddr(ss, alen);  /* see SVC_NET_CONNECT */
+        /* When an app is run for local use, keep wildcard listeners on
+         * the host loopback interfaces. Explicit addresses are unchanged. */
+        if (lunaria_env_long("LUNARIA_LOOPBACK_WILDCARD_BIND", 0) == 1) {
+          if (ss.ss_family == AF_INET && alen >= sizeof(sockaddr_in)) {
+            auto &addr = reinterpret_cast<sockaddr_in &>(ss).sin_addr;
+            if (addr.s_addr == htonl(INADDR_ANY)) addr.s_addr = htonl(INADDR_LOOPBACK);
+          } else if (ss.ss_family == AF_INET6 && alen >= sizeof(sockaddr_in6)) {
+            auto &addr = reinterpret_cast<sockaddr_in6 &>(ss).sin6_addr;
+            const uint8_t mapped_prefix[12] = {0,0,0,0,0,0,0,0,0,0,255,255};
+            const bool mapped = !memcmp(&addr,mapped_prefix,sizeof mapped_prefix);
+            uint32_t ipv4 = 0;
+            memcpy(&ipv4,addr.s6_addr + 12,sizeof ipv4);
+            if (IN6_IS_ADDR_UNSPECIFIED(&addr) || (mapped && !ipv4)) {
+              int only_v6 = 1;
+              socklen_t size = sizeof only_v6;
+              if (luna_socket_get_option(fd,IPPROTO_IPV6,IPV6_V6ONLY,&only_v6,&size)) {
+                fail(errno);
+                break;
+              }
+              if (only_v6) addr = in6addr_loopback;
+              else {
+                /* Android clients commonly dial 127.0.0.1 even when Go
+                 * creates its wildcard listener on a dual-stack socket. */
+                ipv4 = htonl(INADDR_LOOPBACK);
+                memcpy(&addr,mapped_prefix,sizeof mapped_prefix);
+                memcpy(addr.s6_addr + 12,&ipv4,sizeof ipv4);
+              }
+            }
+          }
+        }
         map_unix_socket_path(ss, alen);
         clear_stale_unix_socket(ss, alen);
+#ifdef _WIN32
+        if (ss.ss_family == AF_UNIX) rc = luna_local_bind(fd, (const sockaddr_un *)&ss);
+        else
+#endif
         rc = ::luna_socket_bind(fd, (struct sockaddr *)&ss, alen);
         if (trace() || ss.ss_family == AF_UNIX) {
           if (ss.ss_family == AF_UNIX) {
@@ -44584,7 +44762,7 @@ aaudio_write_retry:
     case SVC_NET_SELECT: {
       // select(nfds, readfds, writefds, exceptfds, timeout).
       int nfds = (int)r0;
-      if (nfds < 0 || nfds > FD_SETSIZE) nfds = FD_SETSIZE;
+      if (nfds < 0 || nfds > 1024) { fail(EINVAL); break; }
       GuestVA rp = argp(1), wp = argp(2), ep = argp(3), tp = argp_n(4);
       /* pselect6 arrives here with its timeout already in milliseconds:
        * its struct timespec is not the struct timeval this reads. */
@@ -44596,70 +44774,9 @@ aaudio_write_retry:
       /* The guest's fd_sets are both the input and the output, so a
        * select that finds nothing must leave them untouched until it
        * gives up — only then are they cleared. */
-      ArmExecCtx *cp = &ctx;
-      auto select_once = [cp, nfds, rp, wp, ep]() -> int {
-        fd_set r2, w2, e2;
-        auto ld = [cp](GuestVA p, fd_set &s) {
-          FD_ZERO(&s);
-          if (p) std::memcpy(&s, cp->mem.ptr(p), sizeof(fd_set));
-        };
-        ld(rp, r2);
-        ld(wp, w2);
-        ld(ep, e2);
-        struct timeval z{0, 0};
-        int rc = ::select(nfds, rp ? &r2 : nullptr, wp ? &w2 : nullptr,
-                          ep ? &e2 : nullptr, &z);
-        /* See poll_once()'s matching check just above and
-         * SockState::sync_connect_failed: this host's select() is as
-         * blind to a synchronously-failed connect() as its poll() is. */
-        for (int fd = 0; fd < nfds; ++fd) {
-          const SockState *s = state(fd);
-          if (!s || !s->sync_connect_failed) continue;
-          bool added = false;
-          if (rp && FD_ISSET(fd, &r2) == 0) {
-            fd_set orig;
-            FD_ZERO(&orig);
-            std::memcpy(&orig, cp->mem.ptr(rp), sizeof(fd_set));
-            if (FD_ISSET(fd, &orig)) {
-              FD_SET(fd, &r2);
-              added = true;
-            }
-          }
-          if (wp && FD_ISSET(fd, &w2) == 0) {
-            fd_set orig;
-            FD_ZERO(&orig);
-            std::memcpy(&orig, cp->mem.ptr(wp), sizeof(fd_set));
-            if (FD_ISSET(fd, &orig)) {
-              FD_SET(fd, &w2);
-              added = true;
-            }
-          }
-          if (ep && FD_ISSET(fd, &e2) == 0) {
-            fd_set orig;
-            FD_ZERO(&orig);
-            std::memcpy(&orig, cp->mem.ptr(ep), sizeof(fd_set));
-            if (FD_ISSET(fd, &orig)) {
-              FD_SET(fd, &e2);
-              added = true;
-            }
-          }
-          if (added) ++rc;
-        }
-        if (rc > 0) {
-          if (rp) std::memcpy(cp->mem.ptr(rp), &r2, sizeof(fd_set));
-          if (wp) std::memcpy(cp->mem.ptr(wp), &w2, sizeof(fd_set));
-          if (ep) std::memcpy(cp->mem.ptr(ep), &e2, sizeof(fd_set));
-        }
-        return rc;
-      };
-      auto select_clear = [cp, rp, wp, ep]() -> int {
-        fd_set z;
-        FD_ZERO(&z);
-        if (rp) std::memcpy(cp->mem.ptr(rp), &z, sizeof(fd_set));
-        if (wp) std::memcpy(cp->mem.ptr(wp), &z, sizeof(fd_set));
-        if (ep) std::memcpy(cp->mem.ptr(ep), &z, sizeof(fd_set));
-        return 0;
-      };
+      FdWaitSelectCtx request{&ctx,nfds,rp,wp,ep};
+      auto select_once = [&]() { return fd_wait_select_ready(&request); };
+      auto select_clear = [&]() { return fd_wait_select_expire(&request); };
       int rc = select_once();
       if (rc < 0) {
         fail(errno);
@@ -45283,6 +45400,59 @@ aaudio_write_retry:
       retptr(he);
       break;
     }
+#ifdef _WIN32
+    case SVC_NET_RES_SEARCH: {
+      const GuestVA name_va = argp(0), answer_va = argp(3);
+      const uint32_t dns_class = arg32(1), type = arg32(2);
+      const int32_t requested = (int32_t)arg32(4);
+      if (dns_class != 1 || !type || type > UINT16_MAX || requested <= 0) {
+        arm_set_h_errno(ctx, GUEST_NO_RECOVERY);
+        fail(EINVAL);
+        break;
+      }
+      const size_t capacity = std::min<unsigned>((unsigned)requested, UINT16_MAX);
+      char name[1024];
+      size_t n = 0;
+      for (; n < sizeof name; ++n) {
+        const uint8_t *byte = name_va ? ctx.mem.try_ptr(name_va + n, 1) : nullptr;
+        if (!byte) {
+          name[n] = 1;
+          break;
+        }
+        if (!(name[n] = (char)*byte)) break;
+      }
+      if (n == sizeof name || n == 0 || name[n] || !answer_va ||
+          !ctx.mem.try_ptr(answer_va, capacity)) {
+        arm_set_h_errno(ctx, GUEST_NO_RECOVERY);
+        fail(EFAULT);
+        break;
+      }
+      std::vector<uint8_t> packet(capacity);
+      int count, resolver_error;
+      {
+        ArmLockDropped unlocked;
+        count = luna_socket_dns_packet(name, (uint16_t)type, packet.data(), capacity, &resolver_error);
+      }
+      if (count < 0) {
+        arm_set_h_errno(ctx, resolver_error == EAI_NONAME ? GUEST_HOST_NOT_FOUND :
+                             resolver_error == EAI_NODATA ? GUEST_NO_DATA :
+                             resolver_error == EAI_AGAIN ? GUEST_TRY_AGAIN : GUEST_NO_RECOVERY);
+        ok(-1);
+        break;
+      }
+      const size_t copied = std::min(capacity, (size_t)count);
+      auto *answer = ctx.mem.try_ptr(answer_va, copied);
+      if (!answer) {
+        arm_set_h_errno(ctx, GUEST_NO_RECOVERY);
+        fail(EFAULT);
+        break;
+      }
+      memcpy(answer, packet.data(), copied);
+      arm_set_h_errno(ctx, 0);
+      ok(count);
+      break;
+    }
+#endif
     case SVC_NET_GETHOSTBYNAME: {
       // struct hostent { char *h_name; char **h_aliases; int h_addrtype; int h_length; char **h_addr_list; }.
       const char *name = argp(0) ? ctx.mem.cstr(argp(0)) : nullptr;
@@ -46767,7 +46937,7 @@ aaudio_write_retry:
       ret32(~0u);
       break;
     }
-    g_guest_cwd.store(cwd, std::memory_order_release);
+    set_guest_directory(cwd);
     ret32(0);
     break;
   }
@@ -46804,7 +46974,7 @@ aaudio_write_retry:
       ret32(~0u);
       break;
     }
-    g_guest_cwd.store(strdup(want), std::memory_order_release);
+    set_guest_directory(strdup(want));
     fprintf(stderr, "[chdir] -> %s\n", want);
     ret32(0);
     break;
@@ -54117,8 +54287,10 @@ fputws_done:
     ArmVarArgs ap = make_arm_varargs(ctx, regs, 0, 3, true);
     std::string s = arm_vformat(ctx, fmt, ap);
     if (s.size()>1023) s.resize(1023);
-    fprintf(stderr, "[android_log p=%" PRIu64 " t=%s lr=0x%08x] %s\n",
+    FILE *log = arm_android_log_stream();
+    fprintf(log, "[android_log p=%" PRIu64 " t=%s lr=0x%08x] %s\n",
             r0, tag?tag:"?", lr, s.c_str());
+    fflush(log);
     ret32(1);
     break;
   }
@@ -56307,7 +56479,7 @@ fputws_done:
   case SVC_GETCWD: {
     /* The guest's cwd, not the host's — handing back this emulator's
      * build directory told the app it lived somewhere it cannot write. */
-    const char *cwd = g_guest_cwd.load(std::memory_order_acquire);
+    const char *cwd = guest_working_directory();
     size_t n = strlen(cwd);
     if (r1 && n + 1 > r1) {
       errno = ERANGE;
@@ -61762,19 +61934,21 @@ mbsrtowcs_done:
     int fd = (int)(int32_t)r0;
     GuestVA mask_va = argp(1);
     int flags = (int)(int32_t)(ctx.is_arm64 ? g_svc_args64[2] : r2);
-    /* Avoid <signal.h>: it macros sa_handler and breaks the sigaction
-     * SVC path that uses that name as a local.  Zeroed mask + memcpy is
-     * enough for the bits the guest wrote. */
-    alignas(uint64_t) unsigned char host_mask[128] {};
-    if (mask_va && ctx.mem.ptr(mask_va)) {
-      size_t n = sizeof(host_mask);
-      if (n > 128) n = 128;
-      std::memcpy(&host_mask, ctx.mem.ptr(mask_va), n);
+    if (!mask_va) {
+      ctx.mem.write32(errno_va(ctx,g_current_tid),14);
+      if (ctx.is_arm64) ret64(UINT64_MAX); else ret32(UINT32_MAX);
+      break;
     }
-    int hfd = luna_os_signal_fd(fd, &host_mask, sizeof host_mask, flags);
-    if (hfd < 0)
-      ctx.mem.write32(errno_va(ctx, g_current_tid), errno);
-    ret32((uint32_t)hfd);
+    uint64_t mask = ctx.is_arm64 ? ctx.mem.read64(mask_va) : ctx.mem.read32(mask_va);
+#ifdef _WIN32
+    int hfd = guest_signal_fd_open(fd,mask,flags);
+#else
+    alignas(uint64_t) unsigned char host_mask[128] = {};
+    memcpy(host_mask,&mask,sizeof mask);
+    int hfd = luna_os_signal_fd(fd,host_mask,sizeof host_mask,flags);
+#endif
+    if (hfd < 0) ctx.mem.write32(errno_va(ctx,g_current_tid),guest_net::host_errno_to_guest_linux(errno));
+    if (ctx.is_arm64) ret64((uint64_t)(int64_t)hfd); else ret32((uint32_t)hfd);
     break;
   }
   case SVC_CMSG_NXTHDR: {
@@ -66639,6 +66813,10 @@ static void jit_progress_hook_install(void);
 
 // Initialize the ARM execution context without loading any ELF.
 extern "C" int arm_exec_context_init(struct jvm *jvm) {
+  if (!arm_android_log_stream()) {
+    perror("arm_exec: open Android log output");
+    return -1;
+  }
   if(g_ctx) {
     fprintf(stderr,"arm_exec: context already exists\n");
     return -1;
@@ -76288,21 +76466,9 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
   return true;
 }
 
-// run_arm64 — execute code in the A64 JIT from `entry_va`.
-static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
-                         uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
-                         uint64_t tick_budget,
-                         uint64_t x4, uint64_t x5,
-                         uint64_t x6, uint64_t x7, bool preemptible) {
-  const uint64_t caller_tpidr_el0 = g_tpidr_el0_val;
-  const uint64_t caller_tpidrro_el0 = g_tpidrro_el0_val;
-  if (entry_va == a64_guest_va(TRAMP_BASE + SVC_ABORT * TRAMP_STRIDE) && lunaria_env("LUNARIA_TRACE_ABORT_STACK")) {
-    fprintf(stderr, "[abort] run_arm64 with abort() as its entry, tid=%u\n", g_current_tid);
-#ifdef __GLIBC__
-    void *frames[48]; const int n = backtrace(frames, 48);
-    backtrace_symbols_fd(frames, n, 2);
-#endif
-  }
+static std::atomic<bool> java_program_needs_engine{false};
+static void ensure_main_jit(ArmExecCtx &ctx)
+{
   if (!ctx.jit64 || !ctx.cb64) {
     // First call: create the JIT
     ctx.cb64 = std::make_unique<Arm64Callbacks>();
@@ -76322,6 +76488,24 @@ static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
     ctx.jit64 = std::make_unique<Dynarmic::A64::Jit>(cfg);
     ctx.cb64->jit64 = ctx.jit64.get();
   }
+}
+
+// run_arm64 — execute code in the A64 JIT from `entry_va`.
+static int64_t run_arm64(ArmExecCtx &ctx, uint64_t entry_va,
+                         uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3,
+                         uint64_t tick_budget,
+                         uint64_t x4, uint64_t x5,
+                         uint64_t x6, uint64_t x7, bool preemptible) {
+  const uint64_t caller_tpidr_el0 = g_tpidr_el0_val;
+  const uint64_t caller_tpidrro_el0 = g_tpidrro_el0_val;
+  if (entry_va == a64_guest_va(TRAMP_BASE + SVC_ABORT * TRAMP_STRIDE) && lunaria_env("LUNARIA_TRACE_ABORT_STACK")) {
+    fprintf(stderr, "[abort] run_arm64 with abort() as its entry, tid=%u\n", g_current_tid);
+#ifdef __GLIBC__
+    void *frames[48]; const int n = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, n, 2);
+#endif
+  }
+  ensure_main_jit(ctx);
 
   tl_owns_main_jit = true;
   a64_drain_main_jit_inval(ctx);
@@ -76989,6 +77173,10 @@ extern "C" int arm_exec_system_load(const char *path) {
 }
 
 extern "C" int arm64_exec_context_init(struct jvm *jvm) {
+  if (!arm_android_log_stream()) {
+    perror("arm64: open Android log output");
+    return -1;
+  }
   if (g_ctx) {
     fprintf(stderr, "arm64: context already exists\n");
     return -1;
@@ -77300,7 +77488,7 @@ static bool guest_program_become(const std::vector<std::string> &words)
 /* system() and a shell pipeline start the program as a child and wait for it,
  * so it runs as a thread of its own from the program's entry. */
 static int guest_program_spawn(const std::vector<std::string> &words,
-                               uint32_t parent_tid, uint32_t *child_tid)
+                               uint32_t parent_tid, uint32_t *child_tid, const char *cwd)
 {
   if (!g_ctx) return -1;
   ArmExecCtx &ctx = *g_ctx;
@@ -77390,6 +77578,12 @@ static int guest_program_spawn(const std::vector<std::string> &words,
     }
     g_thread_by_tid[slot->id] = slot;
   }
+  {
+    std::lock_guard<std::mutex> guard(child_directory_lock);
+    child_directories.erase(t.process_pid);
+    if (cwd) child_directories[t.process_pid] = exec_directories.insert(cwd).first->c_str();
+    have_child_directories.store(!child_directories.empty(),std::memory_order_release);
+  }
   fork_child_add(t.process_ppid, parent_tid, nid);
   thread_mark_ready(nid);
   if (child_tid) *child_tid = nid;
@@ -77403,6 +77597,51 @@ static int guest_program_spawn(const std::vector<std::string> &words,
 /* See arm_exec.h: the bytecode VM answers Process.myPid()/myUid(),
  * RunningAppProcessInfo and ApplicationInfo.uid from here, so that one
  * process cannot disagree with itself about who it is. */
+extern "C" int arm_exec_java_spawn(const char *const *argv, int argc, const char *cwd)
+{
+  if (!g_ctx || !g_ctx->is_arm64 || argc < 1 || !argv[0] || strncmp(argv[0], "/data/app/", 10)) return -1;
+  if (strstr(argv[0], "/../") || strchr(argv[0], '\\')) return -1;
+  std::vector<std::string> words(argv, argv + argc);
+  uint32_t tid = 0;
+  if (guest_program_spawn(words, g_current_tid, &tid, cwd) < 0) return -1;
+  java_program_needs_engine.store(true,std::memory_order_release);
+  return (int)tid;
+}
+extern "C" int arm_exec_java_child(int tid, int terminate)
+{
+  ArmLockGuard locked;
+  const auto child = fork_child_by_tid((uint32_t)tid);
+  if (!child.tid) return -2;
+  int32_t status;
+  if (fork_child_reap((uint32_t)tid, status)) {
+    std::lock_guard<std::mutex> guard(child_directory_lock);
+    child_directories.erase(guest_tid_of(tid));
+    have_child_directories.store(!child_directories.empty(),std::memory_order_release);
+    return (status & 127) ? 128 + (status & 127) : (status >> 8) & 255;
+  }
+  if (terminate && g_ctx) guest_kill_process(*g_ctx, (int)guest_tid_of(tid), 15);
+  return -1;
+}
+#ifdef _WIN32
+extern "C" int arm_exec_local_connect(const char *path)
+{
+  sockaddr_storage ss{};
+  auto &un = reinterpret_cast<sockaddr_un &>(ss);
+  if (!path || !*path || strlen(path) >= sizeof un.sun_path) { errno = ENAMETOOLONG; return -1; }
+  un.sun_family = AF_UNIX;
+  strcpy(un.sun_path, path);
+  socklen_t size = sizeof un;
+  guest_net::map_unix_socket_path(ss,size);
+  if (ss.ss_family != AF_UNIX) { errno = EINVAL; return -1; }
+  int fd = luna_socket_open(AF_UNIX,SOCK_STREAM,0);
+  if (fd < 0) return -1;
+  if (!luna_socket_connect(fd,(const sockaddr *)&un,size)) return fd;
+  int error = errno;
+  luna_fd_close(fd);
+  errno = error;
+  return -1;
+}
+#endif
 extern "C" int arm_exec_guest_pid(void) {
   return (int)guest_pid();
 }
@@ -77822,6 +78061,10 @@ extern "C" void arm64_exec_run_pending_threads(void) {
   g_a64_is_pump = true;   /* this is the frame pump's host thread */
   g_a64_pump_started.store(true, std::memory_order_release);
   // During bootstrap, workers need long slices to finish Unity's thread-pool setup.
+  if (g_ctx && java_program_needs_engine.exchange(false,std::memory_order_acq_rel)) {
+    ArmLockGuard guard;
+    ensure_main_jit(*g_ctx);
+  }
   if (!g_ctx || !g_ctx->jit64) return;
   uint64_t slice = env_ticks("LUNARIA_THREAD_TICKS", UINT64_MAX);
   schedule_threads(slice);

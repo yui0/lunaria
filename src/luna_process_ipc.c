@@ -14,16 +14,21 @@
 #endif
 #include "lunaria_os.h"
 #include "luna_google.h"
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <signal.h>
-#include <spawn.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#ifdef _WIN32
+#include <io.h>
+#include <wchar.h>
+#else
+#include <signal.h>
+#include <spawn.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -295,6 +300,8 @@ int luna_process_state_list(struct luna_process_info **out,size_t *count)
   }
   return result;
 }
+#endif
+
 #define QUEUE_MAX (8u * LUNA_PROCESS_MESSAGE_MAX)
 #define PID_STRIDE 4096u
 #define PID_LIMIT 4194304u
@@ -303,24 +310,41 @@ struct packet {
   struct packet *next;
   size_t size,offset,nfds;
   int *fds;
+#ifdef _WIN32
+  unsigned char *wire;
+  uint32_t sequence;
+#endif
   unsigned char bytes[];
 };
 struct luna_process_channel {
   pthread_mutex_t lock;
-  int fd,error;
+  int error;
   struct packet *head,*tail;
   size_t queued;
+  struct packet *ready_head,*ready_tail;
+#ifdef _WIN32
+  HANDLE pipe, peer;
+  DWORD peer_pid;
+  struct packet *sent_head,*sent_tail;
+  uint32_t sequence, received_sequence, ack;
+#else
+  int fd;
   unsigned char header[8];
   size_t header_size,received;
   struct packet *incoming;
-  struct packet *ready_head,*ready_tail;
   int incoming_fds[LUNA_PROCESS_FD_MAX];
   size_t incoming_nfds;
+#endif
 };
 struct child {
   struct child *next;
   char *name;
+#ifdef _WIN32
+  DWORD host_pid;
+  HANDLE handle;
+#else
   pid_t host_pid;
+#endif
   uint32_t guest_pid;
   struct luna_process_channel *channel;
   bool dead,drained;
@@ -340,6 +364,9 @@ struct luna_process_pool {
   struct exit_notice *exits,*exits_tail;
   struct reply *ready_head,*ready_tail;
   int error;
+#ifdef _WIN32
+  HANDLE job;
+#endif
 };
 static void put32(unsigned char *p,uint32_t v)
 {
@@ -363,7 +390,7 @@ const int *luna_process_message_fds(size_t *count)
 }
 static void fds_free(int *fds,size_t count)
 {
-  for(size_t i=0; i<count; ++i)close(fds[i]);
+  for(size_t i=0; i<count; ++i)luna_fd_close(fds[i]);
   free(fds);
 }
 static int fds_copy(const int *fds,size_t count,int **out)
@@ -374,7 +401,7 @@ static int fds_copy(const int *fds,size_t count,int **out)
   int *copy=malloc(count*sizeof *copy);
   if(!copy)return -ENOMEM;
   for(size_t i=0; i<count; ++i) {
-    copy[i]=fcntl(fds[i],F_DUPFD_CLOEXEC,0);
+    copy[i]=luna_fd_dup(fds[i],0,1);
     if(copy[i]<0) {
       int error=errno;
       fds_free(copy,i);
@@ -388,6 +415,9 @@ static void packet_free(struct packet *p)
 {
   if(p) {
     fds_free(p->fds,p->nfds);
+#ifdef _WIN32
+    free(p->wire);
+#endif
     free(p);
   }
 }
@@ -399,6 +429,9 @@ static void packets_free(struct packet *p)
     p=next;
   }
 }
+#ifdef _WIN32
+#include "luna_process_ipc_windows.h"
+#else
 struct luna_process_channel *luna_process_channel_open(int fd)
 {
   if(fd<0) {
@@ -775,6 +808,8 @@ static int spawn_child(struct luna_process_pool *pool,const char *name,struct ch
   *out=child;
   return 0;
 }
+#endif
+
 struct luna_process_pool *luna_process_pool_open(const char *exe,const char *mode,uint32_t parent,uint32_t first)
 {
   if(!exe || !*exe || !mode || !*mode || !parent || parent>PID_LIMIT-PID_STRIDE || first<parent+PID_STRIDE || first>PID_LIMIT-PID_STRIDE) {
@@ -796,10 +831,24 @@ struct luna_process_pool *luna_process_pool_open(const char *exe,const char *mod
     errno=rc ? rc : ENOMEM;
     return NULL;
   }
+#ifdef _WIN32
+  int job_error=win_pool_job_init(pool);
+  if(job_error) {
+    luna_process_pool_close(pool);
+    errno=-job_error;
+    return NULL;
+  }
+#endif
   return pool;
 }
 struct luna_process_pool *luna_process_pool_open_host(const char *exe,const char *apk,uint32_t uid,uint32_t parent,uint32_t first)
 {
+#ifdef _WIN32
+  /* This backend hosts secondary components inside the same APK/profile. */
+  (void)exe; (void)apk; (void)uid; (void)parent; (void)first;
+  errno=ENOTSUP;
+  return NULL;
+#else
   if(!apk || !*apk) {
     errno=EINVAL;
     return NULL;
@@ -815,6 +864,7 @@ struct luna_process_pool *luna_process_pool_open_host(const char *exe,const char
     return NULL;
   }
   return pool;
+#endif
 }
 int luna_process_pool_set_profile(struct luna_process_pool *pool,const char *profile)
 {
@@ -830,6 +880,13 @@ int luna_process_pool_set_profile(struct luna_process_pool *pool,const char *pro
 static void child_poll(struct child *child)
 {
   if(child->dead)return;
+#ifdef _WIN32
+  if(WaitForSingleObject(child->handle,0)==WAIT_OBJECT_0) {
+    DWORD code;
+    child->dead=true;
+    child->status=GetExitCodeProcess(child->handle,&code) ? (int)code : -EIO;
+  }
+#else
   int status=0;
   pid_t result;
   do {
@@ -840,6 +897,7 @@ static void child_poll(struct child *child)
     child->dead=true;
     child->status=result>0 ? status : -ECHILD;
   }
+#endif
 }
 static void reap(struct luna_process_pool *pool)
 {
@@ -864,6 +922,9 @@ static void reap(struct luna_process_pool *pool)
       } else pool->error=ENOMEM;
       *link=child->next;
       luna_process_channel_close(child->channel);
+#ifdef _WIN32
+      CloseHandle(child->handle);
+#endif
       free(child->name);
       free(child);
       continue;
@@ -871,7 +932,8 @@ static void reap(struct luna_process_pool *pool)
     link=&child->next;
   }
 }
-int luna_process_pool_send_fds(struct luna_process_pool *pool,const char *name,const void *data,size_t size,uint32_t *pid,const int *fds,size_t nfds)
+static int pool_send(struct luna_process_pool *pool,const char *name,const void *data,size_t size,
+                     uint32_t *pid,const int *fds,size_t nfds,bool spawn)
 {
   if(!pool || !name || !*name || strlen(name)>NAME_MAX_BYTES || (!data && size))return -EINVAL;
   if(size>LUNA_PROCESS_MESSAGE_MAX)return -EMSGSIZE;
@@ -882,13 +944,23 @@ int luna_process_pool_send_fds(struct luna_process_pool *pool,const char *name,c
     if(!child->dead && !strcmp(child->name,name))break;
     child=child->next;
   }
-  int rc=child ? 0 : spawn_child(pool,name,&child);
+  int rc=child ? 0 : spawn ? spawn_child(pool,name,&child) : -ESRCH;
   if(!rc) {
     rc=luna_process_channel_send_fds(child->channel,data,size,fds,nfds);
     if(!rc && pid)*pid=child->guest_pid;
   }
   pthread_mutex_unlock(&pool->lock);
   return rc;
+}
+int luna_process_pool_send_existing(struct luna_process_pool *pool,const char *name,
+                                   const void *data,size_t size)
+{
+  return pool_send(pool,name,data,size,NULL,NULL,0,false);
+}
+int luna_process_pool_send_fds(struct luna_process_pool *pool,const char *name,const void *data,
+                              size_t size,uint32_t *pid,const int *fds,size_t nfds)
+{
+  return pool_send(pool,name,data,size,pid,fds,nfds,true);
 }
 int luna_process_pool_send(struct luna_process_pool *pool,const char *name,const void *data,size_t size,uint32_t *pid)
 {
@@ -1011,7 +1083,7 @@ int luna_process_pool_tick(struct luna_process_pool *pool,luna_process_reply_fn 
     replies.child=child;
     int n=luna_process_channel_tick(child->channel,collect_reply,&replies);
     if(n>0)count+=n;
-    if(n<0) {
+    if(n<0 && !child->drained) {
       child->drained=true;
       if(!error)error=-n;
     }
@@ -1093,21 +1165,29 @@ void luna_process_pool_close(struct luna_process_pool *pool)
     c->channel=NULL;
     c->drained=true;
   }
-  struct timespec delay= {0,10000000};
   for(unsigned i=0; i<20 && pool->children; ++i) {
     reap(pool);
-    if(pool->children)nanosleep(&delay,NULL);
+    if(pool->children)usleep(10000);
   }
+#ifdef _WIN32
+  if(pool->job)CloseHandle(pool->job);
+#else
   for(struct child *c=pool->children; c; c=c->next)kill(c->host_pid,SIGTERM);
   for(unsigned i=0; i<20 && pool->children; ++i) {
     reap(pool);
-    if(pool->children)nanosleep(&delay,NULL);
+    if(pool->children)usleep(10000);
   }
+#endif
   while(pool->children) {
     struct child *c=pool->children;
     pool->children=c->next;
+#ifdef _WIN32
+    WaitForSingleObject(c->handle,2000);
+    CloseHandle(c->handle);
+#else
     kill(c->host_pid,SIGKILL);
     while(waitpid(c->host_pid,NULL,0)<0 && errno==EINTR) {}
+#endif
     free(c->name);
     free(c);
   }
@@ -1128,29 +1208,8 @@ void luna_process_pool_close(struct luna_process_pool *pool)
 #else
 /* No fork-only or shared-address-space substitute on unsupported hosts. */
 #include <errno.h>
-#ifdef _WIN32
-#include <io.h>
-#define ipc_close _close
-#else
 #include <unistd.h>
 #define ipc_close close
-#endif
-int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
-                                 size_t count)
-{
-  (void)ranges;
-  (void)count;
-  return -ENOSYS;
-}
-int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
-                                size_t count, const int *fds, size_t fd_count)
-{
-  (void)maps;
-  (void)count;
-  (void)fds;
-  (void)fd_count;
-  return -ENOSYS;
-}
 struct luna_process_channel *luna_process_channel_open(int fd)
 {
   if(fd>=0)ipc_close(fd);
@@ -1270,6 +1329,11 @@ int luna_process_pool_send(struct luna_process_pool *p,const char *n,const void 
   (void)g;
   return -ENOSYS;
 }
+int luna_process_pool_send_existing(struct luna_process_pool *p,const char *n,const void *d,size_t s)
+{
+  (void)p; (void)n; (void)d; (void)s;
+  return -ENOSYS;
+}
 int luna_process_pool_send_fds(struct luna_process_pool *p,const char *n,const void *d,size_t s,uint32_t *g,const int *f,size_t nf)
 {
   (void)p;
@@ -1317,6 +1381,25 @@ int luna_process_state_list(struct luna_process_info **out,size_t *count)
 {
   if(out)*out=NULL;
   if(count)*count=0;
+  return -ENOSYS;
+}
+#endif
+
+#if !defined(__linux__)
+int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
+                                 size_t count)
+{
+  (void)ranges;
+  (void)count;
+  return -ENOSYS;
+}
+int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
+                                size_t count, const int *fds, size_t fd_count)
+{
+  (void)maps;
+  (void)count;
+  (void)fds;
+  (void)fd_count;
   return -ENOSYS;
 }
 #endif

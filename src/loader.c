@@ -33,6 +33,7 @@
 #include <time.h>
 #include "lunaria_os.h"
 #ifdef _WIN32
+#include "lunaria_vpn.h"
 #include <pthread.h>
 #endif
 /* The bionic-compatible dlfcn entry points (src/linker/dlfcn.c). */
@@ -1091,6 +1092,10 @@ pump_now_us(void)
 static struct luna_process_pool *g_component_pool;
 static int component_submit(void *user,const char *process,const void *bytes,size_t size)
 {
+  const unsigned char *message=bytes;
+  if(size<8 || memcmp(message,"LSV1",4))return -EINVAL;
+  if(message[4]!=1)
+    return luna_process_pool_send_existing(user,process,bytes,size);
   uint32_t pid=0;
   int rc=luna_process_pool_send(user,process,bytes,size,&pid);
   if(!rc)fprintf(stderr,"[service-broker] accepted start for %s pid=%u\n",process,pid);
@@ -2347,10 +2352,16 @@ static void *service_process_io(void *user)
 {
   struct service_process *process = user;
   while (!atomic_load(&process->io_stop)) {
+#ifdef _WIN32
+    /* The inherited native pipe is never put in the guest descriptor table. */
+    int rc = luna_process_channel_tick(process->channel, service_process_receive, process);
+    if (!rc) usleep(10000);
+#else
     struct pollfd fd = luna_pollfd_make(process->control_fd, POLLIN);
     int rc = luna_socket_poll(&fd, 1, 100);
     if (rc < 0 && errno == EINTR) continue;
     if (rc > 0) rc = luna_process_channel_tick(process->channel, service_process_receive, process);
+#endif
     if (rc < 0) {
       atomic_store(&process->fatal, 1);
       break;
@@ -3295,6 +3306,8 @@ main(int argc, const char *argv[])
 /* Decode Windows arguments losslessly, including drag-and-drop Unicode paths. */
 int wmain(int argc, wchar_t *wide_argv[])
 {
+  const char *vpn = getenv("LUNARIA_HOST_VPN");
+  luna_vpn_init(vpn && !strcmp(vpn, "1"));
   char **argv = calloc((size_t)argc + 1, sizeof *argv);
   if (!argv) return EXIT_FAILURE;
   for (int i = 0; i < argc; i++) {
@@ -3306,7 +3319,17 @@ int wmain(int argc, wchar_t *wide_argv[])
       return EXIT_FAILURE;
     }
   }
-  int result = lunaria_main(argc, (const char **)argv);
+  int result = EXIT_FAILURE;
+  if (argc == 3 && (!strcmp(argv[1], "--service-process-arm64") ||
+                    !strcmp(argv[1], "--service-process-arm32"))) {
+    int error = luna_process_win_prepare_child();
+    if (error) {
+      fprintf(stderr, "[service-process] inherited Windows pipe: %s\n",strerror(-error));
+      goto done;
+    }
+  }
+  result = lunaria_main(argc, (const char **)argv);
+done:
   for (int i = 0; i < argc; i++) free(argv[i]);
   free(argv);
   return result;

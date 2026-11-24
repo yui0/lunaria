@@ -526,6 +526,11 @@ void arm_exec_apk_version(int32_t *code, const char **name);
  * was handing out the *host* process's pid and uid, so the app appeared to be
  * running as root under a pid the guest's own getpid() had never heard of. */
 int arm_exec_guest_pid(void);
+int arm_exec_java_spawn(const char *const *argv, int argc, const char *cwd);
+int arm_exec_java_child(int tid, int terminate);
+#ifdef _WIN32
+int arm_exec_local_connect(const char *path);
+#endif
 int arm_exec_guest_tid(void);
 int arm_exec_guest_is_64bit(void);
 int arm_exec_guest_uid(void);
