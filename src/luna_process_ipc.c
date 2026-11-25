@@ -41,6 +41,7 @@
 #include <unistd.h>
 extern char **environ;
 
+#ifdef __linux__
 static int snapshot_copy_range(int source, int snapshot,
                                const struct luna_process_memory_range *range)
 {
@@ -161,6 +162,7 @@ int luna_process_restore_memory(const struct luna_process_memory_mapping *maps,
   }
   return -error;
 }
+#endif /* __linux__ */
 
 void luna_process_dispose_memory(struct luna_process_memory_image *image)
 {
@@ -1535,7 +1537,7 @@ int luna_process_state_list(struct luna_process_info **out,size_t *count)
 }
 #endif
 
-#if !defined(__linux__)
+#ifdef _WIN32
 int luna_process_snapshot_memory(const struct luna_process_memory_range *ranges,
                                  size_t count)
 {

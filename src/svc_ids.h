@@ -1392,6 +1392,10 @@ enum SvcId : uint32_t {
    * data directory and its shell is /system/bin/sh.  NULL means "no such user",
    * which is not true of the uid the app is running as. */
   SVC_GETPWUID,
+  /* getpwnam(3), getgrnam(3), getgrgid(3): the same bionic account table. */
+  SVC_GETPWNAM,
+  SVC_GETGRNAM,
+  SVC_GETGRGID,
   /* sleep(3) takes seconds and returns the unslept seconds.  It cannot share
    * SVC_USLEEP: treating the same register as microseconds made sleep(1) a
    * one-microsecond delay and turned ordinary retry loops into busy loops. */

@@ -930,7 +930,8 @@ luna-browser-test: luna-browser test/test_webview_cdp_host
 
 clean:
 	$(RM) $(bins) $(LUNARIA_OBJECTS) $(BUILD_DIR)/luna_overlay.o $(BUILD_DIR)/luna_boot.o libdl.so libpthread.so
-	$(RM) -r runtime
+	@# runtime/framework-res is downloaded (scripts/install-framework.py), not built: keep it.
+	@if [ -d runtime ]; then find runtime -mindepth 1 -maxdepth 1 ! -name framework-res -exec $(RM) -r {} +; fi
 	$(RM) test/test_unity test/test_dvm test/dvm_test.dex test/test_regex test/test_http_chunked test/test_charset test/test_vulkan_bridge
 	$(RM) test/test_audio_clock test/test_pcm_queue test/test_boot_card test/test_keymap test/test_motion_event test/libkeymapguest.so test/libkeymapndk.so test/libslqueuetest.so
 	$(RM) test/libabitest64.so test/libabitest32.so test/abi_test_values.h

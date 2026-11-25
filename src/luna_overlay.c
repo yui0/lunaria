@@ -2717,7 +2717,7 @@ bool luna_overlay_get_font_metrics(float px,bool bold,struct luna_overlay_font_m
  * ======================================================================== */
 
 /* The right-click menu is a short main list; each group opens one panel beside it. */
-enum { SUB_NONE, SUB_INPUT, SUB_DISPLAY, SUB_GRAPHICS, SUB_SOUND, SUB_LOCALE, SUB_WEBVIEW, SUB_PROFILE, SUB_GOOGLE, SUB_COUNT };
+enum { SUB_NONE, SUB_INPUT, SUB_DISPLAY, SUB_GRAPHICS, SUB_SOUND, SUB_LOCALE, SUB_WEBVIEW, SUB_PROFILE, SUB_GOOGLE, SUB_ENGINES, SUB_COUNT };
 
 #define MENU_W 248
 #define ROW_H 24
@@ -3019,6 +3019,8 @@ static int menu_main_rows(struct menu_buf *b, int parent_y[SUB_COUNT])
   y += menu_item(b, "sub-display", "Display", false, arrow);
   parent_y[SUB_GRAPHICS] = y;
   y += menu_item(b, "sub-graphics", "Graphics API", false, arrow);
+  parent_y[SUB_ENGINES] = y;
+  y += menu_item(b, "sub-engines", "CPU engines", false, arrow);
   parent_y[SUB_SOUND] = y;
   y += menu_item(b, "sub-sound", "Sound", false, arrow);
   parent_y[SUB_LOCALE] = y;
@@ -3131,6 +3133,21 @@ static int menu_sub_rows(struct menu_buf *b)
     y += menu_header(b, "GL IDENTITY");
     y += menu_item(b, "glid-device", "Device: ARM / Mali-G78", g_gl_identity_choice == 0, NULL);
     y += menu_item(b, "glid-host", "Host driver", g_gl_identity_choice == 1, NULL);
+    y += menu_sep(b);
+    y += menu_item(b, NULL, "Restart the app to apply", false, NULL);
+  } else if (g_menu_sub == SUB_ENGINES) {
+    /* How many guest threads run at the same time, each on its own host thread (0 = by core count). */
+    const char *env = getenv("LUNARIA_A64_ENGINES");
+    const int cur = env ? atoi(env) : 0;
+    static const int counts[] = { 0, 1, 2, 3, 4, 6, 8 };
+    y += menu_header(b, "A64 ENGINES");
+    for (size_t i = 0; i < sizeof counts / sizeof counts[0]; ++i) {
+      char label[32];
+      snprintf(id, sizeof id, "ae-%d", counts[i]);
+      if (counts[i]) snprintf(label, sizeof label, "%d", counts[i]);
+      else snprintf(label, sizeof label, "Automatic (by core count)");
+      y += menu_item(b, id, label, cur == counts[i], NULL);
+    }
     y += menu_sep(b);
     y += menu_item(b, NULL, "Restart the app to apply", false, NULL);
   } else if (g_menu_sub == SUB_SOUND) {
@@ -3815,7 +3832,7 @@ static void menu_clicked(const char *id)
       { "input", SUB_INPUT }, { "display", SUB_DISPLAY }, { "graphics", SUB_GRAPHICS },
       { "sound", SUB_SOUND }, { "locale", SUB_LOCALE }, { "webview", SUB_WEBVIEW },
       { "profile", SUB_PROFILE },
-      { "google", SUB_GOOGLE },
+      { "google", SUB_GOOGLE }, { "engines", SUB_ENGINES },
     };
     int sub = SUB_NONE;
     for (size_t i = 0; i < sizeof groups / sizeof groups[0]; ++i)
@@ -3896,6 +3913,15 @@ static void menu_clicked(const char *id)
     char msg[64];
     snprintf(msg, sizeof msg, "WebView zoom %d%%", (int)(dvm_webview_zoom() * 100.0f + 0.5f));
     menu_notice_locked(msg);
+  } else if (!strncmp(id, "ae-", 3)) {
+    const int n = atoi(id + 3);
+    char value[8];
+    snprintf(value, sizeof value, "%d", n);
+    if (menu_conf_write("LUNARIA_A64_ENGINES", n ? value : "0", false)) {
+      setenv("LUNARIA_A64_ENGINES", value, 1);
+      menu_notice_locked("Engines saved: restart the app to apply");
+    } else menu_notice_locked("Cannot save engine settings");
+    keep_open = true;
   } else if (!strcmp(id, "gfx-vulkan") || !strcmp(id, "gfx-opengl")) {
     const int vulkan = !strcmp(id, "gfx-vulkan");
     if (menu_conf_write("LUNARIA_VULKAN", vulkan ? "1" : "0", false)) {

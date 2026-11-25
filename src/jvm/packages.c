@@ -290,6 +290,23 @@ static void ota_certs_materialise(void)
   (void)fclose(f);
 }
 
+/* /dev/__properties__: the system property area, one file per SELinux property context plus
+ * the index and serial files.  Every Android process has it mapped from init's tmpfs, so
+ * the directory exists on every device whatever the reader does with it. */
+static void property_area_materialise(void)
+{
+  static const char *const files[] = { "property_info", "properties_serial", NULL };
+  char dir[PATH_MAX], host[PATH_MAX];
+  if ((size_t)snprintf(dir, sizeof dir, "%s/dev/__properties__", guest_root()) >= sizeof dir)
+    return;
+  mkdir_p(dir);
+  for (const char *const *f = files; *f; ++f) {
+    if ((size_t)snprintf(host, sizeof host, "%s/%s", dir, *f) >= sizeof host) return;
+    FILE *fp = fopen(host, "ab");
+    if (fp) (void)fclose(fp);
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Building the ledger
  * ------------------------------------------------------------------ */
@@ -552,6 +569,7 @@ static void ledger_build(void)
   g_built = 1;
   build_prop_materialise();
   ota_certs_materialise();
+  property_area_materialise();
 
   /* The caller is row 0.  Every other reader of this table expects to find
    * the running package in it, and a lookup that misses it would answer

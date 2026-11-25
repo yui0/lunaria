@@ -137,6 +137,7 @@ void ln64_java_load_end(struct ln64_module *module, int version);
 
 /* Diagnostics: one line per image with what was found in it. */
 void ln64_dump(void);
+void ln64_diagnose(struct ln64_module *module, const char *name);
 
 #ifdef __cplusplus
 }

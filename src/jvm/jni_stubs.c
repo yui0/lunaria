@@ -1116,6 +1116,9 @@ android_property_entry(const char *name, size_t index)
     { "ro.build.type",            "user" },
     { "ro.build.tags",            "release-keys" },
     { "ro.build.user",            "android-build" },
+    /* The image's build time: also the modification time of every file it carries. */
+    { "ro.build.date",            "Tue Jul  5 12:30:36 UTC 2022" },
+    { "ro.build.date.utc",        "1657024236" },
     { "ro.build.host",            "abfarm" },
     { "ro.build.characteristics", "default" },
     { "ro.build.version.incremental", dev->incremental },

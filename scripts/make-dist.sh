@@ -83,6 +83,14 @@ else
     cp -p runtime/*.dylib "$stage/runtime/" 2>/dev/null || true
 fi
 [ -z "$decoder" ] || cp -p "$decoder" "$stage/runtime/"
+# Android framework resources (scripts/install-framework.py): the emulator reads them from
+# runtime/framework-res next to itself; without them the layouts of Java UI such as a
+# WebView dialog cannot be inflated.
+if [ -s runtime/framework-res/resources.arsc ]; then
+    cp -R runtime/framework-res "$stage/runtime/"
+else
+    echo 'warning: runtime/framework-res is missing (run scripts/install-framework.py); the bundle will not show WebView dialogs' >&2
+fi
 
 # luna-browser, the WebView engine used when no Chrome is installed (and the
 # fallback when Chrome does not start).  The emulator looks for it next to

@@ -660,6 +660,41 @@ bool ln64_lookup_in(struct ln64_module *mod, const char *name,
   return false;
 }
 
+/* Why a name is not found: how many symbols the image's live table holds and
+ * what its hash chain for the name leads to.  A packed image fills its table in
+ * after it is mapped, so this reads the table as it is now. */
+void ln64_diagnose(struct ln64_module *m, const char *name)
+{
+  if (!m || !m->symtab || !m->strtab) return;
+  uint32_t n = m->gnu_bucket ? m->gnu_symoffset : m->nchain, named = 0, defined = 0;
+  const uint32_t total = m->gnu_bucket ? 0 : m->nchain;
+  (void)total;
+  const uint32_t limit = m->nchain ? m->nchain : 4096;
+  for (uint32_t i = 0; i < limit; ++i) {
+    Elf64_Sym tmp;
+    const Elf64_Sym *s = symbol_at(m, i, &tmp);
+    if (s->st_name && m->strtab[s->st_name]) ++named;
+    if (s->st_shndx != SHN_UNDEF) ++defined;
+  }
+  (void)n;
+  const uint32_t gh = gnu_hash(name);
+  fprintf(stderr, "[ln64] %s: %u/%u symbols named, %u defined; gnu nbucket=%u symoffset=%u bloom=%u\n",
+          m->soname, named, limit, defined, m->gnu_nbucket, m->gnu_symoffset, m->gnu_bloom_size);
+  if (m->gnu_bucket && m->gnu_nbucket) {
+    uint32_t i = m->gnu_bucket[gh % m->gnu_nbucket];
+    fprintf(stderr, "[ln64]   %s: hash=0x%08x bucket->%u\n", name, gh, i);
+    for (int k = 0; i && k < 8; ++k, ++i) {
+      const uint32_t c = m->gnu_chain[i - m->gnu_symoffset];
+      Elf64_Sym tmp;
+      const Elf64_Sym *s = symbol_at(m, i, &tmp);
+      fprintf(stderr, "[ln64]     idx=%u chain=0x%08x st_name=%u shndx=%u value=0x%llx name=\"%.40s\"\n",
+              i, c, s->st_name, s->st_shndx, (unsigned long long)s->st_value,
+              m->strtab + s->st_name);
+      if (c & 1u) break;
+    }
+  }
+}
+
 bool ln64_lookup_global(const char *name, struct ln64_sym *out)
 {
   Elf64_Sym converted;

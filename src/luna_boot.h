@@ -199,6 +199,8 @@ void luna_keymap_current(char *out, size_t capacity);
 int luna_keymap_take(luna_keymap *out);
 /* Profiles are ordinary normalized touch layouts; no guest-specific behavior. */
 int luna_keymap_load(luna_keymap *, const char *profile);
+/* Mouse inputs a keymap line can name (MOUSE3 = the wheel button, WHEELUP, WHEELDOWN). */
+enum { LUNA_KEY_MOUSE3 = 1001, LUNA_KEY_WHEELUP = 1002, LUNA_KEY_WHEELDOWN = 1003 };
 int luna_keymap_key(luna_keymap *, int key, int pressed, float width, float height,
                     luna_keymap_emit, void *);
 void luna_keymap_release(luna_keymap *, float width, float height, luna_keymap_emit, void *);

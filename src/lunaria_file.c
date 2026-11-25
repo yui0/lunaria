@@ -1324,6 +1324,42 @@ static const struct {
 } android_fs_files[]= {
   {"system/bin/app_process64",0755,0,2000},{"system/bin/app_process32",0755,0,2000},
 };
+/* The read-only platform partitions: root's on every device, whatever the host user that
+ * unpacked them is.  Directories are 0755; files 0644, and 0755 under a bin directory. */
+/* Each partition is its own mount with its own device number, the ones the process's
+ * mountinfo lists: /system (with system_ext and product) is 0:21, /vendor 0:22, and the
+ * APEX tree 0:29.  Linux packs minor numbers above bit 8 of st_dev.  The mount point itself
+ * is on the mounted device, as are its children. */
+static void luna_android_platform_device(const char *path,luna_file_info *info)
+{
+  static const char *const roots[]={"/system","/system_ext","/product","/vendor","/apex",NULL};
+  for (const char *const *r=roots; *r; ++r) {
+    size_t n=strlen(*r);
+    if (strncmp(path,*r,n) || (path[n] && path[n]!='/')) continue;
+    const unsigned minor=!strcmp(*r,"/vendor") ? 22u : !strcmp(*r,"/apex") ? 29u : 21u;
+    info->device=(uint64_t)(minor&0xffu)|((uint64_t)(minor&~0xffu)<<12);
+    return;
+  }
+}
+static int luna_android_platform_inode(const char *path,luna_file_info *info)
+{
+  static const char *const roots[]={"/system","/system_ext","/product","/vendor","/apex",NULL};
+  for (const char *const *r=roots; *r; ++r) {
+    size_t n=strlen(*r);
+    if (strncmp(path,*r,n) || (path[n] && path[n]!='/')) continue;
+    const unsigned type=info->mode&~07777u;
+    const int link=(type&0170000u)==0120000u;
+    const int directory=(type&0170000u)==0040000u;
+    const int bin=strstr(path,"/bin/")!=NULL;
+    info->uid=0;
+    info->gid=bin ? 2000u : 0u;
+    /* Android's image builder gives symlinks 0755 (`lrwxr-xr-x`), not the 0777 of a Linux one. */
+    info->mode=type|(link||directory||bin ? 0755u : 0644u);
+    luna_android_platform_device(path,info);
+    return 1;
+  }
+  return 0;
+}
 int luna_android_fs_inode(const char *path,luna_file_info *info)
 {
   if (!path || *path!='/' || !info) return 0;
@@ -1332,6 +1368,7 @@ int luna_android_fs_inode(const char *path,luna_file_info *info)
     info->uid=android_fs_dirs[i].uid;
     info->gid=android_fs_dirs[i].gid;
     info->mode=(info->mode&~07777u)|android_fs_dirs[i].mode;
+    luna_android_platform_device(path,info);
     return 1;
   }
   for (unsigned i=0; i<sizeof android_fs_files/sizeof android_fs_files[0]; ++i) {
@@ -1339,9 +1376,10 @@ int luna_android_fs_inode(const char *path,luna_file_info *info)
     info->uid=android_fs_files[i].uid;
     info->gid=android_fs_files[i].gid;
     info->mode=(info->mode&~07777u)|android_fs_files[i].mode;
+    luna_android_platform_device(path,info);
     return 1;
   }
-  return 0;
+  return luna_android_platform_inode(path,info);
 }
 /* Do not follow a replacement link or overwrite existing user data. The
  * configured root may itself be a host mount; children belong to this layout. */

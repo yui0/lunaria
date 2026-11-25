@@ -88,6 +88,10 @@ static int key_code(const char *s)
   if (!strcmp(s, "SPACE")) return 32;
   if (!strcmp(s, "SHIFT")) return 340;
   if (!strcmp(s, "CTRL")) return 341;
+  /* Mouse inputs have no GLFW key value; these are the mapper's own (above GLFW_KEY_LAST). */
+  if (!strcmp(s, "MOUSE3")) return LUNA_KEY_MOUSE3;
+  if (!strcmp(s, "WHEELUP")) return LUNA_KEY_WHEELUP;
+  if (!strcmp(s, "WHEELDOWN")) return LUNA_KEY_WHEELDOWN;
   if (s[0] && !s[1] && ((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= '0' && s[0] <= '9'))) return s[0];
   return -1;
 }

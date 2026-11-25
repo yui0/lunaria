@@ -462,6 +462,10 @@ const char *arm_exec_canonical_guest_path(const char *path,char *buf,size_t bufs
 const char *arm_exec_guest_getenv(const char *name);
 /* Allocated NULL-terminated K=V snapshot; caller frees strings and array. */
 char **arm_exec_guest_environ_snapshot(void);
+/* Write the emulated process environment; the guest's getenv and `environ`
+ * see the change.  Return 0, or -EINVAL for an empty name or one with '='. */
+int arm_exec_guest_setenv(const char *name, const char *value, int overwrite);
+int arm_exec_guest_unsetenv(const char *name);
 /* The locale the emulated device is configured in, as two-letter language and
  * country (plus NUL).  One answer for the whole process: the VM's
  * java.util.Locale default and AConfiguration must not disagree, or an app

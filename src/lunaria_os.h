@@ -233,11 +233,25 @@ static inline int luna_socket_startup(void) {
 static inline intptr_t luna_socket_native(int fd) {
   return fd;
 }
+/* Linux has AF_UNIX/SOCK_SEQPACKET and Android code uses it (ordered, connected, and
+ * message-bounded).  Other POSIX hosts (macOS) do not: they get the nearest connected,
+ * ordered socket, SOCK_STREAM, which keeps the call working but not its message
+ * boundaries. */
+static inline int luna_socket_host_type(int family, int type)
+{
+#ifndef __linux__
+  if (family == AF_UNIX && type == SOCK_SEQPACKET) return SOCK_STREAM;
+#else
+  (void)family;
+#endif
+  return type;
+}
 static inline int luna_socket_pair(int family, int type, int protocol, int pair[2])
 {
-  return socketpair(family,type,protocol,pair);
+  return socketpair(family,luna_socket_host_type(family,type),protocol,pair);
 }
 static inline int luna_socket_open(int family, int type, int protocol) {
+  type = luna_socket_host_type(family, type);
 #ifdef __linux__
   return socket(family, type | SOCK_CLOEXEC, protocol);
 #else

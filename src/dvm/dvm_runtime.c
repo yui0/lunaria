@@ -91775,7 +91775,65 @@ static bool os_file_operation(struct dvm *vm,dvm_ref self,const union dvm_value 
   RETV();
 }
 
+/* android.system.Os.getenv/setenv/unsetenv: the process environment the guest's libc
+ * reads, not a copy. */
+static bool os_getenv(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                      union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  const char *name = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  if (!name) {
+    dvm__throw(vm, "java/lang/NullPointerException", "name == null");
+    return false;
+  }
+  const char *value = arm_exec_guest_getenv(name);
+  RETL(value ? dvm_new_string(vm, value) : 0);
+}
+
+static bool os_setenv(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                      union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  (void)out;
+  const char *name = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  const char *value = ARG(1).l ? dvm_string_utf8(vm, ARG(1).l) : NULL;
+  if (!name || !value) {
+    dvm__throw(vm, "java/lang/NullPointerException", name ? "value == null" : "name == null");
+    return false;
+  }
+  const int rc = arm_exec_guest_setenv(name, value, ARG(2).i != 0);
+  if (rc < 0) {
+    throw_errno(vm, "setenv", -rc);
+    return false;
+  }
+  RETV();
+}
+
+static bool os_unsetenv(struct dvm *vm, dvm_ref self, const union dvm_value *args, int nargs,
+                        union dvm_value *out)
+{
+  (void)self;
+  (void)nargs;
+  (void)out;
+  const char *name = ARG(0).l ? dvm_string_utf8(vm, ARG(0).l) : NULL;
+  if (!name) {
+    dvm__throw(vm, "java/lang/NullPointerException", "name == null");
+    return false;
+  }
+  const int rc = arm_exec_guest_unsetenv(name);
+  if (rc < 0) {
+    throw_errno(vm, "unsetenv", -rc);
+    return false;
+  }
+  RETV();
+}
+
 static const struct rt_method rt_android_os[] = {
+  SM("getenv", "(Ljava/lang/String;)Ljava/lang/String;", os_getenv),
+  SM("setenv", "(Ljava/lang/String;Ljava/lang/String;Z)V", os_setenv),
+  SM("unsetenv", "(Ljava/lang/String;)V", os_unsetenv),
   SM("symlink","(Ljava/lang/String;Ljava/lang/String;)V",os_file_operation),
   SM("readlink","(Ljava/lang/String;)Ljava/lang/String;",os_file_operation),
   SM("stat","(Ljava/lang/String;)Landroid/system/StructStat;",os_file_operation),

@@ -13,6 +13,8 @@
 #   ./_make-release.sh --all-targets       # Linux + Windows + macOS すべて
 #   ./_make-release.sh --push              # タグを自動的にリモートへプッシュ (確認省略)
 #   ./_make-release.sh --no-upload         # ビルドのみ (GitHub Release を作らない)
+#   ./_make-release.sh --no-framework      # runtime/framework-res (Android SDK Platform 31 のリソース) を導入しない
+#                                          # 既定では scripts/install-framework.py で導入し、成果物に同梱する
 #   ./_make-release.sh --sync-os           # リリース後に yui0/qBerryOS へアセットを同期
 #
 # ビルド成果物 (Makefile の `make dist` が作る。名前は lunaria-YYYY-MM-DD-<os>-<arch>.*):
@@ -57,6 +59,7 @@ AUTO_PUSH=false
 SYNC_OS=false
 UPLOAD=true
 LINUX_CROSS=true
+INSTALL_FRAMEWORK=true
 while [[ $# -gt 0 ]]; do
   case "${1:-}" in
     --windows)       BUILD_WINDOWS=true ;;
@@ -66,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --sync-os)       SYNC_OS=true ;;
     --no-upload)     UPLOAD=false ;;
     --native-only)   LINUX_CROSS=false ;;
+    --no-framework)  INSTALL_FRAMEWORK=false ;;
     -h|--help)       sed -n '2,32p' "$0"; exit 0 ;;
     -*)              echo "不明なオプション: $1" >&2; exit 1 ;;
     *)               break ;;
@@ -407,6 +411,22 @@ fi
 info "サブモジュールを更新中..."
 git submodule update --init --recursive
 
+# ── framework リソース (WebView など Java UI のレイアウト解決に必要) ──
+# Google の Android SDK Platform 31 から無改変で取り出す。導入済みなら何もしない。
+# アーカイブの SHA1 は install-framework.py が検証する。
+if [[ "$INSTALL_FRAMEWORK" == "true" && ! -s runtime/framework-res/resources.arsc ]]; then
+  FRAMEWORK_ZIP="${FRAMEWORK_ZIP:-${XDG_CACHE_HOME:-$HOME/.cache}/lunaria/platform-31_r01.zip}"
+  if [[ ! -s "$FRAMEWORK_ZIP" ]]; then
+    check_cmd curl
+    info "Android SDK Platform 31 を取得中..."
+    mkdir -p "$(dirname "$FRAMEWORK_ZIP")"
+    curl -fsSL -o "$FRAMEWORK_ZIP.part" https://dl.google.com/android/repository/platform-31_r01.zip \
+      && mv "$FRAMEWORK_ZIP.part" "$FRAMEWORK_ZIP" || die "platform-31_r01.zip を取得できません"
+  fi
+  info "framework リソースを導入中..."
+  python3 scripts/install-framework.py "$FRAMEWORK_ZIP" || die "install-framework.py が失敗しました"
+fi
+
 # ── タグ (make dist は git describe でバージョンを決めるので先に作る) ──
 if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
   git tag "$TAG"
@@ -448,7 +468,11 @@ build_package() {
 build_syslib() { make syslib guestlib || warn "syslib/guestlib をビルドできませんでした。無しで同梱します。"; }
 
 # ビルドツリー直下のアーキ依存成果物を消す (ネイティブ/クロスの混在防止)
-reset_tree() { rm -rf lunaria lunaria.exe runtime libdl.so libpthread.so; }
+# runtime/framework-res は取得物でありビルド成果物ではないので残す
+reset_tree() {
+  rm -rf lunaria lunaria.exe libdl.so libpthread.so
+  if [[ -d runtime ]]; then find runtime -mindepth 1 -maxdepth 1 ! -name framework-res -exec rm -rf {} +; fi
+}
 
 # ─────────────────────────────────────────────────────────
 # ① Linux / macOS ネイティブ (ホスト OS に対応する成果物)

@@ -822,6 +822,21 @@ inline GuestVA a64_va_mmap_file(GuestVA hint, uint64_t len, uint32_t prot,
                                 int map_flags, int fd, int64_t off) {
   len = (len + 4095ull) & ~4095ull;
   if (!len || fd < 0) return 0;
+  /* The guest's pages are 4 KiB; the host's may be 16 KiB, and a file offset the guest
+   * aligned to 4 KiB then cannot be handed to the host's mmap as it is.  Map from the host
+   * page the offset falls in and give the guest the address of the byte it asked for; the
+   * host pages before it stay mapped but belong to no guest mapping.  (A MAP_FIXED request
+   * has an address of its own to honour and is refused, as before.) */
+  {
+    const uint64_t hp = a64_host_page_size();
+    const uint64_t delta = hp > 4096 ? (uint64_t)off & (hp - 1) : 0;
+    if (delta && !(map_flags & (LUNA_MAP_FIXED | LUNA_MAP_NOREPLACE))) {
+      const GuestVA base = a64_va_mmap_file(0, len + delta, prot, map_flags, fd, off - (int64_t)delta);
+      if (!base) return 0;
+      a64_map_remove(base, base + delta, /*release=*/false, /*keep_backing=*/true);
+      return base + delta;
+    }
+  }
   int host_prot = (int)(prot & (LUNA_PROT_READ | LUNA_PROT_WRITE | LUNA_PROT_EXEC));
   if (!(map_flags & (LUNA_MAP_SHARED | LUNA_MAP_PRIVATE)))
     map_flags |= LUNA_MAP_PRIVATE;
@@ -1006,6 +1021,9 @@ struct LoadedRegion {
   /* Linux mappings belong to an mm/process.  The emulator has one backing
    * arena, but procfs must never expose an exec child image in its parent. */
   uint32_t process_pid = guest_pid_base_ref(); /* initial Android app process */
+  /* PT_GNU_RELRO inside this segment: the linker makes it read-only once relocation is done,
+   * and maps shows it as r--p between the segment's file-backed halves.  Zero when none. */
+  uint32_t relro_lo = 0, relro_hi = 0;
 };
 inline std::vector<LoadedRegion> g_loaded_regions;
 // Process-wide ABI selector used by synthetic /proc files.
