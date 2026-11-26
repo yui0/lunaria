@@ -5214,14 +5214,51 @@ static uint64_t g_global_ticks = 0;   /* updated from run loop / AddTicks */
  * is then readable from the stage dumps (LUNARIA_DUMP_EXEC). */
 static bool  g_a64_step_on = false;
 static FILE *g_a64_step_f = nullptr;
+static bool g_a64_step_main = false;
+static uint64_t g_a64_step_stop_pc = 0;   /* LUNARIA_A64_STEP_STOP_AT_BP_NEXT: stop when execution reaches the instruction after the breakpoint */   /* trace only tid 0 (g_a64_step_tid 0 means every thread) */
 static uint32_t g_a64_step_tid = 0;   /* nonzero: step only this guest thread */
+/* LUNARIA_A64_BP=<w-8>,<w-4>[;<w-8>,<w-4>...]: up to 8 breakpoints; a report names the one that hit (bp#n). */
+static constexpr unsigned BP_MAX_PATTERNS = 8;
+static uint32_t g_bp_pat[BP_MAX_PATTERNS][2];
+static unsigned g_bp_npat;
+static const bool g_bp_have = [] {
+  const char *e = lunaria_env("LUNARIA_A64_BP");
+  while (e && *e && g_bp_npat < BP_MAX_PATTERNS) {
+    int adv = 0;
+    if (sscanf(e, "%x,%x%n", &g_bp_pat[g_bp_npat][0], &g_bp_pat[g_bp_npat][1], &adv) != 2) break;
+    ++g_bp_npat;
+    e += adv;
+    if (*e == ';') ++e; else break;
+  }
+  return g_bp_npat != 0;
+}();
+/* Index of the breakpoint whose two preceding words these are, or -1. */
+static int a64_bp_match(uint32_t w8, uint32_t w4)
+{
+  for (unsigned i = 0; i < g_bp_npat; ++i)
+    if (g_bp_pat[i][0] == w8 && g_bp_pat[i][1] == w4) return (int)i;
+  return -1;
+}
+static std::atomic<uint64_t> g_bp_skip{0};
 template <class Jit>
 static Dynarmic::HaltReason a64_run_or_step(Jit &j) {
   if constexpr (!requires { j.GetPC(); }) {
     return j.Run();   /* an A32 engine: only A64 is traced */
   } else {
+  /* LUNARIA_A64_BP_LOG=1: a breakpoint that stays: run the one instruction it replaced by single step, then
+   * put it back, so every pass through the address is reported, not the first after each host call. */
+  if (g_bp_have && g_bp_skip.load(std::memory_order_relaxed) && lunaria_env("LUNARIA_A64_BP_LOG")) {
+    const uint64_t at = g_bp_skip.load(std::memory_order_relaxed);
+    if (j.GetPC() == at) {
+      const Dynarmic::HaltReason sr = j.Step();
+      g_bp_skip.store(0, std::memory_order_relaxed);
+      j.InvalidateCacheRange(at, 4);
+      return sr;
+    }
+  }
   if (!(g_a64_step_on && g_a64_step_f)) return j.Run();
   if (g_a64_step_tid && g_current_tid != g_a64_step_tid) return j.Run();
+  if (g_a64_step_main && g_current_tid != 0) return j.Run();
   Dynarmic::HaltReason hr{};
   fprintf(stderr, "[a64-step] stepping from pc=0x%llx tid=%u\n", (unsigned long long)j.GetPC(), g_current_tid);
   /* LUNARIA_A64_STEP_MAX=<n>: stop tracing after n steps in all, so a check that runs soon after the trigger
@@ -5237,9 +5274,33 @@ static Dynarmic::HaltReason a64_run_or_step(Jit &j) {
     const uint64_t from = j.GetPC();
     hr = j.Step();
     const uint64_t to = j.GetPC();
+    /* LUNARIA_A64_STEP_RING=<n>: keep only the last n branches in memory, and write them out (and stop
+     * stepping) when execution reaches a pc whose low 16 bits are LUNARIA_A64_STEP_STOP_LOW. */
+    static const size_t ring_n = [] { const char *e = lunaria_env("LUNARIA_A64_STEP_RING"); return e ? (size_t)strtoull(e, nullptr, 0) : 0u; }();
+    static const uint64_t stop_low = [] { const char *e = lunaria_env("LUNARIA_A64_STEP_STOP_LOW"); return e ? strtoull(e, nullptr, 16) : ~0ull; }();
+    static std::vector<uint64_t> ring;
+    static size_t ring_at;
     if (to != from + 4u) {
       const uint64_t rec[2] = { from, to };
-      fwrite(rec, sizeof rec, 1, g_a64_step_f);
+      if (ring_n) {
+        if (ring.size() < ring_n * 2) { ring.push_back(from); ring.push_back(to); }
+        else { ring[ring_at] = from; ring[ring_at + 1] = to; ring_at = (ring_at + 2) % (ring_n * 2); }
+      } else {
+        fwrite(rec, sizeof rec, 1, g_a64_step_f);
+      }
+    }
+    static const unsigned stop_nth = [] { const char *e = lunaria_env("LUNARIA_A64_STEP_STOP_NTH"); return e ? (unsigned)strtoul(e, nullptr, 0) : 1u; }();
+    static unsigned stop_seen;
+    if (ring_n && ((g_a64_step_stop_pc && to == g_a64_step_stop_pc) || (!g_a64_step_stop_pc && (to & 0xffffull) == stop_low && ++stop_seen >= stop_nth))) {
+      for (size_t k = 0; k < ring.size(); k += 2) {
+        const size_t at = (ring_at + k) % ring.size();
+        fwrite(&ring[at], sizeof(uint64_t), 2, g_a64_step_f);
+      }
+      fflush(g_a64_step_f);
+      fprintf(stderr, "[a64-step] ring written (%zu branches), x0=%llx at pc=0x%llx\n", ring.size() / 2,
+              (unsigned long long)j.GetRegister(0), (unsigned long long)to);
+      g_a64_step_on = false;
+      break;
     }
     /* LUNARIA_A64_REGS_AT=<comma-separated low 12 bits of pcs>: print x0-x7, x19-x21 and the 32-bit
      * words at [x19+0x38] when execution reaches such a pc (a compare, say), 80 times at most; then the
@@ -6860,6 +6921,9 @@ static const char *synthetic_proc_path_raw(const char *path) {
 static std::map<std::string, uint32_t> g_exported_syms;
 // A64 exports are architectural 64-bit guest VAs.
 static std::map<std::string, GuestVA> g_exported_syms64;
+/* bionic's own pthread_exit (its default-visibility slots are redirected to the host implementation, which a
+ * bionic-created thread must not use: bionic's pthread_join reads the pthread_internal_t it fills in). */
+static GuestVA g_bionic_pthread_exit = 0;
 /* Entry points the Java->native bridge has already resolved, keyed by
  * "<arch><class>\0<method>\0<signature>".  Resolving a native costs a scan of
  * the registered natives and, for an implicitly bound one, building and looking
@@ -8305,7 +8369,13 @@ static const char *synth_guest_maps_render(bool totals_only) {
           next = std::min(next, rlo);
         }
         if (named) continue;
-        anon_a64(at, next, perm, "");
+        if (m.name_id && m.name_id < g_a64_vma_names.size()) {
+          char label[128];
+          snprintf(label, sizeof label, "[anon:%s]", g_a64_vma_names[m.name_id].c_str());
+          anon_a64(at, next, perm, label);
+        } else {
+          anon_a64(at, next, perm, "");
+        }
         at = next;
       }
     }
@@ -10378,6 +10448,7 @@ static void wake_latency_note(uint32_t tid, uint64_t ns) {
  * something; this says what. */
 static bool thread_has_sync_wait(const ArmThread &t);
 static bool thread_needs_poll(const ArmThread &t);
+static void futex_check_start(void);
 static void state_sampler_start(void) {
   static const char *want = lunaria_env("LUNARIA_STATE_SAMPLE");
   static std::once_flag once;
@@ -11254,7 +11325,13 @@ static bool mtrace_addr(GuestVA va) {
     const char *e = lunaria_env("LUNARIA_TRACE_MUTEX_ADDR");
     return e ? (GuestVA)strtoull(e, nullptr, 16) : (GuestVA)0;
   }();
-  return a && a == va;
+  /* LUNARIA_TRACE_MUTEX_LOW=<hex>: any mutex whose address ends in these 20 bits (the heap's addresses move from
+   * one run to the next, an object's offset within its block does not). */
+  static const GuestVA low = [] {
+    const char *e = lunaria_env("LUNARIA_TRACE_MUTEX_LOW");
+    return e ? (GuestVA)strtoull(e, nullptr, 16) : (GuestVA)0;
+  }();
+  return (a && a == va) || (low && (va & 0xfffffull) == low);
 }
 struct MutexHistoryEvent {
   GuestVA mva;
@@ -11339,6 +11416,48 @@ static void futex_wait_addr_remove(GuestVA uaddr, uint32_t count = 1u)
   if (it->second == 0u) g_futex_wait_addrs.erase(it);
 }
 
+/* LUNARIA_FUTEX_CHECK=1: every 3 s, report a futex word somebody is registered to wait on whose guest-visible
+ * counter reads zero (the guest's lock-free wakers would then skip the wake: a lost wakeup). */
+static void futex_check_start(void) {
+  static std::once_flag once;
+  if (!lunaria_env("LUNARIA_FUTEX_CHECK")) return;
+  std::call_once(once, [] {
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        ArmLockGuard g;
+        /* A thread parked on a futex word that no longer holds the value it waited on was told "go" by a store
+         * and never got the wake that was meant to follow: the other kind of lost wakeup. */
+        for (const auto &t : g_threads) {
+          if (t.finished || !t.id || !t.waiting_futex) continue;
+          const uint32_t word = *reinterpret_cast<const volatile uint32_t *>(t.waiting_futex);
+          if (word != t.futex_val)
+            fprintf(stderr, "[futex-check] tid=%u (%s) parked on 0x%llx expecting 0x%x but the word is 0x%x\n",
+                    t.id, thread_name_of(t.id), (unsigned long long)t.waiting_futex, t.futex_val, word);
+        }
+        for (const auto &t : g_threads) {
+          if (t.finished || !t.id) continue;
+          const uint64_t pend = t.pending_signals;
+          if (pend || t.signal_depth || lunaria_env("LUNARIA_FUTEX_CHECK_ALL"))
+
+            fprintf(stderr, "[sig-check] tid=%u (%s) has pending signals 0x%llx mask=0x%llx running=%d depth=%d "
+                            "futex=0x%llx mutex=0x%llx cond=0x%llx sem=%d join=%d fds=%d pc=0x%llx\n",
+                    t.id, thread_name_of(t.id), (unsigned long long)pend, (unsigned long long)signal_mask_load(t.id), (int)t.running, (int)t.signal_depth,
+                    (unsigned long long)t.waiting_futex, (unsigned long long)t.waiting_mutex,
+                    (unsigned long long)t.waiting_cond, (int)t.waiting_sem, (int)t.waiting_join,
+                    (int)t.waiting_fds, (unsigned long long)t.pc64);
+        }
+        for (const auto &e : g_futex_wait_addrs) {
+          std::atomic<uint32_t> *sl = fwa_slot(e.first);
+          const uint32_t v = sl ? sl->load() : 0u;
+          if (e.second && v == 0u)
+            fprintf(stderr, "[futex-check] 0x%llx has %u registered waiter(s) but counter=0 (lost-wake hazard)\n",
+                    (unsigned long long)e.first, e.second);
+        }
+      }
+    }).detach();
+  });
+}
 /* A FUTEX_WAIT that comes straight back is how a stall looks from inside.
  *
  * On a kernel, FUTEX_WAIT either blocks or answers EAGAIN because the word
@@ -30049,6 +30168,63 @@ static bool guest_ptrace_traceme_start(uint32_t pid)
   return true;
 }
 
+/* ptrace(request, pid, addr, data) for the one tracer/tracee pair a protector builds: a process and
+ * the host child it forked (or that child and its parent).  The kernel's rules, in the part that
+ * matters here: a process cannot trace itself (EPERM), a pid that is nobody's is ESRCH, a tracee has
+ * one tracer (EPERM), PTRACE_ATTACH stops the tracee with SIGSTOP and PTRACE_SEIZE does not,
+ * CONT and DETACH let it run, and any request on a process that is not our tracee is ESRCH.  Memory
+ * and register access is not offered (EIO).  Returns 0 or -errno. */
+#define GUEST_PTRACE_TRACEE_MAX 16u
+static uint32_t g_guest_ptrace_tracees[GUEST_PTRACE_TRACEE_MAX];
+static unsigned g_guest_ptrace_tracee_count;
+
+static bool guest_ptrace_is_tracee(uint32_t pid)
+{
+  unsigned i;
+  for (i = 0; i < g_guest_ptrace_tracee_count; ++i)
+    if (g_guest_ptrace_tracees[i] == pid) return true;
+  return false;
+}
+
+static pid_t guest_ptrace_host_pid(uint32_t pid)
+{
+  for (const auto &c : g_host_children)
+    if (!c.reaped && c.pid == pid) return (pid_t)c.pid;
+  if (g_host_fork_child && pid == GUEST_PPID) return g_host_parent_pid;
+  return 0;
+}
+
+static int64_t guest_ptrace(int64_t request, int64_t pid, uint64_t data)
+{
+  enum { T_TRACEME = 0, T_CONT = 7, T_ATTACH = 16, T_DETACH = 17, T_SEIZE = 0x4206 };
+  (void)data;
+  if (request == T_TRACEME) return guest_ptrace_traceme_start(guest_pid()) ? 0 : -EPERM;
+  if (pid <= 0) return -ESRCH;
+  if ((uint32_t)pid == guest_pid()) return -EPERM;
+  const pid_t host = guest_ptrace_host_pid((uint32_t)pid);
+  if (request == T_ATTACH || request == T_SEIZE) {
+    if (!host) return -ESRCH;
+    if (guest_ptrace_is_tracee((uint32_t)pid) || g_guest_ptrace_tracee_count >= GUEST_PTRACE_TRACEE_MAX)
+      return -EPERM;
+    g_guest_ptrace_tracees[g_guest_ptrace_tracee_count++] = (uint32_t)pid;
+    if (request == T_ATTACH && kill(host, SIGSTOP)) return -errno;
+    return 0;
+  }
+  if (!host || !guest_ptrace_is_tracee((uint32_t)pid)) return -ESRCH;
+  if (request == T_CONT || request == T_DETACH) {
+    if (request == T_DETACH) {
+      unsigned i;
+      for (i = 0; i < g_guest_ptrace_tracee_count; ++i)
+        if (g_guest_ptrace_tracees[i] == (uint32_t)pid) {
+          g_guest_ptrace_tracees[i] = g_guest_ptrace_tracees[--g_guest_ptrace_tracee_count];
+          break;
+        }
+    }
+    return kill(host, SIGCONT) ? -errno : 0;
+  }
+  return -EIO;
+}
+
 /* Descriptor readiness, on the kernel's schedule rather than the frame's. A
  * guest thread parked in poll/select that is only completed by a scheduler
  * pass learns that its socket became writable up to a whole frame late (40
@@ -36561,6 +36737,9 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
       ret64(child_guest_tid);
       break;
     }
+    case 117: /* AArch64 __NR_ptrace(request, pid, addr, data) */
+      ret64((uint64_t)guest_ptrace((int64_t)g_svc_args64[0], (int64_t)g_svc_args64[1], g_svc_args64[3]));
+      break;
     case 93: { /* AArch64 __NR_exit: terminate only the calling thread */
       if (!ctx.is_arm64 && !canon) {
         ret32((uint32_t)-(int32_t)ENOSYS);
@@ -49111,6 +49290,7 @@ aaudio_write_retry:
     constexpr long kPrGetSeccomp   = 21;
     constexpr long kPrSetNoNewPrivs = 38;
     constexpr long kPrGetNoNewPrivs = 39;
+    constexpr long kPrSetVma       = 0x53564d41;
     if (op == kPrGetDumpable) {
       ret32(guest_dumpable_load(guest_pid()));
     } else if (op == kPrSetDumpable) {
@@ -49141,6 +49321,41 @@ aaudio_write_retry:
       }
     } else if (op == kPrGetNoNewPrivs) {
       ret32(g_guest_no_new_privs ? 1u : 0u);
+    } else if (op == kPrSetVma) {
+      /* prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, start, len, name): Android's kernels name anonymous
+       * memory, which bionic's allocators and Rust/C++ runtimes use for every arena they map.  name
+       * is up to 79 printable characters without \ ` $ [ ], or NULL to clear. */
+      constexpr uint32_t kSetVmaAnonName = 0;
+      int err = 0;
+      uint32_t id = 0;
+      const GuestVA start = argp(2);
+      const uint64_t len = argp(3);
+      const GuestVA name = argp(4);
+      if (arg32(1) != kSetVmaAnonName) err = EINVAL;
+      else if (name) {
+        const char *n = ctx.mem.cstr(name);
+        size_t k = 0;
+        if (!n) err = EFAULT;
+        else {
+          for (; n[k] && k < 80; ++k) {
+            const unsigned char c = (unsigned char)n[k];
+            if (c < 0x20 || c > 0x7e || c == '\\' || c == '`' || c == '$' || c == '[' || c == ']') { err = EINVAL; break; }
+          }
+          if (!err && k >= 80) err = EINVAL;
+          if (!err) id = a64_vma_name_id(n);
+        }
+      }
+      if (!err && ctx.is_arm64) {
+        const GuestVA end = (start + len + 4095u) & ~4095ull;
+        if ((start & 4095u) || end < start) err = EINVAL;
+        else if (len && a64_map_set_name(start, end, id)) err = errno;
+      } else if (!err) err = EINVAL;
+      if (err) {
+        arm_set_errno(ctx, err);
+        ret32(~0u);
+      } else {
+        ret32(0);
+      }
     } else {
       /* An unknown option was not carried out, so it did not succeed. The kernel
        * answers EINVAL for an option it does not implement, and capability probes
@@ -54241,12 +54456,12 @@ fputws_done:
               request, (long long)(int64_t)argp(1),
               (unsigned long long)argp(2), (unsigned long long)argp(3),
               g_current_tid);
-    if (request == 0 /* PTRACE_TRACEME */ &&
-        guest_ptrace_traceme_start(guest_pid())) {
-      ret32(0);
-    } else {
-      arm_set_errno(ctx, EPERM);
+    const int64_t pr = guest_ptrace(request, (int64_t)argp(1), argp(3));
+    if (pr < 0) {
+      arm_set_errno(ctx, (int)-pr);
       ret32((uint32_t)-1);
+    } else {
+      ret32(0);
     }
     break;
   }
@@ -54360,6 +54575,10 @@ fputws_done:
         break;
       }
       ArmThread *target = thread_slot_by_tid(target_tid);
+      if (lunaria_env("LUNARIA_TRACE_SIG"))
+        fprintf(stderr, "[pthread_kill] route target=%u slot=%d finished=%d running=%d dvm_attached=%d dvm_tid=%u\n",
+                target_tid, target ? 1 : 0, target ? (int)target->finished : -1, target ? (int)target->running : -1,
+                target_tid < 4096 ? (int)g_dvm_native_stacks[target_tid].attached : -1, (unsigned)g_dvm_guest_tid);
       if (target) {
         /* A terminated but unjoined pthread still has a handle;
          * it receives no signal.  Never invoke at the sender. */
@@ -56678,6 +56897,15 @@ fputws_done:
             if (mtrace_addr(mva))
               fprintf(stderr, "[mtrace] park   mutex=0x%llx tid=%u\n",
                       (unsigned long long)mva, g_current_tid);
+            if (lunaria_env("LUNARIA_TRACE_PARK")) {
+              static std::set<std::pair<GuestVA, uint32_t>> seen;
+              if (seen.size() < 200 && seen.insert({mva, g_current_tid}).second) {
+                const uint32_t ow = (w & 0xffu) ? ((w & 0xffu) - 1u) : 0u;
+                fprintf(stderr, "[park] tid=%u (%s) waits for mutex 0x%llx word=0x%08x owner tid=%u (%s) lr=0x%08x\n",
+                        g_current_tid, thread_name_of(g_current_tid), (unsigned long long)mva, raw, ow,
+                        thread_name_of(ow), (uint32_t)lr);
+              }
+            }
             /* Say the mutex is contended before parking, so the
              * owner's inline unlock traps and wakes us. */
             guest_mutex_mark_contended(ctx.mem, mva);
@@ -57071,6 +57299,19 @@ fputws_done:
   }
 
   case SVC_PTHREAD_EXIT:
+    /* A thread bionic created with clone() (it owns the stack and pthread_internal_t, and its
+     * pthread_join reads thread->return_value after waiting for the kernel to clear the tid word)
+     * leaves through bionic's own pthread_exit: return value, join state, TLS destructors and the
+     * exit system call.  The host's bookkeeping below knows none of that. */
+    if (ctx.is_arm64 && g_svc_jit64 && g_bionic_pthread_exit && g_current_tid != 0) {
+      const ArmThread *self = thread_slot_by_tid(g_current_tid);
+      if (self && self->clear_tid_va) {
+        g_svc_jit64->SetRegister(0, g_svc_args64[0]);
+        g_svc_jit64->SetPC(g_bionic_pthread_exit);
+        g_svc_context_restored = true;
+        break;
+      }
+    }
     guest_thread_atexit_run(ctx, g_current_tid);
     if (g_current_tid != 0) {
       /* pthread_exit(void *retval): keep it for whoever joins. */
@@ -57325,6 +57566,12 @@ fputws_done:
     }
     /* The value the thread produced, which pthread_join hands back. */
     const uint64_t value = target ? target->exit_value : 0;
+    if (lunaria_env("LUNARIA_TRACE_JOIN"))
+      fprintf(stderr, "[join] tid=%u joins tid=%u handle=0x%llx retval_ptr=0x%llx -> value=0x%llx "
+                      "(slot %s, finished=%d running=%d detached=%d)\n",
+              g_current_tid, target_tid, (unsigned long long)argp(0), (unsigned long long)retval_ptr,
+              (unsigned long long)value, target ? "present" : "gone", target ? (int)target->finished : -1,
+              target ? (int)target->running : -1, target ? (int)target->detached : -1);
     if (retval_ptr) {
       if (ctx.is_arm64) ctx.mem.write64(retval_ptr, value);
       else              ctx.mem.write32(retval_ptr, (uint32_t)value);
@@ -59870,7 +60117,7 @@ pv_done:
       if (hc && (pid > 0 || !fork_child_for_parent(parent_pid, pid).tid)) {
         for (;;) {
           int st = 0;
-          const pid_t r = waitpid((pid_t)hc->pid, &st, WNOHANG | ((options & 2) ? WUNTRACED : 0));
+          const pid_t r = waitpid((pid_t)hc->pid, &st, WNOHANG | (((options & 2) || guest_ptrace_is_tracee(hc->pid)) ? WUNTRACED : 0));
           if (r == (pid_t)hc->pid) {
             /* Linux wait status: exit code in bits 8..15, signal in bits 0..6, 0x7f stopped. */
             uint32_t linux_status = 0;
@@ -69946,18 +70193,28 @@ enum { CODE_HOOK_MAX = sizeof kCodeHookSyms / sizeof kCodeHookSyms[0] };
  * LUNARIA_TRACE_A64_RET uses so a stray report cannot be mistaken for it. */
 static constexpr uint32_t CODE_HOOK_BRK = 0xd4200000u | (0x4855u << 5);
 
+/* LUNARIA_A64_BP_DUMP_MAPS=<dir>: every anonymous guest mapping up to 64 MiB, as <dir>/bp_map_<lo>.bin. */
+static void a64_bp_dump_maps(ArmExecCtx *ctx, const char *dir)
+{
+  std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  for (const A64Mapping &m : g_a64_maps) {
+    if (m.file_backed || m.hi - m.lo > 0x4000000ull) continue;
+    char name[PATH_MAX];
+    snprintf(name, sizeof name, "%s/bp_map_%llx.bin", dir, (unsigned long long)m.lo);
+    if (FILE *f = fopen(name, "wb")) {
+      fwrite(ctx->mem.ptr((GuestVA)m.lo), 1, (size_t)(m.hi - m.lo), f);
+      fclose(f);
+    }
+  }
+}
+
 /* LUNARIA_A64_BP=<w-8>,<w-4> (32-bit hex instruction words): a debugging breakpoint on the guest instruction
  * whose two preceding words are those (an address changes every run for code a protector maps itself; its
  * instructions do not).  The translator is handed a `brk #0x4856` there, so nothing in guest memory changes;
  * ExceptionRaised() prints the registers and lets the real instruction run, and the breakpoint is put back
  * the next time the guest makes a call into the host.  LUNARIA_A64_BP_MAX=<n> bounds the reports. */
 static constexpr uint32_t DEBUG_BRK = 0xd4200000u | (0x4856u << 5);
-static uint32_t g_bp_pat[2];
-static const bool g_bp_have = [] {
-  const char *e = lunaria_env("LUNARIA_A64_BP");
-  return e && sscanf(e, "%x,%x", &g_bp_pat[0], &g_bp_pat[1]) == 2;
-}();
-static std::atomic<uint64_t> g_bp_skip{0};
+
 static std::atomic<unsigned> g_bp_hits{0};
 
 /* Installed hooks, as a flat array: there are at most a handful, the lookup
@@ -70361,8 +70618,15 @@ public:
       const uint64_t pc = j->GetPC() + (uint64_t)shift;
       const long back = lunaria_env_long("LUNARIA_FAULT_CODE_WORDS", 8);
       fprintf(stderr, "[arm64]   code @0x%llx:", (unsigned long long)(pc - 4 * back));
-      for (long i = -back; i < lunaria_env_long("LUNARIA_FAULT_CODE_FWD", 8); ++i)
-        fprintf(stderr, " %08x", self->ctx->mem.read32((GuestVA)(pc + 4 * i)));
+      /* Guest VA is host VA: read the mapping itself (an address outside the image window is not an
+       * offset into the backing store), and print 0 for a word that is not mapped. */
+      for (long i = -back; i < lunaria_env_long("LUNARIA_FAULT_CODE_FWD", 8); ++i) {
+        const GuestVA at = (GuestVA)(pc + 4 * i);
+        GuestVA bad = at;
+        uint32_t w = 0;
+        if (!a64_access_fault_for_prot(at, 4u, 1u, &bad)) memcpy(&w, (const void *)at, sizeof w);
+        fprintf(stderr, " %08x", w);
+      }
       fprintf(stderr, "\n");
     }
   }
@@ -70463,6 +70727,18 @@ public:
     GuestVA fault = (GuestVA)va;
     const int code = a64_access_fault((GuestVA)va, len, write, &fault);
     if (!code) return false;
+    if (lunaria_env("LUNARIA_TRACE_FAULT")) {
+      static std::atomic<int> shown{0};
+      if (shown.fetch_add(1) < 24) {
+        std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+        const A64Mapping *m = a64_find_locked((GuestVA)va);
+        fprintf(stderr, "[fault] tid=%u va=0x%llx len=%zu %s code=%d reported=0x%llx pc=0x%llx vma=%s",
+                g_current_tid, (unsigned long long)va, len, write ? "store" : "load", code,
+                (unsigned long long)fault, (unsigned long long)cur_pc(), m ? "" : "none\n");
+        if (m) fprintf(stderr, "[0x%llx-0x%llx prot=%u file=%d]\n", (unsigned long long)m->lo,
+                       (unsigned long long)m->hi, m->prot, (int)m->file_backed);
+      }
+    }
     if (!g_a64_fault.valid) {
       g_a64_fault.addr  = fault;
       g_a64_fault.code = code;
@@ -70542,7 +70818,7 @@ public:
       // 64-bit mapping: guest-generated code (Boehm-GC / Mono stubs).
       if (a64_executable(va)) {
         if (g_bp_have && va != g_bp_skip.load(std::memory_order_relaxed) && va >= 8 &&
-            ctx->mem.read32((GuestVA)va - 8) == g_bp_pat[0] && ctx->mem.read32((GuestVA)va - 4) == g_bp_pat[1])
+            a64_bp_match(ctx->mem.read32((GuestVA)va - 8), ctx->mem.read32((GuestVA)va - 4)) >= 0)
           return DEBUG_BRK;
         return ctx->mem.read32((GuestVA)va);
       }
@@ -70570,6 +70846,10 @@ public:
         return CODE_HOOK_BRK;
       }
       uint32_t insn = ctx->mem.read32(c);
+      /* LUNARIA_A64_BP inside the image window too (a library the loader mapped, not code a protector made). */
+      if (g_bp_have && (GuestVA)va != g_bp_skip.load(std::memory_order_relaxed) && c >= 8 &&
+          a64_bp_match(ctx->mem.read32(c - 8), ctx->mem.read32(c - 4)) >= 0)
+        return DEBUG_BRK;
       /* Non-mutating return probe.  Translation sees a BRK only at a
        * requested RET; ExceptionRaised logs x0 and performs that RET.
        * Guest memory is never patched, and execution is identical
@@ -71038,8 +71318,25 @@ public:
         return;
       }
     }
+    int bp_index = -1;
     if (ex == E::Breakpoint && ctx && jit64 && g_bp_have && pc >= 8 &&
-        ctx->mem.read32((GuestVA)pc - 8) == g_bp_pat[0] && ctx->mem.read32((GuestVA)pc - 4) == g_bp_pat[1]) {
+        (bp_index = a64_bp_match(ctx->mem.read32((GuestVA)pc - 8), ctx->mem.read32((GuestVA)pc - 4))) >= 0) {
+      /* LUNARIA_A64_BP_WHEN=<reg>=<hex>: only a pass with that register value counts (and is traced or reported);
+       * any other pass runs the replaced instruction and goes on. */
+      {
+        static unsigned when_reg = 99; static uint64_t when_val;
+        static const bool when_on = [] {
+          const char *e = lunaria_env("LUNARIA_A64_BP_WHEN");
+          return e && sscanf(e, "%u=%llx", &when_reg, (unsigned long long *)&when_val) == 2 && when_reg < 31;
+        }();
+        if (when_on && jit64->GetRegister((int)when_reg) != when_val) {
+          g_bp_skip.store(pc, std::memory_order_relaxed);
+          jit64->InvalidateCacheRange(pc, 4);
+          jit64->SetPC(pc);
+          jit64->HaltExecution();
+          return;
+        }
+      }
       static const unsigned max_hits = [] { const char *e = lunaria_env("LUNARIA_A64_BP_MAX"); return e ? (unsigned)strtoul(e, nullptr, 0) : 200u; }();
       static const unsigned min_tid = [] { const char *e = lunaria_env("LUNARIA_A64_BP_MINTID"); return e ? (unsigned)strtoul(e, nullptr, 0) : 0u; }();
       if (g_current_tid >= min_tid && g_bp_hits.fetch_add(1) < max_hits) {
@@ -71047,6 +71344,45 @@ public:
         std::string rep;
         char tmp[512];
         auto add = [&](const char *fmt, auto... a) { snprintf(tmp, sizeof tmp, fmt, a...); rep += tmp; };
+        if (lunaria_env("LUNARIA_A64_BP_LOG")) {   /* one short line per pass */
+          add("[a64-bp] bp#%d pc=0x%llx tid=%u", bp_index, (unsigned long long)pc, g_current_tid);
+          for (int r = 0; r < 8; ++r) add(" x%d=%llx", r, (unsigned long long)jit64->GetRegister(r));
+          add(" x29=%llx x30=%llx sp=%llx", (unsigned long long)jit64->GetRegister(29), (unsigned long long)jit64->GetRegister(30),
+              (unsigned long long)jit64->GetSP());
+          /* LUNARIA_A64_BP_PEEK=<reg>:<hex off>,<hex off>...: the 8-byte words at those offsets from a register. */
+          if (const char *pk = lunaria_env("LUNARIA_A64_BP_PEEK")) {
+            unsigned pr = 0; int adv = 0;
+            if (sscanf(pk, "%u:%n", &pr, &adv) >= 1 && pr < 31 && adv) {
+              const uint64_t q = jit64->GetRegister((int)pr);
+              add(" peek[x%u]:", pr);
+              for (const char *c = pk + adv; *c;) {
+                char *e; const unsigned long off = strtoul(c, &e, 16);
+                uint64_t v = 0; const uint8_t *m = ctx->mem.try_ptr((GuestVA)(q + off), 8);
+                if (m) memcpy(&v, m, 8);
+                add(" %lx=%llx", off, (unsigned long long)v);
+                if (*e == ',') c = e + 1; else break;
+              }
+            }
+          }
+          /* The words at the top of the stack: a frame without an fp chain keeps its caller's lr there. */
+          if (const uint8_t *m = ctx->mem.try_ptr((GuestVA)jit64->GetSP(), 0x80)) {
+            add(" stack:");
+            for (int i = 0; i < 16; ++i) { uint64_t q; memcpy(&q, m + 8 * i, 8); add(" %llx", (unsigned long long)q); }
+          }
+          rep += "\n";
+          fputs(rep.c_str(), stderr);
+          if (const char *tf = lunaria_env("LUNARIA_A64_BP_TRACE")) {
+            static unsigned bp_seen_log;
+            static const unsigned nth = [] { const char *e = lunaria_env("LUNARIA_A64_BP_NTH"); return e ? (unsigned)strtoul(e, nullptr, 0) : 1u; }();
+            if (!g_a64_step_f && ++bp_seen_log == nth && (g_a64_step_f = fopen(tf, "wb"))) {
+              if (const char *dd = lunaria_env("LUNARIA_A64_BP_DUMP_MAPS")) a64_bp_dump_maps(ctx, dd); if (lunaria_env("LUNARIA_A64_STEP_STOP_AT_BP_NEXT")) g_a64_step_stop_pc = pc + 4; g_a64_step_tid = g_current_tid; g_a64_step_main = g_current_tid == 0; g_a64_step_on = true; }
+          }
+          g_bp_skip.store(pc, std::memory_order_relaxed);
+          jit64->InvalidateCacheRange(pc, 4);
+          jit64->SetPC(pc);
+          jit64->HaltExecution();
+          return;
+        }
         add("[a64-bp] pc=0x%llx tid=%u sp=0x%llx", (unsigned long long)pc, g_current_tid, (unsigned long long)jit64->GetSP());
         for (int r = 0; r < 31; ++r)
           add("%sx%d=%llx", r % 6 ? " " : "\n   ", r, (unsigned long long)jit64->GetRegister(r));
@@ -71054,6 +71390,21 @@ public:
         auto hexdump = [&](const uint8_t *m, int n) {
           for (int i = 0; i < n; ++i) { add("%02x", m[i]); }
         };
+        /* LUNARIA_A64_BP_DUMP=<reg>:<bytes>: that much memory at the address a register holds (a table). */
+        if (const char *dspec = lunaria_env("LUNARIA_A64_BP_DUMP")) {
+          unsigned dr = 0, dn = 0;
+          if (sscanf(dspec, "%u:%x", &dr, &dn) == 2 && dr < 31 && dn && dn <= 0x10000u) {
+            const uint64_t q = jit64->GetRegister((int)dr);
+            if (const uint8_t *m = ctx->mem.try_ptr((GuestVA)q, dn)) {
+              add("[a64-bp]   dump x%u=0x%llx +0x%x:\n", dr, (unsigned long long)q, dn);
+              for (unsigned i = 0; i < dn; i += 16) {
+                add("[a64-bp]   %04x: ", i);
+                for (unsigned k = 0; k < 16 && i + k < dn; ++k) add("%02x", m[i + k]);
+                rep += "\n";
+              }
+            }
+          }
+        }
         for (int r : {0, 1, 2, 3, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28}) {
           const uint64_t q = jit64->GetRegister(r);
           if (q < 0x10000u || q > 0x7fffffffffffull) continue;
@@ -71077,6 +71428,14 @@ public:
             }
         }
         fputs(rep.c_str(), stderr);
+      }
+      /* LUNARIA_A64_BP_TRACE=<file>[, LUNARIA_A64_BP_NTH=<n>]: start the single-step branch trace at the
+       * n-th hit of the breakpoint (the first by default), on that thread. */
+      if (const char *tf = lunaria_env("LUNARIA_A64_BP_TRACE")) {
+        static unsigned bp_seen;
+        static const unsigned nth = [] { const char *e = lunaria_env("LUNARIA_A64_BP_NTH"); return e ? (unsigned)strtoul(e, nullptr, 0) : 1u; }();
+        if (!g_a64_step_f && ++bp_seen == nth && (g_a64_step_f = fopen(tf, "wb"))) {
+          if (const char *dd = lunaria_env("LUNARIA_A64_BP_DUMP_MAPS")) a64_bp_dump_maps(ctx, dd); if (lunaria_env("LUNARIA_A64_STEP_STOP_AT_BP_NEXT")) g_a64_step_stop_pc = pc + 4; g_a64_step_tid = g_current_tid; g_a64_step_main = g_current_tid == 0; g_a64_step_on = true; }
       }
       /* Run the real instruction: it is translated again, from the guest's own bytes. */
       g_bp_skip.store(pc, std::memory_order_relaxed);
@@ -73100,8 +73459,24 @@ a64_hooks_done:
       /* LUNARIA_DUMP_AT_ERRORDATA=<dir>: the memory around the moment a protector
        * writes its error record, for `strings`: whatever it decrypted to decide is
        * usually still lying in its heap and on its stack. */
-      if (svc_no && !strcmp(svc_symbol_name(svc_no), "setenv") && strstr(ctx->mem.cstr((GuestVA)x0), "ERRORDATA")) {
-        if (const char *dir = lunaria_env("LUNARIA_DUMP_AT_ERRORDATA")) {
+      /* LUNARIA_DUMP_AT_SETENV=<name>: the same dump at an earlier setenv of that name (the reporter
+       * starts by setting "Log", before it reads the record: the code that decided is still there). */
+      /* LUNARIA_DUMP_AT_SVC=<svc name>:<tid>:<nth>: or at that call of that thread (a join before the
+       * protector erases the code it is about to leave). */
+      bool dump_at_svc = false;
+      if (svc_no)
+        if (const char *spec = lunaria_env("LUNARIA_DUMP_AT_SVC")) {
+          char name[64] = ""; unsigned tid = 0, nth = 1;
+          static unsigned seen;
+          if (sscanf(spec, "%63[^:]:%u:%u", name, &tid, &nth) >= 2 && tid == g_current_tid &&
+              !strcmp(svc_symbol_name(svc_no), name) && ++seen == nth) dump_at_svc = true;
+        }
+      if (svc_no && (dump_at_svc || (!strcmp(svc_symbol_name(svc_no), "setenv") &&
+          (strstr(ctx->mem.cstr((GuestVA)x0), "ERRORDATA") ||
+           (lunaria_env("LUNARIA_DUMP_AT_SETENV") && !strcmp(ctx->mem.cstr((GuestVA)x0), lunaria_env("LUNARIA_DUMP_AT_SETENV"))))))) {
+        static bool dumped;
+        if (const char *dir = (!dumped || !(lunaria_env("LUNARIA_DUMP_AT_SETENV") || lunaria_env("LUNARIA_DUMP_AT_SVC"))) ? lunaria_env("LUNARIA_DUMP_AT_ERRORDATA") : nullptr) {
+          dumped = true;
           struct R { GuestVA lo; uint64_t len; const char *tag; };
           const GuestVA sp = jit64->GetSP();
           const R rs[] = {
@@ -73527,6 +73902,8 @@ a64_hooks_done:
                 (unsigned long long)x0, (unsigned long long)x1,
                 (unsigned long long)x2, (unsigned long long)x30,
                 (long long)ret, eno);
+        if (svc_no && ret && !strcmp(svc_symbol_name(svc_no), "realpath"))
+          fprintf(stderr, "[svc-ret]   realpath -> %.300s\n", ctx->mem.cstr((GuestVA)ret));
         /* What a raw stat or readlink handed back: integrity code compares these fields
          * with what /proc/self/maps shows for the same file. */
         if (!svc_no && (int64_t)ret >= 0) {
@@ -74586,6 +74963,7 @@ static void sched64_run_thread(ArmExecCtx &ctx, ArmThread &t, uint64_t slice, ui
     return;
   }
   state_sampler_start();
+  futex_check_start();
   const uint64_t sl_t0 = host_mono_ns();
   if (!t.slices) t.engine_ns = sl_t0;
   if (t.id < 256) {
@@ -75847,7 +76225,9 @@ static void cb_signal_suspend_wait(ArmExecCtx &ctx, ArmSignalFrameState &frame)
   (void)ctx;
   if (!g_cb_depth || g_cb_lock_wait.from_slice ||
       (g_cb_lock_wait.kind != CbLockWait::Futex &&
-       g_cb_lock_wait.kind != CbLockWait::Sem)) return;
+       g_cb_lock_wait.kind != CbLockWait::Sem &&
+       g_cb_lock_wait.kind != CbLockWait::Mu &&
+       g_cb_lock_wait.kind != CbLockWait::Cond)) return;
   frame.callback_wait_slot = g_cb_depth - 1;
   g_cb_signal_wait[g_main_signal_depth] = *cb_wait_slot();
   if (g_cb_lock_wait.kind == CbLockWait::Futex)
@@ -76333,9 +76713,23 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
         lock_abandon = true;
         break;
       }
+      /* A signal ends any blocking wait the way it does on a kernel: the handler runs on this thread, and the
+       * wait carries on (or restarts) once it returns.  Boehm's stop-the-world signals a thread that is parked
+       * on a contended pthread mutex, and waits for the handler to run. */
       if ((g_cb_lock_wait.kind == CbLockWait::Futex ||
-           g_cb_lock_wait.kind == CbLockWait::Sem) &&
+           g_cb_lock_wait.kind == CbLockWait::Sem ||
+           g_cb_lock_wait.kind == CbLockWait::Mu ||
+           g_cb_lock_wait.kind == CbLockWait::Cond) &&
           cb.take_main_signal()) break;
+      if (trace_wait && g_current_tid && g_current_tid < 4096) {
+        static std::atomic<int> said{0};
+        const uint64_t pd = g_dvm_pending_signals[g_current_tid].load();
+        if (pd && said++ < 12)
+          fprintf(stderr, "[cb-sig] tid=%u kind=%u pending=0x%llx mask=0x%llx dvm_tid=%u signal_depth=%u\n",
+                  g_current_tid, (unsigned)g_cb_lock_wait.kind, (unsigned long long)pd,
+                  (unsigned long long)signal_mask_load(g_current_tid), (unsigned)g_dvm_guest_tid,
+                  (unsigned)g_main_signal_depth);
+      }
       if (cb_lock_wait_try_grant(ctx)) break;
       if (trace_wait && host_mono_ns() >= wait_trace_at) {
         ArmLockGuard wait_locked;
@@ -77162,16 +77556,16 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
    * guest reading errno from an unmapped low VA and always seeing 0.
    *   mrs x9,tpidr_el0; cbz x9,slow;
    *   ldr w0,[x9,#TLS64_ERRNO_OFF]; cbz w0,slow;
-   *   movk x0,#0x7000,lsl#32; ret;
+   *   movk x0,#0x70,lsl#32; ret;
    * slow: svc #N; ret */
   {
     static_assert(TLS64_ERRNO_OFF == 0xBFCu,
                   "the ldr offset below encodes TLS64_ERRNO_OFF");
-    static_assert((A64_GUEST_BASE >> 32) == 0x7000ull,
+    static_assert((A64_GUEST_BASE >> 32) == 0x70ull,
                   "the movk below encodes A64_GUEST_BASE[47:32]");
     const uint32_t er[] = {
       0xD53BD049u, 0xB40000A9u, 0xB94BFD20u, 0x34000060u,
-      0xF2CE0000u, 0xD65F03C0u,
+      0xF2C00E00u, 0xD65F03C0u,
       0xD4000001u | (SVC_ERRNO_ADDR << 5), 0xD65F03C0u,
     };
     for (size_t i = 0; i < sizeof er / sizeof er[0]; ++i)
@@ -77211,7 +77605,7 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
    * mutex-type table at 0x1000. */
   {
     static const uint32_t fe[] = {
-      0xb4000140u, 0xd360fc09u, 0xb5000049u, 0xf2ce0000u,
+      0xb4000140u, 0xd360fc09u, 0xb5000049u, 0xf2c00e00u,
       0xf9400c01u, 0xb40000a1u, 0xb9400c00u, 0x121b0000u,
       0x53057c00u, 0xd65f03c0u,
       0xd4000001u /* | svc */, 0xd65f03c0u,
@@ -77219,7 +77613,7 @@ static void build_fast_rwlock_stubs64(ArmExecCtx &ctx) {
     /* fgets promote: bare FILE* offsets get A64_GUEST_BASE before the
      * body at 0xF40 (same class of bug as __errno). */
     static const uint32_t fg_prom[] = {
-      0xb4000460u, 0xd360fc09u, 0xb5000049u, 0xf2ce0000u,
+      0xb4000460u, 0xd360fc09u, 0xb5000049u, 0xf2c00e00u,
     };
     static const uint32_t fg[] = {
       0xb4000440u, 0xb4000422u, 0x7100043fu, 0x540003ebu,
@@ -78171,6 +78565,8 @@ static bool load_elf64(ArmExecCtx &ctx, const char *path,
            * TLS/heap/stdio state as bionic-private structures.
            * Keep direct intra-image calls untouched; only ELF
            * interposable slots can be redirected correctly. */
+          if (pure_libc_image && !g_bionic_pthread_exit && !strcmp(sname, "pthread_exit"))
+            g_bionic_pthread_exit = sym_va;   /* bionic's own definition, see SVC_PTHREAD_EXIT */
           if (pure_libc_image &&
               (rt == R_AARCH64_JUMP_SLOT || rt == R_AARCH64_GLOB_DAT) &&
               (a64_symbol_is_ifunc(stab[si].st_info) ||
@@ -80428,7 +80824,7 @@ extern "C" void arm_exec_log_guest_chain(const char *tag) {
       if (!w) break;
       uint64_t v;
       std::memcpy(&v, w, 8);
-      if (v >= 0x700010000000ull && v < 0x700020000000ull && !(v & 3u)) {
+      if (v >= A64_GUEST_BASE + 0x10000000ull && v < A64_GUEST_BASE + 0x20000000ull && !(v & 3u)) {
         m += snprintf(sl + m, sizeof sl - (size_t)m, " %llx", (unsigned long long)v);
         ++found;
       }

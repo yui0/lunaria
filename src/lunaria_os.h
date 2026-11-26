@@ -2098,6 +2098,7 @@ struct luna_guest_mapping {
   bool owned, file_backed, shared;
   unsigned backing_handle; /* retained host descriptor plus one, or zero */
   uint64_t backing_offset;
+  uint32_t name_id;        /* PR_SET_VMA_ANON_NAME: index into the guest's name table, 0 = unnamed */
 };
 typedef int (*luna_vm_host_operation)(void *, size_t, int);
 typedef int (*luna_vm_host_release)(void *, size_t);

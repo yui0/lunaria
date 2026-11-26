@@ -328,7 +328,10 @@ inline bool     g_mmap2_active = false;
 using GuestVA = uint64_t;
 using BackingOffset = uint32_t;
 // A64 guest ptrs: 48-bit lower-half VA; backing store is still 4 GiB.
-constexpr GuestVA A64_GUEST_BASE = 0x0000700000000000ull;
+/* Android arm64 kernels give user space 39 bits of address (7a12345678 and the like); code that packs a
+ * pointer into 40 bits, or compares ten-digit addresses, must see the same range here.  0x7000000000 is the
+ * lowest address macOS honours as an mmap hint. */
+constexpr GuestVA A64_GUEST_BASE = 0x0000007000000000ull;
 constexpr GuestVA A64_GUEST_SIZE = 0x0000000100000000ull;
 /* The kernel's own two mappings at the top of the user address space.  Every
  * Linux process has them; a process whose /proc/<pid>/maps has no [vdso] was
@@ -477,9 +480,19 @@ inline int a64_access_fault(GuestVA va, size_t len, bool write, GuestVA *fault) 
   return a64_access_fault_for_prot(va, len, write ? 3u : 1u, fault);
 }
 
+/* LUNARIA_A64_VMA_TRACE=<hex lo>-<hex hi>: report every insert/remove of a guest mapping that overlaps the
+ * range, with the prot, to learn where a region a thread is running in came from or went. */
+inline void a64_vma_trace(const char *what, GuestVA lo, GuestVA hi, uint32_t prot) {
+  static const char *spec = lunaria_env("LUNARIA_A64_VMA_TRACE");
+  if (!spec) return;
+  unsigned long long a = 0, b = 0;
+  if (sscanf(spec, "%llx-%llx", &a, &b) != 2 || hi <= a || lo >= b) return;
+  fprintf(stderr, "[vma] %s 0x%llx-0x%llx prot=%u\n", what, (unsigned long long)lo, (unsigned long long)hi, prot);
+}
 inline void a64_map_insert(GuestVA lo, GuestVA hi, uint32_t prot, bool owned,
                            bool file_backed = false, bool shared = false,
                            unsigned backing_handle = 0, uint64_t backing_offset = 0) {
+  a64_vma_trace("insert", lo, hi, prot);
   std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
   auto it = std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), lo,
   [](const A64Mapping &m, GuestVA v) {
@@ -563,6 +576,7 @@ inline A64Mapping a64_mapping_slice(A64Mapping mapping, GuestVA lo, GuestVA hi) 
 // Drop [lo,hi) from the table, splitting/trimming entries as needed.
 inline bool a64_map_remove(GuestVA lo, GuestVA hi, bool release,
                            bool keep_backing = false) {
+  a64_vma_trace("remove", lo, hi, 0);
   a64_loaded_regions_unmap(lo, hi);
   std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
   bool removed_exec = false;
@@ -667,6 +681,60 @@ inline int a64_map_set_prot(GuestVA lo, GuestVA hi, uint32_t prot, bool *code_ch
   return 0;
 }
 
+/* Names given to anonymous memory with prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...).  A mapping keeps the
+ * index; 0 is "no name".  The table only grows: a process uses a few dozen distinct names. */
+inline std::vector<std::string> g_a64_vma_names{std::string()};
+inline uint32_t a64_vma_name_id(const char *name) {
+  std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  for (uint32_t i = 1; i < g_a64_vma_names.size(); ++i)
+    if (g_a64_vma_names[i] == name) return i;
+  g_a64_vma_names.emplace_back(name);
+  return (uint32_t)g_a64_vma_names.size() - 1u;
+}
+/* The kernel's rules for PR_SET_VMA_ANON_NAME over [lo,hi): page-aligned start, every page mapped (ENOMEM),
+ * only anonymous memory (EBADF).  Returns 0 or -1 with errno. */
+inline int a64_map_set_name(GuestVA lo, GuestVA hi, uint32_t name_id) {
+  if ((lo & 4095u) || hi <= lo) {
+    errno = EINVAL;
+    return -1;
+  }
+  lo = a64_mapping_va(lo);
+  hi = a64_mapping_va(hi - 1) + 1;
+  std::unique_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  for (GuestVA cursor = lo; cursor < hi;) {
+    const A64Mapping *m = a64_find_locked(cursor);
+    if (!m) {
+      errno = ENOMEM;
+      return -1;
+    }
+    if (m->file_backed) {
+      errno = EBADF;
+      return -1;
+    }
+    cursor = std::min(hi, m->hi);
+  }
+  for (size_t i = 0; i < g_a64_maps.size(); ++i) {
+    A64Mapping &m = g_a64_maps[i];
+    if (m.hi <= lo || m.lo >= hi || m.name_id == name_id) continue;
+    const GuestVA clo = std::max(m.lo, lo), chi = std::min(m.hi, hi);
+    if (m.lo == clo && m.hi == chi) {
+      m.name_id = name_id;
+      continue;
+    }
+    const A64Mapping head = a64_mapping_slice(m, m.lo, clo);
+    const A64Mapping tail = a64_mapping_slice(m, chi, m.hi);
+    m = a64_mapping_slice(m, clo, chi);
+    m.name_id = name_id;
+    if (tail.hi > tail.lo) g_a64_maps.insert(g_a64_maps.begin() + (long)i + 1, tail);
+    if (head.hi > head.lo) {
+      g_a64_maps.insert(g_a64_maps.begin() + (long)i, head);
+      ++i;
+    }
+  }
+  a64_maps_bump();
+  return 0;
+}
+
 // Guest VA is host VA, so a mapping must never land inside the image window.
 inline bool a64_va_usable(void *p, uint64_t len) {
   if (!p) return false;
@@ -676,6 +744,30 @@ inline bool a64_va_usable(void *p, uint64_t len) {
   // Must stay inside the AArch64 lower-half canonical range (52-bit VA).
   if (hi > 0x0010000000000000ull) return false;
   return true;
+}
+
+/* The highest gap of at least `len` bytes between the top of the mmap area and its floor, as Linux's top-down
+ * allocator picks it (vm_unmapped_area): an address freed by munmap is found again here. 0 if there is none. */
+inline GuestVA a64_topdown_gap(uint64_t len) {
+  constexpr GuestVA kTop = 0x7f00000000ull, kFloor = 0x7200000000ull;
+  len = (len + 0xffffull) & ~0xffffull;
+  std::shared_lock<std::shared_mutex> lk(g_a64_maps_mu);
+  GuestVA cur = kTop;
+  size_t i = (size_t)(std::lower_bound(g_a64_maps.begin(), g_a64_maps.end(), kTop,
+                      [](const A64Mapping &m, GuestVA v) { return m.lo < v; }) - g_a64_maps.begin());
+  while (i > 0) {
+    const A64Mapping &m = g_a64_maps[i - 1];
+    if (m.hi <= kFloor) break;
+    if (m.hi < cur) {
+      const GuestVA lo = std::max<GuestVA>(m.hi, kFloor);
+      const GuestVA cand = (cur - len) & ~0xffffull;
+      if (cur >= len && cand >= lo) return cand;
+    }
+    cur = std::min<GuestVA>(cur, m.lo);
+    --i;
+  }
+  const GuestVA cand = cur >= len ? (cur - len) & ~0xffffull : 0;
+  return cand >= kFloor ? cand : 0;
 }
 
 // Reserve `len` bytes of 64-bit guest VA backed by real host pages.
@@ -697,6 +789,15 @@ inline GuestVA a64_va_map(GuestVA hint, uint64_t len, uint32_t prot,
   if (fixed && !want) {
     errno = EINVAL;
     return 0;
+  }
+  /* A kernel places an address-less mmap top-down under the top of the 39-bit user space (0x7f........), in the
+   * highest gap that fits -- so an address freed by munmap is the next one handed out for a mapping of that size.
+   * The host's own choice (0x1........ on macOS, in the heap's neighbourhood) is an address no Android process
+   * ever sees, and code that checks where its mappings are (or takes a freed address to be reused) will notice.
+   * Hint the same place; the host may still answer elsewhere. */
+  if (!want && !fixed) {
+    const GuestVA at = a64_topdown_gap(len);
+    if (at) want = (void *)at;
   }
   /* Android exposes 4 KiB pages while Apple Silicon uses 16 KiB host
    * pages.  Scudo reserves a large PROT_NONE span and commits 4 KiB-aligned

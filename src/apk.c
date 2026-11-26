@@ -3042,7 +3042,7 @@ static int obb_alias(const char *source, const char *dir, const char *name)
     return -1;
   /* Expansion archives are immutable package resources. Prefer sharing the
    * original over copying gigabytes into every guest-visible OBB alias. */
-  if (!luna_file_link(source, path) || !luna_file_symlink(source, path))
+  if (!luna_file_link(source, path) || !luna_symlink_create(source, path))
     return 0;
   return copy_file(source, path);
 }

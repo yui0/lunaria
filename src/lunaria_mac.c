@@ -427,10 +427,21 @@ static int luna_memory_range(void *addr, size_t len, int reject_locked)
 
 int luna_os_memory_advise(void *addr, size_t len, int advice)
 {
-  /* Darwin rounds unaligned addresses; the Android API rejects them. */
-  if ((uintptr_t)addr % luna_os_page_size()) {
+  /* The guest has 4 KiB pages: an address that is not 4 KiB aligned is EINVAL, as Android answers, and one
+   * that is aligned is fine even though the 16 KiB host page it falls in is not.  Darwin rounds unaligned
+   * addresses (and rejects some), so the host call is made on the whole host pages inside the range; the
+   * advice is only a hint, and a range with no whole host page in it has nothing to apply it to. */
+  if ((uintptr_t)addr % 4096u) {
     errno = EINVAL;
     return -1;
+  }
+  {
+    const uintptr_t page = luna_os_page_size();
+    const uintptr_t lo = ((uintptr_t)addr + page - 1u) & ~(page - 1u);
+    const uintptr_t end = ((uintptr_t)addr + len) & ~(page - 1u);
+    if (end < lo || end - lo == 0) return 0;
+    addr = (void *)lo;
+    len = (size_t)(end - lo);
   }
   int native;
   switch (advice) {

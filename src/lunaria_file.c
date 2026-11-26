@@ -738,7 +738,18 @@ static int sym_publish(const char *from,const char *to)
   if (luna_file_link(from,to)) return -1;
   return luna_file_unlink(from);
 #elif defined(__APPLE__)
-  return renamex_np(from,to,RENAME_EXCL);
+  if (!renamex_np(from,to,RENAME_EXCL)) return 0;
+  if (errno!=ENOTSUP && errno!=EINVAL) return -1;
+  /* The volume cannot rename exclusively (exFAT, FAT: no hard links either).  Every creation in this layer
+   * runs under sym_enter(), so checking that the name is free and then renaming is exclusive within the
+   * process, which is the only writer of a guest's metadata. */
+  struct stat taken;
+  if (!lstat(to,&taken)) {
+    errno=EEXIST;
+    return -1;
+  }
+  if (errno!=ENOENT) return -1;
+  return rename(from,to);
 #else
   if (luna_file_link(from,to)) return -1;
   return luna_file_unlink(from);

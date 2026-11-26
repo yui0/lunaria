@@ -44,6 +44,9 @@
 
 #include "quickjs.h"
 #include <dlfcn.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include <pthread.h>
 
 /* WebP, which stb_image does not read (Bing's picture of the day, among others). */
@@ -296,6 +299,9 @@ static int g_verbose;
 static double g_t0;
 static double lb_now_ms(void);
 #define LB_LOG(...) do { if (g_verbose) { fprintf(stderr, "[luna-browser %.0f] ", lb_now_ms() - g_t0); fprintf(stderr, __VA_ARGS__); } } while (0)
+
+static void page_gc(int force);
+static int g_in_tick;               /* inside __lb_tick, called from page_pump */
 
 static double lb_now_ms(void)
 {
@@ -2909,9 +2915,22 @@ static int el_parent(int i)
 }
 
 /* Element siblings (text runs are not elements to selectors). */
+static int el_sib_ok(int j)
+{
+  return el_node(j) && !elements[j].anon_text;
+}
+
 static int el_prev(int i)
 {
   int p = elements[i].parent_idx;
+  if (p >= 0 && p < elem_count) {          /* the parent's child list */
+    int prev = -1;
+    LUNA_FOR_KIDS(c, p) {
+      if (c == i) return prev;
+      if (el_sib_ok(c)) prev = c;
+    }
+    return -1;
+  }
   for (int j = i - 1; j >= 0; --j)
     if (elements[j].parent_idx == p && el_node(j) && !elements[j].anon_text &&
         !(p == -1 && elements[j].dom_detached))
@@ -2922,6 +2941,12 @@ static int el_prev(int i)
 static int el_next(int i)
 {
   int p = elements[i].parent_idx;
+  if (p >= 0 && p < elem_count) {
+    luna_kids_sync();
+    for (int c = g_kid_next[i]; c != -1; c = g_kid_next[c])
+      if (el_sib_ok(c)) return c;
+    return -1;
+  }
   for (int j = i + 1; j < elem_count; ++j)
     if (elements[j].parent_idx == p && el_node(j) && !elements[j].anon_text &&
         !(p == -1 && elements[j].dom_detached))
@@ -2953,8 +2978,10 @@ static int sel_simple_match(const struct sel_simple *s, int i)
 {
   const LunaElement *e = &elements[i];
   if (s->ps & PS_NEVER) return 0;
+  for (int k = 0; k < s->ncls; ++k)        /* the class bloom rules most out */
+    if (!(e->class_bloom & class_bit(s->cls[k], strlen(s->cls[k])))) return 0;
+  if (s->id[0] && (s->id[0] != e->id[0] || strcmp(s->id, e->id))) return 0;
   if (s->tag[0] && strcasecmp(s->tag, e->type)) return 0;
-  if (s->id[0] && strcmp(s->id, e->id)) return 0;
   for (int k = 0; k < s->ncls; ++k) if (!el_has_class(i, s->cls[k])) return 0;
   for (int k = 0; k < s->nat; ++k) {
     char v[512];
@@ -3069,7 +3096,22 @@ static int el_within(int i, int root)
 
 static int layout_now(void)
 {
-  if (g_layout_dirty) luna_update(lb_now_ms() / 1000.0, 0.0);
+  luna_dom_flush_restyle();          /* a restyle decides whether boxes moved */
+  if (!g_layout_dirty) return 0;
+  double t0 = g_verbose ? lb_now_ms() : 0;
+  int before = elem_count;
+  luna_update(lb_now_ms() / 1000.0, 0.0);
+  if (g_verbose && lb_now_ms() - t0 > 30 && g_page.ctx) {
+    /* LUNA_BROWSER_VERBOSE: who forced a slow layout */
+    static int shown;
+    if (shown++ < 40) {
+      JSValue st = JS_Eval(g_page.ctx, "new Error().stack", 17, "<layout>", JS_EVAL_TYPE_GLOBAL);
+      const char *s = JS_ToCString(g_page.ctx, st);
+      LB_LOG("forced layout %.0fms (%d elements): %.400s\n", lb_now_ms() - t0, before, s ? s : "");
+      if (s) JS_FreeCString(g_page.ctx, s);
+      JS_FreeValue(g_page.ctx, st);
+    }
+  }
   return 0;
 }
 
@@ -3138,8 +3180,32 @@ static JSValue lb_query(JSContext *ctx, JSValueConst this_val, int argc, JSValue
   int all = JS_ToBool(ctx, argv[2]);
   JSValue out = all ? JS_NewArray(ctx) : JS_NewUint32(ctx, 0);
   uint32_t n = 0;
-  for (int i = 0; i < elem_count; ++i) {
-    if (!el_within(i, root) || !sel_match(sel, i)) continue;
+  /* Which elements are inside root (or connected), in one forward pass:
+   * parents come before their children, so each answer is its parent's. */
+  static unsigned char *in;
+  static int in_cap;
+  if (elem_count > in_cap) {
+    unsigned char *g = realloc(in, (size_t)elem_count);
+    if (g) {
+      in = g;
+      in_cap = elem_count;
+    }
+  }
+  int fast = in && in_cap >= elem_count;
+  int from = root >= 0 ? root + 1 : 0;
+  if (fast) {
+    if (root >= 0) in[root] = 0;
+    for (int i = from; i < elem_count; ++i) {
+      int p = elements[i].parent_idx;
+      if (elements[i].dom_detached) in[i] = 0;
+      else if (p == -1) in[i] = root < 0;
+      else if (p == root) in[i] = 1;
+      else if (p >= from && p < i) in[i] = in[p];
+      else in[i] = (unsigned char)el_within(i, root);
+    }
+  }
+  for (int i = fast ? from : 0; i < elem_count; ++i) {
+    if (!(fast ? in[i] : el_within(i, root)) || !sel_match(sel, i)) continue;
     if (!all) {
       out = js_uid(ctx, i);
       break;
@@ -3168,6 +3234,7 @@ static JSValue lb_matches(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 static JSValue lb_create(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 {
   (void)this_val;
+
   const char *tag = JS_ToCString(ctx, argv[0]);
   if (!tag) return JS_EXCEPTION;
   const char *attrs = argc > 1 && JS_IsString(argv[1]) ? JS_ToCString(ctx, argv[1]) : NULL;
@@ -3348,6 +3415,33 @@ static JSValue lb_connected(JSContext *ctx, JSValueConst this_val, int argc, JSV
   (void)argc;
   int i = uid_idx(ctx, argv[0]);
   return JS_NewBool(ctx, i >= 0 && luna_dom_is_connected(i));
+}
+
+/* Between two timer callbacks, straight from __lb_tick (no native frame
+ * holding an element index is below): a chance to free dead nodes. */
+static JSValue lb_gc_point(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  if (g_in_tick == 1) page_gc(0);
+  return JS_UNDEFINED;
+}
+
+/* The root of the detached tree uid is in (0: in the document, -1: gone). */
+static JSValue lb_gc_root(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  (void)this_val;
+  (void)argc;
+  int i = uid_idx(ctx, argv[0]);
+  if (i < 0) return JS_NewInt32(ctx, -1);
+  for (int depth = 0; depth < 100000; ++depth) {
+    if (elements[i].dom_detached) return js_uid(ctx, i);
+    int p = elements[i].parent_idx;
+    if (p < 0 || p >= elem_count) return JS_NewInt32(ctx, 0);
+    i = p;
+  }
+  return JS_NewInt32(ctx, 0);
 }
 
 static JSValue lb_get_attr(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -3812,6 +3906,8 @@ static void js_run_jobs(void)
       if (r < 0) js_report(jc, "promise job");
       break;
     }
+    /* straight under __lb_tick no native frame holds an element index */
+    if (g_in_tick == 1 && (i & 15) == 15) page_gc(0);
     if (i == 9999) LB_LOG("microtask queue not draining\n");
   }
 }
@@ -4349,6 +4445,8 @@ static const JSCFunctionListEntry lb_funcs[] = {
   JS_CFUNC_DEF("children", 1, lb_children),
   JS_CFUNC_DEF("tag", 1, lb_tag),
   JS_CFUNC_DEF("connected", 1, lb_connected),
+  JS_CFUNC_DEF("gcRoot", 1, lb_gc_root),
+  JS_CFUNC_DEF("gcPoint", 0, lb_gc_point),
   JS_CFUNC_DEF("getAttr", 2, lb_get_attr),
   JS_CFUNC_DEF("setAttr", 3, lb_set_attr),
   JS_CFUNC_DEF("removeAttr", 2, lb_remove_attr),
@@ -5235,6 +5333,84 @@ static void page_key(const char *key, int vk, int down, const char *text, int mo
 static void cdp_navigate_now(const char *url);
 static void cdp_navigate_request(const char *url, const char *post_body);
 
+/* Detached nodes no script can reach any more are freed: luna-ui keeps every
+ * element in one array, and a page that rebuilds its lists with innerHTML
+ * left tens of thousands of dead nodes there for every walk, restyle and
+ * insertion to step over.  The script side holds the wrappers of detached
+ * nodes weakly (luna-browser.js, __lb_gc); after a collection the trees with
+ * no live wrapper go. */
+static int g_gc_busy;               /* collecting */
+static void page_gc(int force)
+{
+  static int last_count;
+  static double last_ms;
+  if (!g_page.ctx || g_gc_busy) return;
+  double now = lb_now_ms();
+  if (!force && (elem_count < last_count + 3000 || now - last_ms < 500)) return;
+  last_ms = now;
+  int n = elem_count;
+  unsigned char *conn = malloc((size_t)n + 1);
+  if (!conn) return;
+  int live = 0;
+  for (int i = 0; i < n; ++i) {
+    int p = elements[i].parent_idx;
+    if (elements[i].dom_detached) conn[i] = 0;
+    else if (p < 0 || p >= n) conn[i] = 1;
+    else if (p < i) conn[i] = conn[p];
+    else conn[i] = (unsigned char)luna_dom_is_connected(i);
+    live += conn[i];
+  }
+  if (!force && n - live < 3000 + live / 2) {
+    free(conn);
+    last_count = n - 1500;
+    return;
+  }
+  double t0 = lb_now_ms();
+  g_gc_busy = 1;
+  JSValue phase = JS_NewInt32(g_page.ctx, 0);
+  JS_FreeValue(g_page.ctx, js_hook("__lb_gc", 1, &phase));
+  JS_RunGC(JS_GetRuntime(g_page.ctx));
+  phase = JS_NewInt32(g_page.ctx, 1);
+  JSValue held = js_hook("__lb_gc", 1, &phase);
+  unsigned char *keep = calloc((size_t)n + 1, 1);
+  int ok = keep && JS_IsArray(g_page.ctx, held);
+  if (ok) {
+    uint32_t len = 0;
+    JSValue lv = JS_GetPropertyStr(g_page.ctx, held, "length");
+    JS_ToUint32(g_page.ctx, &len, lv);
+    JS_FreeValue(g_page.ctx, lv);
+    for (uint32_t k = 0; k < len; ++k) {
+      JSValue v = JS_GetPropertyUint32(g_page.ctx, held, k);
+      uint32_t uid = 0;
+      JS_ToUint32(g_page.ctx, &uid, v);
+      JS_FreeValue(g_page.ctx, v);
+      int i = uid ? luna_dom_find(uid) : -1;
+      for (int d = 0; i >= 0 && i < n && d < 100000; ++d) {   /* its tree's root */
+        if (elements[i].dom_detached || elements[i].parent_idx < 0) {
+          keep[i] = 1;
+          break;
+        }
+        i = elements[i].parent_idx;
+      }
+    }
+  }
+  JS_FreeValue(g_page.ctx, held);
+  int freed = 0;
+  if (ok) {
+    /* the roots of detached trees nothing holds; luna_dom_compact takes
+     * their subtrees along */
+    for (int i = 0; i < n; ++i)
+      conn[i] = !conn[i] && elements[i].dom_detached && !keep[i] && !elements[i].luna_internal;
+    freed = luna_dom_compact(conn);
+  }
+  free(keep);
+  free(conn);
+  g_gc_busy = 0;
+  last_count = elem_count;
+  LB_LOG("gc: %d elements freed, %d left (%d in the document), %.0fms\n", freed, elem_count, live,
+         lb_now_ms() - t0);
+}
+
 static double page_pump(void)
 {
   if (!g_page_loading && g_page.nav_url) {             /* the page's own navigation (a link, location) */
@@ -5249,11 +5425,14 @@ static double page_pump(void)
   http_drain();
   if (!g_page.ctx) return -1;
   JSValue a = JS_NewFloat64(g_page.ctx, lb_now_ms());
+  g_in_tick++;
   JSValue r = js_hook("__lb_tick", 1, &a);
+  g_in_tick--;
   double next = -1;
   JS_ToFloat64(g_page.ctx, &next, r);
   JS_FreeValue(g_page.ctx, r);
   sync_focus_and_value();
+  if (!g_in_tick) page_gc(0);
   return next;
 }
 
@@ -6125,7 +6304,7 @@ static const char ui_html[] =
   "<button id=\"reload\" title=\"Reload\">\xe2\x86\xbb</button>"
   "<input id=\"url\" type=\"text\" spellcheck=\"false\">"
   "<div id=\"spin\"></div>"
-  "<button id=\"pc\" title=\"Request desktop site\">PC</button>"
+  "<button id=\"pc\" title=\"PC\xe7\x89\x88 / \xe3\x83\xa2\xe3\x83\x90\xe3\x82\xa4\xe3\x83\xab\xe7\x89\x88 (Ctrl+Shift+M)\">PC</button>"
   "</div><div id=\"view\"></div>"
   "<div id=\"cat\"><div class=\"cf\" id=\"cf\"></div>"
   "<div id=\"cattext\">Loading as hard as I can...</div></div>"
@@ -6648,9 +6827,34 @@ static void ui_viewport(void)
   sent_zoom = g_ui.zoom;
 }
 
+static const char ui_desktop_ua[] =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+  "Chrome/124.0.0.0 Safari/537.36 " LB_PRODUCT;
+
+/* Whether new tabs ask for the desktop (PC) version of sites.  Mobile first;
+ * the PC button, Ctrl+Shift+M or the context menu switch, and the choice
+ * carries over to tabs opened afterwards.  LUNA_BROWSER_DESKTOP=1 starts on PC. */
+static int g_ui_desktop = 0;
+
+/* This program's own file, for the page processes. */
+static const char *self_exe(void)
+{
+  static char path[4096];
+  if (path[0]) return path;
+#ifdef __APPLE__
+  uint32_t n = sizeof path;
+  char raw[4096];
+  if (_NSGetExecutablePath(raw, &n) == 0 && realpath(raw, path)) return path;
+  if (_NSGetExecutablePath(path, &n) == 0) return path;
+#endif
+  snprintf(path, sizeof path, "%s", "/proc/self/exe");
+  return path;
+}
+
 static int ui_spawn(void)
 {
   int in[2], out[2];
+  const char *exe = self_exe();
   if (pipe(in) != 0 || pipe(out) != 0) return -1;
   char size[64];
   snprintf(size, sizeof size, "--window-size=%d,%d", g_page.w, g_page.h - UI_BAR);
@@ -6662,7 +6866,8 @@ static int ui_spawn(void)
     snprintf(profile, sizeof profile, "--user-data-dir=%s/.config/luna-browser", getenv("HOME"));
   }
   char ua[600] = "";
-  if (g_user_agent[0]) snprintf(ua, sizeof ua, "--user-agent=%s", g_user_agent);
+  if (g_ui.t->desktop) snprintf(ua, sizeof ua, "--user-agent=%s", ui_desktop_ua);
+  else if (g_user_agent[0]) snprintf(ua, sizeof ua, "--user-agent=%s", g_user_agent);
   pid_t pid = fork();
   if (pid < 0) return -1;
   if (pid == 0) {
@@ -6675,7 +6880,7 @@ static int ui_spawn(void)
     if (ua[0]) argv[n++] = ua;
     if (g_verbose) argv[n++] = "-v";
     argv[n] = NULL;
-    execv("/proc/self/exe", (char *const *)argv);
+    execv(exe, (char *const *)argv);
     _exit(127);
   }
   close(in[0]);
@@ -6689,10 +6894,6 @@ static int ui_spawn(void)
   ui_send("Target.attachToTarget", "{\"targetId\":\"" TARGET_ID "\",\"flatten\":true}", 0);
   return 0;
 }
-
-static const char ui_desktop_ua[] =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
-  "Chrome/124.0.0.0 Safari/537.36 " LB_PRODUCT;
 
 static char *ui_html_escape(const char *s)
 {
@@ -6812,6 +7013,7 @@ static void ui_tab_open(const char *url)
   t->to = -1;
   t->from = -1;
   t->going = -1;
+  t->desktop = g_ui_desktop;
   t->start = lb_strdup(url ? url : "about:blank");
   struct ui_tab *old = g_ui.t;
   g_tabs[g_ntabs++] = t;
@@ -6885,6 +7087,7 @@ static void ui_toggle_desktop(void)
 {
   struct ui_tab *t = g_ui.t;
   t->desktop = !t->desktop;
+  g_ui_desktop = t->desktop;                 /* new tabs follow the last choice */
   struct buf b = { 0 };
   buf_puts(&b, "{\"userAgent\":");
   buf_json_str(&b, t->desktop ? ui_desktop_ua : g_user_agent);
@@ -7448,6 +7651,11 @@ static int ui_key(int key, int scancode, int action, int mods, void *user)
     ui_status(g_ui.zoom == 1.0f ? NULL : z);
     return 1;
   }
+  if (down && ctrl && (mods & LUNA_MOD_SHIFT) && key == LUNA_KEY_M) {   /* PC / mobile version */
+    ui_toggle_desktop();
+    ui_status(g_ui.t->desktop ? "PC\xe7\x89\x88\xe3\x82\xb5\xe3\x82\xa4\xe3\x83\x88" : "\xe3\x83\xa2\xe3\x83\x90\xe3\x82\xa4\xe3\x83\xab\xe7\x89\x88\xe3\x82\xb5\xe3\x82\xa4\xe3\x83\x88");
+    return 1;
+  }
   if (down && ((ctrl && key == LUNA_KEY_R) || key == LUNA_KEY_F5)) {
     ui_on_reload(NULL);
     return 1;
@@ -7575,7 +7783,13 @@ static void ui_shutdown(void *user)
 
 static int window_main(const char *url)
 {
+#ifdef __APPLE__
+  /* ANGLE through EGL, like the page process: Cocoa's desktop GL and ANGLE's
+   * GLES symbols cannot share one process */
+  setenv("LUNA_GL", "es", 0);
+#endif
   g_ui.start = lb_strdup(url);
+  if (getenv("LUNA_BROWSER_DESKTOP") && atoi(getenv("LUNA_BROWSER_DESKTOP"))) g_ui_desktop = 1;
   LunaAppConfig cfg;
   memset(&cfg, 0, sizeof cfg);
   cfg.title = "Luna Browser";
@@ -7690,6 +7904,11 @@ int main(int argc, char **argv)
     unsigned char *png = page_capture(&len, 0);
     FILE *f = png ? fopen(shot, "wb") : NULL;
     if (f && fwrite(png, 1, len, f) == len) fprintf(stderr, "luna-browser: wrote %s (%dx%d)\n", shot, g_page.w, g_page.h);
+    if (g_verbose) {
+      int live = 0;
+      for (int i = 0; i < elem_count; ++i) live += luna_dom_is_connected(i);
+      fprintf(stderr, "luna-browser: %d elements, %d connected\n", elem_count, live);
+    }
     else {
       fprintf(stderr, "luna-browser: screenshot failed\n");
       rc = 1;

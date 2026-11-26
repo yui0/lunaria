@@ -21,10 +21,22 @@ LB_GL_LIBS ?= -lEGL
 CFLAGS   += $(LB_CPPFLAGS)
 LIBS     := $(LB_GL_LIBS) -ldl -lm -lpthread
 
+ifeq ($(shell uname -s),Darwin)
+LB_WINDOW ?= $(shell test -f ../.deps/lib/libglfw3.a && echo 1 || echo 0)
+endif
 LB_WINDOW ?= $(shell pkg-config --exists glfw3 2>/dev/null && echo 1 || echo 0)
 ifeq ($(LB_WINDOW),1)
 CFLAGS   += -DLB_WINDOW
+ifeq ($(shell uname -s),Darwin)
+# GLFW (lunaria's .deps/, or LB_GLFW_*) with an EGL context: the page renders
+# through ANGLE, and the window must use the same GL.
+LB_GLFW_CFLAGS ?= -I$(abspath ../.deps/glfw/include)
+LB_GLFW_LIBS   ?= $(abspath ../.deps/lib/libglfw3.a)
+CFLAGS   += -DLUNA_UI_BACKEND_GLFW $(LB_GLFW_CFLAGS)
+LIBS     += $(LB_GLFW_LIBS) -framework Cocoa -framework IOKit -framework CoreFoundation -framework QuartzCore
+else
 LIBS     += $(shell pkg-config --libs glfw3 2>/dev/null || echo -lglfw)
+endif
 endif
 ifeq ($(LB_NO_TLS),1)
 CFLAGS   += -DLB_NO_TLS

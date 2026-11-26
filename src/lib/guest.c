@@ -734,8 +734,13 @@ __asm__(".text\n"
  * sees the other.  A non-zero counter only says "maybe": the real call
  * decides. */
 /* Guest addresses of the emulator's own pages carry the identity window's base
- * (A64_GUEST_BASE in arm.h) in front of the offset FUTEX_TAB_VA names. */
-#define LUNARIA_FUTEX_TAB ((const volatile uint32_t *)(0x700000000000ull + 0x0E310000ull))
+ * (A64_GUEST_BASE in arm.h) in front of the offset FUTEX_TAB_VA names.  The window sits inside the
+ * 39 bits of user address space an Android arm64 kernel gives a process, so the base is ten hex
+ * digits: keep this in step with arm.h. */
+#ifndef LUNARIA_GUEST_BASE
+#define LUNARIA_GUEST_BASE 0x7000000000ull
+#endif
+#define LUNARIA_FUTEX_TAB ((const volatile uint32_t *)(LUNARIA_GUEST_BASE + 0x0E310000ull))
 #define LUNARIA_FUTEX_TAB_N 4096u
 static inline long raw_futex_wake(uint32_t *addr, uint32_t n)
 {

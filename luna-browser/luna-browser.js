@@ -244,10 +244,21 @@ g.reportError = reportError;
 
 const ceRegistry = new Map(), ceWaiters = new Map();
 let ceUpgrading = null;
-const wrappers = new Map();
+/* uid -> wrapper.  Nodes in the document are held here; a detached node's
+ * wrapper moves to weakWrappers at the next __lb_gc, so the native side can
+ * free trees no script refers to. */
+const wrappers = new Map(), weakWrappers = new Map();
 function W(uid) {
    if (!uid) return null;
    let w = wrappers.get(uid);
+   if (!w && weakWrappers.size) {
+      const r = weakWrappers.get(uid);
+      if (r) {
+         weakWrappers.delete(uid);
+         w = r.deref();
+         if (w) { wrappers.set(uid, w); return w; }
+      }
+   }
    if (!w) {
       const tag = L.tag(uid) || 'div';
       const C = tag === '#text' ? Text : TAGS[tag] || HTMLElement;
@@ -258,6 +269,53 @@ function W(uid) {
    }
    return w;
 }
+
+/* Detached elements that may still fire load/error (a picture or script
+ * being fetched) stay held, as browsers keep them alive. */
+const gcPinTags = new Set(['img', 'script', 'link', 'iframe', 'video', 'audio', 'source', 'object', 'embed', 'style']);
+function gcPinned(w) {
+   const ls = w._ls;
+   if (!(ls && ((ls.load && ls.load.length) || (ls.error && ls.error.length))) &&
+       typeof w.onload !== 'function' && typeof w.onerror !== 'function') return false;
+   return gcPinTags.has(L.tag(w._uid));
+}
+/* Phase 0: hold the wrappers of each detached tree together (one reachable
+ * wrapper keeps its whole tree's, so no state is lost while any part of it
+ * can still be reached) and only weakly from here.  Phase 1, after the
+ * collection: the uids whose wrappers survived. */
+/* A detached tree going back in: its wrappers are held again at once (an
+ * automatic collection before the next __lb_gc must not take one). */
+function gcPromote(c) {
+   const t = c._gcTree;
+   c._gcTree = null;
+   if (!weakWrappers.size) return;
+   for (const w of t) if (weakWrappers.delete(w._uid)) wrappers.set(w._uid, w);
+}
+g.__lb_gc = phase => {
+   if (phase === 0) {
+      const all = [], trees = new Map();
+      for (const e of wrappers) all.push(e);
+      for (const [uid, r] of weakWrappers) { const w = r.deref(); if (w) all.push([uid, w]); }
+      weakWrappers.clear();
+      for (const [uid, w] of all) {
+         const root = L.gcRoot(uid);
+         if (root === 0) { if (w._gcTree) w._gcTree = null; wrappers.set(uid, w); continue; }
+         if (root < 0) { wrappers.delete(uid); continue; }
+         let t = trees.get(root);
+         if (!t) trees.set(root, t = []);
+         t.push(w);
+         hide(w, '_gcTree', t);
+         if (gcPinned(w)) { wrappers.set(uid, w); continue; }
+         wrappers.delete(uid);
+         weakWrappers.set(uid, new WeakRef(w));
+      }
+      return;
+   }
+   const out = [];
+   for (const uid of wrappers.keys()) out.push(uid);
+   for (const [uid, r] of weakWrappers) if (r.deref()) out.push(uid); else weakWrappers.delete(uid);
+   return out;
+};
 
 class NodeList extends Array {
    item(i) { return this[i] || null; }
@@ -331,6 +389,7 @@ class Node extends EventTarget {
       if (c._uid && this._uid) {
          const before = ref && ref._uid ? ref._uid : 0;
          L.insert(this._uid, c._uid, before);
+         if (c._gcTree) gcPromote(c);
       } else {
          /* A virtual parent, or a virtual child of a rendered parent. */
          domVer++;
@@ -1545,6 +1604,7 @@ g.__lb_tick = function (now) {
          else (0, eval)(String(t.fn));
       } catch (e) { reportError(e); }
       if (L.verbose && L.now() - t0 > 150) L.log('warn', 'slow timer ' + Math.round(L.now() - t0) + 'ms: ' + String(t.fn).replace(/\s+/g, ' ').slice(0, 160));
+      L.gcPoint();
    }
    if (rafs.size && now - lastFrame >= 16) {
       lastFrame = now;
