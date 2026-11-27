@@ -18,8 +18,10 @@ JNI、EGL、OpenGL ES、MediaCodecなどのAndroid機能はホスト側へ橋渡
 `.apk`、`.apkm`、`.xapk`、`.apks`、`.aab`をそのまま開けます。展開、split APKの統合、キャッシュ、アカウント別のデータ分離はLunariaが行います。
 WebViewにはChrome／Chromium、または内蔵の[luna-browser](luna-browser/)を使います。
 
-**動作を確認したタイトル：** 原神、二ノ国：Cross Worlds、アルケミアストーリー、気球！エアロノート（2013年のARM32向けAPK）、
-Black Clover: Asta Fight、Kingdoms & Lords、そのほかのUnity／Unrealタイトル、TVer（本編再生）やAPKPureなどのJavaアプリ。
+**動作を確認したタイトル：** 原神、二ノ国：Cross Worlds、燕雲十六声（NetEase Messiahエンジン）、学園アイドルマスター、
+まどか☆マギカ Magia Exedra、白猫プロジェクト、Royal Revolt 2、アルケミアストーリー、気球！エアロノート（2013年のARM32向けAPK）、
+レイトン ブラザーズ ミステリールーム、Black Clover: Asta Fight、Kingdoms & Lords、そのほかのUnity／Unrealタイトル、
+TVer（本編再生）、WhatsApp、LINE、ツムツム、APKPureなどのJavaアプリ。
 どこまで進めたかは[互換性](#互換性)をご覧ください。
 
 > [!IMPORTANT]
@@ -31,14 +33,16 @@ Black Clover: Asta Fight、Kingdoms & Lords、そのほかのUnity／Unrealタ�
 </p>
 
 <p align="center">
-  <img src="shots/genshin-glide-coast.png" width="32%" alt="原神：夕暮れの海岸へ向かって滑空する蛍">
+  <img src="shots/genshin-glide-coast.png" width="23%" alt="原神：夕暮れの海岸へ向かって滑空する蛍">
   &nbsp;
-  <img src="shots/genshin-lisa.png" width="32%" alt="原神：四風を語るリサ。日本語の会話 UI">
+  <img src="shots/cross-worlds-portal.png" width="23%" alt="二ノ国：Cross Worlds、黄金の広間で青く光るポータルと使い魔">
   &nbsp;
-  <img src="shots/cross-worlds-crystal.png" width="32%" alt="二ノ国：Cross Worlds、装飾された広間に浮かぶ青い結晶">
+  <img src="shots/shironeko-first-stage.png" width="23%" alt="白猫プロジェクト：縦画面の最初のステージ。HUDとチュートリアル">
+  &nbsp;
+  <img src="shots/madoka-exedra-battle.png" width="23%" alt="Magia Exedra：盾を差し出すほむらのスキルカットインと、ターン表示・スキルボタン">
 </p>
 
-<p align="center"><sub>原神 7.2.0（Unity IL2CPP、arm64-v8a）· 二ノ国：Cross Worlds（Unreal Engine 4、arm64-v8a）</sub></p>
+<p align="center"><sub>原神 7.2.0 · 二ノ国：Cross Worlds · 白猫プロジェクト · Magia Exedra 3.24.5</sub></p>
 
 ## インストール
 
@@ -219,10 +223,12 @@ Lunariaはアプリのdexバイトコードを実行し、Androidのビュー、
   &nbsp;
   <img src="shots/tver-playback-portrait.png" width="30%" alt="TVer：薬屋のひとりごと第54話を縦画面で再生。引き戸から覗く猫猫">
   &nbsp;
-  <img src="shots/tver-welcome.png" width="14%" alt="TVerの縦画面ウェルカム画面。番組アートワークと同意ボタン">
+  <img src="shots/tver-series-portrait.png" width="26%" alt="TVer：縦画面のシリーズページ。再生中の動画、いいね・ピン・共有、お気に入りボタン、エピソード一覧">
+  &nbsp;
+  <img src="shots/tver-welcome.png" width="12%" alt="TVerの縦画面ウェルカム画面。番組アートワークと同意ボタン">
 </p>
 
-<p align="center"><sub>TVer 6.40.0 · 横画面と縦画面での再生 · ウェルカム画面</sub></p>
+<p align="center"><sub>TVer 6.40.0 · 横画面と縦画面での再生 · シリーズページ · ウェルカム画面</sub></p>
 
 APKPureもストア、アプリ詳細、ダウンロードマネージャーを表示できます（ダウンロードの進行は確認済み、インストール完了は未検証）。
 
@@ -314,6 +320,62 @@ Unreal Engine 4。ログイン、サーバー選択、キャラクター作成�
 
 </details>
 
+### ソーシャルアプリ：WhatsApp、LINE、ツムツム
+
+**LINE 15.15.1**はウェルカム画面から電話番号登録、国選択リスト（CollapsingToolbar + RecyclerView）まで進み、スクロール、戻る、端からのスワイプも動作します。ニュースフィードと公式アカウントのメッセージも描画できます。
+**WhatsApp 2.26.39.74**は結合済みネイティブライブラリを読み込み、利用規約と電話番号登録画面（+81 / 日本）まで到達します。APKを一度インデックスすることで起動が70秒から1.4秒になりました。
+どちらのアプリでも電話番号やSMSは送信していません。
+
+**ツムツム 12.11.0**（LIAPP v5 + Cocos2dx）はタイトル画面まで到達します。初回の利用規約WebViewとLINEログインページも開きます。`ACTION_VIEW https://`のIntentはWebView付きのシステムブラウザーで開き、`intent:`のリダイレクトはアプリへ戻ります。ゲームはまだプレイできません。
+
+<p align="center">
+  <img src="shots/tumutumu-title.png" width="30%" alt="ツムツムのタイトル画面。ディズニーのアートワークとTAP TO START">
+  &nbsp;
+  <img src="shots/line-news-feed.png" width="30%" alt="LINEのニュースフィード。Sony Xperiaの広告">
+  &nbsp;
+  <img src="shots/line-auto-reply.png" width="30%" alt="LINEの公式アカウント（LINEMO）の自動応答メッセージ">
+</p>
+
+<p align="center"><sub>ツムツムのタイトル · LINEのニュースフィード · LINEMO公式アカウントの自動応答</sub></p>
+
+### Magia Exedra（まどか☆マギカ Magia Exedra）
+
+Unity IL2CPP（CRIWARE、SPARKGEAR SDK）、`arm64-v8a`、バージョン**3.24.5**、**1024×576**。タイトル画面、最初のアセットダウンロード、オープニング動画、3Dフィールド、タッチHUD付きのバトルを描画し、タップもゲームに届きます。
+このタイトルをきっかけに、Unityがタップの入力元を判定する`MotionEvent.getDevice()`、CRIのホスト駆動の音声スレッド用スタック、2つのJNIハンドルの不具合（解放済みのローカル参照が別スレッドで再利用される問題、古いハンドルのせいでリクエスト署名が完成しない問題）を修正しました。
+以前は約半数の実行で描画が止まっていましたが、修正後は30回以上で再現していません。
+
+<p align="center">
+  <img src="shots/madoka-exedra-title.png" width="48%" alt="Magia Exedraのタイトル画面。ピンクのロゴとTAP TO START、Ver.3.24.5">
+  &nbsp;
+  <img src="shots/madoka-exedra-intro.png" width="48%" alt="Magia Exedraのオープニング動画：手をつなぐまどかとほむら、赤いリボン、金色の空。下にアセットのダウンロードバー（170 / 2225 MB）">
+</p>
+
+<p align="center">
+  <img src="shots/madoka-exedra-battle.png" width="48%" alt="Magia Exedraのバトル：手榴弾投擲スキルで盾を差し出すほむら。ターン表示、パーティー、スキルボタン">
+  &nbsp;
+  <img src="shots/madoka-exedra-field.png" width="48%" alt="Magia Exedra：白黒の市松模様の床に立つ後ろ姿のまどか。長い影">
+</p>
+
+<p align="center"><sub>タイトル · アセットのダウンロード中に流れるオープニング · バトルのスキルカットイン · 3Dフィールド</sub></p>
+
+### 燕雲十六声（Where Winds Meet）
+
+NetEaseのオープンワールドで、独自の**Messiahエンジン**（`MessiahNativeActivity`、`libGame.so`、`arm64-v8a`）で動きます。保護されたDEXの読み込み、リソースチェック、日本語ニュース、NetEase／Google／ゲストのログイン選択、同意・ガイド画面、キャラクター作成まで描画できます。ゲームプレイには未到達です。
+
+<p align="center">
+  <img src="shots/where-winds-meet.png" width="48%" alt="燕雲十六声のキャラクター作成。白と藍の漢服の少女、性別選択、次へボタン">
+</p>
+
+### 白猫プロジェクト
+
+5.62.0（`jp.colopl.wcat`）、Unity 2022.3 IL2CPP、`armeabi-v7a`、縦画面`576×1024`。タイトル、データダウンロードのダイアログ、START、プロローグのムービー、最初の3Dステージを描画し、タップもゲームに届きます。Google Playサービスがないため、Firebaseは利用不可と報告されます。
+
+<p align="center">
+  <img src="shots/shironeko-prologue.png" width="26%" alt="白猫プロジェクトのプロローグ。SKIPボタンと吹き出し">
+  &nbsp;
+  <img src="shots/shironeko-first-stage.png" width="26%" alt="白猫プロジェクトの最初のステージ。縦画面の3DシーンとHUD">
+</p>
+
 ### そのほかのタイトル
 
 <p align="center">
@@ -337,6 +399,30 @@ Unreal Engine 4。ログイン、サーバー選択、キャラクター作成�
 </p>
 
 <p align="center"><sub><a href="https://github.com/yui0/Kikyu">気球！エアロノート</a>：2013年の<code>armeabi</code> APKを無改変で実行 · Kingdoms &amp; Lords：Androidビュー層で描画した村のシーン</sub></p>
+
+<p align="center">
+  <img src="shots/royal-revolt-2-intro.png" width="48%" alt="Royal Revolt 2の絵本イントロ：開いた本と、テディベアを抱く幼い王子">
+  &nbsp;
+  <img src="shots/royal-revolt-2-tutorial.png" width="48%" alt="Royal Revolt 2の最初のステージ：森の広場に立つ王冠の主人公。日本語のチュートリアル吹き出し">
+</p>
+
+<p align="center"><sub>Royal Revolt 2：絵本のイントロと最初のチュートリアルステージ（日本語UI）</sub></p>
+
+<p align="center">
+  <img src="shots/layton-brothers-title.png" width="48%" alt="レイトン ブラザーズ ミステリールームのタイトル画面">
+  &nbsp;
+  <img src="shots/layton-brothers-dialogue.png" width="48%" alt="レイトン ブラザーズ ミステリールームの会話シーン。署内の廊下で話す2人の刑事">
+</p>
+
+<p align="center"><sub>レイトン ブラザーズ ミステリールーム：2013年のLEVEL-5作品。JavaのUIをすべてAndroidビュー層で描画</sub></p>
+
+<p align="center">
+  <img src="shots/gakumas-setup.png" width="48%" alt="学園アイドルマスターの初回セットアップ画面。リソースを26.61%ダウンロード中">
+  &nbsp;
+  <img src="shots/another-eden-dialogue.png" width="48%" alt="アナザーエデンの日本語会話シーン。AUTOとダウンロード表示">
+</p>
+
+<p align="center"><sub>学園アイドルマスター 3.5.3：初回のアセットダウンロード（Unity 6000.0 IL2CPP、Vulkan、CRI） · アナザーエデン：会話は描画、ゲームの読み込みは異常終了</sub></p>
 
 <p align="center">
   <img src="shots/disney-magic-kingdoms-loading.png" width="48%" alt="Disney Magic Kingdoms：氷上ステージのミニーとミッキー。下に日本語の確認メッセージと緑の進捗バー">
@@ -384,8 +470,15 @@ Unreal Engine 4。ログイン、サーバー選択、キャラクター作成�
 | タイトル | エンジン / ABI | 現在の状況 |
 |---|---|---|
 | **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux：ログイン、サーバー・キャラクター選択、村、会話、音声付きムービー、フィールド操作を確認。SharedPreferencesも保持。Apple Silicon：5.04.12でオープニング動画、3Dイントロ、利用規約画面まで。以降は未検証。 |
+| **Shironeko Project 5.62.0** | Unity 2022.3 IL2CPP · ARM32 XAPK | タイトル、データダウンロード、START、プロローグ、最初の3Dステージ。タップ可。GMSなしのためFirebaseは利用不可。 |
+| **TumuTumu 12.11.0** | Cocos2dx + LIAPP v5 · AArch64 XAPK | パックされたApplicationとネイティブライブラリが起動。タイトル、規約WebView、LINEログインページを描画。最初のタップ後に停止し、プレイ不可。 |
+| **WhatsApp 2.26.39.74** | Java / dex Android UI · AArch64 XAPK | 利用規約と電話番号登録（+81 / 日本）を描画。APKを一度インデックスすれば起動約1.4秒。アカウント作成は未検証。 |
+| **Magia Exedra 3.24.5** | Unity IL2CPP（CRIWARE、SPARKGEAR）· AArch64 | タイトル、最初のアセットダウンロード、オープニング動画、3Dフィールド、バトルを描画。タップ可。描画停止（2026-11-27より前は約半数の実行）とNow Loadingでの停止は修正済み。約2.2GBのアセットダウンロードが次の段階。 |
+| **Where Winds Meet** | NetEase Messiah · AArch64 XAPK | リソースダウンロード付きタイトル、日本語ニュース、ログイン選択、同意・ガイド、キャラクター作成。ゲームプレイは未到達。 |
+| **Gakuen Idolmaster 3.5.3** | Unity 6000.0 IL2CPP（Vulkan、CRI）· AArch64 XAPK | セットアップと同意画面を描画し、ゲームCDNからの最初のアセットダウンロードが始まる（約806MB）。ゲームプレイは未到達。 |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | オープニング動画を最後まで再生し、タイトル画面を表示。追加データの確認で同意するとダウンロードが始まる。 |
 | **Genshin Impact 7.2.0** | Unity IL2CPP · AArch64 XAPK | Linuxでオープンワールドに到達（プロローグ、モンド城、滑空）。ログイン、サーバー、音量設定は再起動後も保持。キーボード移動可。ある環境でフィールド約18～22fps、メニュー約30fps。アカウントWebViewは表示可、Google Play課金は未対応。 |
+| **Royal Revolt 2** | Androidゲーム · ABI未記録 | 絵本のイントロと最初のチュートリアルステージを描画（日本語テキスト含む）。その先は未検証。 |
 | **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | タイトル、日本語のストーリー（横・縦画面）、キャラクター作成画面を描画（2026-10-09）。 |
 | **Kikyu! Aeronaut** | native `armeabi` · ARM32 APK（2013） | タイトル画面を描画し、Returnキー待ち。 |
 | **Between Two Worlds** | Unity 2023 IL2CPP · ARMv7 / AArch64 | ARMv7：プレイ可能でメインストーリーのシーンまで。AArch64：メインメニュー。最近の確認では言語選択画面まで約70fps。 |
@@ -396,8 +489,10 @@ Unreal Engine 4。ログイン、サーバー選択、キャラクター作成�
 | **Blade & Soul Revolution** | Unreal Engine 4 · AArch64 | ゲーム独自のダイアログまで起動。パッチサーバーへの経路がないと再接続を要求。 |
 | **Trickcal Chibi+Go 1.6.1** | Unity 6000.3 IL2CPP · ARMv7 XAPK | 利用規約Activityとサーバー設定の読み込み画面まで。ゲームプレイは未検証。 |
 | **Disney Magic Kingdoms 12.1.1c** | Unity · ARMv7 XAPK | コンテンツ確認画面を描画。サーバーへ更新を問い合わせる段階で停止。 |
+| **Layton Brothers: Mystery Room** | Java / dex Android UI（2013） | タイトルと会話シーンをAndroidビュー層で描画。 |
 | **Kingdoms & Lords** | Gameloft製の村作りゲーム | 島の村、資源カウンター、会話枠を描画（2026-11-09）。その先は未検証。 |
 | **TVer 6.40.0** | Java / dex Android UI | ウェルカム画面、動画タイル付きホーム、エピソード詳細、本編再生。起動は重く、一部レイアウトに崩れ。 |
+| **LINE 15.15.1** | Java / dex Android UI | ウェルカム、電話番号登録、国選択（CollapsingToolbar + RecyclerView）。スクロール、戻る、端からのスワイプ可。ニュースフィードと公式アカウントのメッセージを描画。登録より先の認証は未到達。 |
 | **APKPure 3.20.8002** | Java / dex Android UI | ストア、おすすめ、詳細、ダウンロードマネージャーを描画。ダウンロードの進行は確認、インストール完了は未検証。 |
 | **Another Eden** | Native · ARMv7 XAPK | 既存アカウントの読み込み画面。ゲームの読み込み中に異常終了。 |
 | **Daggerfall Unity** | Unity Mono · ARMv7 | Monoは起動。描画はまだ動作しない。 |

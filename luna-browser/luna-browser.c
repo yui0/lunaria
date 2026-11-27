@@ -43,6 +43,14 @@
 #include "luna-ui.h"
 
 #include "quickjs.h"
+#ifdef LB_ICU
+#include <unicode/ubrk.h>
+#include <unicode/udat.h>
+#include <unicode/udatpg.h>
+#include <unicode/ufieldpositer.h>
+#include <unicode/uloc.h>
+#include <unicode/ustring.h>
+#endif
 #include <dlfcn.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -2421,11 +2429,11 @@ static char *document_base_url(const char *html, const char *url)
   return NULL; /* without a base element, history URL changes remain effective */
 }
 
-static void page_prefetch(const char *html, int scripts)
+static struct pf_pool prefetch_collect(const char *html, int scripts)
 {
-  if (!strncmp(g_page.url, "file:", 5) || !strncmp(g_page.url, "about:", 6)) return;
+  if (!strncmp(g_page.url, "file:", 5) || !strncmp(g_page.url, "about:", 6)) return (struct pf_pool){ 0 };
   struct pf_pool pool = { calloc(LB_PF_MAX, sizeof(struct pf_job)), 0, 0 };
-  if (!pool.jobs) return;
+  if (!pool.jobs) return pool;
   for (const char *p = html; (p = strchr(p, '<')) != NULL && pool.n < LB_PF_MAX; ) {
     if (!strncmp(p, "<!--", 4)) {
       const char *e = strstr(p, "-->");
@@ -2448,16 +2456,21 @@ static void page_prefetch(const char *html, int scripts)
         break;
       }
     }
-    if (!kind || (kind == 2) != scripts) {
+    if (!kind || (kind == 2 && !scripts)) {
       p = next;
       continue;
     }
     char val[1024], rel[128];
     const char *attr = kind == 1 ? "href" : "src";
     int ok = tag_attr(p + 1, end, attr, val, sizeof val) && val[0];
-    if (ok && kind == 1)       /* stylesheets, and modules the page says it will import */
-      ok = tag_attr(p + 1, end, "rel", rel, sizeof rel) &&
-           (strcasestr(rel, "stylesheet") || strcasestr(rel, "modulepreload"));
+    int stylesheet = 0;
+    if (ok && kind == 1) {
+      ok = tag_attr(p + 1, end, "rel", rel, sizeof rel);
+      if (ok) {
+        stylesheet = strcasestr(rel, "stylesheet") != NULL;
+        ok = scripts ? !stylesheet && strcasestr(rel, "modulepreload") != NULL : stylesheet;
+      }
+    }
     /* async scripts must not hold the first frame behind a slow server. */
     if (ok && kind == 2 && tag_attr(p + 1, end, "async", NULL, 0)) ok = 0;
     if (ok && !strncasecmp(val, "data:", 5)) ok = 0;
@@ -2470,24 +2483,32 @@ static void page_prefetch(const char *html, int scripts)
       for (int i = 0; !dup && i < pool.n; ++i) dup = !strcmp(pool.jobs[i].url, abs);
       if (dup) free(abs);
       else {
-        pool.jobs[pool.n].stylesheet = kind == 1 && strcasestr(rel, "stylesheet") != NULL;
+        pool.jobs[pool.n].stylesheet = stylesheet;
         pool.jobs[pool.n++].url = abs;
       }
     }
     if (!*end) break;
     p = next;
   }
-  if (pool.n > 1) {
+  return pool;
+}
+
+static void prefetch_run(struct pf_pool *pool)
+{
+  if (pool->n > 1) {
     pthread_t th[PF_THREADS];
-    int nt = pool.n < PF_THREADS ? pool.n : PF_THREADS, started = 0;
+    int nt = pool->n < PF_THREADS ? pool->n : PF_THREADS, started = 0;
     for (int i = 0; i < nt; ++i)
-      if (pthread_create(&th[started], NULL, pf_worker, &pool) == 0) started++;
-    if (!started) pf_worker(&pool);
+      if (pthread_create(&th[started], NULL, pf_worker, pool) == 0) started++;
+    if (!started) pf_worker(pool);
     for (int i = 0; i < started; ++i) pthread_join(th[i], NULL);
-  }
-  for (int i = 0; i < pool.n; ++i) {
-    struct pf_job *j = &pool.jobs[i];
-    if (pool.n == 1) lb_fetch(j->url, "GET", NULL, NULL, 0, &j->r);
+  } else pf_worker(pool);
+}
+
+static void prefetch_apply(struct pf_pool *pool)
+{
+  for (int i = 0; i < pool->n; ++i) {
+    struct pf_job *j = &pool->jobs[i];
     LB_LOG("prefetch %s -> %d %s\n", j->url, j->r.status, j->r.error ? j->r.error : "");
     if (j->r.body && j->r.status >= 200 && j->r.status < 300) {
       if (j->stylesheet) {
@@ -2507,10 +2528,24 @@ static void page_prefetch(const char *html, int scripts)
       cache_add(j->url, NULL, 0);
       j->url = NULL;
     }
-    free(j->url);
-    response_free(&j->r);
   }
-  free(pool.jobs);
+}
+
+static void prefetch_free(struct pf_pool *pool)
+{
+  for (int i = 0; i < pool->n; ++i) {
+    free(pool->jobs[i].url);
+    response_free(&pool->jobs[i].r);
+  }
+  free(pool->jobs);
+}
+
+static void page_prefetch(const char *html)
+{
+  struct pf_pool pool = prefetch_collect(html, 0);
+  prefetch_run(&pool);
+  prefetch_apply(&pool);
+  prefetch_free(&pool);
 }
 
 /* luna-ui's resource reader: every relative reference in the document is a
@@ -2615,7 +2650,7 @@ void luna_app_request_redraw(void) {
 enum {
   PS_FIRST = 1, PS_LAST = 2, PS_ONLY = 4, PS_EMPTY = 8, PS_ROOT = 16,
   PS_CHECKED = 32, PS_DISABLED = 64, PS_ENABLED = 128, PS_FOCUS = 256,
-  PS_NTH = 512, PS_NTH_LAST = 1024, PS_NEVER = 2048, PS_TARGET = 4096,
+  PS_NTH = 512, PS_NTH_LAST = 1024, PS_NEVER = 2048, PS_TARGET = 4096, PS_DEFINED = 8192,
 };
 
 struct sel_attr {
@@ -2797,6 +2832,7 @@ static int sel_compound(const char **pp, struct sel_simple *s)
       else if (!strcmp(name, "empty")) s->ps |= PS_EMPTY;
       else if (!strcmp(name, "root")) s->ps |= PS_ROOT;
       else if (!strcmp(name, "target")) s->ps |= PS_TARGET;
+      else if (!strcmp(name, "defined") && !arg) s->ps |= PS_DEFINED;
       else if (!strcmp(name, "checked")) s->ps |= PS_CHECKED;
       else if (!strcmp(name, "disabled")) s->ps |= PS_DISABLED;
       else if (!strcmp(name, "enabled")) s->ps |= PS_ENABLED;
@@ -2974,6 +3010,24 @@ static int nth_ok(int a, int b, int pos)
   return (pos - b) % a == 0 && (pos - b) / a >= 0;
 }
 
+static int selector_defined(const char *tag)
+{
+  if (!strchr(tag, '-')) return 1;
+  JSContext *ctx = g_page.ctx;
+  if (!ctx) return 0;
+  JSValue global = JS_GetGlobalObject(ctx);
+  JSValue check = JS_GetPropertyStr(ctx, global, "__lb_is_defined");
+  JSValue arg = JS_NewString(ctx, tag);
+  JSValue result = JS_Call(ctx, check, JS_UNDEFINED, 1, &arg);
+  int defined = JS_IsBool(result) && JS_ToBool(ctx, result);
+  if (JS_IsException(result)) JS_FreeValue(ctx, JS_GetException(ctx));
+  JS_FreeValue(ctx, result);
+  JS_FreeValue(ctx, arg);
+  JS_FreeValue(ctx, check);
+  JS_FreeValue(ctx, global);
+  return defined;
+}
+
 static int sel_simple_match(const struct sel_simple *s, int i)
 {
   const LunaElement *e = &elements[i];
@@ -3043,6 +3097,7 @@ static int sel_simple_match(const struct sel_simple *s, int i)
       if (!matches) return 0;
     }
     if ((s->ps & PS_FOCUS) && luna_focused_element() != i) return 0;
+    if ((s->ps & PS_DEFINED) && !selector_defined(e->type)) return 0;
     if (s->ps & (PS_NTH | PS_NTH_LAST)) {
       int pos = 1;
       for (int j = i; (j = (s->ps & PS_NTH) ? el_prev(j) : el_next(j)) >= 0; ) pos++;
@@ -4428,8 +4483,185 @@ static JSValue lb_load_complete(JSContext *ctx, JSValueConst this_val, int argc,
   return JS_UNDEFINED;
 }
 
+#ifdef LB_ICU
+static JSValue lb_segment_boundaries(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv)
+{
+  const char *locale = JS_ToCString(ctx, argv[0]);
+  size_t len;
+  const char *text = JS_ToCStringLen(ctx, &len, argv[1]);
+  int32_t granularity;
+  JSValue result = JS_EXCEPTION;
+  UChar *utf16 = NULL;
+  UBreakIterator *iter = NULL;
+  if (!locale || !text || JS_ToInt32(ctx, &granularity, argv[2]) < 0) goto done;
+
+  static const UBreakIteratorType types[] = { UBRK_CHARACTER, UBRK_WORD, UBRK_SENTENCE };
+  if (granularity < 0 || granularity >= (int)(sizeof types / sizeof types[0])) {
+    result = JS_ThrowRangeError(ctx, "Invalid segment granularity");
+    goto done;
+  }
+  UErrorCode status = U_ZERO_ERROR;
+  int32_t length = 0;
+  if (len >= INT32_MAX) {
+    result = JS_ThrowRangeError(ctx, "String is too long to segment");
+    goto done;
+  }
+  utf16 = malloc((len + 1) * sizeof *utf16);
+  if (!utf16) {
+    result = JS_ThrowOutOfMemory(ctx);
+    goto done;
+  }
+  u_strFromUTF8WithSub(utf16, (int32_t)len + 1, &length, text, (int32_t)len, 0xfffd, NULL, &status);
+  iter = ubrk_open(types[granularity], *locale ? locale : NULL, utf16, length, &status);
+  if (U_FAILURE(status)) {
+    result = JS_ThrowRangeError(ctx, "Could not segment the string");
+    goto done;
+  }
+  result = JS_NewArray(ctx);
+  unsigned index = 0;
+  for (int32_t end = ubrk_next(iter); end != UBRK_DONE; end = ubrk_next(iter)) {
+    int word = granularity == 1 && ubrk_getRuleStatus(iter) >= UBRK_WORD_NONE_LIMIT;
+    JS_SetPropertyUint32(ctx, result, index++, JS_NewInt32(ctx, end));
+    JS_SetPropertyUint32(ctx, result, index++, JS_NewBool(ctx, word));
+  }
+done:
+  if (iter) ubrk_close(iter);
+  free(utf16);
+  JS_FreeCString(ctx, text);
+  JS_FreeCString(ctx, locale);
+  return result;
+}
+
+static const char *date_part_name(int field)
+{
+  switch (field) {
+  case UDAT_YEAR_FIELD: return "year";
+  case UDAT_MONTH_FIELD:
+  case UDAT_STANDALONE_MONTH_FIELD: return "month";
+  case UDAT_DATE_FIELD: return "day";
+  case UDAT_HOUR_OF_DAY0_FIELD:
+  case UDAT_HOUR_OF_DAY1_FIELD:
+  case UDAT_HOUR0_FIELD:
+  case UDAT_HOUR1_FIELD: return "hour";
+  case UDAT_MINUTE_FIELD: return "minute";
+  case UDAT_SECOND_FIELD: return "second";
+  case UDAT_AM_PM_FIELD: return "dayPeriod";
+  case UDAT_DAY_OF_WEEK_FIELD:
+  case UDAT_STANDALONE_DAY_FIELD:
+  case UDAT_DOW_LOCAL_FIELD: return "weekday";
+  case UDAT_ERA_FIELD: return "era";
+  case UDAT_TIMEZONE_FIELD:
+  case UDAT_TIMEZONE_GENERIC_FIELD:
+  case UDAT_TIMEZONE_LOCALIZED_GMT_OFFSET_FIELD: return "timeZoneName";
+  default: return "unknown";
+  }
+}
+
+static void date_part_append(JSContext *ctx, JSValue parts, unsigned index,
+                             const char *type, const UChar *text, int32_t length)
+{
+  char utf8[768];
+  int32_t n = 0;
+  UErrorCode status = U_ZERO_ERROR;
+  u_strToUTF8(utf8, sizeof utf8, &n, text, length, &status);
+  if (U_FAILURE(status)) return;
+  JSValue part = JS_NewObject(ctx);
+  JS_SetPropertyStr(ctx, part, "type", JS_NewString(ctx, type));
+  JS_SetPropertyStr(ctx, part, "value", JS_NewStringLen(ctx, utf8, (size_t)n));
+  JS_SetPropertyUint32(ctx, parts, index, part);
+}
+
+static JSValue lb_date_parts(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  double ms;
+  if (JS_ToFloat64(ctx, &ms, argv[0]) < 0) return JS_EXCEPTION;
+  if (!isfinite(ms) || fabs(ms) > 8640000000000000.0)
+    return JS_ThrowRangeError(ctx, "Invalid time value");
+
+  const char *tag = JS_ToCString(ctx, argv[1]);
+  const char *zone = JS_ToCString(ctx, argv[2]);
+  const char *spec = JS_ToCString(ctx, argv[3]);
+  const char *hours = JS_ToCString(ctx, argv[4]);
+  UErrorCode status = U_ZERO_ERROR;
+  char locale[ULOC_FULLNAME_CAPACITY] = "";
+  UChar timezone[128], skeleton[64], pattern[256], result[256];
+  UDateTimePatternGenerator *generator = NULL;
+  UDateFormat *formatter = NULL;
+  UFieldPositionIterator *positions = NULL;
+  int32_t zone_len = 0, spec_len = 0, parsed = 0, length = 0;
+  JSValue parts = JS_UNDEFINED;
+  if (!tag || !zone || !spec || !hours) {
+    parts = JS_EXCEPTION;
+    goto done;
+  }
+  if (*tag) {
+    uloc_forLanguageTag(tag, locale, sizeof locale, &parsed, &status);
+    if ((size_t)parsed != strlen(tag)) status = U_ILLEGAL_ARGUMENT_ERROR;
+  } else {
+    snprintf(locale, sizeof locale, "%s", uloc_getDefault());
+  }
+  if (*hours) uloc_setKeywordValue("hours", hours, locale, sizeof locale, &status);
+  u_strFromUTF8(timezone, 128, &zone_len, zone, -1, &status);
+  if (zone_len && U_SUCCESS(status)) {
+    UChar canonical[128];
+    UBool system_zone;
+    ucal_getCanonicalTimeZoneID(timezone, zone_len, canonical, 128, &system_zone, &status);
+    if (!system_zone && U_SUCCESS(status)) status = U_ILLEGAL_ARGUMENT_ERROR;
+  }
+  u_strFromUTF8(skeleton, 64, &spec_len, spec, -1, &status);
+  if (U_FAILURE(status)) goto done;
+  generator = udatpg_open(locale, &status);
+  if (U_FAILURE(status)) goto done;
+  int32_t pattern_len = udatpg_getBestPatternWithOptions(generator, skeleton, spec_len,
+      UDATPG_MATCH_ALL_FIELDS_LENGTH, pattern, 256, &status);
+  if (U_FAILURE(status) || pattern_len >= 256) goto done;
+  formatter = udat_open(UDAT_PATTERN, UDAT_PATTERN, locale,
+                        zone_len ? timezone : NULL, zone_len, pattern, pattern_len, &status);
+  positions = ufieldpositer_open(&status);
+  if (U_FAILURE(status)) goto done;
+  length = udat_formatForFields(formatter, ms, result, 256, positions, &status);
+  if (U_FAILURE(status) || length >= 256) goto done;
+  parts = JS_NewArray(ctx);
+  int32_t start, end, cursor = 0, field;
+  unsigned index = 0;
+  while ((field = ufieldpositer_next(positions, &start, &end)) >= 0) {
+    if (start < cursor || end > length) continue;
+    if (start > cursor) date_part_append(ctx, parts, index++, "literal", result + cursor, start - cursor);
+    date_part_append(ctx, parts, index++, date_part_name(field), result + start, end - start);
+    cursor = end;
+  }
+  if (cursor < length) date_part_append(ctx, parts, index, "literal", result + cursor, length - cursor);
+done:
+  if (positions) ufieldpositer_close(positions);
+  if (formatter) udat_close(formatter);
+  if (generator) udatpg_close(generator);
+  JS_FreeCString(ctx, hours);
+  JS_FreeCString(ctx, spec);
+  JS_FreeCString(ctx, zone);
+  JS_FreeCString(ctx, tag);
+  return JS_IsUndefined(parts) ? JS_ThrowRangeError(ctx, "Invalid date format locale or time zone") : parts;
+}
+#endif
+
+static JSValue lb_valid_css_rule(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  const char *text = JS_ToCString(ctx, argv[0]);
+  if (!text) return JS_EXCEPTION;
+  CSSStyleSheet *sheet = css_parse(text, 0);
+  int valid = sheet && sheet->rule_count + sheet->at_rule_count == 1;
+  if (sheet) css_free(sheet);
+  JS_FreeCString(ctx, text);
+  return JS_NewBool(ctx, valid);
+}
+
 static const JSCFunctionListEntry lb_funcs[] = {
+#ifdef LB_ICU
+  JS_CFUNC_DEF("dateParts", 5, lb_date_parts),
+  JS_CFUNC_DEF("segmentBoundaries", 3, lb_segment_boundaries),
+#endif
   JS_CFUNC_DEF("body", 0, lb_body),
+  JS_CFUNC_DEF("validCSSRule", 1, lb_valid_css_rule),
   JS_CFUNC_DEF("byId", 1, lb_by_id),
   JS_CFUNC_DEF("query", 3, lb_query),
   JS_CFUNC_DEF("matches", 2, lb_matches),
@@ -4764,6 +4996,11 @@ static JSModuleDef *lb_mod_load(JSContext *ctx, const char *name, void *opaque)
   return m;
 }
 
+static JSValue js_window_get(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+  return JS_GetGlobalObject(ctx);
+}
+
 static int js_open(void)
 {
   js_close();
@@ -4778,6 +5015,11 @@ static int js_open(void)
   g_page.ctx = JS_NewContext(g_page.rt);
   if (!g_page.ctx) return -1;
   JSValue global = JS_GetGlobalObject(g_page.ctx);
+  JSAtom window = JS_NewAtom(g_page.ctx, "window");
+  JS_DefinePropertyGetSet(g_page.ctx, global, window,
+                          JS_NewCFunction(g_page.ctx, js_window_get, "get window", 0),
+                          JS_UNDEFINED, JS_PROP_ENUMERABLE);
+  JS_FreeAtom(g_page.ctx, window);
   JSValue lb = JS_NewObject(g_page.ctx);
   JS_SetPropertyFunctionList(g_page.ctx, lb, lb_funcs, (int)(sizeof lb_funcs / sizeof lb_funcs[0]));
   JS_SetPropertyStr(g_page.ctx, lb, "userAgent", JS_NewString(g_page.ctx, g_user_agent));
@@ -4901,8 +5143,72 @@ static const char lb_ua_css[] =
   "hr{border-top:1px solid #9a9a9a;margin:8px 0}"
   "table{border-spacing:2px}";
 
+/* Keep the parsed page interactive while external scripts download. The
+ * page and worker hold independent references so navigation never joins an
+ * obsolete fetch or applies its results to the next document. */
+struct pending_scripts {
+  struct pf_pool pool;
+  struct script_tag *scripts;
+  int count;
+  double started, stage;
+  atomic_int refs, done;
+};
+static struct pending_scripts *g_pending_scripts;
+static int cast_active(void);
+
+static void pending_scripts_release(struct pending_scripts *pending)
+{
+  if (atomic_fetch_sub(&pending->refs, 1) != 1) return;
+  for (int i = 0; i < pending->count; ++i) {
+    free(pending->scripts[i].src);
+    free(pending->scripts[i].code);
+  }
+  free(pending->scripts);
+  prefetch_free(&pending->pool);
+  free(pending);
+}
+
+static void *pending_scripts_worker(void *arg)
+{
+  struct pending_scripts *pending = arg;
+  prefetch_run(&pending->pool);
+  atomic_store(&pending->done, 1);
+  if (g_wake[1] >= 0) {
+    ssize_t written = write(g_wake[1], "x", 1);
+    (void)written;
+  }
+  pending_scripts_release(pending);
+  return NULL;
+}
+
+static int pending_scripts_start(struct pf_pool pool, struct script_tag *scripts, int count,
+                                 double started, double stage)
+{
+  struct pending_scripts *pending = calloc(1, sizeof *pending);
+  if (!pending) return 0;
+  pending->pool = pool;
+  pending->scripts = scripts;
+  pending->count = count;
+  pending->started = started;
+  pending->stage = stage;
+  atomic_init(&pending->refs, 2);
+  atomic_init(&pending->done, 0);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, pending_scripts_worker, pending) != 0) {
+    free(pending);
+    return 0;
+  }
+  pthread_detach(thread);
+  g_pending_scripts = pending;
+  return 1;
+}
+
 static void page_teardown(void)
 {
+  if (g_pending_scripts) {
+    pending_scripts_release(g_pending_scripts);
+    g_pending_scripts = NULL;
+  }
   free(g_page.base_url);
   g_page.base_url = NULL;
   g_page_gen++;              /* requests still in flight belong to the old page */
@@ -4933,55 +5239,8 @@ static void ready_state(int stage)
   JS_FreeValue(g_page.ctx, js_hook("__lb_ready", 1, &a));
 }
 
-static void page_load_html(const char *html, const char *url)
+static void run_parser_scripts(struct script_tag *scripts, int n, double total, double stage)
 {
-  double stage = lb_now_ms(), total = stage;
-  g_page_loading++;
-  page_teardown();
-  free(g_page.nav_body);
-  g_page.nav_body = NULL;
-  free(g_page.nav_url);
-  g_page.nav_url = NULL;
-  free(g_page.url);
-  g_page.url = lb_strdup(url && url[0] ? url : "about:blank");
-  g_page.base_url = document_base_url(html, g_page.url);
-  /* luna-ui joins relative references onto this base; lb_read_resource then
-   * resolves the result against the page URL. */
-  if (!strncmp(page_base(), "file://", 7)) {
-    struct url u;
-    if (url_parse(page_base(), &u) == 0) {
-      char *path = percent_decode(u.path, strlen(u.path));
-      luna_set_html_base_dir(path);
-      free(path);
-    }
-    url_free(&u);
-  } else luna_set_html_base_dir(page_base());
-  snprintf(luna_doc_title, sizeof luna_doc_title, "%s", "");
-  page_prefetch(html, 0);
-  LB_LOG("load prefetch %.0fms\n", lb_now_ms() - stage);
-  stage = lb_now_ms();
-  js_open();
-  luna_parse_css(lb_ua_css);
-  for (int i = 0; i < g_page.nboot; ++i) js_eval(g_page.boot_scripts[i], strlen(g_page.boot_scripts[i]), "boot", 0);
-  /* HTML always has a body: content outside one belongs to it. */
-  if (!strcasestr(html, "<body")) {
-    struct buf wrapped = { 0 };
-    buf_puts(&wrapped, "<body>");
-    buf_puts(&wrapped, html);
-    buf_puts(&wrapped, "</body>");
-    luna_parse_html(wrapped.p ? wrapped.p : "<body></body>");
-    free(wrapped.p);
-  } else luna_parse_html(html);
-  LB_LOG("load parse %.0fms (%d elements, %d rules)\n", lb_now_ms() - stage, elem_count, rule_count);
-  stage = lb_now_ms();
-  luna_inject_body_background();
-  luna_resize((float)g_page.w, (float)g_page.h);
-  /* Publish the parsed document before page scripts can occupy the thread. */
-  g_page.dirty = 1;
-  cast_pump();
-  page_prefetch(html, 1);
-  struct script_tag *scripts = NULL;
-  int n = scan_scripts(html, &scripts);
   JS_FreeValue(g_page.ctx, js_hook("__lb_parser_scripts", 0, NULL));
   for (int pass = 0; pass < 2; ++pass) for (int i = 0; i < n; ++i) {
       int deferred = !scripts[i].async && (scripts[i].defer || scripts[i].module);
@@ -5022,6 +5281,85 @@ static void page_load_html(const char *html, const char *url)
   g_page.dirty = 1;
   g_page_loading--;
   LB_LOG("load events %.0fms, total %.0fms\n", lb_now_ms() - stage, lb_now_ms() - total);
+}
+
+static void page_load_html(const char *html, const char *url)
+{
+  double stage = lb_now_ms(), total = stage;
+  g_page_loading++;
+  page_teardown();
+  free(g_page.nav_body);
+  g_page.nav_body = NULL;
+  free(g_page.nav_url);
+  g_page.nav_url = NULL;
+  free(g_page.url);
+  g_page.url = lb_strdup(url && url[0] ? url : "about:blank");
+  g_page.base_url = document_base_url(html, g_page.url);
+  /* luna-ui joins relative references onto this base; lb_read_resource then
+   * resolves the result against the page URL. */
+  if (!strncmp(page_base(), "file://", 7)) {
+    struct url u;
+    if (url_parse(page_base(), &u) == 0) {
+      char *path = percent_decode(u.path, strlen(u.path));
+      luna_set_html_base_dir(path);
+      free(path);
+    }
+    url_free(&u);
+  } else luna_set_html_base_dir(page_base());
+  snprintf(luna_doc_title, sizeof luna_doc_title, "%s", "");
+  page_prefetch(html);
+  LB_LOG("load prefetch %.0fms\n", lb_now_ms() - stage);
+  stage = lb_now_ms();
+  js_open();
+  luna_parse_css(lb_ua_css);
+  for (int i = 0; i < g_page.nboot; ++i) js_eval(g_page.boot_scripts[i], strlen(g_page.boot_scripts[i]), "boot", 0);
+  /* HTML always has a body: content outside one belongs to it. */
+  if (!strcasestr(html, "<body")) {
+    struct buf wrapped = { 0 };
+    buf_puts(&wrapped, "<body>");
+    buf_puts(&wrapped, html);
+    buf_puts(&wrapped, "</body>");
+    luna_parse_html(wrapped.p ? wrapped.p : "<body></body>");
+    free(wrapped.p);
+  } else luna_parse_html(html);
+  LB_LOG("load parse %.0fms (%d elements, %d rules)\n", lb_now_ms() - stage, elem_count, rule_count);
+  stage = lb_now_ms();
+  luna_inject_body_background();
+  luna_resize((float)g_page.w, (float)g_page.h);
+  /* Publish the parsed document before page scripts can occupy the thread. */
+  g_page.dirty = 1;
+  cast_pump();
+  struct script_tag *scripts = NULL;
+  int n = scan_scripts(html, &scripts);
+  struct pf_pool pool = prefetch_collect(html, 1);
+  if (pool.n && cast_active() && pending_scripts_start(pool, scripts, n, total, stage)) {
+    g_page_loading--;
+    return;
+  }
+  prefetch_run(&pool);
+  prefetch_apply(&pool);
+  prefetch_free(&pool);
+  run_parser_scripts(scripts, n, total, stage);
+}
+
+static void finish_pending_scripts(void)
+{
+  struct pending_scripts *pending = g_pending_scripts;
+  if (!pending || !atomic_load(&pending->done)) return;
+  g_pending_scripts = NULL;
+  prefetch_apply(&pending->pool);
+  struct script_tag *scripts = pending->scripts;
+  int count = pending->count;
+  double started = pending->started, stage = pending->stage;
+  pending->scripts = NULL;
+  pending->count = 0;
+  pending_scripts_release(pending);
+  g_page_loading++;
+  run_parser_scripts(scripts, count, started, stage);
+  if (g_page.ready == 2) {
+    page_emit("Page.loadEventFired", "{}");
+    page_emit("Page.frameStoppedLoading", "{}");
+  }
 }
 
 static int page_navigate_request(const char *url, const char *post_body)
@@ -5161,7 +5499,7 @@ static void page_set_cursor(int type) {
 
 static void page_pointer(double x, double y, int action, int touch, int button, int mods)
 {
-  luna_mouse_move(x, y);
+  int visual_change = luna_mouse_move_changed(x, y);
   if (action < 0) {
     if (g_page.pressed && g_page.ctx) {
       JSValue a[7] = { JS_NewInt32(g_page.ctx, 3), JS_NewUint32(g_page.ctx, node_uid_at((luna_dom_flush_restyle(), luna_element_at_point(x, y)))),
@@ -5196,7 +5534,7 @@ static void page_pointer(double x, double y, int action, int touch, int button, 
         sent = g_page_cursor;
       }
     }
-    g_page.dirty = 1;
+    if (visual_change || g_page.pressed) g_page.dirty = 1;
     return;
   }
   if (button == LUNA_MOUSE_BUTTON_LEFT) g_page.pressed = action == 1;
@@ -5207,6 +5545,7 @@ static void page_pointer(double x, double y, int action, int touch, int button, 
 
 static void page_wheel(double x, double y, double dx, double dy)
 {
+  layout_now();
   luna_mouse_move(x, y);
   /* CDP deltas are pixels; luna-ui's wheel unit is a notch. */
   luna_scroll(-dx / 18.0, -dy / 18.0);
@@ -5423,6 +5762,7 @@ static double page_pump(void)
     free(u);
   }
   http_drain();
+  finish_pending_scripts();
   if (!g_page.ctx) return -1;
   JSValue a = JS_NewFloat64(g_page.ctx, lb_now_ms());
   g_in_tick++;
@@ -5461,9 +5801,9 @@ static void page_render(void)
     for (int i = 0; i < elem_count; ++i) {
       const LunaElement *e = &elements[i];
       if (!is_visible(i)) continue;
-      fprintf(stderr, "[box] %d %s#%s.%s @%.0f,%.0f %.0fx%.0f bg=%.2f,%.2f,%.2f,%.2f z=%d text='%.30s'\n",
+      fprintf(stderr, "[box] %d %s#%s.%s @%.0f,%.0f %.0fx%.0f bg=%.2f,%.2f,%.2f,%.2f z=%d vis=%d opacity=%.3f text='%.30s'\n",
               i, e->type, e->id, e->class_name, e->x, e->y, e->w, e->h,
-              e->cur_r, e->cur_g, e->cur_b, e->cur_a, e->z_index, e->text);
+              e->cur_r, e->cur_g, e->cur_b, e->cur_a, e->z_index, g_rc[i].vis, g_rc[i].eff_op, e->text);
     }
   }
   /* read_pixels in page_capture waits for rendering; an extra glFinish
@@ -5478,9 +5818,14 @@ static void png_sink(void *ctx, void *data, int size) {
 #define CAST_MS 16          /* ~60 frames a second while things move */
 #define CAST_CARET_MS 500   /* a focused field's caret alone */
 static struct {
-  int on, acked, quality, seq;
+  int on, acked, quality, seq, pending_gap;
   double last_ms;
 } g_cast;
+
+static int cast_active(void)
+{
+  return g_cast.on;
+}
 
 /* A screenshot/screencast "quality" (JPEG), 80 when not given. */
 static int cast_quality(const struct jv *params)
@@ -5878,6 +6223,7 @@ static void cdp_handle(const char *text)
     g_cast.quality = fmt && !strcmp(fmt, "png") ? 0 : cast_quality(params);
     g_cast.on = 1;
     g_cast.acked = 1;
+    g_cast.pending_gap = 0;
     g_page.dirty = 1;               /* the first frame right away */
     cdp_reply(id, in_session, "{}");
   } else if (!strcmp(method, "Page.stopScreencast")) {
@@ -5990,16 +6336,19 @@ static void cdp_handle(const char *text)
   } else if (!strcmp(method, "Input.dispatchMouseEvent")) {
     const char *type = jstr(params, "type");
     double x = jnum(params, "x", 0), y = jnum(params, "y", 0);
-    cdp_reply(id, in_session, "{}");
-    const char *bname = jstr(params, "button");
-    int button = bname && !strcmp(bname, "right") ? LUNA_MOUSE_BUTTON_RIGHT :
-                 bname && !strcmp(bname, "middle") ? 2 : LUNA_MOUSE_BUTTON_LEFT;
-    int mods = cdp_mods((int)jnum(params, "modifiers", 0));
-    if (type && !strcmp(type, "mousePressed")) page_pointer(x, y, 1, 0, button, mods);
-    else if (type && !strcmp(type, "mouseReleased")) page_pointer(x, y, 0, 0, button, mods);
-    else if (type && !strcmp(type, "mouseMoved")) page_pointer(x, y, -1, 0, 0, mods);
-    else if (type && !strcmp(type, "mouseWheel"))
+    if (type && !strcmp(type, "mouseWheel")) {
       page_wheel(x, y, jnum(params, "deltaX", 0), jnum(params, "deltaY", 0));
+      cdp_reply(id, in_session, "{}");
+    } else {
+      cdp_reply(id, in_session, "{}");
+      const char *bname = jstr(params, "button");
+      int button = bname && !strcmp(bname, "right") ? LUNA_MOUSE_BUTTON_RIGHT :
+                   bname && !strcmp(bname, "middle") ? 2 : LUNA_MOUSE_BUTTON_LEFT;
+      int mods = cdp_mods((int)jnum(params, "modifiers", 0));
+      if (type && !strcmp(type, "mousePressed")) page_pointer(x, y, 1, 0, button, mods);
+      else if (type && !strcmp(type, "mouseReleased")) page_pointer(x, y, 0, 0, button, mods);
+      else if (type && !strcmp(type, "mouseMoved")) page_pointer(x, y, -1, 0, 0, mods);
+    }
   } else if (!strcmp(method, "Lunaria.contextInfo")) {
     /* What is under the pointer, for the window's right-click menu. */
     double x = jnum(params, "x", 0), y = jnum(params, "y", 0);
@@ -6130,13 +6479,18 @@ static int cast_pump(void)
 {
   if (!g_cast.on || !g_cast.acked) return -1;
   double now = lb_now_ms();
-  double gap = CAST_MS;
-  if (!g_page.dirty) {
+  if (g_page.dirty) {
+    g_cast.pending_gap = CAST_MS;
+  } else if (g_cast.pending_gap != CAST_MS) {
+    /* The probe consumes layout and caret changes. Keep them pending until
+     * a frame can be sent, and let a new layout override a pending caret. */
     int m = luna_needs_redraw(now / 1000.0, 0.0);
-    if (!m) return -1;
-    if (!(m & (LUNA_REDRAW_LAYOUT | LUNA_REDRAW_ANIM))) gap = CAST_CARET_MS;
+    if (m & (LUNA_REDRAW_LAYOUT | LUNA_REDRAW_ANIM)) g_cast.pending_gap = CAST_MS;
+    else if (m) g_cast.pending_gap = CAST_CARET_MS;
   }
-  if (g_page.ready && now - g_cast.last_ms < gap) return (int)ceil(gap - (now - g_cast.last_ms));
+  if (!g_cast.pending_gap) return -1;
+  double wait = g_cast.pending_gap - (now - g_cast.last_ms);
+  if (g_page.ready && wait > 0) return (int)ceil(wait);
   size_t len = 0;
   unsigned char *img = page_capture(&len, g_cast.quality);
   if (!img) return -1;
@@ -6151,6 +6505,7 @@ static int cast_pump(void)
   free(b.p);
   free(img);
   g_cast.acked = 0;
+  g_cast.pending_gap = 0;
   g_cast.last_ms = now;
   return -1;
 }
@@ -6372,8 +6727,11 @@ static const char ui_css[] =
 struct ui_tab {
   pid_t pid;
   int to, from;                     /* the child's fds 3 and 4, from here */
-  struct buf rx;
-  unsigned next_id, title_id;
+  struct buf rx, tx;
+  size_t tx_offset;
+  double wheel_x, wheel_y;           /* wheel distance still to send, in pixels */
+  double wheel_at_x, wheel_at_y;
+  unsigned next_id, title_id, wheel_id, hover_id;
   unsigned char *frame;             /* the newest picture (JPEG) */
   size_t frame_len;
   char **hist;                      /* back/forward list and where we are */
@@ -6393,6 +6751,7 @@ static struct {
   int shown;
   float scale;
   int pressed;                      /* a button went down over the page */
+  int hover_pending;
   float zoom;                       /* page zoom (Ctrl +/-) */
   int find_on, url_click;
   char find_last[256];
@@ -6407,8 +6766,6 @@ static struct {
   int ctx_open, ctx_n;
   int ctx_cmd[16];
   char *ctx_arg[16];
-  double wheel_x, wheel_y;          /* wheel distance not yet sent (px): sent a share per frame */
-  double wheel_at_x, wheel_at_y;
   unsigned shot_id;                 /* the captureScreenshot being waited for */
   char shot_path[1024];
   unsigned frames;                  /* ui_frame calls, for LUNA_BROWSER_SCREENSHOT_EVERY */
@@ -6428,26 +6785,39 @@ static void ui_ctx_show(const char *link, const char *image, const char *sel, in
 static void ui_menu_do(int i);
 static void ui_ctx_close(void);
 
+/* Keep partially written commands intact while the page is busy. */
+static void ui_flush_commands(struct ui_tab *t)
+{
+  while (t->tx_offset < t->tx.len) {
+    ssize_t w = write(t->to, t->tx.p + t->tx_offset, t->tx.len - t->tx_offset);
+    if (w < 0 && errno == EINTR) continue;
+    if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    if (w <= 0) {
+      close(t->to);
+      t->to = -1;
+      break;
+    }
+    t->tx_offset += (size_t)w;
+  }
+  t->tx_offset = t->tx.len = 0;
+}
+
 /* A protocol command to the page's session (or the browser, session 0). */
 static unsigned ui_send(const char *method, const char *params, int session)
 {
-  if (g_ui.t->to < 0) return 0;
-  unsigned id = ++g_ui.t->next_id;
-  struct buf b = { 0 };
-  buf_printf(&b, "{\"id\":%u,\"method\":\"%s\",\"params\":%s%s}", id, method,
-             params ? params : "{}", session ? ",\"sessionId\":\"" SESSION_ID "\"" : "");
-  buf_put(&b, "", 1);               /* the NUL that ends a message */
-  const char *p = b.p;
-  size_t n = b.len;
-  while (n > 0) {
-    ssize_t w = write(g_ui.t->to, p, n);
-    if (w < 0 && errno == EINTR) continue;
-    if (w <= 0) break;
-    p += w;
-    n -= (size_t)w;
+  struct ui_tab *t = g_ui.t;
+  if (t->to < 0) return 0;
+  unsigned id = ++t->next_id;
+  if (t->tx_offset) {
+    t->tx.len -= t->tx_offset;
+    memmove(t->tx.p, t->tx.p + t->tx_offset, t->tx.len);
+    t->tx_offset = 0;
   }
-  free(b.p);
-  return id;
+  buf_printf(&t->tx, "{\"id\":%u,\"method\":\"%s\",\"params\":%s%s}", id, method,
+             params ? params : "{}", session ? ",\"sessionId\":\"" SESSION_ID "\"" : "");
+  buf_put(&t->tx, "", 1);           /* the NUL that ends a message */
+  ui_flush_commands(t);
+  return t->to >= 0 ? id : 0;
 }
 
 static unsigned char *ui_read_resource(const char *path, size_t *out_size)
@@ -6688,7 +7058,11 @@ static void ui_message(const char *text)
   if (!m) return;
   const char *method = jstr(m, "method");
   const struct jv *params = jget(m, "params");
-  if (method && !strcmp(method, "Page.screencastFrame")) {
+  if (!method && g_ui.t->wheel_id && (unsigned)jnum(m, "id", 0) == g_ui.t->wheel_id) {
+    g_ui.t->wheel_id = 0;
+  } else if (!method && g_ui.t->hover_id && (unsigned)jnum(m, "id", 0) == g_ui.t->hover_id) {
+    g_ui.t->hover_id = 0;
+  } else if (method && !strcmp(method, "Page.screencastFrame")) {
     const char *data = jstr(params, "data");
     size_t n = 0;
     unsigned char *img = data ? base64_decode(data, strlen(data), &n) : NULL;
@@ -6756,7 +7130,7 @@ static void ui_message(const char *text)
   } else if (method && !strcmp(method, "Target.attachedToTarget")) {
     ui_send("Page.enable", NULL, 1);
     ui_send("Runtime.enable", NULL, 1);
-    ui_send("Page.startScreencast", "{\"format\":\"jpeg\",\"quality\":80}", 1);
+    if (ui_is_active()) ui_send("Page.startScreencast", "{\"format\":\"jpeg\",\"quality\":80}", 1);
     if (g_ui.t->start) {
       char *home = strcmp(g_ui.t->start, "about:blank") ? NULL : ui_home_url();
       ui_navigate(home ? home : g_ui.t->start);
@@ -6805,6 +7179,7 @@ static void ui_pump(void)
   for (int i = 0; i < g_ntabs; ++i) {
     g_ui.t = g_tabs[i];
     ui_pump_one();
+    ui_flush_commands(g_ui.t);
   }
   g_ui.t = active;
 }
@@ -6889,6 +7264,7 @@ static int ui_spawn(void)
   g_ui.t->to = in[1];
   g_ui.t->from = out[0];
   fcntl(g_ui.t->to, F_SETFD, FD_CLOEXEC);
+  fcntl(g_ui.t->to, F_SETFL, O_NONBLOCK);
   fcntl(g_ui.t->from, F_SETFD, FD_CLOEXEC);
   fcntl(g_ui.t->from, F_SETFL, O_NONBLOCK);
   ui_send("Target.attachToTarget", "{\"targetId\":\"" TARGET_ID "\",\"flatten\":true}", 0);
@@ -6983,6 +7359,7 @@ static void ui_tab_switch(int i)
   if (i < 0 || i >= g_ntabs) return;
   struct ui_tab *old = g_ui.t, *t = g_tabs[i];
   if (old && old != t) {
+    g_ui.hover_pending = 0;
     ui_send("Page.stopScreencast", NULL, 1);       /* a hidden page need not stream */
     g_ui.t = t;
     ui_send("Page.startScreencast", "{\"format\":\"jpeg\",\"quality\":80}", 1);
@@ -7017,6 +7394,7 @@ static void ui_tab_open(const char *url)
   t->start = lb_strdup(url ? url : "about:blank");
   struct ui_tab *old = g_ui.t;
   g_tabs[g_ntabs++] = t;
+  g_ui.hover_pending = 0;
   g_ui.t = t;
   if (ui_spawn() != 0) {
     ui_status("Could not start the page process.");
@@ -7050,6 +7428,7 @@ static void ui_tab_free(struct ui_tab *t)
   free(t->hist);
   free(t->frame);
   free(t->rx.p);
+  free(t->tx.p);
   free(t->start);
   free(t);
 }
@@ -7059,7 +7438,10 @@ static void ui_tab_close(int i)
   if (i < 0 || i >= g_ntabs) return;
   int was_active = i == g_active;
   struct ui_tab *t = g_tabs[i];
-  if (was_active) g_ui.t = NULL;
+  if (was_active) {
+    g_ui.t = NULL;
+    g_ui.hover_pending = 0;
+  }
   ui_tab_free(t);
   for (int k = i; k + 1 < g_ntabs; ++k) g_tabs[k] = g_tabs[k + 1];
   g_tabs[--g_ntabs] = NULL;
@@ -7175,6 +7557,7 @@ static void ui_shot_pictures(void)
 }
 
 static void ui_wheel_pump(void);
+static void ui_hover_pump(void);
 
 /* The cat runs on the white page while the active tab loads. */
 static void ui_cat(void)
@@ -7235,6 +7618,7 @@ static void ui_frame(double dt, void *user)
   if (g_ui.tabs_dirty) ui_tabs_refresh();
   ui_cat();
   ui_wheel_pump();
+  ui_hover_pump();
   ui_shot_poll();
   ui_viewport();
   if (g_ui.find_on) {                                   /* find as you type */
@@ -7492,18 +7876,19 @@ static int ui_in_ctx_menu(double x, double y)
   return 0;
 }
 
-static void ui_mouse(const char *type, double x, double y, int button, int clicks, int mods)
+static unsigned ui_mouse(const char *type, double x, double y, int button, int clicks, int mods)
 {
   char p[240];
   static const char *names[] = { "left", "right", "middle" };
   snprintf(p, sizeof p, "{\"type\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"button\":\"%s\",\"clickCount\":%d,\"modifiers\":%d}",
            type, x / g_ui.zoom, (y - UI_BAR) / g_ui.zoom, button >= 0 && button < 3 ? names[button] : "none", clicks, ui_cdp_mods(mods));
-  ui_send("Input.dispatchMouseEvent", p, 1);
+  return ui_send("Input.dispatchMouseEvent", p, 1);
 }
 
 static int ui_mouse_button(int button, int action, int mods, double x, double y, void *user)
 {
   (void)user;
+  g_ui.hover_pending = 0;
   if (button == LUNA_MOUSE_BUTTON_LEFT && !ui_in_view(y)) {
     int u = ui_el("url");
     if (action == LUNA_PRESS) g_ui.url_click = u >= 0 && luna_focused_element() != u && (luna_dom_flush_restyle(), luna_element_at_point(x, y)) == u;
@@ -7545,39 +7930,54 @@ static int ui_mouse_move(double x, double y, void *user)
   (void)user;
   g_ui.mx = x;
   g_ui.my = y;
-  if (ui_in_view(y) || g_ui.pressed) ui_mouse("mouseMoved", x, y, g_ui.pressed ? 0 : -1, 0, 0);
+  g_ui.hover_pending = !g_ui.pressed && ui_in_view(y);
+  if (g_ui.pressed && !g_ui.t->tx.len)
+    ui_mouse("mouseMoved", x, y, 0, 0, 0);
   return 0;
+}
+
+/* Keep only the latest hover while a slow page handles the previous one. */
+static void ui_hover_pump(void)
+{
+  struct ui_tab *t = g_ui.t;
+  if (!g_ui.hover_pending || t->hover_id || t->tx.len || t->to < 0) return;
+  g_ui.hover_pending = 0;
+  t->hover_id = ui_mouse("mouseMoved", g_ui.mx, g_ui.my, -1, 0, 0);
 }
 
 static int ui_scroll(double dx, double dy, void *user)
 {
   (void)user;
   if (!ui_in_view(g_ui.my)) return 0;
+  struct ui_tab *t = g_ui.t;
   /* A notch is about 90 px; it is eased out over the next frames rather than
    * jumped, so scrolling looks continuous. */
-  g_ui.wheel_x += -dx * 90.0;
-  g_ui.wheel_y += -dy * 90.0;
-  g_ui.wheel_at_x = g_ui.mx;
-  g_ui.wheel_at_y = g_ui.my;
+  t->wheel_x += -dx * 90.0;
+  t->wheel_y += -dy * 90.0;
+  t->wheel_at_x = g_ui.mx;
+  t->wheel_at_y = g_ui.my;
   return 1;
 }
 
-/* Called every frame: sends a share of the pending wheel distance. */
+/* Keep one wheel command in flight so slow page handlers cannot queue a
+ * batch that the renderer has to finish before publishing another frame. */
 static void ui_wheel_pump(void)
 {
-  if (fabs(g_ui.wheel_x) < 0.5 && fabs(g_ui.wheel_y) < 0.5) {
-    g_ui.wheel_x = g_ui.wheel_y = 0.0;
+  struct ui_tab *t = g_ui.t;
+  if (t->wheel_id || t->tx.len || t->to < 0) return;
+  if (fabs(t->wheel_x) < 0.5 && fabs(t->wheel_y) < 0.5) {
+    t->wheel_x = t->wheel_y = 0.0;
     return;
   }
-  double fx = g_ui.wheel_x * 0.35, fy = g_ui.wheel_y * 0.35;
-  if (fabs(g_ui.wheel_x) < 6.0) fx = g_ui.wheel_x;        /* finish small remainders */
-  if (fabs(g_ui.wheel_y) < 6.0) fy = g_ui.wheel_y;
-  g_ui.wheel_x -= fx;
-  g_ui.wheel_y -= fy;
+  double fx = t->wheel_x * 0.35, fy = t->wheel_y * 0.35;
+  if (fabs(t->wheel_x) < 6.0) fx = t->wheel_x;           /* finish small remainders */
+  if (fabs(t->wheel_y) < 6.0) fy = t->wheel_y;
+  t->wheel_x -= fx;
+  t->wheel_y -= fy;
   char p[200];
   snprintf(p, sizeof p, "{\"type\":\"mouseWheel\",\"x\":%.1f,\"y\":%.1f,\"deltaX\":%.2f,\"deltaY\":%.2f}",
-           g_ui.wheel_at_x / g_ui.zoom, (g_ui.wheel_at_y - UI_BAR) / g_ui.zoom, fx / g_ui.zoom, fy / g_ui.zoom);
-  ui_send("Input.dispatchMouseEvent", p, 1);
+           t->wheel_at_x / g_ui.zoom, (t->wheel_at_y - UI_BAR) / g_ui.zoom, fx / g_ui.zoom, fy / g_ui.zoom);
+  t->wheel_id = ui_send("Input.dispatchMouseEvent", p, 1);
 }
 
 static int ui_page_has_keys(void)

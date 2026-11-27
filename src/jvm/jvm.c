@@ -564,6 +564,20 @@ jvm_object_is_per_call_holder(struct jvm *jvm, const struct jvm_object *o)
          jvm_class_is(jvm, o->this_klass, "android/media/MediaCodec$BufferInfo");
 }
 
+/* LUNARIA_TRACE_HANDLE=<class name fragment>: every reference operation on the handles of objects of that class
+ * (slots are recycled at once, so the epoch says which tenant it was).  Caller holds the metadata lock. */
+static void jvm_trace_handle(struct jvm *jvm, const char *op, jobject object)
+{
+  static const char *want = (const char *)-1;
+  if (want == (const char *)-1) want = getenv("LUNARIA_TRACE_HANDLE");
+  if (!want || !object) return;
+  struct jvm_object *o = jvm_get_object(jvm, object);
+  struct jvm_object *k = o->this_klass ? jvm_get_object(jvm, o->this_klass) : NULL;
+  if (!k || !k->klass.name.data || !strstr(k->klass.name.data, want)) return;
+  fprintf(stderr, "[handle %p] %s type=%d refs=%d array=%d global=%d pending=%d epoch=%u\n", (void *)object, op,
+          (int)o->type, o->refs, o->array_refs, o->global_refs, o->bridge_pending, jvm->object_generation[(uintptr_t)object - 1]);
+}
+
 /* Drop a reference (DeleteLocalRef / DeleteGlobalRef).  Only arrays and
  * strings release their slot: those are the handle types an app allocates per
  * call, and unlike classes, methods and the opaque singleton stubs nothing
@@ -577,12 +591,14 @@ jvm_deref_object(struct jvm *jvm, jobject object)
     jvm_meta_unlock();
     return;
   }
+  jvm_trace_handle(jvm, "deref", object);
   if (o->refs > 0)
     --o->refs;
   if (o->refs > 0) {
     jvm_meta_unlock();
     return;
   }
+  jvm_trace_handle(jvm, "FREE(deref)", object);
   if (o->type != JVM_OBJECT_ARRAY && o->type != JVM_OBJECT_STRING &&
       o->type != JVM_OBJECT_MOTION &&
       !(o->type == JVM_OBJECT_OPAQUE && o->bridge_owned) &&
@@ -674,6 +690,7 @@ jvm_release_bridge_local(struct jvm *jvm, jobject object)
     return false;
   jvm_meta_lock();
   struct jvm_object *o = jvm_get_object(jvm, object);
+  jvm_trace_handle(jvm, "release_bridge_local", object);
   /* Method and field ids and classes are not locals of a call: JNI keeps them
    * valid until the class unloads, and native code caches them. */
   if (o->type == JVM_OBJECT_NONE || o->type == JVM_OBJECT_METHOD ||
@@ -1366,6 +1383,7 @@ JNIEnv_NewGlobalRef(JNIEnv* p0, jobject p1)
   jobject result=jvm_ref_object(jvm,p1);
   struct jvm_object *o=jvm_get_object(jvm,p1);
   if (o && o->type != JVM_OBJECT_NONE) ++o->global_refs;
+  jvm_trace_handle(jvm, "NewGlobalRef", p1);
   jvm_meta_unlock();
   return result;
 }
@@ -1406,6 +1424,7 @@ JNIEnv_DeleteLocalRef(JNIEnv* p0, jobject p1)
   jvm_object_print(jnienv_get_jvm(p0), jvm_get_object(jnienv_get_jvm(p0), p1));
   jvm_trace_bridge_ref(jnienv_get_jvm(p0),p1,4);
   jvm_meta_lock();
+  jvm_trace_handle(jnienv_get_jvm(p0), "DeleteLocalRef", p1);
   /* A handle native code never recorded is the bridge's incoming local, so
    * deleting it consumes the bridge's reference (JNI: callee may delete its
    * argument locals) and the bridge must not release it again. */
@@ -1641,6 +1660,13 @@ JNIEnv_GetObjectClass(JNIEnv* env, jobject p1)
     if (!o->this_klass)
       fprintf(stderr, "[jvm] GetObjectClass: handle %p has no class (type %d refs %d global %d bridge_owned %d)\n",
               (void *)p1, (int)o->type, o->refs, o->global_refs, (int)o->bridge_owned);
+    static int trace = -1;
+    if (trace < 0) trace = getenv("LUNARIA_TRACE_CLASS_FLOW") != NULL;
+    if (trace && o->this_klass) {
+      struct jvm_object *k = jvm_get_object(jnienv_get_jvm(env), o->this_klass);
+      fprintf(stderr, "[classflow] GetObjectClass(%p type=%d refs=%d epoch=%u) -> %s\n", (void *)p1, (int)o->type,
+              o->refs, jvm_handle_epoch(jnienv_get_jvm(env), p1), k && k->klass.name.data ? k->klass.name.data : "?");
+    }
     return o->this_klass;
   }
 }

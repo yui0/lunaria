@@ -484,6 +484,7 @@ class CustomElementRegistry {
    upgrade(root) { if (root && root.querySelectorAll) for (const el of root.querySelectorAll('*')) if (el.localName.indexOf('-') > 0) ceUpgrade(el); }
 }
 g.customElements = new CustomElementRegistry();
+Object.defineProperty(g, '__lb_is_defined', { value: tag => ceRegistry.has(tag) });
 g.CustomElementRegistry = CustomElementRegistry;
 
 /* A node just joined the document: run what a browser runs on insertion. */
@@ -889,8 +890,8 @@ class Element extends Node {
    get dataset() { return datasetProxy(this); }
    get hidden() { return this.hasAttribute('hidden'); } set hidden(v) { this.toggleAttribute('hidden', !!v); }
    get title() { return this.getAttribute('title') || ''; } set title(v) { this.setAttribute('title', v); }
-   get lang() { return this.getAttribute('lang') || ''; }
-   get dir() { return this.getAttribute('dir') || ''; }
+   get lang() { return this.getAttribute('lang') || ''; } set lang(v) { this.setAttribute('lang', v); }
+   get dir() { return this.getAttribute('dir') || ''; } set dir(v) { this.setAttribute('dir', v); }
    get tabIndex() { const t = this.getAttribute('tabindex'); return t === null ? -1 : +t; } set tabIndex(v) { this.setAttribute('tabindex', v); }
    get contentEditable() { return this.getAttribute('contenteditable') || 'inherit'; }
    get isContentEditable() { return false; }
@@ -1097,17 +1098,138 @@ class HTMLScriptElement extends HTMLElement {
    get text() { return this.textContent; } set text(v) { this.textContent = v; }
 }
 reflect(HTMLScriptElement, [['src', 'src', 'u'], 'type', ['async', 'async', 'b'], ['defer', 'defer', 'b'], 'crossOrigin', 'integrity', 'charset', 'nonce']);
+class CSSStyleSheet {
+   constructor() { hide(this, '_rules', []); }
+   get cssRules() { return list(this._rules.slice()); }
+   insertRule(rule, index = 0) {
+      const text = String(rule);
+      const offset = Number(index) >>> 0;
+      if (offset > this._rules.length) throw new DOMException('Rule index out of range', 'IndexSizeError');
+      if (!L.validCSSRule(text)) throw new DOMException('Invalid CSS rule', 'SyntaxError');
+      this._rules.splice(offset, 0, { cssText: text, parentStyleSheet: this });
+      return offset;
+   }
+   deleteRule(index) {
+      const offset = Number(index) >>> 0;
+      if (offset >= this._rules.length) throw new DOMException('Rule index out of range', 'IndexSizeError');
+      this._rules.splice(offset, 1);
+   }
+}
 class HTMLStyleElement extends HTMLElement { get sheet() { return { cssRules: [], insertRule(r) { L.css(r); return 0; } }; } }
 class HTMLLinkElement extends HTMLElement {}
 reflect(HTMLLinkElement, [['href', 'href', 'u'], 'rel', 'as', 'type', 'media', 'crossOrigin']);
 class HTMLMetaElement extends HTMLElement {}
 reflect(HTMLMetaElement, ['name', 'content', ['httpEquiv', 'http-equiv', 's']]);
+/* Software backing store for solid-color rectangle drawing and pixel reads. */
+function canvasColor(value) {
+   const color = value.trim().toLowerCase();
+   if (color === 'transparent') return [0, 0, 0, 0];
+   if (color === 'black') return [0, 0, 0, 255];
+   if (color === 'white') return [255, 255, 255, 255];
+   if (/^#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/.test(color)) {
+      let hex = color.slice(1);
+      if (hex.length <= 4) hex = [...hex].map(c => c + c).join('');
+      if (hex.length === 6) hex += 'ff';
+      return hex.match(/../g).map(h => parseInt(h, 16));
+   }
+   if (!/^rgba?\(/.test(color) || !color.endsWith(')')) return null;
+   const values = color.slice(color.indexOf('(') + 1, -1).trim().split(/[,/\s]+/);
+   if (values.length < 3 || values.length > 4 ||
+       values.some(v => !/^[+-]?(?:\d+\.?\d*|\.\d+)%?$/.test(v))) return null;
+   const bytes = values.map((v, i) => Math.max(0, Math.min(255,
+      v.endsWith('%') ? parseFloat(v) * 255 / 100 : Number(v) * (i === 3 ? 255 : 1))));
+   if (bytes.length === 3) bytes.push(255);
+   return bytes;
+}
+
+class CanvasRenderingContext2D {
+   constructor(canvas) {
+      this.canvas = canvas;
+      this._reset();
+   }
+   _reset() {
+      this._pixels = null;
+      this._width = this.canvas.width;
+      this._height = this.canvas.height;
+      this._fillStyle = '#000000';
+      this._fillColor = [0, 0, 0, 255];
+   }
+   get fillStyle() { return this._fillStyle; }
+   set fillStyle(value) {
+      const style = String(value);
+      const color = canvasColor(style);
+      if (color) { this._fillStyle = style; this._fillColor = color; }
+   }
+   _bitmap() {
+      if (this.canvas.width !== this._width || this.canvas.height !== this._height) this._reset();
+      if (!this._pixels) {
+         const size = this._width * this._height;
+         if (size > 16777216) throw new RangeError('Canvas dimensions exceed the bitmap limit');
+         this._pixels = new Uint8ClampedArray(size * 4);
+      }
+      return this._pixels;
+   }
+   _rect(x, y, w, h, color) {
+      [x, y, w, h] = [x, y, w, h].map(Number);
+      if (![x, y, w, h].every(Number.isFinite) || !w || !h) return;
+      if (color && !color[3]) return;
+      const pixels = this._bitmap();
+      const left = Math.max(0, Math.floor(Math.min(x, x + w)));
+      const right = Math.min(this._width, Math.ceil(Math.max(x, x + w)));
+      const top = Math.max(0, Math.floor(Math.min(y, y + h)));
+      const bottom = Math.min(this._height, Math.ceil(Math.max(y, y + h)));
+      if (left >= right || top >= bottom) return;
+      for (let row = top; row < bottom; ++row) {
+         const start = (row * this._width + left) * 4;
+         const end = start + (right - left) * 4;
+         if (!color) {
+            pixels.fill(0, start, end);
+            continue;
+         }
+         for (let i = start; i < end; i += 4) {
+            const remainder = pixels[i + 3] * (1 - color[3] / 255);
+            const alpha = color[3] + remainder;
+            for (let c = 0; c < 3; ++c) pixels[i + c] = (color[c] * color[3] + pixels[i + c] * remainder) / alpha;
+            pixels[i + 3] = alpha;
+         }
+      }
+   }
+   fillRect(x, y, w, h) { this._rect(x, y, w, h, this._fillColor); }
+   clearRect(x, y, w, h) { this._rect(x, y, w, h, null); }
+   getImageData(x, y, w, h) {
+      [x, y, w, h] = [x, y, w, h].map(v => Math.trunc(Number(v)) || 0);
+      if (!w || !h) throw new DOMException('Empty image data', 'IndexSizeError');
+      if (w < 0) { x += w; w = -w; }
+      if (h < 0) { y += h; h = -h; }
+      if (w * h > 16777216) throw new RangeError('Image data exceeds the bitmap limit');
+      const data = new Uint8ClampedArray(w * h * 4);
+      const pixels = this._bitmap();
+      const left = Math.max(0, x), right = Math.min(this._width, x + w);
+      for (let row = Math.max(0, y); left < right && row < Math.min(this._height, y + h); ++row) {
+         const start = (row * this._width + left) * 4;
+         data.set(pixels.subarray(start, start + (right - left) * 4), ((row - y) * w + left - x) * 4);
+      }
+      return { data, width: w, height: h, colorSpace: 'srgb' };
+   }
+}
+function canvasDimension(canvas, name, fallback) {
+   const raw = canvas.getAttribute(name);
+   const match = raw === null ? null : /^\s*\+?(\d+)/.exec(raw);
+   const value = match ? Number(match[1]) : NaN;
+   return value <= 2147483647 ? value : fallback;
+}
 class HTMLCanvasElement extends HTMLElement {
-   getContext() { return null; }
+   get width() { return canvasDimension(this, 'width', 300); }
+   set width(value) { this.setAttribute('width', Number(value) >>> 0); if (this._context2d) this._context2d._reset(); }
+   get height() { return canvasDimension(this, 'height', 150); }
+   set height(value) { this.setAttribute('height', Number(value) >>> 0); if (this._context2d) this._context2d._reset(); }
+   getContext(type) {
+      if (String(type) !== '2d') return null;
+      return this._context2d || (this._context2d = new CanvasRenderingContext2D(this));
+   }
    toDataURL() { return 'data:,'; }
    toBlob(cb) { setTimeout(() => cb(null), 0); }
 }
-reflect(HTMLCanvasElement, [['width', 'width', 'n'], ['height', 'height', 'n']]);
 class HTMLMediaElement extends HTMLElement {
    play() { return Promise.reject(new DOMException('media playback is not available', 'NotSupportedError')); }
    pause() {} load() {} canPlayType() { return ''; }
@@ -1141,7 +1263,12 @@ class HTMLParagraphElement extends HTMLElement {}
 class HTMLUListElement extends HTMLElement {}
 class HTMLLIElement extends HTMLElement {}
 class HTMLTitleElement extends HTMLElement {}
-class SVGElement extends Element {}
+const svgNamespace = 'http://www.w3.org/2000/svg';
+class SVGElement extends Element {
+   get namespaceURI() { return svgNamespace; }
+   get tagName() { return this.localName; }
+}
+class SVGSVGElement extends SVGElement {}
 
 const TAGS = {
    input: HTMLInputElement, textarea: HTMLTextAreaElement, select: HTMLSelectElement, option: HTMLOptionElement,
@@ -1150,7 +1277,7 @@ const TAGS = {
    canvas: HTMLCanvasElement, video: HTMLVideoElement, audio: HTMLAudioElement, iframe: HTMLIFrameElement,
    template: HTMLTemplateElement, label: HTMLLabelElement, body: HTMLBodyElement, head: HTMLHeadElement,
    html: HTMLHtmlElement, div: HTMLDivElement, span: HTMLSpanElement, p: HTMLParagraphElement,
-   ul: HTMLUListElement, li: HTMLLIElement, title: HTMLTitleElement, svg: SVGElement,
+   ul: HTMLUListElement, li: HTMLLIElement, title: HTMLTitleElement, svg: SVGSVGElement,
 };
 
 function virtual(tag) {
@@ -1268,7 +1395,12 @@ class Document extends Node {
       if (tag.indexOf('-') > 0) ceUpgrade(el);
       return el;
    }
-   createElementNS(ns, tag) { return this.createElement(String(tag).replace(/^.*:/, '')); }
+   createElementNS(ns, tag) {
+      const name = String(tag).replace(/^.*:/, '');
+      const el = this.createElement(name);
+      if (ns === svgNamespace) Object.setPrototypeOf(el, name === 'svg' ? SVGSVGElement.prototype : SVGElement.prototype);
+      return el;
+   }
    createTextNode(t) { return new Text(t); }
    createComment(t) { return new Comment(t); }
    createDocumentFragment() { return new DocumentFragment(); }
@@ -1308,9 +1440,94 @@ function syncFocus() {}
 const document = new Document();
 g.document = document;
 
+/* QuickJS has no ECMA-402 implementation. Use ICU for date fields where
+ * the platform provides it. */
+if (!g.Intl && L.dateParts) {
+   const dateFields = {
+      weekday: { narrow: 'EEEEE', short: 'EEE', long: 'EEEE' },
+      era: { narrow: 'GGGGG', short: 'GGG', long: 'GGGG' },
+      year: { numeric: 'y', '2-digit': 'yy' },
+      month: { numeric: 'M', '2-digit': 'MM', short: 'MMM', long: 'MMMM', narrow: 'MMMMM' },
+      day: { numeric: 'd', '2-digit': 'dd' },
+      hour: { numeric: 'j', '2-digit': 'jj' },
+      minute: { numeric: 'm', '2-digit': 'mm' },
+      second: { numeric: 's', '2-digit': 'ss' },
+      timeZoneName: { short: 'z', long: 'zzzz', shortOffset: 'O', longOffset: 'OOOO', shortGeneric: 'v', longGeneric: 'vvvv' }
+   };
+   function DateTimeFormat(locales, options = {}) {
+      if (!new.target) return new DateTimeFormat(locales, options);
+      if (options === null) throw new TypeError('DateTimeFormat options must be an object');
+      const locale = typeof locales === 'string' ? locales : locales == null ? '' : String(locales[0] ?? '');
+      const zone = options.timeZone === undefined ? '' : String(options.timeZone);
+      let hours = options.hourCycle === undefined ? '' : String(options.hourCycle);
+      if (hours && !['h11', 'h12', 'h23', 'h24'].includes(hours)) throw new RangeError('Invalid hourCycle');
+      if (options.hour12 !== undefined) hours = options.hour12 ? 'h12' : 'h23';
+      let skeleton = '';
+      for (const [field, lengths] of Object.entries(dateFields)) {
+         if (options[field] === undefined) continue;
+         const value = String(options[field]);
+         if (!Object.prototype.hasOwnProperty.call(lengths, value))
+            throw new RangeError('Invalid date field: ' + field);
+         skeleton += lengths[value];
+      }
+      if (!skeleton) skeleton = 'yMd';
+      const dateParts = L.dateParts;
+      dateParts(0, locale, zone, skeleton, hours);
+      hide(this, '_formatParts', value => dateParts(value === undefined ? Date.now() : Number(value),
+         locale, zone, skeleton, hours));
+      hide(this, '_format', value => this._formatParts(value).map(part => part.value).join(''));
+   }
+   Object.defineProperty(DateTimeFormat.prototype, 'format', { get() { return this._format; }, configurable: true });
+   DateTimeFormat.prototype.formatToParts = function (value) { return this._formatParts(value); };
+   g.Intl = { DateTimeFormat };
+}
+
+if (g.Intl && !g.Intl.Segmenter && L.segmentBoundaries) {
+   class Segmenter {
+      constructor(locales, options = {}) {
+         const locale = typeof locales === 'string' ? locales : locales == null ? '' : String(locales[0] ?? '');
+         const granularity = options.granularity === undefined ? 'grapheme' : String(options.granularity);
+         const kind = ['grapheme', 'word', 'sentence'].indexOf(granularity);
+         if (kind < 0) throw new RangeError('Invalid segment granularity');
+         hide(this, '_locale', locale);
+         hide(this, '_granularity', granularity);
+         hide(this, '_kind', kind);
+      }
+      segment(value) {
+         const input = String(value);
+         const kind = this._kind;
+         const boundaries = L.segmentBoundaries(this._locale, input, kind);
+         function part(i) {
+            const index = i ? boundaries[i - 2] : 0;
+            const item = { segment: input.slice(index, boundaries[i]), index, input };
+            if (kind === 1) item.isWordLike = boundaries[i + 1];
+            return item;
+         }
+         return {
+            *[Symbol.iterator]() {
+               for (let i = 0; i < boundaries.length; i += 2) yield part(i);
+            },
+            containing(position = 0) {
+               let index = Math.trunc(Number(position)) || 0;
+               if (index < 0 || index >= input.length) return undefined;
+               let lo = 0, hi = boundaries.length / 2;
+               while (lo < hi) {
+                  const mid = (lo + hi) >>> 1;
+                  if (boundaries[mid * 2] <= index) lo = mid + 1;
+                  else hi = mid;
+               }
+               return part(lo * 2);
+            }
+         };
+      }
+      resolvedOptions() { return { locale: this._locale || 'en-US', granularity: this._granularity }; }
+   }
+   Object.defineProperty(g.Intl, 'Segmenter', { value: Segmenter, writable: true, configurable: true });
+}
+
 /* ---------------------------------------------------------------- window */
 
-g.window = g; g.self = g; g.top = g; g.parent = g; g.frames = g; g.opener = null;
+g.self = g; g.top = g; g.parent = g; g.frames = g; g.opener = null;
 for (const k of ['onload', 'onerror', 'onresize', 'onfocus', 'onblur', 'onscroll', 'onbeforeunload', 'onunload']) g[k] = null;
 /* `'onkeydown' in element` must be true: frameworks (preact) pick the event's name from it.
  * invoke() reads the property when an event is dispatched. */
@@ -1530,7 +1747,7 @@ g.navigator = {
                     getHighEntropyValues: () => Promise.resolve({}), toJSON() { return {}; } },
    clipboard: { writeText: () => Promise.resolve(), readText: () => Promise.resolve('') },
    permissions: { query: () => Promise.resolve({ state: 'prompt', addEventListener() {} }) },
-   sendBeacon(u, d) { setTimeout(() => L.http('POST', String(u), '', d === undefined ? null : String(d), false), 0); return true; },
+   sendBeacon(u, d) { L.httpAsync('POST', String(u), '', d === undefined ? null : String(d), false); return true; },
    vibrate() { return false; },
    share: () => Promise.reject(new DOMException('share is not available', 'NotAllowedError')),
    javaEnabled: () => false,
@@ -1831,22 +2048,49 @@ function headerText(h, body) {
 
 class Response {
    constructor(body = null, init = {}) {
-      hide(this, '_body', body === null || body === undefined ? '' : body);
+      hide(this, '_body', body == null ? null : body);
+      hide(this, '_stream', null);
+      hide(this, '_used', false);
       this.status = init.status === undefined ? 200 : init.status;
       this.statusText = init.statusText || '';
       this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
       this.url = init.url || '';
       this.redirected = false;
       this.type = 'basic';
-      this.bodyUsed = false;
    }
    get ok() { return this.status >= 200 && this.status < 300; }
-   _take() { if (this.bodyUsed) return Promise.reject(new TypeError('body already used')); this.bodyUsed = true; return Promise.resolve(this._body); }
-   text() { return this._take().then(b => typeof b === 'string' ? b : new TextDecoder().decode(b)); }
-   json() { return this.text().then(JSON.parse); }
-   arrayBuffer() { return this._take().then(b => typeof b === 'string' ? new TextEncoder().encode(b).buffer : b); }
-   blob() { return this.arrayBuffer().then(b => new Blob([b], { type: this.headers.get('content-type') || '' })); }
-   clone() { return new Response(this._body, this); }
+   get bodyUsed() { return this._used; }
+   get body() {
+      if (this._body === null || typeof g.ReadableStream !== 'function') return null;
+      if (!this._stream) {
+         this._stream = new g.ReadableStream({
+            pull: controller => {
+               if (this._used) { controller.error(new TypeError('body already used')); return; }
+               this._used = true;
+               const bytes = typeof this._body === 'string' ? new TextEncoder().encode(this._body) : new Uint8Array(this._body);
+               if (bytes.length) controller.enqueue(bytes);
+               controller.close();
+            },
+            cancel: () => { this._used = true; }
+         }, { highWaterMark: 0 });
+      }
+      return this._stream;
+   }
+   _consume(convert) {
+      if (this._used || this._stream?.locked) return NativePromise.reject(new TypeError('body already used'));
+      if (this._body !== null) this._used = true;
+      return NativePromise.resolve(this._body ?? '').then(convert);
+   }
+   text() { return this._consume(b => typeof b === 'string' ? b : new TextDecoder().decode(b)); }
+   json() { return this._consume(b => JSON.parse(typeof b === 'string' ? b : new TextDecoder().decode(b))); }
+   arrayBuffer() { return this._consume(b => typeof b === 'string' ? new TextEncoder().encode(b).buffer : b.slice(0)); }
+   blob() {
+      return this._consume(b => new Blob([b], { type: this.headers.get('content-type') || '' }));
+   }
+   clone() {
+      if (this._used || this._stream?.locked) throw new TypeError('body already used');
+      return new Response(this._body, this);
+   }
    static json(v, init) { return new Response(JSON.stringify(v), Object.assign({ headers: { 'content-type': 'application/json' } }, init)); }
    static error() { return new Response(null, { status: 0 }); }
 }
@@ -1895,7 +2139,8 @@ g.fetch = (input, init = {}) => new NativePromise((resolve, reject) => {
    httpAsync(req.method, req.url, headerText(req.headers, req._body), body, true, r => {
       if (req.signal && req.signal.aborted) { reject(req.signal.reason); return; }
       if (r.error && !r.status) { reject(new TypeError('Failed to fetch')); return; }
-      resolve(new Response(r.body, { status: r.status, headers: parseHeaders(r.headers), url: r.url }));
+      const noBody = req.method === 'HEAD' || [204, 205, 304].includes(r.status);
+      resolve(new Response(noBody ? null : r.body, { status: r.status, headers: parseHeaders(r.headers), url: r.url }));
    });
 });
 
@@ -2125,9 +2370,9 @@ Object.assign(g, {
    DOMPoint, DOMPointReadOnly, NodeList, HTMLCollection: NodeList, DOMTokenList, DOMRect, DOMException,
    HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, HTMLOptionElement, HTMLButtonElement,
    HTMLAnchorElement, HTMLImageElement, HTMLFormElement, HTMLScriptElement, HTMLStyleElement, HTMLLinkElement,
-   HTMLMetaElement, HTMLCanvasElement, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, HTMLIFrameElement,
+   HTMLMetaElement, CSSStyleSheet, HTMLCanvasElement, CanvasRenderingContext2D, HTMLMediaElement, HTMLVideoElement, HTMLAudioElement, HTMLIFrameElement,
    HTMLTemplateElement, HTMLLabelElement, HTMLBodyElement, HTMLHeadElement, HTMLHtmlElement, HTMLDivElement,
-   HTMLSpanElement, HTMLParagraphElement, HTMLUListElement, HTMLLIElement, HTMLTitleElement, SVGElement,
+   HTMLSpanElement, HTMLParagraphElement, HTMLUListElement, HTMLLIElement, HTMLTitleElement, SVGElement, SVGSVGElement,
    URL, URLSearchParams, TextEncoder, TextDecoder, Blob, File, FileReader, FormData, Headers, Request, Response,
    AbortController, AbortSignal, XMLHttpRequest, WebSocket, Storage,
    MutationObserver, MutationRecord, ResizeObserver, IntersectionObserver, PerformanceObserver, Image, Audio, DOMParser, XMLSerializer, Window: Object,

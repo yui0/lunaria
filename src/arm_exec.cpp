@@ -11317,6 +11317,14 @@ static bool ftrace_addr(GuestVA uaddr) {
     const char *e = lunaria_env("LUNARIA_TRACE_FUTEX_ADDR");
     return e ? (GuestVA)strtoull(e, nullptr, 16) : (GuestVA)0;
   }();
+  /* LUNARIA_TRACE_FUTEX_THREAD=<thread name>: every futex word that thread has waited on (a heap object's address
+   * moves from run to run, the thread's name does not), traced for all threads. */
+  static const char *tname = lunaria_env("LUNARIA_TRACE_FUTEX_THREAD");
+  if (tname) {
+    static std::set<GuestVA> words;
+    if (g_current_tid && !strcmp(thread_name_of(g_current_tid), tname)) words.insert(uaddr);
+    return words.count(uaddr) != 0;
+  }
   return a && a == uaddr;
 }
 // LUNARIA_TRACE_MUTEX_ADDR=hexaddr — every lock/unlock/park/grant on one pthread_mutex.
@@ -11888,6 +11896,7 @@ static uint64_t g_svc_total = 0;
 static uint64_t g_guest_ticks = 0;
 enum { TICKS_TID_MAX = 256 };
 static void pc_histo_report(void);
+static void a64_dump_stack_returns(uint32_t tid, uint64_t sp);
 static void a64_dump_guest_backtrace(const char *what, uint32_t tid, uint64_t fp);
 static void a64_dump_exec_mappings(void);
 /* Is an engine executing this guest thread right now?  See g_tid_on_engine. */
@@ -28519,8 +28528,8 @@ static void log_tls_alert(const char *dir, const uint8_t *p, size_t n) {
   default:
     break;
   }
-  fprintf(stderr, "[net] TLS alert %s: %s(%u) level=%u\n",
-          dir, name, desc, level);
+  fprintf(stderr, "[net] TLS alert %s: %s(%u) level=%u at %llu ms\n",
+          dir, name, desc, level, (unsigned long long)(host_mono_ns() / 1000000ull));
 }
 
 static SockState *state(int fd) {
@@ -28614,14 +28623,14 @@ static void net_count(int fd, bool rx, ssize_t n) {
    * figure comes out in the hundreds of MB/s, which is worse than no figure
    * at all — a fast burst is obvious from the totals anyway. */
   if (dt >= 100)
-    fprintf(stderr, "[net] fd=%d %s tx=%llu rx=%llu (%llu B/s)\n", fd,
+    fprintf(stderr, "[net] fd=%d %s tx=%llu rx=%llu (%llu B/s) at %lld ms\n", fd,
             s->peer[0] ? s->peer : "?",
             (unsigned long long)s->tx, (unsigned long long)s->rx,
-            (unsigned long long)(step * 1000u / (uint64_t)dt));
+            (unsigned long long)(step * 1000u / (uint64_t)dt), (long long)t);
   else
-    fprintf(stderr, "[net] fd=%d %s tx=%llu rx=%llu\n", fd,
+    fprintf(stderr, "[net] fd=%d %s tx=%llu rx=%llu at %lld ms\n", fd,
             s->peer[0] ? s->peer : "?",
-            (unsigned long long)s->tx, (unsigned long long)s->rx);
+            (unsigned long long)s->tx, (unsigned long long)s->rx, (long long)t);
 }
 
 static void forget(int fd) {
@@ -41525,6 +41534,8 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
     if (r0 >= ARM_ALOOPER_BASE &&
         r0 - ARM_ALOOPER_BASE < (uint32_t)ALOOPER_TID_BITS) {
       const uint32_t wake_tid = (uint32_t)(r0 - ARM_ALOOPER_BASE);
+      if (lunaria_env("LUNARIA_TRACE_CHOREO"))
+        fprintf(stderr, "[alooper] wake tid=%u from tid=%u\n", wake_tid, g_current_tid);
       alooper_wake_set(wake_tid);
       /* The waiter parked on a deadline (see SVC_ALOOPER_POLLONCE); this
        * is the event it was really waiting for, so end the sleep now
@@ -48839,6 +48850,17 @@ aaudio_write_retry:
   }
 
   case SVC_CLOCK_GETTIME: {
+    /* LUNARIA_CHAIN_TID=<tid>|main: a sampling profiler for one thread -- every 50th clock_gettime it makes logs its
+     * guest call chain.  Symbolise with the il2cpp dump (/tmp/lunaria-il2cpp-syms.<pid>). */
+    if (static const char *ct = lunaria_env("LUNARIA_CHAIN_TID"); ct && (g_current_tid == (uint32_t)strtoul(ct, nullptr, 10) ||
+                                                                          (*ct == 'm' && g_current_tid >= 200 && g_current_tid <= 202 &&
+                                                                           !strcmp(thread_name_of(g_current_tid), "UnityMain")))) {
+      static unsigned n;
+      if (++n % 50u == 0u && ctx.is_arm64 && g_svc_jit64) {
+        /* No frame records in il2cpp's runtime: read the return addresses off the stack instead. */
+        a64_dump_stack_returns(g_current_tid, g_svc_jit64->GetSP());
+      }
+    }
     // clock_gettime(clk, struct timespec*) — ARM32: {u32 sec; u32 nsec}
     struct timespec ts {};
     /* The two CPU-time clocks are the emulator's to answer, not the host's. A
@@ -66350,7 +66372,31 @@ static ArmThread *audio_cb_thread(ArmExecCtx &ctx) {
   ArmThread *slot = &g_threads.back();
   g_thread_by_tid[slot->id] = slot;
   thread_name_set(slot->id, "AudioCallback");
-  if (ctx.is_arm64) slot->tls64 = arm64_tls_for_tid(ctx, slot->id);
+  if (ctx.is_arm64) {
+    slot->tls64 = arm64_tls_for_tid(ctx, slot->id);
+    /* The audio system's thread has a stack of its own for as long as it
+     * lives, and pthread_getattr_np reports it: a collector that registers
+     * the thread (Boehm's GC_register_my_thread, entered when CRI's audio
+     * callback calls into il2cpp) aborts on a thread whose stack base is 0
+     * or whose sp lies outside the reported range.  The callback runs on
+     * this stack (see audio_cb_stack_top), not on whichever rotating
+     * callback window happens to be free. */
+    auto &pool = g_thread_stack_free[CB_STACK_SIZE];
+    uint32_t lo = 0;
+    if (!pool.empty()) {
+      lo = pool.back();
+      pool.pop_back();
+    } else if ((uint64_t)g_thread_stack_next + CB_STACK_SIZE <= HEAP_BASE) {
+      lo = g_thread_stack_next;
+      g_thread_stack_next += CB_STACK_SIZE;
+    }
+    if (lo) {
+      thread_stack_map(ctx, lo, CB_STACK_SIZE);
+      slot->stack_base = a64_guest_va(lo);
+      slot->stack_size = CB_STACK_SIZE;
+      guest_pthread_refresh(ctx, slot->id);
+    }
+  }
   fprintf(stderr, "[arm_exec] audio callback thread tid=%u tls=0x%llx\n",
           slot->id, (unsigned long long)slot->tls64);
   return slot;
@@ -69258,8 +69304,62 @@ extern "C" void arm_exec_glfw_poll(void) {
  * it runs guest code that takes IL2CPP's metadata lock, so it is requested
  * (touch /tmp/lunaria-il2cpp-syms) at a quiet moment rather than from a stall
  * dump, where a descheduled thread may hold that lock. */
+/* The 64-bit counterpart: the same walk of il2cpp's own reflection API, so that an address inside a managed method
+ * (a PC in a thread dump, a return address on a stack) can be named.  Each MethodInfo starts with its code pointer. */
+static int a64_il2cpp_symbols(const char *path) {
+  ArmExecCtx &ctx = *g_ctx;
+  struct ln64_sym fn[9];
+  static const char *const names[9] = {
+    "il2cpp_domain_get", "il2cpp_domain_get_assemblies",
+    "il2cpp_assembly_get_image", "il2cpp_image_get_class_count",
+    "il2cpp_image_get_class", "il2cpp_class_get_methods",
+    "il2cpp_method_get_name", "il2cpp_class_get_name",
+    "il2cpp_class_get_namespace",
+  };
+  for (int i = 0; i < 9; ++i)
+    if (!ln64_lookup_global(names[i], &fn[i])) return -2;
+  auto call = [&](int i, uint64_t a = 0, uint64_t b = 0) -> uint64_t {
+    GuestArg args[2] = { guest_arg_j(a), guest_arg_j(b) };
+    GuestRet rv{};
+    call_guest_abi64(ctx, (GuestVA)fn[i].value, args, 2, 'J', &rv);
+    return rv.u;
+  };
+  const GuestVA cell = (GuestVA)arm_malloc(ctx, 16);
+  if (!cell) return -3;
+  const uint64_t domain = call(0);
+  ctx.mem.write64(cell, 0);
+  const uint64_t list = call(1, domain, cell);
+  const uint64_t nasm = ctx.mem.read64(cell);
+  std::vector<std::pair<uint64_t, std::string>> out;
+  for (uint64_t a = 0; list && a < nasm; ++a) {
+    const uint64_t image = call(2, ctx.mem.read64((GuestVA)(list + a * 8u)));
+    const uint64_t ncls = image ? call(3, image) : 0;
+    for (uint64_t c = 0; c < ncls; ++c) {
+      const uint64_t klass = call(4, image, c);
+      if (!klass) continue;
+      std::string cname = ctx.mem.cstr((GuestVA)call(8, klass));
+      if (!cname.empty()) cname += '.';
+      cname += ctx.mem.cstr((GuestVA)call(7, klass));
+      ctx.mem.write64(cell, 0);
+      for (uint64_t m; (m = call(5, klass, cell)) != 0;) {
+        const uint64_t code = ctx.mem.read64((GuestVA)m);
+        if (code) out.emplace_back(code, cname + "::" + ctx.mem.cstr((GuestVA)call(6, m)));
+      }
+    }
+  }
+  std::sort(out.begin(), out.end());
+  FILE *fp = fopen(path, "w");
+  if (!fp) return -4;
+  for (const auto &e : out) fprintf(fp, "%llx %s\n", (unsigned long long)e.first, e.second.c_str());
+  fclose(fp);
+  fprintf(stderr, "[il2cpp-syms] %zu methods from %llu assemblies -> %s\n",
+          out.size(), (unsigned long long)nasm, path);
+  return 0;
+}
+
 extern "C" int arm_exec_il2cpp_symbols(const char *path) {
-  if (!g_ctx || g_ctx->is_arm64) return -1;
+  if (!g_ctx) return -1;
+  if (g_ctx->is_arm64) return a64_il2cpp_symbols(path);
   ArmExecCtx &ctx = *g_ctx;
   struct ln64_sym fn[9];
   static const char *const names[9] = {
@@ -76557,7 +76657,12 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
   }
   const int depth = g_cb_depth;
   GuestVA stack_top;
-  if (depth == 0 && !g_svc_caller_sp && g_dvm_guest_tid) {
+  ArmThread *const audio_thread =
+      depth == 0 && !g_svc_caller_sp && g_current_tid == AUDIO_CB_TID
+          ? thread_slot_by_tid(AUDIO_CB_TID) : nullptr;
+  if (audio_thread && audio_thread->stack_base && audio_thread->stack_size) {
+    stack_top = audio_thread->stack_base + audio_thread->stack_size - 16u;
+  } else if (depth == 0 && !g_svc_caller_sp && g_dvm_guest_tid) {
     const uint32_t base = dvm_native_stack(ctx);
     if (!base) return;
     stack_top = a64_guest_va(base + CB_STACK_SIZE - 16u);
@@ -76745,6 +76850,17 @@ static void call_guest_abi64(ArmExecCtx &ctx, GuestVA fn_va, const GuestArg *arg
                 (int)w.timed, w.timed
                 ? (double)((int64_t)w.deadline_ns - (int64_t)host_mono_ns()) / 1e6
                 : -1.0, depth);
+        a64_dump_guest_backtrace("cb-wait", g_current_tid, j.GetRegister(29));
+        if (w.mva && ctx.mem.try_ptr(w.mva, 0x50))
+          fprintf(stderr, "[cb-wait]   x19=0x%llx x20=0x%llx x21=0x%llx x22=0x%llx "
+                          "words@addr: %llx %llx %llx %llx %llx %llx %llx %llx %llx %llx\n",
+                  (unsigned long long)j.GetRegister(19), (unsigned long long)j.GetRegister(20),
+                  (unsigned long long)j.GetRegister(21), (unsigned long long)j.GetRegister(22),
+                  (unsigned long long)ctx.mem.read64(w.mva - 0x28), (unsigned long long)ctx.mem.read64(w.mva - 0x20),
+                  (unsigned long long)ctx.mem.read64(w.mva - 0x18), (unsigned long long)ctx.mem.read64(w.mva - 0x10),
+                  (unsigned long long)ctx.mem.read64(w.mva - 0x8), (unsigned long long)ctx.mem.read64(w.mva),
+                  (unsigned long long)ctx.mem.read64(w.mva + 0x8), (unsigned long long)ctx.mem.read64(w.mva + 0x10),
+                  (unsigned long long)ctx.mem.read64(w.mva + 0x30), (unsigned long long)ctx.mem.read64(w.mva + 0x38));
         wait_trace_at = host_mono_ns() + 5000000000ull;
       }
       cb_lock_wait_progress(ctx, depth);
@@ -81217,5 +81333,36 @@ extern "C" void arm64_exec_svc_ring_dump(void) {
       }
     }
     a64_dump_guest_backtrace("thread", t.id, t.regs64[29]);
+    if (const char *dm = lunaria_env("LUNARIA_DUMP_MEM"); dm && g_ctx && t.id == (uint32_t)strtoul(getenv("LUNARIA_DUMP_MEM_TID") ? getenv("LUNARIA_DUMP_MEM_TID") : "0", nullptr, 10)) {
+      /* LUNARIA_DUMP_MEM=<hex addr> (+ LUNARIA_DUMP_MEM_TID=<tid>, once per dump): 8 guest words from there. */
+      const GuestVA a = (GuestVA)strtoull(dm, nullptr, 16);
+      fprintf(stderr, "[arm64] mem@0x%llx:", (unsigned long long)a);
+      for (unsigned i = 0; i < 8; ++i) fprintf(stderr, " %08x", g_ctx->mem.read32(a + 4u * i));
+      fputc('\n', stderr);
+    }
+    if (lunaria_env("LUNARIA_DUMP_STACKSCAN") && g_ctx) {
+      /* Leaf wrappers (a futex syscall stub) leave no frame record, so the x29 chain above can be empty.  Scan the
+       * top of the stack for words that point into a loaded module: the return addresses still live there. */
+      fprintf(stderr, "[arm64] thread tid=%u stack scan (sp=0x%llx):\n", t.id, (unsigned long long)t.sp64);
+      unsigned hits = 0;
+      for (uint64_t a = t.sp64; a < t.sp64 + 0x800 && hits < 24; a += 8) {
+        const uint64_t w = g_ctx->mem.read64((GuestVA)a);
+        for (const auto &m : g_module_phdrs) {
+          if (!m.is_64 || w < m.load_bias || w >= m.load_bias + 0x20000000ull) continue;
+          const uint8_t *ph = g_ctx->mem.try_ptr(m.phdr_va, (size_t)m.phnum * sizeof(Elf64_Phdr));
+          if (!ph) continue;
+          GuestVA hi = m.load_bias;
+          for (uint16_t i = 0; i < m.phnum; ++i) {
+            const Elf64_Phdr *q = (const Elf64_Phdr *)ph + i;
+            if (q->p_type == PT_LOAD) hi = std::max(hi, m.load_bias + (GuestVA)q->p_vaddr + (GuestVA)q->p_memsz);
+          }
+          if (w >= hi) continue;
+          fprintf(stderr, "  [sp+0x%llx] %s+0x%llx\n", (unsigned long long)(a - t.sp64),
+                  g_ctx->mem.cstr(m.name_va), (unsigned long long)(w - m.load_bias));
+          ++hits;
+          break;
+        }
+      }
+    }
   }
 }

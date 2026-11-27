@@ -23051,7 +23051,10 @@ static dvm_ref load_host_accepted_issuers(struct dvm *vm)
   free(tmp);
   vm->accepted_issuers = arr;
   if (arr) dvm_pin(vm, arr);
-  fprintf(stderr, "[tls] getAcceptedIssuers: %d host root certificates\n", n);
+  struct timespec tls_now;
+  clock_gettime(CLOCK_MONOTONIC, &tls_now);
+  fprintf(stderr, "[tls] getAcceptedIssuers: %d host root certificates at %lld ms\n", n,
+          (long long)tls_now.tv_sec * 1000 + tls_now.tv_nsec / 1000000);
   return vm->accepted_issuers;
 }
 
@@ -23061,6 +23064,14 @@ static bool x509_getEncoded(struct dvm *vm,dvm_ref self,const union dvm_value *a
   (void)nargs;
   union dvm_value bytes= {0};
   (dvm_get_field)(vm,self,"encoded","[B",&bytes);
+  if(dvm__env("LUNARIA_TRACE_TLS")) {
+    static unsigned calls;
+    uint32_t fnv=2166136261u;
+    const uint8_t *src=bytes.l ? (const uint8_t *)dvm_array_data(vm,bytes.l) : NULL;
+    for(uint32_t i=0; src && i<dvm_array_length(vm,bytes.l); ++i) fnv=(fnv^src[i])*16777619u;
+    fprintf(stderr,"[tls] X509Certificate.getEncoded #%u ref=0x%x bytes=0x%x len=%u fnv=%08x\n",++calls,
+            (unsigned)self,(unsigned)bytes.l,bytes.l ? dvm_array_length(vm,bytes.l) : 0u,fnv);
+  }
   return o_clone(vm,bytes.l,NULL,0,out);
 }
 static bool x509_accepted_issuers(struct dvm *vm,dvm_ref self,const union dvm_value *args,int nargs,union dvm_value *out)
@@ -23688,6 +23699,12 @@ static bool trust_manager_init(struct dvm *vm,dvm_ref self,const union dvm_value
 {
   (void)nargs;
   (void)out;
+  if(dvm__env("LUNARIA_TRACE_TLS")) {
+    struct timespec tls_now;
+    clock_gettime(CLOCK_MONOTONIC, &tls_now);
+    fprintf(stderr, "[tls] TrustManager.init at %lld ms\n",
+            (long long)tls_now.tv_sec * 1000 + tls_now.tv_nsec / 1000000);
+  }
   if(!args[0].l) {
     dvm__throw(vm,"java/lang/NullPointerException","keyStore");
     return false;
@@ -79003,9 +79020,10 @@ static bool choreographer_dispatch_match(struct dvm *vm,int index,void *arg)
   const struct choreographer_state *s=arg;
   return vm->pending_owner[index]==s->owner && vm->pending_threads[index]==s->dispatcher;
 }
+#define JCH_TRACE(...) do { if(dvm__env("LUNARIA_TRACE_CHOREO")) { fprintf(stderr,"[jchoreo %llu] ",(unsigned long long)dvm__now_ms()); fprintf(stderr,__VA_ARGS__); fputc('\n',stderr); } } while(0)
 static bool choreographer_schedule(struct choreographer_state *s)
 {
-  if(s->in_frame) return true;
+  if(s->in_frame) { JCH_TRACE("schedule: in_frame, deferred"); return true; }
   uint64_t due=UINT64_MAX;
   for(unsigned p=0; p<5; ++p) if(s->queues[p] && s->queues[p]->due<due) due=s->queues[p]->due;
   if(due==UINT64_MAX) return true;
@@ -79017,7 +79035,7 @@ static bool choreographer_schedule(struct choreographer_state *s)
   if(ns<=(uint64_t)now) ns=(uint64_t)now+1;
   uint64_t pulse=(ns/(uint64_t)s->interval+1)*(uint64_t)s->interval;
   uint64_t deadline=(pulse+999999)/1000000;
-  if(s->scheduled && s->scheduled_due<=deadline) return true;
+  if(s->scheduled && s->scheduled_due<=deadline) { JCH_TRACE("schedule: already scheduled for %llu (deadline %llu)",(unsigned long long)s->scheduled_due,(unsigned long long)deadline); return true; }
   if(s->scheduled) pending_drop(s->vm,choreographer_dispatch_match,s);
   int64_t delay=deadline>now_ms ? (int64_t)(deadline-now_ms) : 1;
   dvm_ref target=s->looper==looper_main(s->vm) ? 0 : s->looper;
@@ -79028,6 +79046,7 @@ static bool choreographer_schedule(struct choreographer_state *s)
   }
   s->scheduled=true;
   s->scheduled_due=deadline;
+  JCH_TRACE("schedule: queued for %llu (delay %lld ms)",(unsigned long long)deadline,(long long)delay);
   return true;
 }
 static bool choreographer_enqueue(struct dvm *vm,dvm_ref owner,int phase,dvm_ref action,dvm_ref token,int64_t delay,bool frame)
@@ -79116,6 +79135,7 @@ static bool choreographer_frame_run(struct dvm *vm,dvm_ref self,const union dvm_
   if(!s) return false;
   s->scheduled=false;
   s->in_frame=true;
+  JCH_TRACE("frame_run: enter");
   int64_t now=choreographer_now_ns();
   s->frame_time=now-now%s->interval;
   s->last_frame=s->frame_time;
@@ -79160,6 +79180,12 @@ static bool choreographer_frame_run(struct dvm *vm,dvm_ref self,const union dvm_
           }
         }
       }
+      if(!good && dvm__env("LUNARIA_TRACE_CHOREO")) {
+        char text[512]="";
+        struct dvm_class *ac=dvm_object_class(vm,r->action);
+        if(dvm_exception(vm)) dvm_describe_exception(vm,dvm_exception(vm),text,sizeof text);
+        fprintf(stderr,"[jchoreo] callback %s.%s failed: %s (thr=%lx)\n",ac ? dvm_class_name(ac) : "?",r->frame ? "doFrame" : "run",text,(unsigned long)pthread_self());
+      }
       choreographer_release(s,r);
     }
     s->callbacks_running=false;
@@ -79168,6 +79194,7 @@ static bool choreographer_frame_run(struct dvm *vm,dvm_ref self,const union dvm_
   choreographer_animation_frame=old_time;
   s->in_frame=false;
   bool scheduled=choreographer_schedule(s);
+  JCH_TRACE("frame_run: exit good=%d scheduled=%d flag=%d",(int)good,(int)scheduled,(int)s->scheduled);
   if(!good || !scheduled) return false;
   RETV();
 }

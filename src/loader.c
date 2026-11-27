@@ -807,8 +807,11 @@ static void thread_dump_request_tick(void)
    * bare name is whichever process polls it first. */
   char own[64];
   snprintf(own, sizeof own, "/tmp/lunaria-threads.%d", (int)getpid());
-  if (access("/tmp/lunaria-il2cpp-syms", F_OK) == 0) {
-    unlink("/tmp/lunaria-il2cpp-syms");
+  /* /tmp/lunaria-il2cpp-syms.<pid> names one process, like the thread dump's. */
+  char own_syms[80];
+  snprintf(own_syms, sizeof own_syms, "/tmp/lunaria-il2cpp-syms.%d", (int)getpid());
+  if (access(own_syms, F_OK) == 0 || access("/tmp/lunaria-il2cpp-syms", F_OK) == 0) {
+    if (unlink(own_syms)) unlink("/tmp/lunaria-il2cpp-syms");
     const int rc = arm_exec_il2cpp_symbols("/tmp/lunaria-il2cpp-syms.txt");
     if (rc) fprintf(stderr, "[il2cpp-syms] failed (%d)\n", rc);
     return;

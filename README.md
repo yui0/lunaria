@@ -20,7 +20,7 @@ Open an `.apk`, `.apkm`, `.xapk`, `.apks`, or `.aab` directly; extraction, split
 profiles are handled for you. WebView content uses Chrome/Chromium or the bundled [luna-browser](luna-browser/).
 
 **Demonstrated:** Genshin Impact, Ni no Kuni: Cross Worlds, Where Winds Meet (NetEase Messiah engine),
-Gakuen Idolmaster, Alchemia Story, Shironeko Project, Kikyu! Aeronaut (a 2013 ARM32 APK), Layton Brothers:
+Gakuen Idolmaster, Magia Exedra (Madoka Magica), Royal Revolt 2, Alchemia Story, Shironeko Project, Kikyu! Aeronaut (a 2013 ARM32 APK), Layton Brothers:
 Mystery Room, Black Clover: Asta Fight, Kingdoms & Lords, other Unity and Unreal titles,
 and Java apps such as TVer (full-episode playback), WhatsApp, LINE, TumuTumu and APKPure.
 See [Compatibility](#compatibility) for exact stages and limits.
@@ -40,10 +40,10 @@ See [Compatibility](#compatibility) for exact stages and limits.
   &nbsp;
   <img src="shots/shironeko-first-stage.png" width="23%" alt="Shironeko Project: the portrait first stage, with its in-game HUD and tutorial dialog">
   &nbsp;
-  <img src="shots/tumutumu-title.png" width="23%" alt="TumuTumu title screen with TAP TO START over Disney artwork">
+  <img src="shots/madoka-exedra-battle.png" width="23%" alt="Magia Exedra: Homura holds out her shield in a battle skill cut-in, with the turn order and skill buttons around her">
 </p>
 
-<p align="center"><sub>Genshin Impact 7.2.0 · Ni no Kuni: Cross Worlds · Shironeko Project · TumuTumu 12.11.0</sub></p>
+<p align="center"><sub>Genshin Impact 7.2.0 · Ni no Kuni: Cross Worlds · Shironeko Project · Magia Exedra 3.24.5</sub></p>
 
 ## Install
 
@@ -230,10 +230,12 @@ Lunaria runs app dex bytecode and implements Android views, layouts, text, resou
   &nbsp;
   <img src="shots/tver-playback-portrait.png" width="26%" alt="TVer playing episode 54 of The Apothecary Diaries in portrait: Maomao peeking through a sliding door in the video frame above the episode details">
   &nbsp;
+  <img src="shots/tver-series-portrait.png" width="26%" alt="TVer series page in portrait: the playing video above a like / pin / share row, the series card with a favorite button, and the episode list">
+  &nbsp;
   <img src="shots/tver-welcome.png" width="12%" alt="TVer portrait welcome screen with program artwork and the consent button">
 </p>
 
-<p align="center"><sub>TVer 6.40.0 · landscape playback · episode details · portrait playback · welcome screen</sub></p>
+<p align="center"><sub>TVer 6.40.0 · landscape playback · episode details · portrait playback · series page · welcome screen</sub></p>
 
 APKPure renders its store, app details and download manager (download progress observed; completed install not yet verified).
 
@@ -353,6 +355,28 @@ Unreal Engine 4: login and server selection through character creation, the star
 
 </details>
 
+### Magia Exedra (まどか☆マギカ Magia Exedra)
+
+Unity IL2CPP with CRIWARE and the SPARKGEAR SDK, `arm64-v8a`, version **3.24.5**, **1024 × 576**. The title screen, first asset download,
+opening movie, 3D field and battle scenes with the touch HUD render, and taps reach the game. This title drove several fixes: the
+`MotionEvent.getDevice()` input source Unity uses to classify taps, a stack for CRI's host-driven audio thread, and two JNI handle bugs
+(a freed local reference reused by another thread, and a stale handle that kept the game's request signing from ever completing).
+Rendering used to stall in about half of runs; it did not in 30+ runs after the fix.
+
+<p align="center">
+  <img src="shots/madoka-exedra-title.png" width="48%" alt="Magia Exedra title screen, the pink Madoka Magica logo above TAP TO START, version 3.24.5">
+  &nbsp;
+  <img src="shots/madoka-exedra-intro.png" width="48%" alt="Magia Exedra opening movie: Madoka and Homura holding hands, a red ribbon between them, golden sky and petals, with an asset download bar at 170 of 2225 MB">
+</p>
+
+<p align="center">
+  <img src="shots/madoka-exedra-battle.png" width="48%" alt="Magia Exedra battle: Homura extends her shield for the grenade-throw skill, with the turn order, party portrait and skill buttons">
+  &nbsp;
+  <img src="shots/madoka-exedra-field.png" width="48%" alt="Magia Exedra: Madoka seen from behind on a black-and-white checkered floor, long shadows across the tiles">
+</p>
+
+<p align="center"><sub>Title · opening movie while assets download · battle skill cut-in · 3D field</sub></p>
+
 ### Where Winds Meet (燕雲十六声)
 
 NetEase's open-world title runs on its own **Messiah engine** (`MessiahNativeActivity`, `libGame.so`,
@@ -424,6 +448,14 @@ Google Play services are absent, so Firebase reports unavailable; this drove fix
 <p align="center"><sub><a href="https://www.level5.co.jp/">Layton Brothers: Mystery Room</a>: a 2013 LEVEL-5 title whose Java UI is drawn entirely through the Android view layer</sub></p>
 
 <p align="center">
+  <img src="shots/royal-revolt-2-intro.png" width="48%" alt="Royal Revolt 2 storybook intro: an open book reading 'Once upon a time (in fact, a year ago)' beside a portrait of a young prince with a teddy bear">
+  &nbsp;
+  <img src="shots/royal-revolt-2-tutorial.png" width="48%" alt="Royal Revolt 2 first stage: the crowned hero with a sword in a forest clearing, a Japanese tutorial bubble pointing at the sword button, pause shield at top right">
+</p>
+
+<p align="center"><sub>Royal Revolt 2: storybook intro and the first tutorial stage, with Japanese UI text</sub></p>
+
+<p align="center">
   <img src="shots/another-eden-dialogue.png" width="48%" alt="Another Eden Japanese dialogue scene, with AUTO and a download indicator">
 </p>
 
@@ -481,10 +513,12 @@ Results describe **what was actually observed** on particular builds and machine
 | **TumuTumu 12.11.0** | Cocos2dx + LIAPP v5 · AArch64 XAPK | Packed Application and native libraries start; title, terms WebView and LINE login page render. Idles after the first title tap; not playable. |
 | **WhatsApp 2.26.39.74** | Java / dex Android UI · AArch64 XAPK | EULA and phone-number registration (+81 / 日本) render; about 1.4 s startup after indexing the APK once. Account creation untested. |
 | **Ni no Kuni: Cross Worlds** | Unreal Engine 4 · AArch64 XAPK | Linux: login, server and character selection, village, dialogue, voiced cutscenes, field gameplay; SharedPreferences persist. Apple Silicon: 5.04.12 reached the opening movie, 3D intro and terms dialog; later stages unverified. |
+| **Magia Exedra 3.24.5** | Unity IL2CPP (CRIWARE, SPARKGEAR) · AArch64 | Title, first asset download, opening movie, 3D field and battle scenes render; taps work. Rendering stalls (about half of runs before 2026-11-27) and a stale-handle hang at "Now Loading" are fixed; the asset download (about 2.2 GB) is the next step. |
 | **Where Winds Meet** | NetEase Messiah · AArch64 XAPK | Title with resource download, Japanese news, login choice (NetEase / Google / Guest), consent and guide screens, character creation. Gameplay not yet reached; startup videos need Main/High H.264. |
 | **Gakuen Idolmaster 3.5.3** | Unity 6000.0 IL2CPP (Vulkan, CRI) · AArch64 XAPK | Setup and consent screens render; the first asset download from the game CDN starts (~806 MB observed). Gameplay not yet reached. |
 | **Blade & Soul Masia** | Unreal Engine 5 · AArch64 APKS | Opening video completes, title screen appears, accepting the additional-patch prompt starts the download. |
 | **Genshin Impact 7.2.0** | Unity IL2CPP · AArch64 XAPK | Open world on Linux (prologue, Mondstadt, gliding). Login, server and audio settings survive restart; keyboard movement works; about 18–22 fps in the field and 30 fps in menus on one test host. Account WebView opens; Play billing unsupported. |
+| **Royal Revolt 2** | Android game · ABI not recorded | Storybook intro and the first tutorial stage render, Japanese tutorial text included. Further progress unverified. |
 | **Alchemia Story 1.0.154** | Unity IL2CPP · AArch64 APK | Title, Japanese story scenes (landscape and portrait), character-creation room (2026-10-09). |
 | **Kikyu! Aeronaut** | native `armeabi` · ARM32 APK (2013) | Title screen draws and waits for Return. |
 | **Layton Brothers: Mystery Room** | Java / dex Android UI (2013) | Title screen and dialogue scenes render through the Android view layer. |

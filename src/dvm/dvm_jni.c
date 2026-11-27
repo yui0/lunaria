@@ -253,6 +253,10 @@ struct bridge_local {
   jobject handle;
   dvm_ref source;
   bool direct;
+  /* The handle slot's generation when this local was made.  Handle numbers are recycled the moment a
+   * slot is freed, and native code may delete a local itself before the frame ends; releasing by
+   * number alone would then free whatever *another* thread has put in that slot since. */
+  uint32_t epoch;
 };
 struct bridge_frame {
   struct bridge_frame *prev;
@@ -361,13 +365,17 @@ static void bridge_record(jobject handle, dvm_ref source, bool direct)
     f->capacity = cap;
   }
   f->locals[f->count++] = (struct bridge_local) {
-    handle, source, direct
+    handle, source, direct,
+    env ? jvm_handle_epoch(jnienv_get_jvm(env), handle) : 0u
   };
 }
 
 static bool bridge_release_one(struct dvm *vm, JNIEnv *env, struct jvm *jvm,
                                const struct bridge_local *local)
 {
+  /* The slot now holds a different object than the one this frame made: it was freed (by native code's
+   * own DeleteLocalRef, say) and reused.  Nothing in it is this frame's to release any more. */
+  if (jvm_handle_epoch(jvm, local->handle) != local->epoch) return false;
   if (!jvm_bridge_take_pending(jvm, local->handle)) {
     /* Native code deleted the incoming local itself.  Only drop the DVM
      * binding if that was the last reference and the slot is gone. */
@@ -1004,8 +1012,27 @@ static jobject to_jobject(struct dvm *vm, JNIEnv *env, dvm_ref r)
    * slot has gone is not reused. */
   uint32_t host = dvm_external_handle(vm, r);
   if (host) {
+    /* A handle slot is recycled the moment it is freed, and an object bound without a wrapper has nothing to
+     * compare against (wrapper_current takes it as current).  If native code freed this object's handle and the
+     * slot became a Class, answering with it would hand native code a jclass for an instance: Unity's
+     * AndroidJavaObject then reflects on java.lang.Class and every method it asks for is "missing". */
+    const bool slot_is_class = jvm_described_class_name(jnienv_get_jvm(env), (jobject)(uintptr_t)host) != NULL;
+    struct dvm_class *own = dvm_object_class(vm, r);
+    const bool is_class_obj = own && own->name && !strcmp(own->name, "java/lang/Class");
+    /* The same for an array: a slot that now holds some other object, or an array of another size, is not this
+     * array's.  (The region copy below would run off the end of it.) */
+    bool slot_matches_array = true;
+    if (!slot_is_class) {
+      struct dvm_object *ao = dvm__obj(vm, r);
+      const char *hc = class_name_of(env, (jobject)(uintptr_t)host);
+      const bool host_array = hc && hc[0] == '[';
+      if (ao && ao->kind == DVM_OBJ_ARRAY)
+        slot_matches_array = host_array && (uint32_t)(*env)->GetArrayLength(env, (jobject)(uintptr_t)host) == ao->length;
+      else
+        slot_matches_array = !host_array;
+    }
     if (jvm_bridge_ref_count(jnienv_get_jvm(env), (jobject)(uintptr_t)host) > 0 &&
-        wrapper_current(env, host, r)) {
+        (!slot_is_class || is_class_obj) && slot_matches_array && wrapper_current(env, host, r)) {
       struct dvm_object *object = dvm__obj(vm, r);
       if (object && object->kind == DVM_OBJ_ARRAY && object->elem_kind != 'L' &&
           object->length && object->data)

@@ -1579,12 +1579,36 @@ android_view_InputDevice_getDeviceIds(JNIEnv *env, jobject object, va_list args)
 /* InputDevice.getDevice(int id) — static.  Unity probes the source device of
  * every injected MotionEvent to classify it (touchscreen/keyboard/…); a NULL
  * here makes it drop the event, so return a singleton InputDevice stub. */
+static jobject
+input_device_singleton(JNIEnv *env)
+{
+  static jobject sv;
+  return jvm_cached_object(env, &sv, "android/view/InputDevice");
+}
+
 jobject
 android_view_InputDevice_getDevice(JNIEnv *env, jobject object, va_list args)
 {
   assert(env && object);
-  static jobject sv;
-  return jvm_cached_object(env, &sv, "android/view/InputDevice");
+  return input_device_singleton(env);
+}
+
+/* InputEvent.getDevice() — the device an event came from.  On Android every
+ * touch event names the touchscreen that produced it, never null; Unity asks
+ * for it while it queues an injected MotionEvent.  The device is the same
+ * singleton InputDevice.getDevice(int) hands out. */
+jobject
+android_view_InputEvent_getDevice(JNIEnv *env, jobject object, va_list args)
+{
+  assert(env && object);
+  motion_trace("getDevice");
+  return input_device_singleton(env);
+}
+
+jobject
+android_view_MotionEvent_getDevice(JNIEnv *env, jobject object, va_list args)
+{
+  return android_view_InputEvent_getDevice(env, object, args);
 }
 
 jint

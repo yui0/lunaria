@@ -51,6 +51,12 @@ else
 LIBS     += -lz
 endif
 
+LB_ICU ?= $(shell pkg-config --exists icu-i18n 2>/dev/null && echo 1 || echo 0)
+ifeq ($(LB_ICU),1)
+CFLAGS   += -DLB_ICU $(shell pkg-config --cflags icu-i18n)
+LIBS     += $(shell pkg-config --libs icu-i18n icu-uc)
+endif
+
 QJS_SRC  := $(QJS)/quickjs.c $(QJS)/libregexp.c $(QJS)/libunicode.c \
             $(QJS)/cutils.c $(QJS)/dtoa.c
 QJS_OBJ  := $(patsubst $(QJS)/%.c,build/qjs/%.o,$(QJS_SRC))
