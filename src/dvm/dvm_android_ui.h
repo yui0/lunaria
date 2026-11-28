@@ -5457,7 +5457,7 @@ static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
     if ((((n >= 0 && n <= 1))) || (((n >= 11 && n <= 99)))) return 0x01000006u;
     break;
   case 7:
-    if ((((n == 1)))) return 0x01000006u;
+    if (n == 1) return 0x01000006u;
     break;
   case 8:
     if ((((n == 1))) || (!((0 == 0)) && ((n == 0) || (n == 1)))) return 0x01000006u;
@@ -5476,16 +5476,16 @@ static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
     if (((((n % 10) == 1)) && !(((n % 100) == 11))) || (((0 == 2)) && (((0 % 10) == 1)) && !(((0 % 100) == 11))) || (!((0 == 2)) && (((0 % 10) == 1)))) return 0x01000006u;
     break;
   case 13:
-    if ((((n == 0)))) return 0x01000005u;
+    if (n == 0) return 0x01000005u;
     if ((((n == 0) || (n == 1)) && !((n == 0)))) return 0x01000006u;
     break;
   case 14:
-    if ((((n == 0)))) return 0x01000005u;
-    if ((((n == 1)))) return 0x01000006u;
+    if (n == 0) return 0x01000005u;
+    if (n == 1) return 0x01000006u;
     break;
   case 15:
-    if ((((n == 1)))) return 0x01000006u;
-    if ((((n == 2)))) return 0x01000007u;
+    if (n == 1) return 0x01000006u;
+    if (n == 2) return 0x01000007u;
     break;
   case 16:
     if ((((n == 0))) || (((n == 1)))) return 0x01000006u;
@@ -5512,7 +5512,7 @@ static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
     if ((((0 == 0)) && !((n == 0)) && (((n % 1000000) == 0)) && ((0 == 0))) || (!((0 >= 0 && 0 <= 5)))) return 0x01000009u;
     break;
   case 22:
-    if ((((n == 1)))) return 0x01000006u;
+    if (n == 1) return 0x01000006u;
     if ((((0 == 0)) && !((n == 0)) && (((n % 1000000) == 0)) && ((0 == 0))) || (!((0 >= 0 && 0 <= 5)))) return 0x01000009u;
     break;
   case 23:
@@ -5556,7 +5556,7 @@ static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
     if ((!((0 == 0)))) return 0x01000009u;
     break;
   case 31:
-    if ((((n == 1)))) return 0x01000006u;
+    if (n == 1) return 0x01000006u;
     if ((((n == 0))) || ((((n % 100) >= 2 && (n % 100) <= 10)))) return 0x01000008u;
     if (((((n % 100) >= 11 && (n % 100) <= 19)))) return 0x01000009u;
     break;
@@ -5572,8 +5572,8 @@ static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
     if ((!((n == 0)) && (((n % 1000000) == 0)))) return 0x01000009u;
     break;
   case 34:
-    if ((((n == 1)))) return 0x01000006u;
-    if ((((n == 2)))) return 0x01000007u;
+    if (n == 1) return 0x01000006u;
+    if (n == 2) return 0x01000007u;
     if ((((n >= 3 && n <= 6)))) return 0x01000008u;
     if ((((n >= 7 && n <= 10)))) return 0x01000009u;
     break;
@@ -5584,25 +5584,25 @@ static uint32_t integer_plural_attr(const char *locale, int32_t quantity)
     if ((!((0 == 0)))) return 0x01000009u;
     break;
   case 36:
-    if ((((n == 0)))) return 0x01000005u;
-    if ((((n == 1)))) return 0x01000006u;
+    if (n == 0) return 0x01000005u;
+    if (n == 1) return 0x01000006u;
     if (((((n % 100) == 2) || ((n % 100) == 22) || ((n % 100) == 42) || ((n % 100) == 62) || ((n % 100) == 82))) || ((((n % 1000) == 0)) && (((n % 100000) >= 1000 && (n % 100000) <= 20000) || ((n % 100000) == 40000) || ((n % 100000) == 60000) || ((n % 100000) == 80000))) || (!((n == 0)) && (((n % 1000000) == 100000)))) return 0x01000007u;
     if (((((n % 100) == 3) || ((n % 100) == 23) || ((n % 100) == 43) || ((n % 100) == 63) || ((n % 100) == 83)))) return 0x01000008u;
     if ((!((n == 1)) && (((n % 100) == 1) || ((n % 100) == 21) || ((n % 100) == 41) || ((n % 100) == 61) || ((n % 100) == 81)))) return 0x01000009u;
     break;
   case 37:
-    if ((((n == 0)))) return 0x01000005u;
-    if ((((n == 1)))) return 0x01000006u;
-    if ((((n == 2)))) return 0x01000007u;
+    if (n == 0) return 0x01000005u;
+    if (n == 1) return 0x01000006u;
+    if (n == 2) return 0x01000007u;
     if (((((n % 100) >= 3 && (n % 100) <= 10)))) return 0x01000008u;
     if (((((n % 100) >= 11 && (n % 100) <= 99)))) return 0x01000009u;
     break;
   case 38:
-    if ((((n == 0)))) return 0x01000005u;
-    if ((((n == 1)))) return 0x01000006u;
-    if ((((n == 2)))) return 0x01000007u;
-    if ((((n == 3)))) return 0x01000008u;
-    if ((((n == 6)))) return 0x01000009u;
+    if (n == 0) return 0x01000005u;
+    if (n == 1) return 0x01000006u;
+    if (n == 2) return 0x01000007u;
+    if (n == 3) return 0x01000008u;
+    if (n == 6) return 0x01000009u;
     break;
   default:
     break;

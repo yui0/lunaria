@@ -7517,7 +7517,7 @@ static void payload_adopt(struct dvm_object *dst, struct dvm_object *src)
  * references.  NULL, and the object untouched, when it cannot be had. */
 static struct rt_list *list_alloc(struct dvm_object *o, uint32_t capacity)
 {
-  if (capacity > (SIZE_MAX - sizeof(struct rt_list)) / sizeof(dvm_ref)) return NULL;
+  if ((size_t)capacity > (SIZE_MAX - sizeof(struct rt_list)) / sizeof(dvm_ref)) return NULL;
   struct rt_list *l = calloc(1, sizeof *l + (size_t)capacity * sizeof(dvm_ref));
   if (!l) return NULL;
   l->cap = capacity;
@@ -7533,7 +7533,7 @@ static struct rt_list *list_alloc(struct dvm_object *o, uint32_t capacity)
 static struct rt_list *list_resize(struct dvm_object *o, struct rt_list *l,
                                    uint32_t capacity)
 {
-  if (capacity > (SIZE_MAX - sizeof *l) / sizeof(dvm_ref)) return NULL;
+  if ((size_t)capacity > (SIZE_MAX - sizeof *l) / sizeof(dvm_ref)) return NULL;
   struct rt_list *n = realloc(l, sizeof *n + (size_t)capacity * sizeof(dvm_ref));
   if (!n) return NULL;
   if (!l) memset(n, 0, sizeof *n);
@@ -26250,22 +26250,22 @@ static bool process_child_status(struct dvm *vm, dvm_ref self, const union dvm_v
   const bool alive = !strcmp(builtin_name(),"isAlive");
   for (;;) {
     union dvm_value tid = {0}, status = {0}, busy = {0};
-    dvm_get_field(vm,self,"childTid","I",&tid);
+    (void)dvm_get_field(vm,self,"childTid","I",&tid);
     if (!tid.i) {
-      dvm_get_field(vm,self,"exitCode","I",&status);
+      (void)dvm_get_field(vm,self,"exitCode","I",&status);
       RETI(alive || destroy ? 0 : status.i);
     }
-    dvm_get_field(vm,self,"checkingChild","Z",&busy);
+    (void)dvm_get_field(vm,self,"checkingChild","Z",&busy);
     if (!busy.i) {
-      dvm_set_field(vm,self,"checkingChild","Z",(union dvm_value){.i=1});
+      (void)dvm_set_field(vm,self,"checkingChild","Z",(union dvm_value){.i=1});
       unsigned depth = dvm_gil_unlock_all(vm);
       int rc = arm_exec_java_child(tid.i,destroy);
       dvm_gil_relock(vm,depth);
-      dvm_set_field(vm,self,"checkingChild","Z",(union dvm_value){.i=0});
+      (void)dvm_set_field(vm,self,"checkingChild","Z",(union dvm_value){.i=0});
       if (rc != -1) {
         status.i = rc < 0 ? 127 : rc;
-        dvm_set_field(vm,self,"exitCode","I",status);
-        dvm_set_field(vm,self,"childTid","I",(union dvm_value){.i=0});
+        (void)dvm_set_field(vm,self,"exitCode","I",status);
+        (void)dvm_set_field(vm,self,"childTid","I",(union dvm_value){.i=0});
         RETI(alive || destroy ? 0 : status.i);
       }
       if (destroy || alive) RETI(alive);
@@ -62180,7 +62180,7 @@ static bool webview_load_data(struct dvm *vm, dvm_ref self,
       ok=bytes_printf(&bytes,"data:%s;charset=UTF-8;base64,",mime);
       if (ok) b64_encode((const uint8_t *)text,(uint32_t)length,2,&bytes);
     }
-    if (ok) request=luna_strndup(bytes.p,bytes.len);
+    if (ok) request=luna_strndup((const char *)bytes.p,bytes.len);
     free(bytes.p);
   } else {
     request=strdup(base);

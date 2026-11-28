@@ -96,6 +96,14 @@ def main():
         write_png(master)
         if png:
             shutil.copyfile(master, png)
+        if os.environ.get("MACOS_CROSS") == "1":
+            # ic10 contains a 1024px PNG, including its alpha channel.
+            with open(master, "rb") as source, open(out, "wb") as icon:
+                data = source.read()
+                icon.write(struct.pack(">4sI4sI", b"icns", len(data) + 16,
+                                       b"ic10", len(data) + 8))
+                icon.write(data)
+            return
         iconset = os.path.join(work, "Lunaria.iconset")
         os.mkdir(iconset)
         for size in (16, 32, 128, 256, 512):

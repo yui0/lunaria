@@ -90,7 +90,7 @@ struct r_debug {
 #  define AELF(x)  ELF32_##x
 #endif
 
-void apkenv_debugger_init();
+void apkenv_debugger_init(void);
 
 /* magic shared structures that GDB knows about */
 

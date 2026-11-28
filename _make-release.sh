@@ -9,7 +9,7 @@
 #   ※ Orange Pi 等で panfork Mesa があると amd64 の libegl が multiarch 同居できない。
 #     その場合は .deb を .cross-sysroot-amd64/ に展開してクロスリンクする。
 #   ./_make-release.sh --windows           # + Windows (mingw クロス, .zip)
-#   ./_make-release.sh --macos             # Linux + macOS (.tar.gz; macOS ホスト上のみビルド可)
+#   ./_make-release.sh --macos             # Linux + macOS (.tar.gz; Linux では クロスコンパイルで arm64 をビルド)
 #   ./_make-release.sh --all-targets       # Linux + Windows + macOS すべて
 #   ./_make-release.sh --push              # タグを自動的にリモートへプッシュ (確認省略)
 #   ./_make-release.sh --no-upload         # ビルドのみ (GitHub Release を作らない)
@@ -22,16 +22,18 @@
 #                            : Linux (同梱 lib/runtime/fonts 付き)。ホストが aarch64 なら
 #                              x86_64 を gcc クロス (crossbuild-essential-amd64) で作る
 #   lunaria-*-windows-x86_64.zip : Windows x86_64 UCRT (Linux から `make dist-cross-win`)
-#   lunaria-*-macos-arm64.tar.gz : macOS (.app バンドル同梱; codesign が要るため macOS 上でのみ生成)
+#   lunaria-*-macos-arm64.tar.gz : macOS (.app バンドル同梱; Linux クロスは rcodesign で署名)
 #
 # 注意: ツリー直下の lunaria / runtime/ / libdl.so / libpthread.so はビルドのたびに
 #       消して作り直す (アーキ違いのビルド成果物が混ざらないようにするため)。
 #       syslib-arm64/ は ARM64 ゲスト用でアーキ非依存のため両方で共用する。
 #
 # macOS について:
-#   Linux ホストでは macOS パッケージを作れない。--macos 指定時、Linux ホストでは
-#   リポジトリ直下 (または MACOS_PKG=/path/to.tar.gz) に Mac で作成済みの
-#   lunaria-*-macos-*.tar.gz があればそれをリリースに含め、無ければ警告してスキップする。
+#   Linux は SDK・署名ツール・OpenSSL を自動取得する。既存環境を使う場合の指定例。
+#   SDKROOT=/path/to/MacOSX.sdk (macOS 13 以降)
+#   MAC_DEPS=/path/to/.deps (任意。省略時は arm64 用の依存をクロスビルド)
+#   MAC_OPENSSL=/path/to/openssl (macOS arm64 用 include/ と lib/)
+#   MACOS_PKG=/path/to/archive を指定すると、作成済みの配布物を使う。
 #
 # 環境変数:
 #   GITHUB_TOKEN        — Release 作成用 (未設定時は ~/.config/gh/hosts.yml から取得)
@@ -111,6 +113,18 @@ if [[ "$HOST_OS" == "Linux" ]]; then
     *) die "未対応の Linux ホストアーキ: $HOST_ARCH (x86_64 / aarch64 のみ)" ;;
   esac
   [[ "$LINUX_CROSS" == "true" ]] && info "Linux クロス: $HOST_ARCH → $CROSS_ARCH ($CROSS_TRIPLE)"
+fi
+
+if [[ "$HOST_OS" == Linux && "$BUILD_MACOS" == true ]]; then
+  PKG="${MACOS_PKG:-${MACOS_DMG:-}}"
+  if [[ -n "$PKG" ]]; then
+    [[ -f "$PKG" ]] || die "macOS パッケージが見つかりません: $PKG"
+    # dist-clean removes old archives in the source directory.
+    saved_pkg=$(mktemp -d)
+    trap 'rm -rf "$saved_pkg"' EXIT
+    cp "$PKG" "$saved_pkg/"
+    PKG="$saved_pkg/$(basename "$PKG")"
+  fi
 fi
 
 # クロスアーキ用の -dev パッケージ (Makefile が -lglfw -lEGL -lGLESv2 -lasound -lbsd -lunwind -lssl -lz を使う)
@@ -555,20 +569,17 @@ if [[ "$BUILD_WINDOWS" == "true" ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────
-# ③ macOS: Linux ホストでは作成済み .tar.gz を取り込むのみ
+# ③ macOS arm64
 # ─────────────────────────────────────────────────────────
-if [[ "$BUILD_MACOS" == "true" && "$HOST_OS" != "Darwin" ]]; then
-  PKG="${MACOS_PKG:-${MACOS_DMG:-}}"
-  if [[ -z "$PKG" ]]; then
-    PKG="$(ls -t lunaria-*-macos-*.tar.gz lunaria-*-macos-*.dmg lunaria-*-macos.dmg 2>/dev/null | head -1 || true)"
-  fi
-  if [[ -n "$PKG" && -f "$PKG" ]]; then
-    cp "$PKG" "$ARTIFACTS_DIR/$(basename "$PKG")"
-    success "作成済みの macOS パッケージを取り込みました: $(basename "$PKG")"
+if [[ "$BUILD_MACOS" == true && "$HOST_OS" == Linux ]]; then
+  if [[ -n "$PKG" ]]; then
+    cp "$PKG" "$ARTIFACTS_DIR/"
   else
-    warn "macOS パッケージは Linux では作れません (codesign が必要)。"
-    warn "Mac で ./_make-release.sh --macos --no-upload を実行して lunaria-*-macos-*.tar.gz を作り、"
-    warn "このディレクトリに置くか MACOS_PKG=/path/to.tar.gz を指定してください。macOS はスキップします。"
+    NAME="lunaria-$DIST_DATE-macos-arm64"
+    reset_tree
+    build_package "$NAME" bash scripts/dist-cross-macos.sh "$NAME" "$JOBS"
+    collect "$NAME.tar.gz"
+    reset_tree
   fi
 fi
 

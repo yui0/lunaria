@@ -3918,7 +3918,7 @@ static void menu_clicked(const char *id)
     char value[8];
     snprintf(value, sizeof value, "%d", n);
     if (menu_conf_write("LUNARIA_A64_ENGINES", n ? value : "0", false)) {
-      setenv("LUNARIA_A64_ENGINES", value, 1);
+      luna_os_setenv("LUNARIA_A64_ENGINES", value, 1);
       menu_notice_locked("Engines saved: restart the app to apply");
     } else menu_notice_locked("Cannot save engine settings");
     keep_open = true;

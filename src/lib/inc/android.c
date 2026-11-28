@@ -213,7 +213,7 @@ struct ASensorList {
 };
 
 struct ASensorManager*
-ASensorManager_getInstance()
+ASensorManager_getInstance(void)
 {
   return NULL;
 }

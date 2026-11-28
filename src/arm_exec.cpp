@@ -14,6 +14,11 @@
 #define _DARWIN_C_SOURCE 1
 #endif
 
+#if defined(__APPLE__) && defined(__clang__)
+/* getdirentries64 and gettid have no non-deprecated spelling on macOS. */
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
 #include "lunaria_os.h"
 #include "lunaria_file.h"
 #include "lib/inc/log_assert.h"
@@ -12891,6 +12896,7 @@ static bool process_exit_pending(void) {
  * blocked inside libc. A window-close flag alone cannot unwind those waits. */
 static void guest_fatal_signal(int sig)
 {
+#ifndef _WIN32
   if (g_host_fork_child) {
     /* A fork child is a host process of its own: end it the way the signal would, so the
      * parent's waitpid() reports WIFSIGNALED. */
@@ -12901,6 +12907,7 @@ static void guest_fatal_signal(int sig)
     }
     _exit((128 + sig) & 0xff);
   }
+#endif
   if (g_guest_exit_count.load(std::memory_order_acquire)) return;
   dvm_jni_exit_process((128+sig)&0xff);
   g_guest_exit_status.store((128+sig)&0xff,std::memory_order_relaxed);
@@ -12932,6 +12939,7 @@ static int guest_kill_process(ArmExecCtx &ctx, int32_t selector, int sig)
             guest_pid(),guest_tid_of(g_current_tid),selector,sig,(unsigned long long)caller);
   }
   if (sig < 0 || sig > 64) return -EINVAL;
+#ifndef _WIN32
   /* Processes made by the host's fork() are host processes.  Signals 1..15 are numbered the
    * same on Linux and the host except SIGBUS, SIGUSR1/2 and SIGCHLD, which have no use here. */
   if (selector > 0) {
@@ -12941,6 +12949,7 @@ static int guest_kill_process(ArmExecCtx &ctx, int32_t selector, int sig)
     if (g_host_fork_child && (uint32_t)selector == GUEST_PPID) host = g_host_parent_pid;
     if (host) return kill(host, sig) ? -errno : 0;
   }
+#endif
   uint32_t wanted = selector > 0 ? guest_process_of_tid((uint32_t)selector) : 0;
   const uint32_t group = selector == 0 ? guest_process_group(guest_pid())
                          : selector < -1 ? (uint32_t)-(int64_t)selector : 0;
@@ -22395,12 +22404,12 @@ static void apk_meta_ensure_loaded() {
       if (eocd >= 0) {
         uint8_t eh[22];
         fseek(fp, eocd, SEEK_SET);
-        fread(eh, 1, 22, fp);
+        if (fread(eh, 1, 22, fp) != 22) memset(eh, 0, sizeof eh);
         uint32_t cd_off = *(uint32_t *)(eh + 16);
         uint32_t cd_size = *(uint32_t *)(eh + 12);
         std::vector<uint8_t> cd(cd_size);
         fseek(fp, cd_off, SEEK_SET);
-        fread(cd.data(), 1, cd_size, fp);
+        if (fread(cd.data(), 1, cd_size, fp) != cd_size) std::fill(cd.begin(), cd.end(), 0);
         for (uint32_t o = 0; o + 46 <= cd_size; ) {
           if (*(uint32_t *)(cd.data() + o) != 0x02014b50u) break;
           uint16_t nlen = *(uint16_t *)(cd.data() + o + 28);
@@ -22411,14 +22420,14 @@ static void apk_meta_ensure_loaded() {
           if (name == "AndroidManifest.xml") {
             uint8_t lh[30];
             fseek(fp, lhoff, SEEK_SET);
-            fread(lh, 1, 30, fp);
+            if (fread(lh, 1, 30, fp) != 30) memset(lh, 0, sizeof lh);
             uint16_t ln = *(uint16_t *)(lh + 26);
             uint16_t le = *(uint16_t *)(lh + 28);
             uint32_t comp = *(uint32_t *)(lh + 18);
             uint16_t method = *(uint16_t *)(lh + 8);
             fseek(fp, lhoff + 30 + ln + le, SEEK_SET);
             std::vector<uint8_t> raw(comp);
-            fread(raw.data(), 1, comp, fp);
+            if (fread(raw.data(), 1, comp, fp) != comp) std::fill(raw.begin(), raw.end(), 0);
             if (method == 0) {
               buf = std::move(raw);
               got = true;
@@ -24376,7 +24385,7 @@ static const char *map_guest_path_raw(const char *path, char *buf, size_t bufsz)
 
   /* procfs has no host fallback, including Java and metadata operations. */
   if (path_under(path, "/proc", 5)) {
-    /* SLOW: this writes host files for /proc/<pid>/task/<tid>/*.  Hot readers
+    /* SLOW: this writes host files for the /proc/<pid>/task/<tid> entries.  Hot readers
      * (fopen) must serve those from memory BEFORE calling map_guest_path(). */
     if (const char *synth = synthetic_proc_path(path)) return synth;
     /* Since Android 10 an app is denied /proc/net: the file exists, and
@@ -30210,6 +30219,9 @@ static int64_t guest_ptrace(int64_t request, int64_t pid, uint64_t data)
   if (request == T_TRACEME) return guest_ptrace_traceme_start(guest_pid()) ? 0 : -EPERM;
   if (pid <= 0) return -ESRCH;
   if ((uint32_t)pid == guest_pid()) return -EPERM;
+#ifdef _WIN32
+  return -ESRCH;  /* No host-fork children on Windows. */
+#else
   const pid_t host = guest_ptrace_host_pid((uint32_t)pid);
   if (request == T_ATTACH || request == T_SEIZE) {
     if (!host) return -ESRCH;
@@ -30232,6 +30244,7 @@ static int64_t guest_ptrace(int64_t request, int64_t pid, uint64_t data)
     return kill(host, SIGCONT) ? -errno : 0;
   }
   return -EIO;
+#endif
 }
 
 /* Descriptor readiness, on the kernel's schedule rather than the frame's. A
@@ -31839,6 +31852,7 @@ static void fork_pins_subtract(std::vector<std::pair<uint64_t, uint64_t>> &piece
 
 namespace a64par { static void abandon_workers(void); }
 
+#ifndef _WIN32
 /* Runs in the new host process right after fork(), on the thread that called it. */
 static void host_fork_child_enter(uint32_t parent_guest_pid, pid_t parent_host_pid)
 {
@@ -31877,6 +31891,7 @@ static void host_fork_child_enter(uint32_t parent_guest_pid, pid_t parent_host_p
   new (&g_a64_maps_mu) std::shared_mutex;
 }
 
+#endif
 static int a64_guest_munmap(ArmExecCtx *ctx, GuestVA address, uint64_t length)
 {
   uint64_t lo, hi;
@@ -35199,7 +35214,7 @@ __attribute__((noinline)) static void dispatch_svc_general(ArmExecCtx &ctx, uint
       }
       if (lunaria_env("LUNARIA_TRACE_SVC0"))
         fprintf(stderr, "[svc0]   newfstatat(\"%s\") -> %d dev=%llx ino=%llu size=%llu (host %s)\n", guest_path,
-                rc < 0 ? -guest_syscall_errno(errno) : 0, (unsigned long long)st.device,
+                (int)(rc < 0 ? -guest_syscall_errno(errno) : 0), (unsigned long long)st.device,
                 (unsigned long long)st.inode, (unsigned long long)st.size, path ? path : "?");
       ret64(rc < 0 ? (uint64_t)guest_syscall_errno(errno) : 0u);
       break;
@@ -59909,6 +59924,7 @@ pv_done:
         (void)call_guest_cb(ctx, (uint32_t)slot.prepare, 0, 0);
     }
 
+#ifndef _WIN32
     /* The process's first thread forks a process of its own (see HostChild). */
     if (ctx.is_arm64 && g_svc_jit64 && g_current_tid == 0 && !lunaria_env("LUNARIA_FORK_THREAD")) {
       const uint32_t parent_guest = GUEST_TID_BASE;
@@ -59934,6 +59950,7 @@ pv_done:
       break;
     }
 
+#endif
     bool spawned = false;
     uint32_t child_tid = 0;
     if (ctx.is_arm64 && g_svc_jit64) {
@@ -60131,6 +60148,7 @@ pv_done:
     constexpr int32_t GUEST_WNOHANG = 1;
     const uint32_t parent_pid = guest_pid();
 
+#ifndef _WIN32
     /* A child made by the host's fork(): its status is the host's. */
     {
       HostChild *hc = nullptr;
@@ -60159,6 +60177,7 @@ pv_done:
       }
     }
 
+#endif
     const GuestForkChild child = fork_child_for_parent(parent_pid, pid);
     if (!child.tid) {
       arm_set_errno(ctx, ECHILD);
@@ -71443,7 +71462,10 @@ public:
         /* One write for the whole report: other engines print to the same stream. */
         std::string rep;
         char tmp[512];
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
         auto add = [&](const char *fmt, auto... a) { snprintf(tmp, sizeof tmp, fmt, a...); rep += tmp; };
+#pragma GCC diagnostic pop
         if (lunaria_env("LUNARIA_A64_BP_LOG")) {   /* one short line per pass */
           add("[a64-bp] bp#%d pc=0x%llx tid=%u", bp_index, (unsigned long long)pc, g_current_tid);
           for (int r = 0; r < 8; ++r) add(" x%d=%llx", r, (unsigned long long)jit64->GetRegister(r));

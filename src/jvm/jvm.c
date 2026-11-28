@@ -574,8 +574,9 @@ static void jvm_trace_handle(struct jvm *jvm, const char *op, jobject object)
   struct jvm_object *o = jvm_get_object(jvm, object);
   struct jvm_object *k = o->this_klass ? jvm_get_object(jvm, o->this_klass) : NULL;
   if (!k || !k->klass.name.data || !strstr(k->klass.name.data, want)) return;
-  fprintf(stderr, "[handle %p] %s type=%d refs=%d array=%d global=%d pending=%d epoch=%u\n", (void *)object, op,
-          (int)o->type, o->refs, o->array_refs, o->global_refs, o->bridge_pending, jvm->object_generation[(uintptr_t)object - 1]);
+  fprintf(stderr, "[handle %p] %s type=%d refs=%d array=%d global=%d pending=%d epoch=%llu\n", (void *)object, op,
+          (int)o->type, o->refs, o->array_refs, o->global_refs, o->bridge_pending,
+          (unsigned long long)jvm->object_generation[(uintptr_t)object - 1]);
 }
 
 /* Drop a reference (DeleteLocalRef / DeleteGlobalRef).  Only arrays and

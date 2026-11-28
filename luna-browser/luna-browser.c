@@ -6629,7 +6629,13 @@ static char *arg_url(const char *a)
   char *real = realpath(a, NULL);
   struct buf b = { 0 };
   buf_puts(&b, "file://");
-  buf_puts(&b, real ? real : a);
+  const unsigned char *path = (const unsigned char *)(real ? real : a);
+  for (; *path; ++path) {
+    if (*path <= 0x20 || *path >= 0x7f || strchr("%?#", *path))
+      buf_printf(&b, "%%%02X", (unsigned)*path);
+    else
+      buf_put(&b, path, 1);
+  }
   free(real);
   return buf_take(&b);
 }
@@ -6736,6 +6742,8 @@ struct ui_tab {
   size_t frame_len;
   char **hist;                      /* back/forward list and where we are */
   int nhist, cur, going;            /* going: index a back/forward is loading */
+  unsigned history_id;
+  char history_loader[32];
   int sent_w, sent_h;
   int loading, committed, desktop;             /* desktop: asked for the PC version of sites */
   char hover[1024];
@@ -6849,12 +6857,22 @@ static void ui_status(const char *text)
   else luna_remove_class(i, "on");
 }
 
+static void ui_loading_icon(void)
+{
+  int spin = ui_el("spin");
+  if (spin < 0) return;
+  if (g_ui.t->loading) luna_add_class(spin, "on");
+  else luna_remove_class(spin, "on");
+}
+
 /* The status line: the link under the pointer, else the loading note. */
 static void ui_show_hover(const char *url)
 {
-  snprintf(g_ui.t->hover, sizeof g_ui.t->hover, "%s", url ? url : "");
+  if (url != g_ui.t->hover)
+    snprintf(g_ui.t->hover, sizeof g_ui.t->hover, "%s", url ? url : "");
   if (!ui_is_active()) return;
-  ui_status(g_ui.t->hover[0] ? g_ui.t->hover : g_ui.t->loading ? "Loading\xe2\x80\xa6" : NULL);
+  if (g_ui.t->from < 0) ui_status("The page process is unavailable.");
+  else ui_status(g_ui.t->hover[0] ? g_ui.t->hover : g_ui.t->loading ? "Loading\xe2\x80\xa6" : NULL);
 }
 
 static void ui_buttons(void)
@@ -6877,7 +6895,7 @@ static void ui_buttons(void)
 }
 
 /* The page a new tab shows: a search box and the sites people go to most. */
-#define UI_HOME_PREFIX "data:text/html;charset=utf-8,"
+#define UI_HOME_PREFIX "data:text/html;charset=utf-8;luna-home=1,"
 static const char ui_home_html[] =
   "<!doctype html><html><head><meta charset=\"utf-8\"><title>New tab</title><style>\n"
   "html,body{margin:0;height:100%;overflow:hidden;}\n"
@@ -6962,55 +6980,94 @@ static char *ui_search_url(const char *t)
   return buf_take(&b);
 }
 
-/* A host that is this machine or a bare address: plain http, not https. */
-static int ui_is_local_host(const char *t)
+/* A host that is this machine or a bare address: plain HTTP. */
+static int ui_is_local_host(const char *host, size_t len)
 {
-  size_t n = strcspn(t, "/:?#");
-  if (n >= 9 && !strncmp(t, "localhost", 9)) return 1;
-  int dots = 0, digits = 1;
-  for (size_t i = 0; i < n; ++i) {
-    if (t[i] == '.') ++dots;
-    else if (!isdigit((unsigned char)t[i])) digits = 0;
+  if (len == 9 && !strncasecmp(host, "localhost", len)) return 1;
+  if (len >= INET6_ADDRSTRLEN) return 0;
+  char address[INET6_ADDRSTRLEN];
+  memcpy(address, host, len);
+  address[len] = '\0';
+  struct in_addr ipv4;
+  struct in6_addr ipv6;
+  if (len >= 2 && address[0] == '[' && address[len - 1] == ']') {
+    address[len - 1] = '\0';
+    return inet_pton(AF_INET6, address + 1, &ipv6) == 1;
   }
-  return digits && dots == 3;
+  return inet_pton(AF_INET, address, &ipv4) == 1;
 }
 
 /* What was typed: a URL, a file, or else a search. */
-static char *ui_typed_url(const char *t)
+static char *ui_typed_url(const char *text)
 {
-  while (*t == ' ') t++;
-  if (!*t) return NULL;
-  if (strstr(t, "://") || !strncmp(t, "about:", 6) || !strncmp(t, "data:", 5)) return lb_strdup(t);
-  if (t[0] == '/' || t[0] == '.' || t[0] == '~') return arg_url(t);
-  if (!strncmp(t, "www.", 4) || (!strchr(t, ' ') && (strchr(t, '.') || ui_is_local_host(t)))) {
-    struct buf b = { 0 };
-    buf_puts(&b, ui_is_local_host(t) ? "http://" : "https://");
-    buf_puts(&b, t);
-    return buf_take(&b);
+  if (!text) return NULL;
+  while (isspace((unsigned char)*text)) text++;
+  size_t len = strlen(text);
+  while (len && isspace((unsigned char)text[len - 1])) len--;
+  if (!len) return NULL;
+  char *t = lb_strndup(text, len);
+  if (!t) return NULL;
+  if (!strncasecmp(t, "http://", 7) || !strncasecmp(t, "https://", 8) ||
+      !strncasecmp(t, "file://", 7) || !strncasecmp(t, "about:", 6) ||
+      !strncasecmp(t, "data:", 5)) return t;
+  char *url;
+  if (t[0] == '/' || !strncmp(t, "./", 2) || !strncmp(t, "../", 3)) {
+    url = arg_url(t);
+  } else if (!strncmp(t, "~/", 2) && getenv("HOME")) {
+    struct buf path = { 0 };
+    buf_puts(&path, getenv("HOME"));
+    buf_puts(&path, t + 1);
+    url = arg_url(path.p);
+    free(path.p);
+  } else {
+    size_t authority = strcspn(t, "/?#");
+    size_t host = strcspn(t, ":/?#");
+    const char *bracket = t[0] == '[' ? memchr(t, ']', authority) : NULL;
+    if (bracket) host = (size_t)(bracket - t) + 1;
+    int local = ui_is_local_host(t, host);
+    if (!strpbrk(t, " \t\r\n") && (local || memchr(t, '.', host))) {
+      struct buf b = { 0 };
+      buf_puts(&b, local ? "http://" : "https://");
+      buf_puts(&b, t);
+      url = buf_take(&b);
+    } else {
+      url = ui_search_url(t);
+    }
   }
-  return ui_search_url(t);
+  free(t);
+  return url;
 }
 
-static void ui_navigate(const char *url)
+static const char *ui_display_url(const char *url)
 {
-  if (!url) return;
+  if (!url || !strcmp(url, "about:blank") ||
+      !strncmp(url, UI_HOME_PREFIX, sizeof UI_HOME_PREFIX - 1)) return "";
+  return url;
+}
+
+static unsigned ui_navigate(const char *url)
+{
+  if (!url) return 0;
   struct buf b = { 0 };
   buf_puts(&b, "{\"url\":");
   buf_json_str(&b, url);
   buf_puts(&b, "}");
-  ui_send("Page.navigate", b.p, 1);
+  unsigned id = ui_send("Page.navigate", b.p, 1);
   free(b.p);
+  if (!id) return 0;
   g_ui.t->loading = 1;
   g_ui.t->committed = 0;
   ui_status("Loading\xe2\x80\xa6");
+  return id;
 }
 
 static void ui_go(int delta)
 {
   int to = g_ui.t->cur + delta;
-  if (to < 0 || to >= g_ui.t->nhist) return;
-  g_ui.t->going = to;
-  ui_navigate(g_ui.t->hist[to]);
+  if (g_ui.t->going >= 0 || (g_ui.t->loading && !g_ui.t->committed) ||
+      to < 0 || to >= g_ui.t->nhist) return;
+  g_ui.t->history_id = ui_navigate(g_ui.t->hist[to]);
+  if (g_ui.t->history_id) g_ui.t->going = to;
 }
 
 static void ui_on_back(LunaElement *e) {
@@ -7021,25 +7078,47 @@ static void ui_on_fwd(LunaElement *e) {
   (void)e;
   ui_go(1);
 }
+static int ui_spawn(void);
+
 static void ui_on_reload(LunaElement *e) {
   (void)e;
-  ui_send("Page.reload", NULL, 1);
+  struct ui_tab *t = g_ui.t;
+  if (t->from < 0) {
+    if (!t->start) t->start = lb_strdup(t->cur < t->nhist ? t->hist[t->cur] : "about:blank");
+    if (ui_spawn() == 0) {
+      t->sent_w = 0;
+      t->loading = 1;
+      t->committed = 0;
+      ui_show_hover(NULL);
+    } else {
+      ui_status("Could not start the page process.");
+    }
+    return;
+  }
+  if (!ui_send("Page.reload", NULL, 1)) return;
   g_ui.t->loading = 1;
   g_ui.t->committed = 0;
   ui_status("Loading\xe2\x80\xa6");
 }
 
 /* A page committed: the address bar, the history, then its title. */
-static void ui_committed(const char *url)
+static void ui_committed(const char *url, const char *loader)
 {
   int u = ui_el("url");
   g_ui.t->committed = 1;
   if (ui_is_active() && u >= 0 && luna_focused_element() != u)
-    luna_set_value(u, strncmp(url, UI_HOME_PREFIX, sizeof UI_HOME_PREFIX - 1) ? url : "");
-  if (g_ui.t->going >= 0) {
+    luna_set_value(u, ui_display_url(url));
+  if (g_ui.t->going >= 0 && loader && g_ui.t->history_loader[0] &&
+      !strcmp(loader, g_ui.t->history_loader)) {
+    g_ui.t->history_loader[0] = '\0';
     g_ui.t->cur = g_ui.t->going;
     g_ui.t->going = -1;
-  } else if (!(g_ui.t->cur < g_ui.t->nhist && !strcmp(g_ui.t->hist[g_ui.t->cur], url))) {
+    char *entry = lb_strdup(url);
+    if (entry) {
+      free(g_ui.t->hist[g_ui.t->cur]);
+      g_ui.t->hist[g_ui.t->cur] = entry;
+    }
+  } else if (g_ui.t->going < 0 && !(g_ui.t->cur < g_ui.t->nhist && !strcmp(g_ui.t->hist[g_ui.t->cur], url))) {
     for (int i = g_ui.t->cur + 1; i < g_ui.t->nhist; ++i) free(g_ui.t->hist[i]);
     g_ui.t->nhist = g_ui.t->nhist ? g_ui.t->cur + 1 : 0;
     char **h = realloc(g_ui.t->hist, sizeof *h * (size_t)(g_ui.t->nhist + 1));
@@ -7058,7 +7137,12 @@ static void ui_message(const char *text)
   if (!m) return;
   const char *method = jstr(m, "method");
   const struct jv *params = jget(m, "params");
-  if (!method && g_ui.t->wheel_id && (unsigned)jnum(m, "id", 0) == g_ui.t->wheel_id) {
+  if (!method && g_ui.t->history_id && (unsigned)jnum(m, "id", 0) == g_ui.t->history_id) {
+    const char *loader = jstr(jget(m, "result"), "loaderId");
+    g_ui.t->history_id = 0;
+    if (loader) snprintf(g_ui.t->history_loader, sizeof g_ui.t->history_loader, "%s", loader);
+    else g_ui.t->going = -1;
+  } else if (!method && g_ui.t->wheel_id && (unsigned)jnum(m, "id", 0) == g_ui.t->wheel_id) {
     g_ui.t->wheel_id = 0;
   } else if (!method && g_ui.t->hover_id && (unsigned)jnum(m, "id", 0) == g_ui.t->hover_id) {
     g_ui.t->hover_id = 0;
@@ -7092,8 +7176,9 @@ static void ui_message(const char *text)
   } else if (method && !strcmp(method, "Lunaria.cursor")) {
     if (ui_is_active() && g_luna_platform.set_cursor) g_luna_platform.set_cursor((int)jnum(params, "type", 0));
   } else if (method && !strcmp(method, "Page.frameNavigated")) {
-    const char *url = jstr(jget(params, "frame"), "url");
-    if (url) ui_committed(url);
+    const struct jv *frame = jget(params, "frame");
+    const char *url = jstr(frame, "url");
+    if (url) ui_committed(url, jstr(frame, "loaderId"));
   } else if (method && !strcmp(method, "Lunaria.hover")) {
     ui_show_hover(jstr(params, "url"));
   } else if (method && !strcmp(method, "Lunaria.findResult")) {
@@ -7106,9 +7191,8 @@ static void ui_message(const char *text)
                                "{\"expression\":\"document.title\",\"returnByValue\":true}", 1);
   } else if (!method && g_ui.t->title_id && (unsigned)jnum(m, "id", 0) == g_ui.t->title_id) {
     const char *t = jstr(jget(jget(m, "result"), "result"), "value");
-    int u = ui_el("url");
-    const char *url = g_ui.t->hist && g_ui.t->cur < g_ui.t->nhist ? g_ui.t->hist[g_ui.t->cur] : (u >= 0 ? luna_get_value(u) : "");
-    snprintf(g_ui.t->title, sizeof g_ui.t->title, "%s", t && *t ? t : url);
+    const char *url = g_ui.t->cur < g_ui.t->nhist ? ui_display_url(g_ui.t->hist[g_ui.t->cur]) : "";
+    snprintf(g_ui.t->title, sizeof g_ui.t->title, "%s", t && *t ? t : *url ? url : "New Tab");
     if (ui_is_active()) luna_platform_set_title(g_ui.t->title);
     g_ui.t->title_id = 0;
     g_ui.tabs_dirty = 1;
@@ -7155,7 +7239,9 @@ static void ui_pump_one(void)
     if (n == 0) {
       close(g_ui.t->from);
       g_ui.t->from = -1;
-      ui_status("The page process ended.");
+      if (g_ui.t->to >= 0) close(g_ui.t->to);
+      g_ui.t->to = -1;
+      g_ui.t->tx_offset = g_ui.t->tx.len = 0;
     }
     break;
   }
@@ -7168,6 +7254,20 @@ static void ui_pump_one(void)
   if (start) {
     memmove(g_ui.t->rx.p, g_ui.t->rx.p + start, g_ui.t->rx.len - start);
     g_ui.t->rx.len -= start;
+  }
+  if (g_ui.t->from < 0) {
+    struct ui_tab *t = g_ui.t;
+    if (t->pid > 0) {
+      while (waitpid(t->pid, NULL, 0) < 0 && errno == EINTR) {}
+      t->pid = -1;
+    }
+    t->rx.len = 0;
+    t->loading = 0;
+    t->going = -1;
+    t->history_loader[0] = '\0';
+    t->history_id = t->title_id = t->wheel_id = t->hover_id = 0;
+    t->wheel_x = t->wheel_y = 0;
+    ui_show_hover(NULL);
   }
 }
 
@@ -7230,7 +7330,12 @@ static int ui_spawn(void)
 {
   int in[2], out[2];
   const char *exe = self_exe();
-  if (pipe(in) != 0 || pipe(out) != 0) return -1;
+  if (pipe(in) != 0) return -1;
+  if (pipe(out) != 0) {
+    close(in[0]);
+    close(in[1]);
+    return -1;
+  }
   char size[64];
   snprintf(size, sizeof size, "--window-size=%d,%d", g_page.w, g_page.h - UI_BAR);
   char profile[1024] = "";
@@ -7244,7 +7349,13 @@ static int ui_spawn(void)
   if (g_ui.t->desktop) snprintf(ua, sizeof ua, "--user-agent=%s", ui_desktop_ua);
   else if (g_user_agent[0]) snprintf(ua, sizeof ua, "--user-agent=%s", g_user_agent);
   pid_t pid = fork();
-  if (pid < 0) return -1;
+  if (pid < 0) {
+    close(in[0]);
+    close(in[1]);
+    close(out[0]);
+    close(out[1]);
+    return -1;
+  }
   if (pid == 0) {
     dup2(in[0], 3);
     dup2(out[1], 4);
@@ -7368,10 +7479,11 @@ static void ui_tab_switch(int i)
   g_ui.t = t;
   t->sent_w = 0;                                    /* the viewport is sent again */
   int u = ui_el("url");
-  if (u >= 0) luna_set_value(u, t->hist && t->cur < t->nhist ? t->hist[t->cur] : (t->start ? t->start : ""));
+  if (u >= 0) luna_set_value(u, ui_display_url(t->cur < t->nhist ? t->hist[t->cur] : t->start));
   luna_platform_set_title(t->title[0] ? t->title : "Luna Browser");
   ui_buttons();
   ui_show_hover(t->hover);
+  ui_loading_icon();
   luna_invalidate_texture(UI_FRAME);
   if (!g_ui.shown && t->frame && ui_el("view") >= 0) {
     luna_set_background_image(ui_el("view"), UI_FRAME);
@@ -7396,9 +7508,7 @@ static void ui_tab_open(const char *url)
   g_tabs[g_ntabs++] = t;
   g_ui.hover_pending = 0;
   g_ui.t = t;
-  if (ui_spawn() != 0) {
-    ui_status("Could not start the page process.");
-  }
+  int started = ui_spawn() == 0;
   if (old && old != t) {                            /* hide the tab we came from */
     g_ui.t = old;
     ui_send("Page.stopScreencast", NULL, 1);
@@ -7407,10 +7517,11 @@ static void ui_tab_open(const char *url)
   g_active = g_ntabs - 1;
   t->sent_w = 0;
   int u = ui_el("url");
-  if (u >= 0) luna_set_value(u, t->start && strcmp(t->start, "about:blank") ? t->start : "");
+  if (u >= 0) luna_set_value(u, ui_display_url(t->start));
   luna_platform_set_title("Luna Browser");
   ui_buttons();
-  ui_status(NULL);
+  ui_status(started ? NULL : "Could not start the page process.");
+  ui_loading_icon();
   luna_invalidate_texture(UI_FRAME);
   luna_app_request_redraw();
   ui_tabs_refresh();
@@ -7476,10 +7587,7 @@ static void ui_toggle_desktop(void)
   buf_puts(&b, "}");
   ui_send("Emulation.setUserAgentOverride", b.p, 1);
   free(b.p);
-  ui_send("Page.reload", NULL, 1);
-  t->loading = 1;
-  t->committed = 0;
-  ui_status("Loading\xe2\x80\xa6");
+  ui_on_reload(NULL);
   ui_buttons();
 }
 
@@ -7608,12 +7716,8 @@ static void ui_frame(double dt, void *user)
   for (int i = 0; i < g_ntabs; ++i) if (g_tabs[i]->loading) mask |= 1u << i;
   if (mask != g_ui.load_mask) {
     g_ui.load_mask = mask;
+    ui_loading_icon();
     g_ui.tabs_dirty = 1;
-    int sp = ui_el("spin");
-    if (sp >= 0 && g_ntabs) {
-      if (g_tabs[g_active]->loading) luna_add_class(sp, "on");
-      else luna_remove_class(sp, "on");
-    }
   }
   if (g_ui.tabs_dirty) ui_tabs_refresh();
   ui_cat();
@@ -8101,7 +8205,7 @@ static int ui_key(int key, int scancode, int action, int mods, void *user)
       return 1;
     }
     if (down && key == LUNA_KEY_ESCAPE) {
-      if (g_ui.t->cur < g_ui.t->nhist) luna_set_value(ui_el("url"), g_ui.t->hist[g_ui.t->cur]);
+      if (g_ui.t->cur < g_ui.t->nhist) luna_set_value(ui_el("url"), ui_display_url(g_ui.t->hist[g_ui.t->cur]));
       luna_focus_element(-1);
       return 1;
     }

@@ -15,6 +15,9 @@ CFLAGS   ?= $(OPT) -g
 CFLAGS   += -std=c11 -D_GNU_SOURCE
 WARN     := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
             -Wno-missing-field-initializers
+# A packaged build inherits -Wpedantic; dlsym() results are function pointers
+# (POSIX requires the cast) and the embedded JS is one long string literal.
+WARN     += -Wno-pedantic -Wno-overlength-strings
 # Where EGL comes from: the system's, or ANGLE's on macOS (the emulator's own
 # Makefile passes its HOST_GL_LIBS and include flags for a packaged build).
 LB_GL_LIBS ?= -lEGL

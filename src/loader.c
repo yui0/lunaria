@@ -2840,7 +2840,13 @@ run_jni_game_arm(struct jvm *jvm)
   return EXIT_SUCCESS;
 }
 
-__attribute__((optimize(0))) static void
+/* GCC's optimize attribute has no clang counterpart; optnone is the equivalent. */
+#if defined(__clang__)
+#define LUNARIA_NOOPT __attribute__((optnone))
+#else
+#define LUNARIA_NOOPT __attribute__((optimize(0)))
+#endif
+LUNARIA_NOOPT static void
 raw_start(void *entry, int argc, const char *argv[])
 {
   // XXX: make this part of the linker when it's rewritten

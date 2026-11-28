@@ -36,6 +36,13 @@ WARNINGS = -Wall -Wextra -Wpedantic -Wformat=2 -Wstrict-aliasing=3 -Wno-strict-o
 	-Wno-unused-variable -Wno-unused-but-set-variable -Wno-unused-result -Wno-sign-compare -Wno-type-limits \
 	-Wno-format-truncation -Wno-array-bounds -Wno-comment
 
+# clang rejects GCC-only options such as -Warray-bounds=2, and its -Wcast-align
+# also flags byte-buffer casts that are harmless on x86-64 and arm64.
+CC_IS_CLANG := $(findstring clang,$(shell $(CC) --version 2>/dev/null))
+ifneq ($(CC_IS_CLANG),)
+WARNINGS += -Wno-unknown-warning-option -Wno-cast-align
+endif
+
 OPTFLAGS ?= -g -O2
 CFLAGS ?= $(OPTFLAGS) $(WARNINGS)
 CFLAGS += -std=c11
@@ -315,8 +322,10 @@ lunaria: $(LUNARIA_BIN)
 endif
 
 macos-deps:
+ifneq ($(MACOS_CROSS),1)
 	sh scripts/fetch-macos-deps.sh
 	sh scripts/build-macos-glfw.sh
+endif
 
 # https://developer.android.com/ndk/guides/abis
 # https://android.googlesource.com/platform/ndk/+/ics-mr0/docs/STANDALONE-TOOLCHAIN.html
@@ -3248,8 +3257,10 @@ field-cache-test: test/test_dvm
 	./test/test_dvm --field-cache-test
 
 ifeq ($(LUNA_OS_NAME),Darwin)
+ifneq ($(MACOS_CROSS),1)
 $(MAC_DEPS)/lib/libharfbuzz.0.dylib: scripts/fetch-macos-deps.sh
 	sh scripts/fetch-macos-deps.sh
+endif
 $(BUILD_DIR)/luna_overlay.o: $(MAC_DEPS)/lib/libharfbuzz.0.dylib
 endif
 
@@ -3609,6 +3620,9 @@ endif
 dist-luna-browser:
 ifeq ($(DIST_OS),windows)
 	@echo "dist-luna-browser: skipped (luna-browser has no Windows port)"
+else ifeq ($(MACOS_CROSS),1)
+	$(MAKE) -C luna-browser -B LB_WINDOW=0 LUNA_UI=$(abspath $(LUNA_UI_DIR)) \
+	    CFLAGS="$(DIST_OPTFLAGS) -std=c11 -D_GNU_SOURCE -DEGL_NO_PLATFORM_SPECIFIC_TYPES -I$(MAC_DEPS)/linux-abi -I$(MAC_DEPS)/khronos/include -I$(MAC_OPENSSL)/include" $(LB_DIST_VARS)
 else
 	-$(MAKE) -C luna-browser -B LB_WINDOW=0 LUNA_UI=$(abspath $(LUNA_UI_DIR)) \
 	    OPT="$(DIST_OPTFLAGS)" $(LB_DIST_VARS)
@@ -3665,8 +3679,13 @@ dist-mac: dist-stage
 	# The files inside were signed one by one; the bundle itself has to be
 	# sealed after it is assembled, or its signature does not cover Info.plist
 	# and Resources and macOS refuses it as damaged.
+ifeq ($(MACOS_CROSS),1)
+	rcodesign sign "$(MAC_APP)"
+	@test -s "$(MAC_APP)/Contents/_CodeSignature/CodeResources"
+else
 	codesign --force --deep --sign - "$(MAC_APP)"
 	codesign --verify --deep --strict "$(MAC_APP)"
+endif
 	rm -f "$(CURDIR)/$(DIST_NAME).tar.gz"
 	cd "$(dir $(MAC_APP))" && COPYFILE_DISABLE=1 tar czf "$(CURDIR)/$(DIST_NAME).tar.gz" "$(notdir $(MAC_APP))"
 	@echo "$(DIST_NAME).tar.gz"

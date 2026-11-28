@@ -2823,8 +2823,7 @@ uintptr_t apkenv___linker_init(uintptr_t **elfdata) {
   AElf(Phdr) *phdr =
     (AElf(Phdr) *)((unsigned char *)(uintptr_t)linker_addr + elf_hdr->e_phoff);
 
-  soinfo linker_so;
-  memset(&linker_so, 0, sizeof(soinfo));
+  soinfo linker_so = {0};
 
   linker_so.base = linker_addr;
   linker_so.dynamic = (AElf(Dyn) *)-1;

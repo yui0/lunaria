@@ -4,9 +4,10 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-src="$root/.deps/glfw"
-obj="$root/.deps/glfw-build"
-out="$root/.deps/lib/libglfw3.a"
+deps=${MAC_DEPS:-"$root/.deps"}
+src="$deps/glfw"
+obj="$deps/glfw-build"
+out="$deps/lib/libglfw3.a"
 
 [ -f "$src/include/GLFW/glfw3.h" ] || "$root/scripts/fetch-macos-deps.sh"
 mkdir -p "$obj" "$(dirname "$out")"
@@ -20,11 +21,16 @@ objects=
 for file in $sources; do
     name=${file%.*}.o
     target="$obj/$name"
-    xcrun clang -O2 -fPIC -D_GLFW_COCOA -I"$src/include" -I"$src/src" \
+    if [ "${MACOS_CROSS:-}" = 1 ]; then set -- "$CC"; else set -- xcrun clang; fi
+    "$@" -O2 -fPIC -D_GLFW_COCOA -I"$src/include" -I"$src/src" \
         -c "$src/src/$file" -o "$target"
     objects="$objects $target"
 done
 
 # shellcheck disable=SC2086
-libtool -static -o "$out" $objects
+if [ "${MACOS_CROSS:-}" = 1 ]; then
+    "$MAC_AR" rcs "$out" $objects
+else
+    libtool -static -o "$out" $objects
+fi
 printf '%s\n' "built $out"

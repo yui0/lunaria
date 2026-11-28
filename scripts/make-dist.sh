@@ -71,10 +71,10 @@ mkdir -p "$stage/licenses"
 cp -p src/lib/musl/COPYRIGHT "$stage/licenses/musl.txt"
 cp -p LICENSE.unicode "$stage/licenses/unicode.txt"
 if [ "$os" = macos ]; then
-    [ -s .deps/lib/harfbuzz-LICENSE.txt ] || err 'missing HarfBuzz license; run make macos-deps'
-    cp -p .deps/lib/harfbuzz-LICENSE.txt "$stage/licenses/harfbuzz.txt"
-    [ -d .deps/moltenvk-licenses ] || err 'missing MoltenVK source licenses; run make macos-deps'
-    cp -R .deps/moltenvk-licenses "$stage/licenses/moltenvk"
+    [ -s "${MAC_DEPS:-.deps}/lib/harfbuzz-LICENSE.txt" ] || err 'missing HarfBuzz license; run make macos-deps'
+    cp -p "${MAC_DEPS:-.deps}/lib/harfbuzz-LICENSE.txt" "$stage/licenses/harfbuzz.txt"
+    [ -d "${MAC_DEPS:-.deps}/moltenvk-licenses" ] || err 'missing MoltenVK source licenses; run make macos-deps'
+    cp -R "${MAC_DEPS:-.deps}/moltenvk-licenses" "$stage/licenses/moltenvk"
 fi
 if [ "$os" = windows ]; then
     cp -p runtime/*.dll "$stage/runtime/" 2>/dev/null || true

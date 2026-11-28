@@ -7,6 +7,9 @@
 # newer standalone ANGLE build on Apple Silicon; callers can override it with
 # ANGLE_LIB_DIR.  Copy dylibs locally because external applications may update.
 set -eu
+sha256() {
+    if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
 
 # Print the failed URL: curl's own error line ("error: 504") does not say
 # which download died, so say it here before the script exits.
@@ -18,7 +21,11 @@ fetch() {
 }
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-deps="$root/.deps"
+deps=${MAC_DEPS:-"$root/.deps"}
+sign_library() {
+    if [ "${MACOS_CROSS:-}" = 1 ]; then rcodesign sign "$1"
+    else codesign --force --sign - --timestamp=none "$1"; fi
+}
 glfw="$deps/glfw"
 khr="$deps/khronos/include"
 linux_abi="$deps/linux-abi"
@@ -118,7 +125,7 @@ if [ ! -f "$deps/vulkan/include/vulkan/vulkan.h" ]; then
     trap - EXIT HUP INT TERM
 fi
 angle=${ANGLE_LIB_DIR:-}
-if [ -z "$angle" ] && [ "$(uname -m)" = arm64 ]; then
+if [ -z "$angle" ] && [ "${MAC_TARGET_ARCH:-$(uname -m)}" = arm64 ]; then
     angle_version=1.0.16
     angle="$deps/angle-$angle_version"
     if [ ! -f "$angle/libEGL.dylib" ] || [ ! -f "$angle/libGLESv2.dylib" ]; then
@@ -128,7 +135,7 @@ if [ -z "$angle" ] && [ "$(uname -m)" = arm64 ]; then
             "https://github.com/startergo/homebrew-angle/releases/download/v${angle_version}/angle-${angle_version}.arm64_sequoia.bottle.tar.gz" \
             --output "$archive"
         expected=29fe2175b157a65f12879f9a12b5c8f94d0a76fafdf41ff009a2fdb4e9df525c
-        actual=$(shasum -a 256 "$archive" | cut -d ' ' -f 1)
+        actual=$(sha256 "$archive" | cut -d ' ' -f 1)
         [ "$actual" = "$expected" ] || { echo "ANGLE archive checksum mismatch" >&2; exit 1; }
         mkdir -p "$angle"
         tar -xzf "$archive" -C "$angle" --strip-components=3 \
@@ -176,10 +183,10 @@ if [ "$angle" != "$deps/lib" ] && \
     cp "$angle/libEGL.dylib" "$deps/lib/libEGL.dylib"
     cp "$angle/libGLESv2.dylib" "$deps/lib/libGLESv2.dylib"
     chmod u+w "$deps/lib/libEGL.dylib" "$deps/lib/libGLESv2.dylib"
-    install_name_tool -id @rpath/libEGL.dylib "$deps/lib/libEGL.dylib"
-    install_name_tool -id @rpath/libGLESv2.dylib "$deps/lib/libGLESv2.dylib"
-    codesign --force --sign - --timestamp=none "$deps/lib/libEGL.dylib"
-    codesign --force --sign - --timestamp=none "$deps/lib/libGLESv2.dylib"
+    "${MAC_INSTALL_NAME_TOOL:-install_name_tool}" -id @rpath/libEGL.dylib "$deps/lib/libEGL.dylib"
+    "${MAC_INSTALL_NAME_TOOL:-install_name_tool}" -id @rpath/libGLESv2.dylib "$deps/lib/libGLESv2.dylib"
+    sign_library "$deps/lib/libEGL.dylib"
+    sign_library "$deps/lib/libGLESv2.dylib"
     printf '%s\n' "$angle" > "$angle_stamp"
 fi
 
@@ -232,8 +239,8 @@ if [ ! -s "$harfbuzz_library" ] || [ ! -s "$deps/lib/harfbuzz-LICENSE.txt" ] || 
         --parallel "${DYNARMIC_JOBS:-4}"
     cp -L "$harfbuzz_build/libharfbuzz.dylib" "$harfbuzz_library"
     cp "$harfbuzz_source/COPYING" "$deps/lib/harfbuzz-LICENSE.txt"
-    install_name_tool -id @rpath/libharfbuzz.0.dylib "$harfbuzz_library"
-    codesign --force --sign - --timestamp=none "$harfbuzz_library"
+    "${MAC_INSTALL_NAME_TOOL:-install_name_tool}" -id @rpath/libharfbuzz.0.dylib "$harfbuzz_library"
+    sign_library "$harfbuzz_library"
     printf '%s\n' "$harfbuzz_version" > "$deps/lib/.harfbuzz-version"
 fi
 

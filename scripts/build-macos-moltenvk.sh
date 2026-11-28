@@ -2,19 +2,26 @@
 # Rebuild the existing MoltenVK dependency with its fragment-output compiler fix.
 # Uses the CMake, compiler and Python already required by the macOS build.
 set -eu
+sha256() {
+    if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi
+}
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-deps="$root/.deps"
+deps=${MAC_DEPS:-"$root/.deps"}
+sign_library() {
+    if [ "${MACOS_CROSS:-}" = 1 ]; then rcodesign sign "$1"
+    else codesign --force --sign - --timestamp=none "$1"; fi
+}
 sources="$deps/moltenvk-sources"
 cache="$deps/moltenvk-source-archives"
 build="$deps/moltenvk-build"
 patch_file="$root/scripts/patches/spirv-cross-fragment-output-mask.patch"
 cmake_file="$root/scripts/macos-moltenvk/CMakeLists.txt"
 version=1.4.2
-arch=$(uname -m)
+arch=${MAC_TARGET_ARCH:-$(uname -m)}
 cmake="$deps/bin/cmake"
 stamp="$deps/lib/.moltenvk-version"
 out="$deps/lib/libMoltenVK.dylib"
-fingerprint=$( { for file in "$0" "$patch_file" "$cmake_file"; do shasum -a 256 "$file" | awk '{print $1}'; done; printf '%s\n' "$arch"; } | shasum -a 256 | awk '{print $1}')
+fingerprint=$( { for file in "$0" "$patch_file" "$cmake_file"; do sha256 "$file" | awk '{print $1}'; done; printf '%s\n' "$arch"; } | sha256 | awk '{print $1}')
 expected="$version-privateapi-fragment-output-$fingerprint"
 if [ -f "$out" ] && [ -f "$deps/moltenvk/include/vulkan/vulkan.h" ] && \
    [ -f "$deps/moltenvk/include/vk_video/vulkan_video_codecs_common.h" ] && \
@@ -27,10 +34,10 @@ mkdir -p "$sources" "$cache" "$deps/lib" "$deps/moltenvk/include"
 fetch_source() {
     name=$1 repository=$2 revision=$3 digest=$4
     archive="$cache/$name.tar.gz"
-    if [ ! -f "$archive" ] || [ "$(shasum -a 256 "$archive" | awk '{print $1}')" != "$digest" ]; then
+    if [ ! -f "$archive" ] || [ "$(sha256 "$archive" | awk '{print $1}')" != "$digest" ]; then
         curl --fail --location --silent --show-error \
             "https://github.com/$repository/archive/$revision.tar.gz" --output "$archive.tmp"
-        actual=$(shasum -a 256 "$archive.tmp" | awk '{print $1}')
+        actual=$(sha256 "$archive.tmp" | awk '{print $1}')
         [ "$actual" = "$digest" ] || { rm -f "$archive.tmp"; echo "$name source checksum mismatch" >&2; exit 1; }
         mv "$archive.tmp" "$archive"
     fi
@@ -71,8 +78,8 @@ patch -s -p1 -d "$cross" -i "$patch_file"
 "$cmake" --build "$build" --target MoltenVK -j "${LUNARIA_BUILD_JOBS:-4}"
 
 cp "$build/moltenvk/MoltenVK/libMoltenVK.dylib" "$out.tmp"
-install_name_tool -id @rpath/libMoltenVK.dylib "$out.tmp"
-codesign --force --sign - --timestamp=none "$out.tmp"
+"${MAC_INSTALL_NAME_TOOL:-install_name_tool}" -id @rpath/libMoltenVK.dylib "$out.tmp"
+sign_library "$out.tmp"
 mv "$out.tmp" "$out"
 cp -R "$sources/Vulkan-Headers/include/vulkan" "$deps/moltenvk/include/"
 cp -R "$sources/Vulkan-Headers/include/vk_video" "$deps/moltenvk/include/"

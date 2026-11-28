@@ -894,7 +894,7 @@ static bool x_pb_start(struct dvm *vm, dvm_ref self, const union dvm_value *args
     uint32_t count = l->size;
     char **words = calloc(count, sizeof *words);
     union dvm_value directory = {0};
-    dvm_get_field(vm,self,"directory","Ljava/io/File;",&directory);
+    (void)dvm_get_field(vm,self,"directory","Ljava/io/File;",&directory);
     const char *path = directory.l ? file_path(vm,directory.l) : NULL;
     char *cwd = path ? strdup(path) : NULL;
     bool valid = words && (!path || cwd);
@@ -915,7 +915,7 @@ static bool x_pb_start(struct dvm *vm, dvm_ref self, const union dvm_value *args
       dvm__throw(vm,"java/io/IOException","Could not start packaged ARM64 executable");
       return false;
     }
-    dvm_set_field(vm,process,"childTid","I",(union dvm_value){.i=tid});
+    (void)dvm_set_field(vm,process,"childTid","I",(union dvm_value){.i=tid});
     RETL(process);
   }
   const union dvm_value one = { .l = argv };
